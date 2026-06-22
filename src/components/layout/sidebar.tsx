@@ -1,11 +1,13 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import {
   ChevronsDownUp,
   ChevronsUpDown,
   Crosshair,
   Funnel,
+  MessageSquare,
+  FolderKanban,
   Search,
   SquarePen,
 } from "lucide-react"
@@ -14,6 +16,7 @@ import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useSidebarContext } from "@/contexts/sidebar-context"
 import { useTabContext } from "@/contexts/tab-context"
 import { useSearchDialog } from "@/contexts/search-dialog-context"
+import type { SidebarTab } from "@/contexts/platform-context"
 import {
   SidebarConversationList,
   type SidebarConversationListHandle,
@@ -57,8 +60,18 @@ const SHORTCUT_BADGE_CLASS = cn(
   "group-hover:opacity-100 group-focus-visible:opacity-100"
 )
 
-export function Sidebar() {
+interface SidebarProps {
+  /** Which tab is active. When "project", the sidebar renders children instead
+   *  of the conversation list and hides chat-specific actions. */
+  tab?: SidebarTab
+  /** Content to render when tab="project". Ignored when tab="chat" (or unset). */
+  children?: ReactNode
+}
+
+export function Sidebar({ tab = "chat", children }: SidebarProps) {
   const t = useTranslations("Folder.sidebar")
+  const pt = useTranslations("Platform.sidebar")
+  const isProjectTab = tab === "project"
   const { isOpen, toggle } = useSidebarContext()
   const { activeFolder } = useActiveFolder()
   const { openNewConversationTab, openChatModeTab } = useTabContext()
@@ -128,125 +141,166 @@ export function Sidebar() {
   return (
     <aside className="@container/sidebar flex h-full min-h-0 flex-col overflow-hidden bg-sidebar text-sidebar-foreground select-none">
       <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border pl-4 pr-2">
-        <div className="flex min-w-0 items-center gap-4">
+        <div className="flex min-w-0 items-center gap-2">
+          {/* ── Slot: Tab toggle ── */}
+          <div className="flex items-center rounded-md bg-muted p-0.5">
+            <button
+              type="button"
+              onClick={() => {
+                if (isProjectTab) {
+                  // Navigate to /workspace (chat mode)
+                  window.location.href = "/workspace"
+                }
+              }}
+              className={cn(
+                "flex h-6 items-center justify-center rounded-sm px-2 text-[0.75rem] font-medium transition-all",
+                !isProjectTab
+                  ? "bg-background shadow-sm text-foreground"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+              aria-label={pt("chatTab")}
+            >
+              <MessageSquare className="h-3 w-3 shrink-0" />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (!isProjectTab) {
+                  // Navigate to /platform (project mode)
+                  window.location.href = "/platform"
+                }
+              }}
+              className={cn(
+                "flex h-6 items-center justify-center rounded-sm px-2 text-[0.75rem] font-medium transition-all",
+                isProjectTab
+                  ? "bg-background shadow-sm text-foreground"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+              aria-label={pt("projectTab")}
+            >
+              <FolderKanban className="h-3 w-3 shrink-0" />
+            </button>
+          </div>
           <h2 className="truncate text-[0.875rem] font-bold tracking-[-0.00625rem] text-sidebar-foreground">
             {t("title")}
           </h2>
         </div>
         <div className="flex items-center gap-0.5">
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-6 w-6 shrink-0 text-muted-foreground"
-            onClick={() => listRef.current?.scrollToActive()}
-            title={t("locateActiveConversation")}
-            aria-label={t("locateActiveConversation")}
-          >
-            <Crosshair aria-hidden="true" className="h-3.5 w-3.5" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-6 w-6 shrink-0 text-muted-foreground"
-            onClick={handleToggleExpandAll}
-            title={toggleExpandLabel}
-            aria-label={toggleExpandLabel}
-          >
-            {allExpanded ? (
-              <ChevronsDownUp aria-hidden="true" className="h-3.5 w-3.5" />
-            ) : (
-              <ChevronsUpDown aria-hidden="true" className="h-3.5 w-3.5" />
-            )}
-          </Button>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
+          {/* ── Chat-only action buttons (hidden on Project tab) ── */}
+          {!isProjectTab && (
+            <>
               <Button
                 variant="ghost"
                 size="icon"
                 className="h-6 w-6 shrink-0 text-muted-foreground"
-                title={filterOptionsLabel}
-                aria-label={filterOptionsLabel}
+                onClick={() => listRef.current?.scrollToActive()}
+                title={t("locateActiveConversation")}
+                aria-label={t("locateActiveConversation")}
               >
-                <Funnel aria-hidden="true" className="h-3.5 w-3.5" />
+                <Crosshair aria-hidden="true" className="h-3.5 w-3.5" />
               </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuCheckboxItem
-                checked={showCompleted}
-                onCheckedChange={handleSetShowCompleted}
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-6 w-6 shrink-0 text-muted-foreground"
+                onClick={handleToggleExpandAll}
+                title={toggleExpandLabel}
+                aria-label={toggleExpandLabel}
               >
-                {t("showCompleted")}
-              </DropdownMenuCheckboxItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuLabel>{t("sortBy")}</DropdownMenuLabel>
-              <DropdownMenuRadioGroup
-                value={sortMode}
-                onValueChange={handleSetSortMode}
-              >
-                <DropdownMenuRadioItem value="created">
-                  {t("sortByCreatedAt")}
-                </DropdownMenuRadioItem>
-                <DropdownMenuRadioItem value="updated">
-                  {t("sortByUpdatedAt")}
-                </DropdownMenuRadioItem>
-              </DropdownMenuRadioGroup>
-            </DropdownMenuContent>
-          </DropdownMenu>
+                {allExpanded ? (
+                  <ChevronsDownUp aria-hidden="true" className="h-3.5 w-3.5" />
+                ) : (
+                  <ChevronsUpDown aria-hidden="true" className="h-3.5 w-3.5" />
+                )}
+              </Button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-6 w-6 shrink-0 text-muted-foreground"
+                    title={filterOptionsLabel}
+                    aria-label={filterOptionsLabel}
+                  >
+                    <Funnel aria-hidden="true" className="h-3.5 w-3.5" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuCheckboxItem
+                    checked={showCompleted}
+                    onCheckedChange={handleSetShowCompleted}
+                  >
+                    {t("showCompleted")}
+                  </DropdownMenuCheckboxItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel>{t("sortBy")}</DropdownMenuLabel>
+                  <DropdownMenuRadioGroup
+                    value={sortMode}
+                    onValueChange={handleSetSortMode}
+                  >
+                    <DropdownMenuRadioItem value="created">
+                      {t("sortByCreatedAt")}
+                    </DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem value="updated">
+                      {t("sortByUpdatedAt")}
+                    </DropdownMenuRadioItem>
+                  </DropdownMenuRadioGroup>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </>
+          )}
         </div>
       </div>
 
-      {/* Fixed actions above the scrollable list. `shrink-0` keeps them pinned —
-          they never scroll with the conversation list. Rows are `rounded-full`
-          like the conversation pills, and the icon/text geometry matches the
-          folder header: a 0.875rem icon + 0.875rem label at a 0.4375rem gap, with
-          the row's pl-[0.4375rem] (atop the container's px-1.5) placing the icon
-          center on the same 0.875rem rail axis as the folder/conversation icons in
-          the list below. Each row is a `group` so its shortcut hint reveals on
-          hover / keyboard focus. */}
-      <div className="flex shrink-0 flex-col gap-0.5 px-1.5 pt-1.5">
-        <button
-          type="button"
-          onClick={handleNewConversation}
-          title={t("newChat")}
-          className={cn(
-            "group flex h-8 w-full items-center gap-[0.4375rem] rounded-full pl-[0.4375rem] pr-1.5",
-            "text-[0.875rem] text-sidebar-foreground outline-none",
-            "transition-colors duration-150 hover:bg-sidebar-accent",
-            "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
-          )}
-        >
-          <SquarePen className="h-[0.875rem] w-[0.875rem] shrink-0 text-muted-foreground" />
-          <span className="truncate">{t("newChat")}</span>
-          {newConversationShortcutLabel ? (
-            <kbd className={SHORTCUT_BADGE_CLASS}>
-              {newConversationShortcutLabel}
-            </kbd>
-          ) : null}
-        </button>
-        <button
-          type="button"
-          onClick={() => setSearchOpen(true)}
-          title={t("search")}
-          className={cn(
-            "group flex h-8 w-full items-center gap-[0.4375rem] rounded-full pl-[0.4375rem] pr-1.5",
-            "text-[0.875rem] text-sidebar-foreground outline-none",
-            "transition-colors duration-150 hover:bg-sidebar-accent",
-            "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
-          )}
-        >
-          <Search className="h-[0.875rem] w-[0.875rem] shrink-0 text-muted-foreground" />
-          <span className="truncate">{t("search")}</span>
-          {searchShortcutLabel ? (
-            <kbd className={SHORTCUT_BADGE_CLASS}>{searchShortcutLabel}</kbd>
-          ) : null}
-        </button>
-      </div>
+      {/* ── Slot: Chat-only fixed actions (hidden on Project tab) ── */}
+      {!isProjectTab && (
+        <div className="flex shrink-0 flex-col gap-0.5 px-1.5 pt-1.5">
+          <button
+            type="button"
+            onClick={handleNewConversation}
+            title={t("newChat")}
+            className={cn(
+              "group flex h-8 w-full items-center gap-[0.4375rem] rounded-full pl-[0.4375rem] pr-1.5",
+              "text-[0.875rem] text-sidebar-foreground outline-none",
+              "transition-colors duration-150 hover:bg-sidebar-accent",
+              "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+            )}
+          >
+            <SquarePen className="h-[0.875rem] w-[0.875rem] shrink-0 text-muted-foreground" />
+            <span className="truncate">{t("newChat")}</span>
+            {newConversationShortcutLabel ? (
+              <kbd className={SHORTCUT_BADGE_CLASS}>
+                {newConversationShortcutLabel}
+              </kbd>
+            ) : null}
+          </button>
+          <button
+            type="button"
+            onClick={() => setSearchOpen(true)}
+            title={t("search")}
+            className={cn(
+              "group flex h-8 w-full items-center gap-[0.4375rem] rounded-full pl-[0.4375rem] pr-1.5",
+              "text-[0.875rem] text-sidebar-foreground outline-none",
+              "transition-colors duration-150 hover:bg-sidebar-accent",
+              "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+            )}
+          >
+            <Search className="h-[0.875rem] w-[0.875rem] shrink-0 text-muted-foreground" />
+            <span className="truncate">{t("search")}</span>
+            {searchShortcutLabel ? (
+              <kbd className={SHORTCUT_BADGE_CLASS}>{searchShortcutLabel}</kbd>
+            ) : null}
+          </button>
+        </div>
+      )}
 
-      {/* On mobile, clicking a conversation card auto-closes the Sheet */}
+      {/* ── Slot: Scrollable content area ──
+          - Chat tab (default): renders SidebarConversationList
+          - Project tab: renders children prop */}
       <div
         className="flex flex-col flex-1 min-h-0 overflow-hidden pt-1.5"
         onClick={
-          isMobile
+          isMobile && !isProjectTab
             ? (e) => {
                 const target = e.target as HTMLElement
                 if (target.closest("[data-conversation-id]")) {
@@ -256,11 +310,15 @@ export function Sidebar() {
             : undefined
         }
       >
-        <SidebarConversationList
-          ref={listRef}
-          showCompleted={showCompleted}
-          sortMode={sortMode}
-        />
+        {isProjectTab && children ? (
+          children
+        ) : (
+          <SidebarConversationList
+            ref={listRef}
+            showCompleted={showCompleted}
+            sortMode={sortMode}
+          />
+        )}
       </div>
     </aside>
   )
