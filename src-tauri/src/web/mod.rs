@@ -837,6 +837,7 @@ pub(crate) async fn do_start_web_server_tauri(
             .state::<crate::update::AppUpdateStateHandle>()
             .inner()
             .clone(),
+        platform_manager: crate::app_state::default_platform_manager(),
     });
 
     // See do_start_web_server_with_state for rationale on the reset.

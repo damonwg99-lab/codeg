@@ -11,3 +11,13 @@ pub mod opened_tab;
 pub mod prelude;
 pub mod quick_message;
 pub mod remote_workspace_connection;
+// ─── Platform entities ───
+pub mod platform_project;
+pub mod platform_project_repo;
+pub mod platform_task;
+pub mod platform_task_type_mapping;
+pub mod platform_task_conversation;
+pub mod platform_task_decomposition;
+pub mod platform_global_config;
+pub mod platform_credential;
+pub mod platform_activity_log;

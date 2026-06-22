@@ -11,3 +11,12 @@ pub mod quick_message_service;
 pub mod remote_workspace_connection_service;
 pub mod sender_context_service;
 pub mod tab_service;
+// ─── Platform services ───
+pub mod platform_project_service;
+pub mod platform_project_repo_service;
+pub mod platform_task_service;
+pub mod platform_task_type_mapping_service;
+pub mod platform_task_conversation_service;
+pub mod platform_task_decomposition_service;
+pub mod platform_global_config_service;
+pub mod platform_credential_service;

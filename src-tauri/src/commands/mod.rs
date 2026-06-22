@@ -30,3 +30,6 @@ pub mod version_control;
 #[cfg(feature = "tauri-runtime")]
 pub mod windows;
 pub mod workspace_state;
+// ─── Platform ───
+pub mod project;
+pub mod task;

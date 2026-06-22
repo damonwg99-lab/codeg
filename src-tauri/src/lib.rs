@@ -27,6 +27,7 @@ pub mod update;
 pub mod web;
 pub mod workspace_state;
 pub mod workspace_transfer;
+pub mod platform;
 
 /// Sweep stale ACP binary cache trash created by the rename-aside fallback in
 /// `acp::binary_cache::clear_agent_cache`. Safe to call any time; intended to
@@ -48,6 +49,7 @@ mod tauri_app {
         experts as experts_commands, feedback as feedback_commands, file_io, folder_commands,
         folders, mcp as mcp_commands,
         model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
+        project as project_commands, task as task_commands,
         question as question_commands, quick_messages as quick_messages_commands,
         remote_proxy as remote_proxy_commands,
         remote_workspace as remote_workspace_commands, session_info as session_info_commands,
@@ -164,6 +166,7 @@ mod tauri_app {
             .manage(ConnectionManager::new())
             .manage(TerminalManager::new())
             .manage(ChatChannelManager::new())
+            .manage(crate::platform::project::manager::PlatformManager::new())
             .manage(windows::SettingsWindowState::new())
             .manage(windows::CommitWindowState::new())
             .manage(windows::MergeWindowState::new())
@@ -1073,6 +1076,35 @@ mod tauri_app {
                 web::get_web_service_config,
                 web::update_web_service_config,
                 web::probe_web_service_port,
+                // ─── Platform ───
+                project_commands::list_projects,
+                project_commands::get_project,
+                project_commands::create_project,
+                project_commands::update_project,
+                project_commands::delete_project,
+                project_commands::list_project_repos,
+                project_commands::add_project_repo,
+                project_commands::remove_project_repo,
+                project_commands::scan_git_repos,
+                project_commands::get_global_config,
+                project_commands::set_global_config,
+                project_commands::save_credential,
+                project_commands::delete_credential,
+                task_commands::list_tasks,
+                task_commands::get_task,
+                task_commands::create_task,
+                task_commands::update_task,
+                task_commands::update_task_status,
+                task_commands::delete_task,
+                task_commands::link_conversation,
+                task_commands::unlink_conversation,
+                task_commands::list_task_conversations,
+                task_commands::get_task_by_conversation,
+                task_commands::list_task_type_mappings,
+                task_commands::create_task_type_mapping,
+                task_commands::update_task_type_mapping,
+                task_commands::delete_task_type_mapping,
+                task_commands::create_decomposition,
             ])
             .build(tauri::generate_context!())
             .expect("error while building tauri application")

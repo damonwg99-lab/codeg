@@ -12,6 +12,7 @@ use crate::terminal::manager::TerminalManager;
 use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
 use crate::web::WebServerState;
 use crate::workspace_transfer::WorkspaceTransferManager;
+use crate::platform::project::manager::PlatformManager;
 
 pub struct AppState {
     pub db: AppDatabase,
@@ -69,6 +70,8 @@ pub struct AppState {
     /// The upgrade UI subscribes to it and re-syncs from a snapshot on mount,
     /// so download progress survives settings-page navigation and reloads.
     pub update_state: crate::update::AppUpdateStateHandle,
+    /// Platform module state manager (Phase 1a: stub, Phase 1b: active project)
+    pub platform_manager: PlatformManager,
 }
 
 pub fn default_system_op_lock() -> Arc<tokio::sync::Mutex<()>> {
@@ -89,6 +92,10 @@ pub fn default_terminal_manager() -> TerminalManager {
 
 pub fn default_chat_channel_manager() -> ChatChannelManager {
     ChatChannelManager::new()
+}
+
+pub fn default_platform_manager() -> PlatformManager {
+    PlatformManager::new()
 }
 
 /// Build the delegation broker + token registry + per-process UDS socket
@@ -226,6 +233,7 @@ impl AppState {
             session_info_config,
             system_op_lock: default_system_op_lock(),
             update_state: default_update_state(),
+            platform_manager: default_platform_manager(),
         }
     }
 }

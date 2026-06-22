@@ -261,6 +261,7 @@ async fn async_main() {
         session_info_config: session_info_config.clone(),
         system_op_lock: codeg_lib::app_state::default_system_op_lock(),
         update_state: codeg_lib::app_state::default_update_state(),
+        platform_manager: codeg_lib::app_state::default_platform_manager(),
     });
 
     // Apply persisted delegation settings (depth, enabled) before

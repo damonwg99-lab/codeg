@@ -26,3 +26,6 @@ pub mod version_control;
 pub mod web_server;
 pub mod workspace_files;
 pub mod workspace_state;
+// ─── Platform ───
+pub mod project;
+pub mod task;

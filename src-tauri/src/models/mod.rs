@@ -34,3 +34,14 @@ pub use system::{
     GitHubTokenValidation, GitSettings, SystemLanguageSettings, SystemProxySettings,
     SystemTerminalSettings, TerminalShellOption,
 };
+// ─── Platform models ───
+pub mod platform_project;
+pub mod platform_task;
+pub mod platform_config;
+pub use platform_project::{
+    GitRepoScanResult, ProjectDetail, ProjectInfo, ProjectRepoInfo, TaskCountByStatus,
+};
+pub use platform_task::{
+    TaskConversationInfo, TaskDecompositionInfo, TaskDetail, TaskInfo, TaskTypeMappingInfo,
+};
+pub use platform_config::{CredentialInfo, GlobalConfigInfo};
