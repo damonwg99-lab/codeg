@@ -156,7 +156,7 @@ export function Sidebar({ tab = "chat", children }: SidebarProps) {
                 "flex h-6 items-center justify-center rounded-sm px-2 text-[0.75rem] font-medium transition-all",
                 !isProjectTab
                   ? "bg-background shadow-sm text-foreground"
-                  : "text-muted-foreground hover:text-foreground",
+                  : "text-muted-foreground hover:text-foreground"
               )}
               aria-label={pt("chatTab")}
             >
@@ -174,7 +174,7 @@ export function Sidebar({ tab = "chat", children }: SidebarProps) {
                 "flex h-6 items-center justify-center rounded-sm px-2 text-[0.75rem] font-medium transition-all",
                 isProjectTab
                   ? "bg-background shadow-sm text-foreground"
-                  : "text-muted-foreground hover:text-foreground",
+                  : "text-muted-foreground hover:text-foreground"
               )}
               aria-label={pt("projectTab")}
             >

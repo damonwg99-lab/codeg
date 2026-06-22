@@ -80,7 +80,7 @@ export async function deleteProject(id: number): Promise<void> {
 // ─── Project Repo ───
 
 export async function listProjectRepos(
-  projectId: number,
+  projectId: number
 ): Promise<ProjectRepoInfo[]> {
   return getTransport().call("list_project_repos", { projectId })
 }
@@ -112,7 +112,7 @@ export async function removeProjectRepo(id: number): Promise<void> {
 // ─── Git Scan ───
 
 export async function scanGitRepos(
-  rootDir: string,
+  rootDir: string
 ): Promise<GitRepoScanResult[]> {
   return getTransport().call("scan_git_repos", { rootDir })
 }
@@ -191,7 +191,7 @@ export async function updateTask(params: {
 
 export async function updateTaskStatus(
   id: number,
-  status: string,
+  status: string
 ): Promise<TaskInfo> {
   return getTransport().call("update_task_status", { id, status })
 }
@@ -225,13 +225,13 @@ export async function unlinkConversation(params: {
 }
 
 export async function listTaskConversations(
-  taskId: number,
+  taskId: number
 ): Promise<TaskConversationInfo[]> {
   return getTransport().call("list_task_conversations", { taskId })
 }
 
 export async function getTaskByConversation(
-  conversationId: number,
+  conversationId: number
 ): Promise<TaskConversationInfo | null> {
   return getTransport().call("get_task_by_conversation", { conversationId })
 }
@@ -239,7 +239,7 @@ export async function getTaskByConversation(
 // ─── Task Type Mapping ───
 
 export async function listTaskTypeMappings(
-  projectId?: number | null,
+  projectId?: number | null
 ): Promise<TaskTypeMappingInfo[]> {
   return getTransport().call("list_task_type_mappings", {
     projectId: projectId ?? null,
@@ -295,7 +295,7 @@ export async function createDecomposition(params: {
 // ─── Global Config ───
 
 export async function getGlobalConfig(
-  configType: string,
+  configType: string
 ): Promise<GlobalConfigInfo | null> {
   return getTransport().call("get_global_config", { configType })
 }

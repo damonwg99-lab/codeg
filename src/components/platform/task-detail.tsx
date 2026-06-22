@@ -3,10 +3,30 @@
 import { useEffect, useState, useCallback } from "react"
 import { useRouter } from "next/navigation"
 import { useTranslations } from "next-intl"
-import { Loader2, Pencil, Save, X, ArrowRight, MessageSquare } from "lucide-react"
-import { getTask, updateTask, updateTaskStatus, listTaskConversations } from "@/lib/platform/api"
-import type { TaskDetail as TaskDetailType, TaskConversationInfo, TaskStatus } from "@/lib/platform/types"
-import { TASK_STATUS_LIST, TASK_STATUS_LABELS, TASK_STATUS_COLORS } from "@/lib/platform/types"
+import {
+  Loader2,
+  Pencil,
+  Save,
+  X,
+  ArrowRight,
+  MessageSquare,
+} from "lucide-react"
+import {
+  getTask,
+  updateTask,
+  updateTaskStatus,
+  listTaskConversations,
+} from "@/lib/platform/api"
+import type {
+  TaskDetail as TaskDetailType,
+  TaskConversationInfo,
+  TaskStatus,
+} from "@/lib/platform/types"
+import {
+  TASK_STATUS_LIST,
+  TASK_STATUS_LABELS,
+  TASK_STATUS_COLORS,
+} from "@/lib/platform/types"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -52,7 +72,9 @@ export function TaskDetail({ taskId }: { taskId: number }) {
       }
     }
     void load()
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+    }
   }, [taskId])
 
   const handleSave = useCallback(async () => {
@@ -67,23 +89,33 @@ export function TaskDetail({ taskId }: { taskId: number }) {
         priority: editPriority || undefined,
         assignee: editAssignee || undefined,
       })
-      setDetail((prev) => prev ? { ...prev, task: updated } : null)
+      setDetail((prev) => (prev ? { ...prev, task: updated } : null))
       setEditing(false)
     } catch (e) {
       console.error("Save failed:", e)
     }
     setSaving(false)
-  }, [detail, editTitle, editDescription, editTaskType, editPriority, editAssignee])
+  }, [
+    detail,
+    editTitle,
+    editDescription,
+    editTaskType,
+    editPriority,
+    editAssignee,
+  ])
 
-  const handleStatusChange = useCallback(async (newStatus: string) => {
-    if (!detail) return
-    try {
-      const updated = await updateTaskStatus(detail.task.id, newStatus)
-      setDetail((prev) => prev ? { ...prev, task: updated } : null)
-    } catch (e) {
-      console.error("Status change failed:", e)
-    }
-  }, [detail])
+  const handleStatusChange = useCallback(
+    async (newStatus: string) => {
+      if (!detail) return
+      try {
+        const updated = await updateTaskStatus(detail.task.id, newStatus)
+        setDetail((prev) => (prev ? { ...prev, task: updated } : null))
+      } catch (e) {
+        console.error("Status change failed:", e)
+      }
+    },
+    [detail]
+  )
 
   // Get the next status in the flow
   const getNextStatus = useCallback((current: string): string | null => {
@@ -95,11 +127,19 @@ export function TaskDetail({ taskId }: { taskId: number }) {
   }, [])
 
   if (loading) {
-    return <div className="flex items-center justify-center py-16 text-muted-foreground">Loading…</div>
+    return (
+      <div className="flex items-center justify-center py-16 text-muted-foreground">
+        Loading…
+      </div>
+    )
   }
 
   if (!detail) {
-    return <div className="flex items-center justify-center py-16 text-destructive">Task not found</div>
+    return (
+      <div className="flex items-center justify-center py-16 text-destructive">
+        Task not found
+      </div>
+    )
   }
 
   const { task, subTasks } = detail
@@ -111,17 +151,30 @@ export function TaskDetail({ taskId }: { taskId: number }) {
         <div className="flex items-center gap-1">
           {editing ? (
             <>
-              <Button variant="outline" size="sm" onClick={() => setEditing(false)} disabled={saving}>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setEditing(false)}
+                disabled={saving}
+              >
                 <X className="mr-1 h-3.5 w-3.5" />
                 {t("project.cancel")}
               </Button>
               <Button size="sm" onClick={handleSave} disabled={saving}>
-                {saving ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> : <Save className="mr-1 h-3.5 w-3.5" />}
+                {saving ? (
+                  <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Save className="mr-1 h-3.5 w-3.5" />
+                )}
                 {t("project.save")}
               </Button>
             </>
           ) : (
-            <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setEditing(true)}
+            >
               <Pencil className="mr-1 h-3.5 w-3.5" />
               {t("project.edit")}
             </Button>
@@ -132,7 +185,9 @@ export function TaskDetail({ taskId }: { taskId: number }) {
       {/* ─── Status Management ─── */}
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-[0.9375rem]">{t("task.statusManagement")}</CardTitle>
+          <CardTitle className="text-[0.9375rem]">
+            {t("task.statusManagement")}
+          </CardTitle>
         </CardHeader>
         <CardContent>
           <div className="flex items-center gap-2">
@@ -143,7 +198,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                 size="sm"
                 className={cn(
                   "text-[0.75rem]",
-                  task.status === status && TASK_STATUS_COLORS[status],
+                  task.status === status && TASK_STATUS_COLORS[status]
                 )}
                 onClick={() => handleStatusChange(status)}
               >
@@ -158,7 +213,12 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                 onClick={() => handleStatusChange(getNextStatus(task.status)!)}
               >
                 <ArrowRight className="mr-1 h-3.5 w-3.5" />
-                {t("task.moveTo", { status: TASK_STATUS_LABELS[getNextStatus(task.status)! as TaskStatus] })}
+                {t("task.moveTo", {
+                  status:
+                    TASK_STATUS_LABELS[
+                      getNextStatus(task.status)! as TaskStatus
+                    ],
+                })}
               </Button>
             )}
           </div>
@@ -168,57 +228,84 @@ export function TaskDetail({ taskId }: { taskId: number }) {
       {/* ─── Basic Info ─── */}
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-[0.9375rem]">{t("task.basicInfo")}</CardTitle>
+          <CardTitle className="text-[0.9375rem]">
+            {t("task.basicInfo")}
+          </CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
           {editing ? (
             <>
               <div className="flex flex-col gap-1.5">
                 <Label>{t("task.title")}</Label>
-                <Input value={editTitle} onChange={(e) => setEditTitle(e.target.value)} />
+                <Input
+                  value={editTitle}
+                  onChange={(e) => setEditTitle(e.target.value)}
+                />
               </div>
               <div className="flex flex-col gap-1.5">
                 <Label>{t("task.description")}</Label>
-                <Input value={editDescription} onChange={(e) => setEditDescription(e.target.value)} />
+                <Input
+                  value={editDescription}
+                  onChange={(e) => setEditDescription(e.target.value)}
+                />
               </div>
               <div className="flex flex-col gap-1.5">
                 <Label>{t("task.taskType")}</Label>
-                <Input value={editTaskType} onChange={(e) => setEditTaskType(e.target.value)} />
+                <Input
+                  value={editTaskType}
+                  onChange={(e) => setEditTaskType(e.target.value)}
+                />
               </div>
               <div className="flex flex-col gap-1.5">
                 <Label>{t("task.priority")}</Label>
-                <Input value={editPriority} onChange={(e) => setEditPriority(e.target.value)} />
+                <Input
+                  value={editPriority}
+                  onChange={(e) => setEditPriority(e.target.value)}
+                />
               </div>
               <div className="flex flex-col gap-1.5">
                 <Label>{t("task.assignee")}</Label>
-                <Input value={editAssignee} onChange={(e) => setEditAssignee(e.target.value)} />
+                <Input
+                  value={editAssignee}
+                  onChange={(e) => setEditAssignee(e.target.value)}
+                />
               </div>
             </>
           ) : (
             <>
               <div className="flex flex-col gap-1">
-                <span className="text-[0.75rem] text-muted-foreground">{t("task.title")}</span>
+                <span className="text-[0.75rem] text-muted-foreground">
+                  {t("task.title")}
+                </span>
                 <span className="text-[0.875rem]">{task.title}</span>
               </div>
               {task.description && (
                 <div className="flex flex-col gap-1">
-                  <span className="text-[0.75rem] text-muted-foreground">{t("task.description")}</span>
+                  <span className="text-[0.75rem] text-muted-foreground">
+                    {t("task.description")}
+                  </span>
                   <span className="text-[0.875rem]">{task.description}</span>
                 </div>
               )}
               <div className="flex flex-col gap-1">
-                <span className="text-[0.75rem] text-muted-foreground">{t("task.taskType")}</span>
+                <span className="text-[0.75rem] text-muted-foreground">
+                  {t("task.taskType")}
+                </span>
                 <Badge variant="outline">{task.taskType}</Badge>
               </div>
               {task.priority && (
                 <div className="flex flex-col gap-1">
-                  <span className="text-[0.75rem] text-muted-foreground">{t("task.priority")}</span>
+                  <span className="text-[0.75rem] text-muted-foreground">
+                    {t("task.priority")}
+                  </span>
                   <Badge variant="outline">{task.priority}</Badge>
                 </div>
               )}
               {task.assignee && (
                 <div className="flex flex-col gap-1">
-                  <span className="text-[0.75rem] text-muted-foreground">{t("task.assignee")}</span>
+                  <span className="text-[0.75rem] text-muted-foreground">
+                    {t("task.assignee")}
+                  </span>
                   <span className="text-[0.875rem]">{task.assignee}</span>
                 </div>
               )}
@@ -230,18 +317,26 @@ export function TaskDetail({ taskId }: { taskId: number }) {
       {/* ─── Linked Conversations ─── */}
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle className="text-[0.9375rem]">{t("task.conversations")}</CardTitle>
+          <CardTitle className="text-[0.9375rem]">
+            {t("task.conversations")}
+          </CardTitle>
         </CardHeader>
         <CardContent>
           {conversations.length === 0 ? (
-            <p className="text-[0.8125rem] text-muted-foreground">{t("task.noConversations")}</p>
+            <p className="text-[0.8125rem] text-muted-foreground">
+              {t("task.noConversations")}
+            </p>
           ) : (
             <div className="flex flex-col gap-2">
               {conversations.map((conv) => (
                 <div
                   key={conv.id}
                   className="flex items-center gap-2 rounded-md border p-2 cursor-pointer hover:bg-accent"
-                  onClick={() => router.push(`/workspace?conversationId=${conv.conversationId}`)}
+                  onClick={() =>
+                    router.push(
+                      `/workspace?conversationId=${conv.conversationId}`
+                    )
+                  }
                 >
                   <MessageSquare className="h-4 w-4 text-muted-foreground" />
                   <div className="flex flex-col gap-0.5 min-w-0">
@@ -266,7 +361,9 @@ export function TaskDetail({ taskId }: { taskId: number }) {
       {subTasks.length > 0 && (
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-[0.9375rem]">{t("task.subTasks")}</CardTitle>
+            <CardTitle className="text-[0.9375rem]">
+              {t("task.subTasks")}
+            </CardTitle>
           </CardHeader>
           <CardContent>
             <div className="flex flex-col gap-2">
@@ -274,13 +371,15 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                 <div
                   key={sub.id}
                   className="flex items-center gap-2 rounded-md border p-2 cursor-pointer hover:bg-accent"
-                  onClick={() => router.push(`/platform?view=task-detail&id=${sub.id}`)}
+                  onClick={() =>
+                    router.push(`/platform?view=task-detail&id=${sub.id}`)
+                  }
                 >
                   <Badge
                     variant="outline"
                     className={cn(
                       "text-[0.625rem]",
-                      TASK_STATUS_COLORS[sub.status as TaskStatus] ?? "",
+                      TASK_STATUS_COLORS[sub.status as TaskStatus] ?? ""
                     )}
                   >
                     {TASK_STATUS_LABELS[sub.status as TaskStatus] ?? sub.status}

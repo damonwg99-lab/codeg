@@ -30,7 +30,9 @@ export function ProjectList() {
       }
     }
     void load()
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   if (loading) {
@@ -42,9 +44,7 @@ export function ProjectList() {
       <div className="flex flex-col items-center justify-center py-16 gap-4">
         <FolderOpen className="h-12 w-12 text-muted-foreground" />
         <p className="text-muted-foreground">{t("sidebar.noProject")}</p>
-        <Button
-          onClick={() => router.push("/platform?view=create-project")}
-        >
+        <Button onClick={() => router.push("/platform?view=create-project")}>
           <Plus className="mr-1 h-4 w-4" />
           {t("project.create")}
         </Button>
@@ -75,9 +75,7 @@ export function ProjectList() {
             }
           >
             <CardHeader className="pb-2">
-              <CardTitle className="text-[0.9375rem]">
-                {project.name}
-              </CardTitle>
+              <CardTitle className="text-[0.9375rem]">{project.name}</CardTitle>
             </CardHeader>
             <CardContent className="pt-0">
               <div className="flex flex-col gap-1 text-[0.8125rem] text-muted-foreground">

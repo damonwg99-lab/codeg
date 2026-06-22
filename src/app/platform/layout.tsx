@@ -19,7 +19,10 @@ export default function PlatformLayout({
     <PlatformProvider>
       <SidebarProvider>
         <div className="flex h-screen w-screen overflow-hidden">
-          <ResizablePanelGroup direction="horizontal" autoSaveId="platform-layout">
+          <ResizablePanelGroup
+            direction="horizontal"
+            autoSaveId="platform-layout"
+          >
             <ResizablePanel
               defaultSize={20}
               minSize={15}

@@ -39,12 +39,15 @@ export function SidebarProjectPanel() {
       }
     }
     void load()
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   // Load tasks when project is selected
   useEffect(() => {
     if (!selectedProjectId || selectedProjectId === "_none") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setTasks([])
       return
     }
@@ -65,7 +68,9 @@ export function SidebarProjectPanel() {
       }
     }
     void load()
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+    }
   }, [selectedProjectId])
 
   function navigateToKanban() {
@@ -82,10 +87,7 @@ export function SidebarProjectPanel() {
     <div className="flex flex-col gap-2 px-1.5 pt-1.5">
       {/* Project selector */}
       <div className="flex items-center gap-1.5">
-        <Select
-          value={selectedProjectId}
-          onValueChange={setSelectedProjectId}
-        >
+        <Select value={selectedProjectId} onValueChange={setSelectedProjectId}>
           <SelectTrigger className="h-8 flex-1 text-[0.875rem]">
             <SelectValue placeholder={t("sidebar.selectProject")} />
           </SelectTrigger>
@@ -148,7 +150,7 @@ export function SidebarProjectPanel() {
                     "group flex items-center gap-1.5 rounded-md px-2 py-1.5",
                     "text-[0.8125rem] text-sidebar-foreground",
                     "hover:bg-sidebar-accent outline-none",
-                    "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+                    "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
                   )}
                   onClick={() =>
                     router.push(`/platform?view=task-detail&id=${task.id}`)
@@ -158,10 +160,12 @@ export function SidebarProjectPanel() {
                     variant="outline"
                     className={cn(
                       "h-5 shrink-0 px-1.5 text-[0.625rem]",
-                      TASK_STATUS_COLORS[task.status as TaskStatus] ?? TASK_STATUS_COLORS.backlog,
+                      TASK_STATUS_COLORS[task.status as TaskStatus] ??
+                        TASK_STATUS_COLORS.backlog
                     )}
                   >
-                    {TASK_STATUS_LABELS[task.status as TaskStatus] ?? task.status}
+                    {TASK_STATUS_LABELS[task.status as TaskStatus] ??
+                      task.status}
                   </Badge>
                   <span className="truncate">{task.title}</span>
                 </button>

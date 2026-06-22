@@ -35,7 +35,9 @@ export function TaskListTable({ projectId }: { projectId: number }) {
       }
     }
     void load()
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+    }
   }, [projectId])
 
   const handleCreateTask = useCallback(async () => {
@@ -60,7 +62,11 @@ export function TaskListTable({ projectId }: { projectId: number }) {
   })
 
   if (loading) {
-    return <div className="flex items-center justify-center py-16 text-muted-foreground">Loading…</div>
+    return (
+      <div className="flex items-center justify-center py-16 text-muted-foreground">
+        Loading…
+      </div>
+    )
   }
 
   return (
@@ -71,16 +77,18 @@ export function TaskListTable({ projectId }: { projectId: number }) {
           <Button
             variant="outline"
             size="sm"
-            onClick={() => router.push(`/platform?view=kanban&projectId=${projectId}`)}
+            onClick={() =>
+              router.push(`/platform?view=kanban&projectId=${projectId}`)
+            }
           >
             {t("task.kanban")}
           </Button>
-          <Button
-            size="sm"
-            disabled={creating}
-            onClick={handleCreateTask}
-          >
-            {creating ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> : <Plus className="mr-1 h-3.5 w-3.5" />}
+          <Button size="sm" disabled={creating} onClick={handleCreateTask}>
+            {creating ? (
+              <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Plus className="mr-1 h-3.5 w-3.5" />
+            )}
             {t("task.create")}
           </Button>
         </div>
@@ -108,17 +116,28 @@ export function TaskListTable({ projectId }: { projectId: number }) {
           <thead>
             <tr className="border-b text-muted-foreground">
               <th className="py-2 pr-2 text-left font-medium">#</th>
-              <th className="py-2 pr-2 text-left font-medium">{t("task.title")}</th>
-              <th className="py-2 pr-2 text-left font-medium">{t("task.taskType")}</th>
-              <th className="py-2 pr-2 text-left font-medium">{t("task.statusManagement")}</th>
-              <th className="py-2 pr-2 text-left font-medium">{t("task.priority")}</th>
+              <th className="py-2 pr-2 text-left font-medium">
+                {t("task.title")}
+              </th>
+              <th className="py-2 pr-2 text-left font-medium">
+                {t("task.taskType")}
+              </th>
+              <th className="py-2 pr-2 text-left font-medium">
+                {t("task.statusManagement")}
+              </th>
+              <th className="py-2 pr-2 text-left font-medium">
+                {t("task.priority")}
+              </th>
               <th className="py-2 text-right font-medium">Actions</th>
             </tr>
           </thead>
           <tbody>
             {filteredTasks.length === 0 ? (
               <tr>
-                <td colSpan={6} className="py-4 text-center text-muted-foreground">
+                <td
+                  colSpan={6}
+                  className="py-4 text-center text-muted-foreground"
+                >
                   {t("task.noTasks")}
                 </td>
               </tr>
@@ -127,27 +146,34 @@ export function TaskListTable({ projectId }: { projectId: number }) {
                 <tr
                   key={task.id}
                   className="border-b hover:bg-accent/50 cursor-pointer"
-                  onClick={() => router.push(`/platform?view=task-detail&id=${task.id}`)}
+                  onClick={() =>
+                    router.push(`/platform?view=task-detail&id=${task.id}`)
+                  }
                 >
                   <td className="py-2 pr-2">{index + 1}</td>
                   <td className="py-2 pr-2 font-medium">{task.title}</td>
                   <td className="py-2 pr-2">
-                    <Badge variant="outline" className="text-[0.625rem]">{task.taskType}</Badge>
+                    <Badge variant="outline" className="text-[0.625rem]">
+                      {task.taskType}
+                    </Badge>
                   </td>
                   <td className="py-2 pr-2">
                     <Badge
                       variant="outline"
                       className={cn(
                         "text-[0.625rem]",
-                        TASK_STATUS_COLORS[task.status as TaskStatus] ?? "",
+                        TASK_STATUS_COLORS[task.status as TaskStatus] ?? ""
                       )}
                     >
-                      {TASK_STATUS_LABELS[task.status as TaskStatus] ?? task.status}
+                      {TASK_STATUS_LABELS[task.status as TaskStatus] ??
+                        task.status}
                     </Badge>
                   </td>
                   <td className="py-2 pr-2">
                     {task.priority ? (
-                      <Badge variant="outline" className="text-[0.625rem]">{task.priority}</Badge>
+                      <Badge variant="outline" className="text-[0.625rem]">
+                        {task.priority}
+                      </Badge>
                     ) : (
                       <span className="text-muted-foreground">—</span>
                     )}

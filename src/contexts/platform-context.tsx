@@ -44,9 +44,7 @@ const PlatformContext = createContext<PlatformContextValue | null>(null)
 export function usePlatformContext() {
   const ctx = useContext(PlatformContext)
   if (!ctx) {
-    throw new Error(
-      "usePlatformContext must be used within PlatformProvider",
-    )
+    throw new Error("usePlatformContext must be used within PlatformProvider")
   }
   return ctx
 }
@@ -72,16 +70,12 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
         selectedTaskId,
         setSelectedTaskId,
       }) as PlatformContextValue,
-    [
-      sidebarTab,
-      activeProjectId,
-      viewMode,
-      platformView,
-      selectedTaskId,
-    ],
+    [sidebarTab, activeProjectId, viewMode, platformView, selectedTaskId]
   )
 
   return (
-    <PlatformContext.Provider value={value}>{children}</PlatformContext.Provider>
+    <PlatformContext.Provider value={value}>
+      {children}
+    </PlatformContext.Provider>
   )
 }

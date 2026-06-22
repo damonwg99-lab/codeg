@@ -11,7 +11,13 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Checkbox } from "@/components/ui/checkbox"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Separator } from "@/components/ui/separator"
 
@@ -142,7 +148,9 @@ export function CreateProjectForm() {
 
           {/* Description */}
           <div className="flex flex-col gap-1.5">
-            <Label htmlFor="project-description">{t("project.description")}</Label>
+            <Label htmlFor="project-description">
+              {t("project.description")}
+            </Label>
             <Input
               id="project-description"
               value={description}
@@ -163,7 +171,10 @@ export function CreateProjectForm() {
           {/* Default agent type */}
           <div className="flex flex-col gap-1.5">
             <Label>{t("project.defaultAgentType")}</Label>
-            <Select value={defaultAgentType} onValueChange={setDefaultAgentType}>
+            <Select
+              value={defaultAgentType}
+              onValueChange={setDefaultAgentType}
+            >
               <SelectTrigger>
                 <SelectValue placeholder="Auto" />
               </SelectTrigger>

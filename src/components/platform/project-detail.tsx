@@ -3,7 +3,13 @@
 import { useEffect, useState, useCallback } from "react"
 import { useTranslations } from "next-intl"
 import { Loader2, Pencil, Save, X, RefreshCw } from "lucide-react"
-import { getProject, updateProject, scanGitRepos, addProjectRepo, removeProjectRepo } from "@/lib/platform/api"
+import {
+  getProject,
+  updateProject,
+  scanGitRepos,
+  addProjectRepo,
+  removeProjectRepo,
+} from "@/lib/platform/api"
 import type { ProjectDetail, GitRepoScanResult } from "@/lib/platform/types"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -13,7 +19,13 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Separator } from "@/components/ui/separator"
 import { Checkbox } from "@/components/ui/checkbox"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 
 export function ProjectDetail({ projectId }: { projectId: number }) {
   const t = useTranslations("Platform")
@@ -31,7 +43,9 @@ export function ProjectDetail({ projectId }: { projectId: number }) {
   // Scan state for add-repo
   const [scanning, setScanning] = useState(false)
   const [scanResults, setScanResults] = useState<GitRepoScanResult[]>([])
-  const [selectedScanRepos, setSelectedScanRepos] = useState<Set<string>>(new Set())
+  const [selectedScanRepos, setSelectedScanRepos] = useState<Set<string>>(
+    new Set()
+  )
 
   useEffect(() => {
     let cancelled = false
@@ -51,7 +65,9 @@ export function ProjectDetail({ projectId }: { projectId: number }) {
       }
     }
     void load()
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+    }
   }, [projectId])
 
   const handleSave = useCallback(async () => {
@@ -65,7 +81,7 @@ export function ProjectDetail({ projectId }: { projectId: number }) {
         clientName: editClientName || undefined,
         defaultAgentType: editDefaultAgentType || undefined,
       })
-      setDetail((prev) => prev ? { ...prev, project: updated } : null)
+      setDetail((prev) => (prev ? { ...prev, project: updated } : null))
       setEditing(false)
     } catch (e) {
       // Keep editing state on error
@@ -116,23 +132,34 @@ export function ProjectDetail({ projectId }: { projectId: number }) {
     setSelectedScanRepos(new Set())
   }, [detail, scanResults, selectedScanRepos, projectId])
 
-  const handleRemoveRepo = useCallback(async (repoId: number) => {
-    try {
-      await removeProjectRepo(repoId)
-      // Reload project detail
-      const d = await getProject(projectId)
-      setDetail(d)
-    } catch (e) {
-      console.error("Failed to remove repo:", e)
-    }
-  }, [projectId])
+  const handleRemoveRepo = useCallback(
+    async (repoId: number) => {
+      try {
+        await removeProjectRepo(repoId)
+        // Reload project detail
+        const d = await getProject(projectId)
+        setDetail(d)
+      } catch (e) {
+        console.error("Failed to remove repo:", e)
+      }
+    },
+    [projectId]
+  )
 
   if (loading) {
-    return <div className="flex items-center justify-center py-16 text-muted-foreground">Loading…</div>
+    return (
+      <div className="flex items-center justify-center py-16 text-muted-foreground">
+        Loading…
+      </div>
+    )
   }
 
   if (!detail) {
-    return <div className="flex items-center justify-center py-16 text-destructive">Project not found</div>
+    return (
+      <div className="flex items-center justify-center py-16 text-destructive">
+        Project not found
+      </div>
+    )
   }
 
   const { project, repos, taskCountByStatus } = detail
@@ -144,17 +171,30 @@ export function ProjectDetail({ projectId }: { projectId: number }) {
         <div className="flex items-center gap-1">
           {editing ? (
             <>
-              <Button variant="outline" size="sm" onClick={() => setEditing(false)} disabled={saving}>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setEditing(false)}
+                disabled={saving}
+              >
                 <X className="mr-1 h-3.5 w-3.5" />
                 {t("project.cancel")}
               </Button>
               <Button size="sm" onClick={handleSave} disabled={saving}>
-                {saving ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> : <Save className="mr-1 h-3.5 w-3.5" />}
+                {saving ? (
+                  <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Save className="mr-1 h-3.5 w-3.5" />
+                )}
                 {t("project.save")}
               </Button>
             </>
           ) : (
-            <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setEditing(true)}
+            >
               <Pencil className="mr-1 h-3.5 w-3.5" />
               {t("project.edit")}
             </Button>
@@ -167,16 +207,28 @@ export function ProjectDetail({ projectId }: { projectId: number }) {
         <Badge variant="outline" className="text-[0.625rem]">
           {taskCountByStatus.backlog} Backlog
         </Badge>
-        <Badge variant="outline" className="text-[0.625rem] bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300">
+        <Badge
+          variant="outline"
+          className="text-[0.625rem] bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300"
+        >
           {taskCountByStatus.confirmed} Confirmed
         </Badge>
-        <Badge variant="outline" className="text-[0.625rem] bg-yellow-50 text-yellow-700 dark:bg-yellow-950 dark:text-yellow-300">
+        <Badge
+          variant="outline"
+          className="text-[0.625rem] bg-yellow-50 text-yellow-700 dark:bg-yellow-950 dark:text-yellow-300"
+        >
           {taskCountByStatus.inProgress} In Progress
         </Badge>
-        <Badge variant="outline" className="text-[0.625rem] bg-green-50 text-green-700 dark:bg-green-950 dark:text-green-300">
+        <Badge
+          variant="outline"
+          className="text-[0.625rem] bg-green-50 text-green-700 dark:bg-green-950 dark:text-green-300"
+        >
           {taskCountByStatus.done} Done
         </Badge>
-        <Badge variant="outline" className="text-[0.625rem] bg-purple-50 text-purple-700 dark:bg-purple-950 dark:text-purple-300">
+        <Badge
+          variant="outline"
+          className="text-[0.625rem] bg-purple-50 text-purple-700 dark:bg-purple-950 dark:text-purple-300"
+        >
           {taskCountByStatus.released} Released
         </Badge>
       </div>
@@ -185,9 +237,15 @@ export function ProjectDetail({ projectId }: { projectId: number }) {
         <TabsList>
           <TabsTrigger value="basic-info">{t("project.basicInfo")}</TabsTrigger>
           <TabsTrigger value="repos">{t("project.repos")}</TabsTrigger>
-          <TabsTrigger value="zentao" disabled>{t("project.zentaoConfig")}</TabsTrigger>
-          <TabsTrigger value="cicd" disabled>{t("project.cicd")}</TabsTrigger>
-          <TabsTrigger value="kb" disabled>{t("project.knowledgeBase")}</TabsTrigger>
+          <TabsTrigger value="zentao" disabled>
+            {t("project.zentaoConfig")}
+          </TabsTrigger>
+          <TabsTrigger value="cicd" disabled>
+            {t("project.cicd")}
+          </TabsTrigger>
+          <TabsTrigger value="kb" disabled>
+            {t("project.knowledgeBase")}
+          </TabsTrigger>
         </TabsList>
 
         {/* Basic Info Tab */}
@@ -198,20 +256,34 @@ export function ProjectDetail({ projectId }: { projectId: number }) {
                 <>
                   <div className="flex flex-col gap-1.5">
                     <Label>{t("project.name")}</Label>
-                    <Input value={editName} onChange={(e) => setEditName(e.target.value)} />
+                    <Input
+                      value={editName}
+                      onChange={(e) => setEditName(e.target.value)}
+                    />
                   </div>
                   <div className="flex flex-col gap-1.5">
                     <Label>{t("project.description")}</Label>
-                    <Input value={editDescription} onChange={(e) => setEditDescription(e.target.value)} />
+                    <Input
+                      value={editDescription}
+                      onChange={(e) => setEditDescription(e.target.value)}
+                    />
                   </div>
                   <div className="flex flex-col gap-1.5">
                     <Label>{t("project.clientName")}</Label>
-                    <Input value={editClientName} onChange={(e) => setEditClientName(e.target.value)} />
+                    <Input
+                      value={editClientName}
+                      onChange={(e) => setEditClientName(e.target.value)}
+                    />
                   </div>
                   <div className="flex flex-col gap-1.5">
                     <Label>{t("project.defaultAgentType")}</Label>
-                    <Select value={editDefaultAgentType} onValueChange={setEditDefaultAgentType}>
-                      <SelectTrigger><SelectValue placeholder="Auto" /></SelectTrigger>
+                    <Select
+                      value={editDefaultAgentType}
+                      onValueChange={setEditDefaultAgentType}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Auto" />
+                      </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="">Auto</SelectItem>
                         <SelectItem value="claude_code">Claude Code</SelectItem>
@@ -226,33 +298,51 @@ export function ProjectDetail({ projectId }: { projectId: number }) {
               ) : (
                 <>
                   <div className="flex flex-col gap-1">
-                    <span className="text-[0.75rem] text-muted-foreground">{t("project.name")}</span>
+                    <span className="text-[0.75rem] text-muted-foreground">
+                      {t("project.name")}
+                    </span>
                     <span className="text-[0.875rem]">{project.name}</span>
                   </div>
                   <div className="flex flex-col gap-1">
-                    <span className="text-[0.75rem] text-muted-foreground">{t("project.status")}</span>
+                    <span className="text-[0.75rem] text-muted-foreground">
+                      {t("project.status")}
+                    </span>
                     <Badge variant="outline">{project.status}</Badge>
                   </div>
                   <div className="flex flex-col gap-1">
-                    <span className="text-[0.75rem] text-muted-foreground">{t("project.rootDir")}</span>
+                    <span className="text-[0.75rem] text-muted-foreground">
+                      {t("project.rootDir")}
+                    </span>
                     <span className="text-[0.875rem]">{project.rootDir}</span>
                   </div>
                   {project.description && (
                     <div className="flex flex-col gap-1">
-                      <span className="text-[0.75rem] text-muted-foreground">{t("project.description")}</span>
-                      <span className="text-[0.875rem]">{project.description}</span>
+                      <span className="text-[0.75rem] text-muted-foreground">
+                        {t("project.description")}
+                      </span>
+                      <span className="text-[0.875rem]">
+                        {project.description}
+                      </span>
                     </div>
                   )}
                   {project.clientName && (
                     <div className="flex flex-col gap-1">
-                      <span className="text-[0.75rem] text-muted-foreground">{t("project.clientName")}</span>
-                      <span className="text-[0.875rem]">{project.clientName}</span>
+                      <span className="text-[0.75rem] text-muted-foreground">
+                        {t("project.clientName")}
+                      </span>
+                      <span className="text-[0.875rem]">
+                        {project.clientName}
+                      </span>
                     </div>
                   )}
                   {project.defaultAgentType && (
                     <div className="flex flex-col gap-1">
-                      <span className="text-[0.75rem] text-muted-foreground">{t("project.defaultAgentType")}</span>
-                      <span className="text-[0.875rem]">{project.defaultAgentType}</span>
+                      <span className="text-[0.75rem] text-muted-foreground">
+                        {t("project.defaultAgentType")}
+                      </span>
+                      <span className="text-[0.875rem]">
+                        {project.defaultAgentType}
+                      </span>
                     </div>
                   )}
                 </>
@@ -266,34 +356,59 @@ export function ProjectDetail({ projectId }: { projectId: number }) {
           <Card>
             <CardHeader className="pb-2">
               <div className="flex items-center justify-between">
-                <CardTitle className="text-[0.9375rem]">{t("project.repos")}</CardTitle>
+                <CardTitle className="text-[0.9375rem]">
+                  {t("project.repos")}
+                </CardTitle>
                 <Button
                   variant="outline"
                   size="sm"
                   onClick={handleScan}
                   disabled={scanning}
                 >
-                  {scanning ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-1 h-3.5 w-3.5" />}
+                  {scanning ? (
+                    <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <RefreshCw className="mr-1 h-3.5 w-3.5" />
+                  )}
                   {t("project.rescan")}
                 </Button>
               </div>
             </CardHeader>
             <CardContent className="flex flex-col gap-2">
               {repos.length === 0 ? (
-                <p className="text-[0.8125rem] text-muted-foreground">{t("project.noRepos")}</p>
+                <p className="text-[0.8125rem] text-muted-foreground">
+                  {t("project.noRepos")}
+                </p>
               ) : (
                 <div className="flex flex-col gap-2">
                   {repos.map((repo) => (
-                    <div key={repo.id} className="flex items-center gap-2 rounded-md border p-2">
+                    <div
+                      key={repo.id}
+                      className="flex items-center gap-2 rounded-md border p-2"
+                    >
                       <div className="flex flex-col gap-0.5 min-w-0">
-                        <span className="text-[0.875rem] font-medium truncate">{repo.name}</span>
-                        <span className="text-[0.75rem] text-muted-foreground truncate">{repo.localDir}</span>
+                        <span className="text-[0.875rem] font-medium truncate">
+                          {repo.name}
+                        </span>
+                        <span className="text-[0.75rem] text-muted-foreground truncate">
+                          {repo.localDir}
+                        </span>
                       </div>
                       {repo.branch && (
-                        <Badge variant="outline" className="text-[0.625rem] shrink-0">{repo.branch}</Badge>
+                        <Badge
+                          variant="outline"
+                          className="text-[0.625rem] shrink-0"
+                        >
+                          {repo.branch}
+                        </Badge>
                       )}
                       {repo.hasClaudeMd && (
-                        <Badge variant="outline" className="text-[0.625rem] shrink-0 bg-green-50 text-green-700">CLAUDE.md</Badge>
+                        <Badge
+                          variant="outline"
+                          className="text-[0.625rem] shrink-0 bg-green-50 text-green-700"
+                        >
+                          CLAUDE.md
+                        </Badge>
                       )}
                       <Button
                         variant="ghost"
@@ -312,30 +427,49 @@ export function ProjectDetail({ projectId }: { projectId: number }) {
               {scanResults.length > 0 && (
                 <>
                   <Separator />
-                  <p className="text-[0.8125rem] font-medium">{t("project.addRepo")}</p>
+                  <p className="text-[0.8125rem] font-medium">
+                    {t("project.addRepo")}
+                  </p>
                   {scanResults.map((repo) => (
-                    <div key={repo.localDir} className="flex items-center gap-2 rounded-md border p-2">
+                    <div
+                      key={repo.localDir}
+                      className="flex items-center gap-2 rounded-md border p-2"
+                    >
                       <Checkbox
                         checked={selectedScanRepos.has(repo.localDir)}
                         onCheckedChange={() => {
                           setSelectedScanRepos((prev) => {
                             const next = new Set(prev)
-                            if (next.has(repo.localDir)) next.delete(repo.localDir)
+                            if (next.has(repo.localDir))
+                              next.delete(repo.localDir)
                             else next.add(repo.localDir)
                             return next
                           })
                         }}
                       />
                       <div className="flex flex-col gap-0.5 min-w-0">
-                        <span className="text-[0.875rem] font-medium truncate">{repo.name}</span>
-                        <span className="text-[0.75rem] text-muted-foreground truncate">{repo.localDir}</span>
+                        <span className="text-[0.875rem] font-medium truncate">
+                          {repo.name}
+                        </span>
+                        <span className="text-[0.75rem] text-muted-foreground truncate">
+                          {repo.localDir}
+                        </span>
                       </div>
                       {repo.hasClaudeMd && (
-                        <Badge variant="outline" className="text-[0.625rem] shrink-0 bg-green-50 text-green-700">CLAUDE.md</Badge>
+                        <Badge
+                          variant="outline"
+                          className="text-[0.625rem] shrink-0 bg-green-50 text-green-700"
+                        >
+                          CLAUDE.md
+                        </Badge>
                       )}
                     </div>
                   ))}
-                  <Button size="sm" onClick={handleAddRepos} disabled={selectedScanRepos.size === 0}>
+                  <Button
+                    size="sm"
+                    onClick={handleAddRepos}
+                    disabled={selectedScanRepos.size === 0}
+                  >
                     {t("project.addRepo")} ({selectedScanRepos.size})
                   </Button>
                 </>
@@ -346,13 +480,25 @@ export function ProjectDetail({ projectId }: { projectId: number }) {
 
         {/* Disabled tabs with coming-soon placeholder */}
         <TabsContent value="zentao">
-          <Card><CardContent className="py-8 text-center text-muted-foreground">{t("project.comingSoon")}</CardContent></Card>
+          <Card>
+            <CardContent className="py-8 text-center text-muted-foreground">
+              {t("project.comingSoon")}
+            </CardContent>
+          </Card>
         </TabsContent>
         <TabsContent value="cicd">
-          <Card><CardContent className="py-8 text-center text-muted-foreground">{t("project.comingSoon")}</CardContent></Card>
+          <Card>
+            <CardContent className="py-8 text-center text-muted-foreground">
+              {t("project.comingSoon")}
+            </CardContent>
+          </Card>
         </TabsContent>
         <TabsContent value="kb">
-          <Card><CardContent className="py-8 text-center text-muted-foreground">{t("project.comingSoon")}</CardContent></Card>
+          <Card>
+            <CardContent className="py-8 text-center text-muted-foreground">
+              {t("project.comingSoon")}
+            </CardContent>
+          </Card>
         </TabsContent>
       </Tabs>
     </div>
