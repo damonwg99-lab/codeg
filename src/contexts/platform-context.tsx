@@ -2,41 +2,35 @@
 
 import {
   createContext,
+  useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ReactNode,
 } from "react"
+import { listProjects, getProject } from "@/lib/platform/api"
+import type { ProjectInfo, ProjectDetail } from "@/lib/platform/types"
 
-export type SidebarTab = "chat" | "project"
+const STORAGE_KEY = "platform:activeProjectId"
+
 export type ViewMode = "kanban" | "list"
-export type PlatformView =
-  | "home"
-  | "project-detail"
-  | "task-detail"
-  | "create-project"
-  | "create-task"
 
 interface PlatformContextValue {
-  // Sidebar tab
-  sidebarTab: SidebarTab
-  setSidebarTab: (tab: SidebarTab) => void
-
-  // Current project
+  // Project context — always requires a selected project
   activeProjectId: number | null
   setActiveProjectId: (id: number | null) => void
+  activeProject: ProjectInfo | null
+  /** All folder IDs associated with the active project (project folder + repo folders) */
+  activeFolderIds: number[]
+  projects: ProjectInfo[]
+  loadProjects: () => Promise<void>
+  hasProjects: boolean
+  loadingProjects: boolean
 
   // Task view mode
   viewMode: ViewMode
   setViewMode: (mode: ViewMode) => void
-
-  // Platform content view
-  platformView: PlatformView
-  setPlatformView: (view: PlatformView) => void
-
-  // Current task
-  selectedTaskId: number | null
-  setSelectedTaskId: (id: number | null) => void
 }
 
 const PlatformContext = createContext<PlatformContextValue | null>(null)
@@ -49,28 +43,137 @@ export function usePlatformContext() {
   return ctx
 }
 
-export function PlatformProvider({ children }: { children: ReactNode }) {
-  const [sidebarTab, setSidebarTab] = useState<SidebarTab>("chat")
-  const [activeProjectId, setActiveProjectId] = useState<number | null>(null)
-  const [viewMode, setViewMode] = useState<ViewMode>("kanban")
-  const [platformView, setPlatformView] = useState<PlatformView>("home")
-  const [selectedTaskId, setSelectedTaskId] = useState<number | null>(null)
+/** Alias for convenience — shorter name used in sidebar and nav buttons. */
+export const usePlatform = usePlatformContext
 
-  const value = useMemo(
+export function PlatformProvider({ children }: { children: ReactNode }) {
+  const [activeProjectId, setActiveProjectId] = useState<number | null>(null)
+  const [activeProject, setActiveProject] = useState<ProjectInfo | null>(null)
+  const [activeFolderIds, setActiveFolderIds] = useState<number[]>([])
+  const [projects, setProjects] = useState<ProjectInfo[]>([])
+  const [loadingProjects, setLoadingProjects] = useState(true)
+  const [viewMode, setViewMode] = useState<ViewMode>("kanban")
+
+  // Hydrate activeProjectId from localStorage on mount
+  useEffect(() => {
+    const stored = localStorage.getItem(STORAGE_KEY)
+    if (stored) {
+      const parsed = Number(stored)
+      if (!Number.isNaN(parsed) && parsed > 0) {
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        setActiveProjectId(parsed)
+      }
+    }
+  }, [])
+
+  // Persist activeProjectId to localStorage when it changes
+  useEffect(() => {
+    if (activeProjectId !== null) {
+      localStorage.setItem(STORAGE_KEY, String(activeProjectId))
+    } else {
+      localStorage.removeItem(STORAGE_KEY)
+    }
+  }, [activeProjectId])
+
+  // Load projects list on mount
+  useEffect(() => {
+    let cancelled = false
+    async function load() {
+      setLoadingProjects(true)
+      try {
+        const list = await listProjects()
+        if (!cancelled) {
+          setProjects(list)
+          setLoadingProjects(false)
+        }
+      } catch {
+        if (!cancelled) setLoadingProjects(false)
+      }
+    }
+    void load()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // When activeProjectId changes, load the full project info + folder IDs
+  useEffect(() => {
+    if (activeProjectId === null) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setActiveProject(null)
+
+      setActiveFolderIds([])
+      return
+    }
+    const projectId = activeProjectId // capture for async closure
+    let cancelled = false
+    async function loadDetail() {
+      try {
+        const detail: ProjectDetail = await getProject(projectId)
+        if (!cancelled) {
+          setActiveProject(detail.project)
+          // Collect all folder IDs: project folder + each repo's folder
+          const folderIds: number[] = []
+          if (detail.project.folderId != null) {
+            folderIds.push(detail.project.folderId)
+          }
+          for (const repo of detail.repos) {
+            if (repo.folderId != null) {
+              folderIds.push(repo.folderId)
+            }
+          }
+          setActiveFolderIds(folderIds)
+        }
+      } catch {
+        if (!cancelled) {
+          setActiveProject(null)
+          setActiveFolderIds([])
+        }
+      }
+    }
+    void loadDetail()
+    return () => {
+      cancelled = true
+    }
+  }, [activeProjectId])
+
+  const loadProjects = useCallback(async () => {
+    setLoadingProjects(true)
+    try {
+      const list = await listProjects()
+      setProjects(list)
+      setLoadingProjects(false)
+    } catch {
+      setLoadingProjects(false)
+    }
+  }, [])
+
+  const hasProjects = projects.length > 0
+
+  const value = useMemo<PlatformContextValue>(
     () =>
       ({
-        sidebarTab,
-        setSidebarTab,
         activeProjectId,
         setActiveProjectId,
+        activeProject,
+        activeFolderIds,
+        projects,
+        loadProjects,
+        hasProjects,
+        loadingProjects,
         viewMode,
         setViewMode,
-        platformView,
-        setPlatformView,
-        selectedTaskId,
-        setSelectedTaskId,
       }) as PlatformContextValue,
-    [sidebarTab, activeProjectId, viewMode, platformView, selectedTaskId]
+    [
+      activeProjectId,
+      activeProject,
+      activeFolderIds,
+      projects,
+      loadProjects,
+      hasProjects,
+      loadingProjects,
+      viewMode,
+    ]
   )
 
   return (

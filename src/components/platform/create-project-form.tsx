@@ -1,10 +1,11 @@
 "use client"
 
 import { useState, useCallback } from "react"
-import { useRouter } from "next/navigation"
 import { useTranslations } from "next-intl"
 import { FolderOpen, Loader2, Check } from "lucide-react"
 import { createProject, scanGitRepos } from "@/lib/platform/api"
+import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
+import { usePlatform } from "@/contexts/platform-context"
 import type { GitRepoScanResult } from "@/lib/platform/types"
 import { openFileDialog, isDesktop } from "@/lib/platform"
 import { Button } from "@/components/ui/button"
@@ -23,7 +24,8 @@ import { Separator } from "@/components/ui/separator"
 
 export function CreateProjectForm() {
   const t = useTranslations("Platform")
-  const router = useRouter()
+  const { setRoute } = useWorkbenchRoute()
+  const { setActiveProjectId, loadProjects } = usePlatform()
 
   // Form state
   const [name, setName] = useState("")
@@ -97,13 +99,24 @@ export function CreateProjectForm() {
         clientName: clientName || undefined,
         defaultAgentType: defaultAgentType || undefined,
       })
-      // Navigate to project detail page
-      router.push(`/platform?view=project-detail&id=${project.id}`)
+      // Update project list + set active project, then navigate to detail
+      await loadProjects()
+      setActiveProjectId(project.id)
+      setRoute("project-detail", { id: project.id })
     } catch (e) {
       setCreateError(String(e))
     }
     setCreating(false)
-  }, [name, rootDir, description, clientName, defaultAgentType, router])
+  }, [
+    name,
+    rootDir,
+    description,
+    clientName,
+    defaultAgentType,
+    setRoute,
+    setActiveProjectId,
+    loadProjects,
+  ])
 
   return (
     <div className="mx-auto max-w-2xl">

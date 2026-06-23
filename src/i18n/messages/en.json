@@ -2986,13 +2986,15 @@
     "loadFailed": "Failed to load: {detail}"
   },
   "Platform": {
-    "sidebar": {
-      "chatTab": "Chat",
-      "projectTab": "Project",
-      "selectProject": "Select project",
-      "noProject": "No project selected",
-      "openInPlatform": "Open in platform",
-      "createProject": "New project"
+    "nav": {
+      "projectList": "Projects",
+      "taskKanban": "Tasks",
+      "createProject": "Create project"
+    },
+    "switcher": {
+      "placeholder": "Select project",
+      "noProject": "No project yet",
+      "createFirst": "Create your first project"
     },
     "project": {
       "create": "Create project",

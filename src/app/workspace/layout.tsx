@@ -12,6 +12,7 @@ import type { ImperativePanelGroupHandle } from "react-resizable-panels"
 import { FolderTitleBar } from "@/components/layout/folder-title-bar"
 import { useIsActiveChatMode } from "@/hooks/use-is-active-chat-mode"
 import { Sidebar } from "@/components/layout/sidebar"
+import { ProjectSwitcher } from "@/components/platform/project-switcher"
 import { StatusBar } from "@/components/layout/status-bar"
 import {
   AppWorkspaceProvider,
@@ -32,6 +33,7 @@ import { ConversationRuntimeProvider } from "@/contexts/conversation-runtime-con
 import { TabProvider, useTabContext } from "@/contexts/tab-context"
 import { SessionStatsProvider } from "@/contexts/session-stats-context"
 import { SidebarProvider, useSidebarContext } from "@/contexts/sidebar-context"
+import { PlatformProvider } from "@/contexts/platform-context"
 import { SearchDialogProvider } from "@/contexts/search-dialog-context"
 import { AutomationsViewProvider } from "@/contexts/automations-view-context"
 import {
@@ -366,7 +368,7 @@ function MobileFolderWorkspaceShell({
           className="w-[85%] max-w-[360px] p-0"
         >
           <SheetTitle className="sr-only">Sidebar</SheetTitle>
-          <Sidebar />
+          <Sidebar headerContent={<ProjectSwitcher />} />
         </SheetContent>
       </Sheet>
 
@@ -731,7 +733,7 @@ function FolderWorkspaceShell({ children }: { children: React.ReactNode }) {
           maxSize={sidebarOpen ? sidebarSizeRange.maxSize : 0}
         >
           <div className="h-full min-h-0 overflow-hidden">
-            <Sidebar />
+            <Sidebar headerContent={<ProjectSwitcher />} />
           </div>
         </ResizablePanel>
 
@@ -882,26 +884,28 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
                         <DeepLinkBootstrap />
                         <PetFocusBridge />
                         <SessionStatsProvider>
-                          <SidebarProvider>
-                            <AuxPanelProvider>
-                              <TerminalProvider>
-                                <SearchDialogProvider>
-                                  <AutomationsViewProvider>
-                                    <WorkbenchRouteProvider>
-                                      <WorkbenchRouteConversationSync />
-                                      {/* Inside WorkbenchRouteProvider: the
+                          <PlatformProvider>
+                            <SidebarProvider>
+                              <AuxPanelProvider>
+                                <TerminalProvider>
+                                  <SearchDialogProvider>
+                                    <AutomationsViewProvider>
+                                      <WorkbenchRouteProvider>
+                                        <WorkbenchRouteConversationSync />
+                                        {/* Inside WorkbenchRouteProvider: the
                                           listener calls openConversations() to
                                           surface a launcher-opened folder. */}
-                                      <WorkspaceOpenFolderListener />
-                                      <FolderLayoutShell>
-                                        {children}
-                                      </FolderLayoutShell>
-                                    </WorkbenchRouteProvider>
-                                  </AutomationsViewProvider>
-                                </SearchDialogProvider>
-                              </TerminalProvider>
-                            </AuxPanelProvider>
-                          </SidebarProvider>
+                                        <WorkspaceOpenFolderListener />
+                                        <FolderLayoutShell>
+                                          {children}
+                                        </FolderLayoutShell>
+                                      </WorkbenchRouteProvider>
+                                    </AutomationsViewProvider>
+                                  </SearchDialogProvider>
+                                </TerminalProvider>
+                              </AuxPanelProvider>
+                            </SidebarProvider>
+                          </PlatformProvider>
                         </SessionStatsProvider>
                       </TabProvider>
                     </WorkspaceProvider>

@@ -27,7 +27,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 
-export function ProjectDetail({ projectId }: { projectId: number }) {
+export function ProjectDetail({ id }: { id: number }) {
   const t = useTranslations("Platform")
   const [detail, setDetail] = useState<ProjectDetail | null>(null)
   const [loading, setLoading] = useState(true)
@@ -51,7 +51,7 @@ export function ProjectDetail({ projectId }: { projectId: number }) {
     let cancelled = false
     async function load() {
       try {
-        const d = await getProject(projectId)
+        const d = await getProject(id)
         if (!cancelled) {
           setDetail(d)
           setEditName(d.project.name)
@@ -68,7 +68,7 @@ export function ProjectDetail({ projectId }: { projectId: number }) {
     return () => {
       cancelled = true
     }
-  }, [projectId])
+  }, [id])
 
   const handleSave = useCallback(async () => {
     if (!detail) return
@@ -126,24 +126,24 @@ export function ProjectDetail({ projectId }: { projectId: number }) {
       }
     }
     // Reload project detail
-    const d = await getProject(projectId)
+    const d = await getProject(id)
     setDetail(d)
     setScanResults([])
     setSelectedScanRepos(new Set())
-  }, [detail, scanResults, selectedScanRepos, projectId])
+  }, [detail, scanResults, selectedScanRepos, id])
 
   const handleRemoveRepo = useCallback(
     async (repoId: number) => {
       try {
         await removeProjectRepo(repoId)
         // Reload project detail
-        const d = await getProject(projectId)
+        const d = await getProject(id)
         setDetail(d)
       } catch (e) {
         console.error("Failed to remove repo:", e)
       }
     },
-    [projectId]
+    [id]
   )
 
   if (loading) {

@@ -1,7 +1,6 @@
 "use client"
 
 import { useEffect, useState, useCallback } from "react"
-import { useRouter } from "next/navigation"
 import { useTranslations } from "next-intl"
 import {
   Loader2,
@@ -32,11 +31,12 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { cn } from "@/lib/utils"
 
 export function TaskDetail({ taskId }: { taskId: number }) {
   const t = useTranslations("Platform")
-  const router = useRouter()
+  const { setRoute, openConversations } = useWorkbenchRoute()
   const [detail, setDetail] = useState<TaskDetailType | null>(null)
   const [conversations, setConversations] = useState<TaskConversationInfo[]>([])
   const [loading, setLoading] = useState(true)
@@ -332,11 +332,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                 <div
                   key={conv.id}
                   className="flex items-center gap-2 rounded-md border p-2 cursor-pointer hover:bg-accent"
-                  onClick={() =>
-                    router.push(
-                      `/workspace?conversationId=${conv.conversationId}`
-                    )
-                  }
+                  onClick={() => openConversations()}
                 >
                   <MessageSquare className="h-4 w-4 text-muted-foreground" />
                   <div className="flex flex-col gap-0.5 min-w-0">
@@ -371,9 +367,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                 <div
                   key={sub.id}
                   className="flex items-center gap-2 rounded-md border p-2 cursor-pointer hover:bg-accent"
-                  onClick={() =>
-                    router.push(`/platform?view=task-detail&id=${sub.id}`)
-                  }
+                  onClick={() => setRoute("task-detail", { taskId: sub.id })}
                 >
                   <Badge
                     variant="outline"

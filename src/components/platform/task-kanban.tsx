@@ -1,7 +1,6 @@
 "use client"
 
 import { useEffect, useState, useCallback } from "react"
-import { useRouter } from "next/navigation"
 import { useTranslations } from "next-intl"
 import { DndContext, closestCorners, type DragEndEvent } from "@dnd-kit/core"
 import {
@@ -11,6 +10,7 @@ import {
 } from "@dnd-kit/sortable"
 import { Plus } from "lucide-react"
 import { listTasks, updateTaskStatus, createTask } from "@/lib/platform/api"
+import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import type { TaskInfo, TaskStatus } from "@/lib/platform/types"
 import {
   TASK_STATUS_LIST,
@@ -24,7 +24,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { cn } from "@/lib/utils"
 
 function TaskCard({ task }: { task: TaskInfo }) {
-  const router = useRouter()
+  const { setRoute } = useWorkbenchRoute()
   const {
     attributes,
     listeners,
@@ -52,7 +52,7 @@ function TaskCard({ task }: { task: TaskInfo }) {
         "cursor-pointer transition-colors hover:bg-accent",
         "touch-none select-none"
       )}
-      onClick={() => router.push(`/platform?view=task-detail&id=${task.id}`)}
+      onClick={() => setRoute("task-detail", { taskId: task.id })}
     >
       <CardContent className="p-2.5">
         <div className="flex items-center gap-1.5">
@@ -93,7 +93,7 @@ function KanbanColumn({
   projectId: number
 }) {
   const t = useTranslations("Platform")
-  const router = useRouter()
+  const { setRoute } = useWorkbenchRoute()
   const [creating, setCreating] = useState(false)
 
   const handleCreateTask = useCallback(async () => {
@@ -108,12 +108,12 @@ function KanbanColumn({
       if (status !== "backlog") {
         await updateTaskStatus(task.id, status)
       }
-      router.push(`/platform?view=task-detail&id=${task.id}`)
+      setRoute("task-detail", { taskId: task.id })
     } catch (e) {
       console.error("Create task failed:", e)
     }
     setCreating(false)
-  }, [projectId, status, router])
+  }, [projectId, status, setRoute])
 
   const sortableIds = tasks.map((t) => `task-${t.id}`)
 
@@ -159,7 +159,7 @@ function KanbanColumn({
 
 export function TaskKanban({ projectId }: { projectId: number }) {
   const t = useTranslations("Platform")
-  const router = useRouter()
+  const { setRoute } = useWorkbenchRoute()
   const [tasks, setTasks] = useState<TaskInfo[]>([])
   const [loading, setLoading] = useState(true)
 
@@ -190,8 +190,6 @@ export function TaskKanban({ projectId }: { projectId: number }) {
       // Parse task ID from sortable ID "task-{id}"
       const taskId = Number(String(active.id).replace("task-", ""))
       // The over.id could be another task card or a column
-      // For simplicity, we use the over container's status
-      // Find the new status from the column the task was dropped into
       const overId = String(over.id)
 
       // Determine the target status
@@ -243,9 +241,7 @@ export function TaskKanban({ projectId }: { projectId: number }) {
           <Button
             variant="outline"
             size="sm"
-            onClick={() =>
-              router.push(`/platform?view=task-list&projectId=${projectId}`)
-            }
+            onClick={() => setRoute("task-kanban", { projectId })}
           >
             {t("task.list")}
           </Button>

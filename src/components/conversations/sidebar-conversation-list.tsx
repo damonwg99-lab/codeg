@@ -569,12 +569,16 @@ export interface SidebarConversationListHandle {
 export interface SidebarConversationListProps {
   showCompleted?: boolean
   sortMode?: SidebarSortMode
+  /** When set, only show conversations belonging to these folder IDs.
+   *  Used by PlatformContext to filter conversations by the active project. */
+  folderFilter?: number[] | null
 }
 
 export function SidebarConversationList({
   ref,
   showCompleted = true,
   sortMode = "created",
+  folderFilter,
 }: SidebarConversationListProps & {
   ref?: Ref<SidebarConversationListHandle>
 }) {
@@ -817,16 +821,29 @@ export function SidebarConversationList({
     return () => clearInterval(interval)
   }, [])
 
+  // When a project is selected, filter conversations to only those in the
+  // project's folder(s). When no filter (null/empty), show all conversations.
+  const folderFilterSet = useMemo(
+    () =>
+      folderFilter && folderFilter.length > 0 ? new Set(folderFilter) : null,
+    [folderFilter]
+  )
+
+  const filteredConversations = useMemo(() => {
+    if (!folderFilterSet) return conversations
+    return conversations.filter((c) => folderFilterSet.has(c.folder_id))
+  }, [conversations, folderFilterSet])
+
   // Folder grouping source: pinned conversations are surfaced in the dedicated
   // Pinned section, and folderless chat conversations in the dedicated Chat
   // section, so exclude both here; then apply the completed filter as before.
   const folderConversations = useMemo(() => {
-    const base = conversations.filter(
+    const base = filteredConversations.filter(
       (c) => c.pinned_at == null && c.kind !== "chat"
     )
     if (showCompleted) return base
     return base.filter((c) => c.status !== "completed")
-  }, [conversations, showCompleted])
+  }, [filteredConversations, showCompleted])
 
   // Flat "Chat" bucket: folderless chat-mode conversations, most-recently-updated
   // first, with reference reuse (so an unrelated status event doesn't rebuild it
@@ -834,23 +851,23 @@ export function SidebarConversationList({
   const chatConvsRef = useRef<DbConversationSummary[]>([])
   const chatConversations = useMemo(() => {
     const next = selectChatConversationsWithReuse(
-      conversations,
+      filteredConversations,
       showCompleted,
       chatConvsRef.current
     )
     chatConvsRef.current = next
     return next
-  }, [conversations, showCompleted])
+  }, [filteredConversations, showCompleted])
 
   // Pinned bucket: the FULL conversation list (ignores "Show completed" — a
   // pinned conversation stays visible regardless), sorted most-recently-pinned
   // first, with reference reuse so an unrelated status event doesn't rebuild it.
   const pinnedRef = useRef<DbConversationSummary[]>([])
   const pinned = useMemo(() => {
-    const next = selectPinnedWithReuse(conversations, pinnedRef.current)
+    const next = selectPinnedWithReuse(filteredConversations, pinnedRef.current)
     pinnedRef.current = next
     return next
-  }, [conversations])
+  }, [filteredConversations])
 
   // Maps each open worktree child folder → its (open) root folder. A child is
   // only redirected when its parent is also open, so a worktree whose root was

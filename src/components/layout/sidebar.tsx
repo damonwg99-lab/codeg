@@ -5,9 +5,9 @@ import {
   ChevronsDownUp,
   ChevronsUpDown,
   Crosshair,
+  FolderOpen,
   Funnel,
-  MessageSquare,
-  FolderKanban,
+  KanbanSquare,
   Search,
   SquarePen,
   Zap,
@@ -15,10 +15,10 @@ import {
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { useActiveFolder } from "@/contexts/active-folder-context"
+import { usePlatform } from "@/contexts/platform-context"
 import { useSidebarContext } from "@/contexts/sidebar-context"
 import { useTabContext } from "@/contexts/tab-context"
 import { useSearchDialog } from "@/contexts/search-dialog-context"
-import type { SidebarTab } from "@/contexts/platform-context"
 import { useAutomationsView } from "@/contexts/automations-view-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import {
@@ -77,17 +77,20 @@ function SidebarNavButton({
   onClick,
   active,
   trailing,
+  disabled,
 }: {
   icon: LucideIcon
   label: string
   onClick: () => void
   active?: boolean
   trailing?: ReactNode
+  disabled?: boolean
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
+      disabled={disabled}
       title={label}
       aria-current={active ? "page" : undefined}
       className={cn(
@@ -95,7 +98,8 @@ function SidebarNavButton({
         "text-[0.875rem] text-sidebar-foreground outline-none",
         "transition-colors duration-150 hover:bg-sidebar-accent",
         "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-        active && "bg-sidebar-primary/8"
+        active && "bg-sidebar-primary/8",
+        disabled && "opacity-50 pointer-events-none"
       )}
     >
       <Icon className="h-[0.875rem] w-[0.875rem] shrink-0 text-muted-foreground" />
@@ -106,19 +110,17 @@ function SidebarNavButton({
 }
 
 interface SidebarProps {
-  /** Which tab is active. When "project", the sidebar renders children instead
-   *  of the conversation list and hides chat-specific actions. */
-  tab?: SidebarTab
-  /** Content to render when tab="project". Ignored when tab="chat" (or unset). */
-  children?: ReactNode
+  /** Custom content for the sidebar header area (replaces default title).
+   *  Used by PlatformProvider to render a project switcher dropdown. */
+  headerContent?: ReactNode
 }
 
-export function Sidebar({ tab = "chat", children }: SidebarProps) {
+export function Sidebar({ headerContent }: SidebarProps) {
   const t = useTranslations("Folder.sidebar")
-  const pt = useTranslations("Platform.sidebar")
-  const isProjectTab = tab === "project"
+  const pt = useTranslations("Platform.nav")
   const { isOpen, toggle } = useSidebarContext()
   const { activeFolder } = useActiveFolder()
+  const { activeProjectId, activeFolderIds } = usePlatform()
   const { openNewConversationTab, openChatModeTab } = useTabContext()
   const { setOpen: setSearchOpen } = useSearchDialog()
   const { unseenFailures } = useAutomationsView()
@@ -191,114 +193,74 @@ export function Sidebar({ tab = "chat", children }: SidebarProps) {
   return (
     <aside className="@container/sidebar flex h-full min-h-0 flex-col overflow-hidden bg-sidebar text-sidebar-foreground select-none">
       <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border pl-4 pr-2">
-        <div className="flex min-w-0 items-center gap-2">
-          {/* ── Slot: Tab toggle ── */}
-          <div className="flex items-center rounded-md bg-muted p-0.5">
-            <button
-              type="button"
-              onClick={() => {
-                if (isProjectTab) {
-                  // Navigate to /workspace (chat mode)
-                  window.location.href = "/workspace"
-                }
-              }}
-              className={cn(
-                "flex h-6 items-center justify-center rounded-sm px-2 text-[0.75rem] font-medium transition-all",
-                !isProjectTab
-                  ? "bg-background shadow-sm text-foreground"
-                  : "text-muted-foreground hover:text-foreground"
-              )}
-              aria-label={pt("chatTab")}
-            >
-              <MessageSquare className="h-3 w-3 shrink-0" />
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                if (!isProjectTab) {
-                  // Navigate to /platform (project mode)
-                  window.location.href = "/platform"
-                }
-              }}
-              className={cn(
-                "flex h-6 items-center justify-center rounded-sm px-2 text-[0.75rem] font-medium transition-all",
-                isProjectTab
-                  ? "bg-background shadow-sm text-foreground"
-                  : "text-muted-foreground hover:text-foreground"
-              )}
-              aria-label={pt("projectTab")}
-            >
-              <FolderKanban className="h-3 w-3 shrink-0" />
-            </button>
-          </div>
-          <h2 className="truncate text-[0.875rem] font-bold tracking-[-0.00625rem] text-sidebar-foreground">
-            {t("title")}
-          </h2>
-        </div>
-        <div className="flex items-center gap-0.5">
-          {/* ── Chat-only action buttons (hidden on Project tab) ── */}
-          {!isProjectTab && (
-            <>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-6 w-6 shrink-0 text-muted-foreground"
-                onClick={() => listRef.current?.scrollToActive()}
-                title={t("locateActiveConversation")}
-                aria-label={t("locateActiveConversation")}
-              >
-                <Crosshair aria-hidden="true" className="h-3.5 w-3.5" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-6 w-6 shrink-0 text-muted-foreground"
-                onClick={handleToggleExpandAll}
-                title={toggleExpandLabel}
-                aria-label={toggleExpandLabel}
-              >
-                {allExpanded ? (
-                  <ChevronsDownUp aria-hidden="true" className="h-3.5 w-3.5" />
-                ) : (
-                  <ChevronsUpDown aria-hidden="true" className="h-3.5 w-3.5" />
-                )}
-              </Button>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-6 w-6 shrink-0 text-muted-foreground"
-                    title={filterOptionsLabel}
-                    aria-label={filterOptionsLabel}
-                  >
-                    <Funnel aria-hidden="true" className="h-3.5 w-3.5" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end">
-                  <DropdownMenuCheckboxItem
-                    checked={showCompleted}
-                    onCheckedChange={handleSetShowCompleted}
-                  >
-                    {t("showCompleted")}
-                  </DropdownMenuCheckboxItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuLabel>{t("sortBy")}</DropdownMenuLabel>
-                  <DropdownMenuRadioGroup
-                    value={sortMode}
-                    onValueChange={handleSetSortMode}
-                  >
-                    <DropdownMenuRadioItem value="created">
-                      {t("sortByCreatedAt")}
-                    </DropdownMenuRadioItem>
-                    <DropdownMenuRadioItem value="updated">
-                      {t("sortByUpdatedAt")}
-                    </DropdownMenuRadioItem>
-                  </DropdownMenuRadioGroup>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </>
+        {/* ── Header slot: default title or custom content (project switcher) ── */}
+        <div className="flex min-w-0 items-center gap-2 flex-1">
+          {headerContent ?? (
+            <h2 className="truncate text-[0.875rem] font-bold tracking-[-0.00625rem] text-sidebar-foreground">
+              {t("title")}
+            </h2>
           )}
+        </div>
+        {/* ── 3 icon buttons (always visible) ── */}
+        <div className="flex items-center gap-0.5">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6 shrink-0 text-muted-foreground"
+            onClick={() => listRef.current?.scrollToActive()}
+            title={t("locateActiveConversation")}
+            aria-label={t("locateActiveConversation")}
+          >
+            <Crosshair aria-hidden="true" className="h-3.5 w-3.5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6 shrink-0 text-muted-foreground"
+            onClick={handleToggleExpandAll}
+            title={toggleExpandLabel}
+            aria-label={toggleExpandLabel}
+          >
+            {allExpanded ? (
+              <ChevronsDownUp aria-hidden="true" className="h-3.5 w-3.5" />
+            ) : (
+              <ChevronsUpDown aria-hidden="true" className="h-3.5 w-3.5" />
+            )}
+          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-6 w-6 shrink-0 text-muted-foreground"
+                title={filterOptionsLabel}
+                aria-label={filterOptionsLabel}
+              >
+                <Funnel aria-hidden="true" className="h-3.5 w-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuCheckboxItem
+                checked={showCompleted}
+                onCheckedChange={handleSetShowCompleted}
+              >
+                {t("showCompleted")}
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel>{t("sortBy")}</DropdownMenuLabel>
+              <DropdownMenuRadioGroup
+                value={sortMode}
+                onValueChange={handleSetSortMode}
+              >
+                <DropdownMenuRadioItem value="created">
+                  {t("sortByCreatedAt")}
+                </DropdownMenuRadioItem>
+                <DropdownMenuRadioItem value="updated">
+                  {t("sortByUpdatedAt")}
+                </DropdownMenuRadioItem>
+              </DropdownMenuRadioGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </div>
 
@@ -310,53 +272,72 @@ export function Sidebar({ tab = "chat", children }: SidebarProps) {
           center on the same 0.875rem rail axis as the folder/conversation icons in
           the list below. Each row is a `group` so its shortcut hint reveals on
           hover / keyboard focus. */}
-      {!isProjectTab && (
-        <div className="flex shrink-0 flex-col gap-0.5 px-1.5 pt-1.5">
-          <SidebarNavButton
-            icon={SquarePen}
-            label={t("newChat")}
-            onClick={handleNewConversation}
-            trailing={
-              newConversationShortcutLabel ? (
-                <kbd className={SHORTCUT_BADGE_CLASS}>
-                  {newConversationShortcutLabel}
-                </kbd>
-              ) : null
-            }
-          />
-          <SidebarNavButton
-            icon={Search}
-            label={t("search")}
-            onClick={() => setSearchOpen(true)}
-            trailing={
-              searchShortcutLabel ? (
-                <kbd className={SHORTCUT_BADGE_CLASS}>{searchShortcutLabel}</kbd>
-              ) : null
-            }
-          />
-          <SidebarNavButton
-            icon={Zap}
-            label={t("automations")}
-            active={routeId === "automations"}
-            onClick={() => setRoute("automations")}
-            trailing={
-              unseenFailures > 0 ? (
-                <span className="ml-auto inline-flex h-[0.9375rem] min-w-[0.9375rem] shrink-0 items-center justify-center rounded-full bg-destructive/15 px-1 font-mono text-[0.625rem] font-medium leading-none text-destructive">
-                  {unseenFailures}
-                </span>
-              ) : null
-            }
-          />
-        </div>
-      )}
+      <div className="flex shrink-0 flex-col gap-0.5 px-1.5 pt-1.5">
+        {/* ── Platform nav items (always visible) ── */}
+        <SidebarNavButton
+          icon={FolderOpen}
+          label={pt("projectList")}
+          active={
+            routeId === "project-list" ||
+            routeId === "project-detail" ||
+            routeId === "create-project"
+          }
+          onClick={() => setRoute("project-list")}
+        />
+        <SidebarNavButton
+          icon={KanbanSquare}
+          label={pt("taskKanban")}
+          active={routeId === "task-kanban" || routeId === "task-detail"}
+          onClick={() =>
+            activeProjectId
+              ? setRoute("task-kanban", { projectId: activeProjectId })
+              : setRoute("project-list")
+          }
+          disabled={!activeProjectId}
+        />
+        {/* ── Existing nav items ── */}
+        <SidebarNavButton
+          icon={SquarePen}
+          label={t("newChat")}
+          onClick={handleNewConversation}
+          trailing={
+            newConversationShortcutLabel ? (
+              <kbd className={SHORTCUT_BADGE_CLASS}>
+                {newConversationShortcutLabel}
+              </kbd>
+            ) : null
+          }
+        />
+        <SidebarNavButton
+          icon={Search}
+          label={t("search")}
+          onClick={() => setSearchOpen(true)}
+          trailing={
+            searchShortcutLabel ? (
+              <kbd className={SHORTCUT_BADGE_CLASS}>{searchShortcutLabel}</kbd>
+            ) : null
+          }
+        />
+        <SidebarNavButton
+          icon={Zap}
+          label={t("automations")}
+          active={routeId === "automations"}
+          onClick={() => setRoute("automations")}
+          trailing={
+            unseenFailures > 0 ? (
+              <span className="ml-auto inline-flex h-[0.9375rem] min-w-[0.9375rem] shrink-0 items-center justify-center rounded-full bg-destructive/15 px-1 font-mono text-[0.625rem] font-medium leading-none text-destructive">
+                {unseenFailures}
+              </span>
+            ) : null
+          }
+        />
+      </div>
 
-      {/* ── Slot: Scrollable content area ──
-          - Chat tab (default): renders SidebarConversationList
-          - Project tab: renders children prop */}
+      {/* ── Scrollable conversation list (always visible) ── */}
       <div
         className="flex flex-col flex-1 min-h-0 overflow-hidden pt-1.5"
         onClick={
-          isMobile && !isProjectTab
+          isMobile
             ? (e) => {
                 const target = e.target as HTMLElement
                 if (target.closest("[data-conversation-id]")) {
@@ -366,15 +347,12 @@ export function Sidebar({ tab = "chat", children }: SidebarProps) {
             : undefined
         }
       >
-        {isProjectTab && children ? (
-          children
-        ) : (
-          <SidebarConversationList
-            ref={listRef}
-            showCompleted={showCompleted}
-            sortMode={sortMode}
-          />
-        )}
+        <SidebarConversationList
+          ref={listRef}
+          showCompleted={showCompleted}
+          sortMode={sortMode}
+          folderFilter={activeFolderIds}
+        />
       </div>
     </aside>
   )

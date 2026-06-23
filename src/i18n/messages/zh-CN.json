@@ -2986,13 +2986,15 @@
     "loadFailed": "加载失败：{detail}"
   },
   "Platform": {
-    "sidebar": {
-      "chatTab": "对话",
-      "projectTab": "项目",
-      "selectProject": "选择项目",
-      "noProject": "未选择项目",
-      "openInPlatform": "在平台中打开",
+    "nav": {
+      "projectList": "项目",
+      "taskKanban": "任务",
       "createProject": "新建项目"
+    },
+    "switcher": {
+      "placeholder": "选择项目",
+      "noProject": "暂无项目",
+      "createFirst": "创建第一个项目"
     },
     "project": {
       "create": "创建项目",
@@ -3074,7 +3076,7 @@
     "sectionTitle": "运行日志",
     "sectionDescription": "查看和配置应用诊断日志。日志会写入本地文件，并保留在内存中以便实时查看。",
     "captureTitle": "日志级别",
-    "captureDescription": "控制记录的详细程度。级别越高（Debug、Trace）记录越多，但日志也越大。"关闭"将停止记录日志。",
+    "captureDescription": "控制记录的详细程度。级别越高（Debug、Trace）记录越多，但日志也越大。「关闭」将停止记录日志。",
     "captureLabel": "采集级别",
     "levels": {
       "off": "关闭",
@@ -3244,7 +3246,7 @@
     "cronPreviewLabel": "预览",
     "cronOpenBuilder": "打开计划生成器",
     "branchDefault": "默认分支",
-    "branchUseCustom": "使用 "{query}"",
+    "branchUseCustom": "使用「{query}」",
     "branchLocal": "本地",
     "branchRemote": "远程",
     "branchSearchPlaceholder": "搜索分支…",
