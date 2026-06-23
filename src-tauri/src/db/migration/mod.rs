@@ -21,6 +21,8 @@ mod m20260607_000001_folder_parent_id;
 mod m20260608_000001_conversation_title_locked;
 mod m20260610_000001_conversation_pinned_at;
 mod m20260611_000001_folder_is_chat;
+mod m20260612_000001_conversation_folder_kind;
+mod m20260621_000001_automation;
 mod m20260622_platform_000001_create_core_tables;
 mod m20260622_platform_000002_create_config_tables;
 mod m20260622_platform_000003_create_activity_log;
@@ -51,6 +53,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260608_000001_conversation_title_locked::Migration),
             Box::new(m20260610_000001_conversation_pinned_at::Migration),
             Box::new(m20260611_000001_folder_is_chat::Migration),
+            Box::new(m20260612_000001_conversation_folder_kind::Migration),
+            Box::new(m20260621_000001_automation::Migration),
             Box::new(m20260622_platform_000001_create_core_tables::Migration),
             Box::new(m20260622_platform_000002_create_config_tables::Migration),
             Box::new(m20260622_platform_000003_create_activity_log::Migration),
