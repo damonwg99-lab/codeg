@@ -2989,7 +2989,8 @@
     "nav": {
       "projectList": "Projects",
       "taskKanban": "Tasks",
-      "createProject": "Create project"
+      "createProject": "Create project",
+      "switchProject": "Switch to this project"
     },
     "switcher": {
       "placeholder": "Select project",
@@ -3028,6 +3029,7 @@
       "delete": "Delete project",
       "deleteConfirm": "Are you sure you want to delete this project?",
       "addRepo": "Add repo",
+      "addRepoFailed": "Failed to add repos: {repos}",
       "rescan": "Rescan",
       "noRepos": "No repos linked to this project"
     },
@@ -3068,7 +3070,32 @@
       "openConversation": "Open conversation",
       "moveTo": "Move to {status}",
       "noTasks": "No tasks",
-      "taskCount": "{count} task(s)"
+      "taskCount": "{count} task(s)",
+      "statusLabel": "Status",
+      "taskTypeOptions": {
+        "bug": "Bug",
+        "feature": "Feature",
+        "task": "Task",
+        "improvement": "Improvement"
+      },
+      "priorityOptions": {
+        "low": "Low",
+        "medium": "Medium",
+        "high": "High",
+        "urgent": "Urgent"
+      },
+      "statusOptions": {
+        "backlog": "Backlog",
+        "confirmed": "Confirmed",
+        "inProgress": "In Progress",
+        "done": "Done",
+        "released": "Released"
+      }
+    },
+    "repoSelector": {
+      "root": "Project root",
+      "placeholder": "Select repo",
+      "noRepos": "No repos"
     }
   },
   "LogsSettings": {

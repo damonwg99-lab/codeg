@@ -1,7 +1,8 @@
 use crate::app_error::AppCommandError;
+use crate::commands::folders::emit_folder_upsert;
 use crate::db::service::{
-    platform_credential_service, platform_global_config_service, platform_project_repo_service,
-    platform_project_service,
+    folder_service, platform_credential_service, platform_global_config_service,
+    platform_project_repo_service, platform_project_service,
 };
 use crate::db::AppDatabase;
 use crate::models::{
@@ -70,6 +71,14 @@ pub async fn create_project_core(
 
     // Check if the directory is already a CodeG Folder; if not, create one
     let folder_id = find_or_create_folder(conn, root_dir, default_agent_type.clone()).await?;
+
+    // Emit folder://changed so every client's workspace auto-adds the root folder
+    // (the project's sidebar conversation group depends on it being in allFolders).
+    if let Some(fid) = folder_id {
+        if let Some(detail) = folder_service::get_folder_by_id(conn, fid).await.map_err(AppCommandError::from)? {
+            emit_folder_upsert(emitter, detail);
+        }
+    }
 
     let project = platform_project_service::create(
         conn,
@@ -172,6 +181,41 @@ pub async fn add_project_repo_core(
     folder_id: Option<i32>,
 ) -> Result<ProjectRepoInfo, AppCommandError> {
     let conn = &db.conn;
+
+    // Auto-create a platform_repo Folder for the repo if no folder_id was provided.
+    // platform_repo folders are excluded from the sidebar folder list but available
+    // for git / file-tree switching via RepoSelector.
+    let resolved_folder_id = if folder_id.is_some() {
+        folder_id
+    } else {
+        // Resolve local_dir to an absolute path for the Folder
+        let abs_dir = if std::path::Path::new(local_dir).is_absolute() {
+            local_dir.to_string()
+        } else {
+            // The local_dir from scan is relative to the project rootDir.
+            // Look up the project to get the rootDir and compose the absolute path.
+            let project = platform_project_service::get_by_id(conn, project_id)
+                .await
+                .map_err(AppCommandError::from)?
+                .ok_or_else(|| AppCommandError::not_found(format!("Project not found: {project_id}")))?;
+            std::path::Path::new(&project.root_dir)
+                .join(local_dir)
+                .to_string_lossy()
+                .to_string()
+        };
+
+        find_or_create_platform_repo_folder(conn, &abs_dir).await?
+    };
+
+    // Emit folder://changed so every client's workspace auto-adds the repo folder
+    // (platform_repo kind → sidebar filter keeps it out of the visible list, but
+    // allFolders gains it so RepoSelector can resolve folderId).
+    if let Some(fid) = resolved_folder_id {
+        if let Some(detail) = folder_service::get_folder_by_id(conn, fid).await.map_err(AppCommandError::from)? {
+            emit_folder_upsert(emitter, detail);
+        }
+    }
+
     let repo = platform_project_repo_service::create(
         conn,
         project_id,
@@ -180,7 +224,7 @@ pub async fn add_project_repo_core(
         local_dir,
         branch,
         has_claude_md,
-        folder_id,
+        resolved_folder_id,
     )
     .await
     .map_err(AppCommandError::from)?;
@@ -327,8 +371,6 @@ async fn find_or_create_folder(
     root_dir: &str,
     default_agent_type: Option<String>,
 ) -> Result<Option<i32>, AppCommandError> {
-    use crate::db::service::folder_service;
-
     // Check if a Folder with this path already exists (including soft-deleted ones
     // — add_folder re-opens deleted folders)
     let existing = folder_service::add_folder(conn, root_dir)
@@ -347,6 +389,20 @@ async fn find_or_create_folder(
                 .map_err(AppCommandError::from)?;
         }
     }
+
+    Ok(Some(existing.id))
+}
+
+/// Create a platform_repo-kind Folder for a project git repository.
+/// platform_repo folders are excluded from the sidebar folder list but
+/// available for git / file-tree switching via RepoSelector.
+async fn find_or_create_platform_repo_folder(
+    conn: &sea_orm::DatabaseConnection,
+    abs_dir: &str,
+) -> Result<Option<i32>, AppCommandError> {
+    let existing = folder_service::add_platform_repo_folder(conn, abs_dir)
+        .await
+        .map_err(AppCommandError::from)?;
 
     Ok(Some(existing.id))
 }

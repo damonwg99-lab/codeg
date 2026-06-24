@@ -282,6 +282,9 @@ mod tauri_app {
                 ))
                 .map_err(|e| e.to_string())?;
                 app.manage(database);
+                app.manage(crate::web::event_bridge::EventEmitter::Tauri(
+                    app.handle().clone(),
+                ));
 
                 // Restore and apply saved system proxy settings before any network operation.
                 let db = app.state::<db::AppDatabase>();

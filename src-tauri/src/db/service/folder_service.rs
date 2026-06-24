@@ -74,7 +74,7 @@ pub async fn add_folder(
     conn: &DatabaseConnection,
     path: &str,
 ) -> Result<FolderHistoryEntry, DbError> {
-    add_folder_inner(conn, path, ParentWrite::Preserve).await
+    add_folder_inner(conn, path, ParentWrite::Preserve, FolderKind::Regular).await
 }
 
 /// Like [`add_folder`] but authoritatively sets `parent_id` — the *root* folder
@@ -87,13 +87,14 @@ pub async fn add_folder_with_parent(
     path: &str,
     parent_id: Option<i32>,
 ) -> Result<FolderHistoryEntry, DbError> {
-    add_folder_inner(conn, path, ParentWrite::Set(parent_id)).await
+    add_folder_inner(conn, path, ParentWrite::Set(parent_id), FolderKind::Regular).await
 }
 
 async fn add_folder_inner(
     conn: &DatabaseConnection,
     path: &str,
     parent: ParentWrite,
+    kind: FolderKind,
 ) -> Result<FolderHistoryEntry, DbError> {
     let now = Utc::now();
     let name = std::path::Path::new(path)
@@ -143,7 +144,7 @@ async fn add_folder_inner(
                 ParentWrite::Preserve => None,
                 ParentWrite::Set(parent_id) => parent_id,
             }),
-            kind: Set(FolderKind::Regular),
+            kind: Set(kind),
         };
         active.insert(conn).await?
     };
@@ -188,6 +189,21 @@ pub async fn add_chat_folder(
     };
     let model = active.insert(conn).await?;
     Ok(to_detail(model))
+}
+
+/// Create a platform-repo folder backing a project git repository.
+///
+/// Unlike [`add_folder`], `kind = platform_repo` is set so the frontend
+/// excludes this folder from the sidebar folder list. It is still available
+/// for git / file-tree switching via RepoSelector. The name is derived from
+/// the path, and `default_agent_type` can be set separately afterwards.
+/// If a folder with this path already exists (including soft-deleted ones),
+/// it is re-opened — but its kind is NOT changed (written once at insert).
+pub async fn add_platform_repo_folder(
+    conn: &DatabaseConnection,
+    path: &str,
+) -> Result<FolderHistoryEntry, DbError> {
+    add_folder_inner(conn, path, ParentWrite::Preserve, FolderKind::PlatformRepo).await
 }
 
 pub async fn update_folder_color(

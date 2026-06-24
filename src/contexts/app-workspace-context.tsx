@@ -363,8 +363,10 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
     // `list_open_folder_details` (the user-facing `folders` list) but kept in
     // `list_all_folder_details` (`allFolders`, for by-id cwd / active-folder
     // lookups). Seeding a chat folder into `folders` would render a "Chat"
-    // header row in the sidebar until the next refetch.
-    if (detail.kind !== "chat") {
+    // header row in the sidebar until the next refetch. `platform_repo`
+    // folders back project repos — they are excluded from the sidebar but
+    // available for git / file-tree switching via RepoSelector.
+    if (detail.kind !== "chat" && detail.kind !== "platform_repo") {
       setFolders(upsert)
     }
     setAllFolders(upsert)

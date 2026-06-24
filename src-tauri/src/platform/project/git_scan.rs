@@ -46,7 +46,27 @@ pub async fn scan_root_dir(root_dir: &str) -> Result<Vec<GitRepoScanResult>, App
     }
 
     let mut results = Vec::new();
-    scan_recursive(root, root, 0, &mut results);
+
+    // If the root itself is a git repo, record it and skip recursion
+    // (subdirectories belong to this repo).
+    let root_git = root.join(".git");
+    if root_git.is_dir() {
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let git_url = parse_git_remote_url(&root_git);
+        let has_claude_md = root.join("CLAUDE.md").is_file();
+        results.push(GitRepoScanResult {
+            name,
+            local_dir: String::new(),
+            git_url,
+            has_claude_md,
+        });
+    } else {
+        // Root is not a git repo — scan children for nested repos
+        scan_recursive(root, root, 0, &mut results);
+    }
 
     // Sort by local_dir for consistent ordering
     results.sort_by(|a, b| a.local_dir.cmp(&b.local_dir));
@@ -67,13 +87,11 @@ fn scan_recursive(
         return;
     }
 
-    // First check: is this directory itself a git repo?
+    // Check if this directory is a git repo
     let git_dir = dir.join(".git");
     if git_dir.is_dir() {
         // This IS a git repo — record it and do NOT descend further
         // (subdirectories belong to this repo, not separate ones).
-        // Exception: if dir IS the root, we still need to scan children
-        // because the root may be a git repo AND also contain other repos.
         let name = dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -87,24 +105,13 @@ fn scan_recursive(
         let git_url = parse_git_remote_url(&git_dir);
         let has_claude_md = dir.join("CLAUDE.md").is_file();
 
-        // Only add if this is NOT the root itself (root may be a repo,
-        // but we only want to discover nested repos under it).
-        // If root IS a repo, we still add it — the user explicitly
-        // chose this root_dir as their project root.
-        if dir != root {
-            results.push(GitRepoScanResult {
-                name,
-                local_dir,
-                git_url,
-                has_claude_md,
-            });
-        }
-        // Even if root is a git repo, we still scan its children
-        // for nested repos (monorepo pattern).
-        // If a non-root dir is a git repo, we do NOT scan its children.
-        if dir != root {
-            return;
-        }
+        results.push(GitRepoScanResult {
+            name,
+            local_dir,
+            git_url,
+            has_claude_md,
+        });
+        return;
     }
 
     // Read entries and recurse into subdirectories

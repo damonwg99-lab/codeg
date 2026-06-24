@@ -405,8 +405,9 @@ export type ConversationStatus =
 export type ConversationKind = "regular" | "chat" | "loop" | "delegate"
 
 /** Mirrors Rust `FolderKind` (src-tauri/src/db/entities/folder.rs).
- *  `loop_worktree` is reserved for M2+ — add it here when the variant lands. */
-export type FolderKind = "regular" | "chat"
+ *  `platform_repo` backs project repos — excluded from sidebar but available
+ *  for git / file-tree switching. `loop_worktree` is reserved for M2+. */
+export type FolderKind = "regular" | "chat" | "platform_repo"
 
 export const STATUS_ORDER: ConversationStatus[] = [
   "in_progress",

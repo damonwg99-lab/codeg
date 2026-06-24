@@ -148,3 +148,11 @@ Rust 集成测试在 `src-tauri/tests/*.rs`，需 `--features test-utils` 才能
 - ESLint：next/core-web-vitals + typescript + prettier（`prettier/prettier: error`）
 - TypeScript：strict + `noUnusedLocals` + `noUnusedParameters`
 - Rust：2021 edition，`thiserror` 定义错误类型，clippy `-D warnings`
+
+## 业务规则（勿反复确认）
+
+- **项目仓库（platform_repo kind Folder）不在 sidebar 文件夹列表中显示**：仓库 Folder 只用于 git/文件树切换（RepoSelector + BranchDropdown），不在会话分组中出现。只有项目根目录（Regular kind Folder）才出现在 sidebar
+- **新建会话归属项目根 Folder**：项目上下文激活时，Ctrl+N / sidebar 新建会话一律归到项目根 Folder（`activeProject.folderId`），不归到当前选中的 repo Folder
+- **项目切换需要显式操作**：创建项目不隐式切换（不调用 `setActiveProjectId`）；只有项目列表的 Check 按钮才切换项目
+- **项目切换后根 Folder 必须进入 workspace**：`setActiveProjectId` → `loadDetail` → 必须 `addFolderToWorkspaceById(rootFolderId)` + `setActiveFolderId(rootFolderId)`，否则 sidebar 无会话分组、BranchDropdown 不显示、RepoSelector 无数据源
+- **后端创建 Folder 必须发 `folder://changed` 事件**：`create_project_core` 和 `add_project_repo_core` 创建 Folder 后需 emit `folder://changed`（用 `emit_folder_upsert`），否则前端 workspace 无法自动感知新 Folder

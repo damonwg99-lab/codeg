@@ -10,7 +10,12 @@ import {
   type ReactNode,
 } from "react"
 import { listProjects, getProject } from "@/lib/platform/api"
-import type { ProjectInfo, ProjectDetail } from "@/lib/platform/types"
+import { useAppWorkspace } from "@/contexts/app-workspace-context"
+import type {
+  ProjectInfo,
+  ProjectDetail,
+  ProjectRepoInfo,
+} from "@/lib/platform/types"
 
 const STORAGE_KEY = "platform:activeProjectId"
 
@@ -21,10 +26,14 @@ interface PlatformContextValue {
   activeProjectId: number | null
   setActiveProjectId: (id: number | null) => void
   activeProject: ProjectInfo | null
-  /** All folder IDs associated with the active project (project folder + repo folders) */
+  /** Repos for the active project (loaded from ProjectDetail) */
+  activeProjectRepos: ProjectRepoInfo[]
+  /** All folder IDs associated with the active project (project folder only — root) */
   activeFolderIds: number[]
   projects: ProjectInfo[]
   loadProjects: () => Promise<void>
+  /** Reload the active project detail (repos, folderIds) — call after repo mutations */
+  loadProjectDetail: () => Promise<void>
   hasProjects: boolean
   loadingProjects: boolean
 
@@ -47,8 +56,15 @@ export function usePlatformContext() {
 export const usePlatform = usePlatformContext
 
 export function PlatformProvider({ children }: { children: ReactNode }) {
+  const {
+    addFolderToWorkspaceById,
+    setActiveFolderId: setWorkspaceActiveFolderId,
+  } = useAppWorkspace()
   const [activeProjectId, setActiveProjectId] = useState<number | null>(null)
   const [activeProject, setActiveProject] = useState<ProjectInfo | null>(null)
+  const [activeProjectRepos, setActiveProjectRepos] = useState<
+    ProjectRepoInfo[]
+  >([])
   const [activeFolderIds, setActiveFolderIds] = useState<number[]>([])
   const [projects, setProjects] = useState<ProjectInfo[]>([])
   const [loadingProjects, setLoadingProjects] = useState(true)
@@ -101,7 +117,7 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
     if (activeProjectId === null) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setActiveProject(null)
-
+      setActiveProjectRepos([])
       setActiveFolderIds([])
       return
     }
@@ -112,21 +128,26 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
         const detail: ProjectDetail = await getProject(projectId)
         if (!cancelled) {
           setActiveProject(detail.project)
-          // Collect all folder IDs: project folder + each repo's folder
+          setActiveProjectRepos(detail.repos)
+          // Only root folder's id for conversation filtering
           const folderIds: number[] = []
           if (detail.project.folderId != null) {
             folderIds.push(detail.project.folderId)
           }
-          for (const repo of detail.repos) {
-            if (repo.folderId != null) {
-              folderIds.push(repo.folderId)
-            }
-          }
           setActiveFolderIds(folderIds)
+
+          // Auto-open root folder + set it as the active folder in workspace.
+          // This ensures the sidebar shows a conversation group, BranchDropdown
+          // renders, and RepoSelector resolves folderId correctly.
+          if (detail.project.folderId != null) {
+            addFolderToWorkspaceById(detail.project.folderId).catch(() => {})
+            setWorkspaceActiveFolderId(detail.project.folderId)
+          }
         }
       } catch {
         if (!cancelled) {
           setActiveProject(null)
+          setActiveProjectRepos([])
           setActiveFolderIds([])
         }
       }
@@ -135,7 +156,7 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true
     }
-  }, [activeProjectId])
+  }, [activeProjectId, addFolderToWorkspaceById, setWorkspaceActiveFolderId])
 
   const loadProjects = useCallback(async () => {
     setLoadingProjects(true)
@@ -148,6 +169,28 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  const loadProjectDetail = useCallback(async () => {
+    if (activeProjectId === null) return
+    try {
+      const detail: ProjectDetail = await getProject(activeProjectId)
+      setActiveProject(detail.project)
+      setActiveProjectRepos(detail.repos)
+      const folderIds: number[] = []
+      if (detail.project.folderId != null) {
+        folderIds.push(detail.project.folderId)
+      }
+      setActiveFolderIds(folderIds)
+
+      // Auto-open root folder + set as active (belt-and-suspenders with backend event)
+      if (detail.project.folderId != null) {
+        addFolderToWorkspaceById(detail.project.folderId).catch(() => {})
+        setWorkspaceActiveFolderId(detail.project.folderId)
+      }
+    } catch {
+      // Keep stale data on error — better than wiping state
+    }
+  }, [activeProjectId, addFolderToWorkspaceById, setWorkspaceActiveFolderId])
+
   const hasProjects = projects.length > 0
 
   const value = useMemo<PlatformContextValue>(
@@ -156,9 +199,11 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
         activeProjectId,
         setActiveProjectId,
         activeProject,
+        activeProjectRepos,
         activeFolderIds,
         projects,
         loadProjects,
+        loadProjectDetail,
         hasProjects,
         loadingProjects,
         viewMode,
@@ -167,9 +212,11 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
     [
       activeProjectId,
       activeProject,
+      activeProjectRepos,
       activeFolderIds,
       projects,
       loadProjects,
+      loadProjectDetail,
       hasProjects,
       loadingProjects,
       viewMode,

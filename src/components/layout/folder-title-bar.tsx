@@ -15,6 +15,7 @@ import { openSettingsWindow } from "@/lib/api"
 import { getPetSettings, openPetWindow } from "@/lib/pet/api"
 import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { useActiveFolder } from "@/contexts/active-folder-context"
+import { usePlatform } from "@/contexts/platform-context"
 import { useIsActiveChatMode } from "@/hooks/use-is-active-chat-mode"
 import { isDesktop, openFileDialog } from "@/lib/platform"
 import { getActiveRemoteConnectionId } from "@/lib/transport"
@@ -36,6 +37,7 @@ import { BranchDropdown } from "./branch-dropdown"
 import { CommandDropdown } from "./command-dropdown"
 import { NewFolderDropdown } from "./new-folder-dropdown"
 import { RemoteWorkspaceDropdown } from "./remote-workspace-dropdown"
+import { RepoSelector } from "@/components/platform/repo-selector"
 import { SearchCommandDialog } from "@/components/conversations/search-command-dialog"
 import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-dialog"
 import { useIsMobile } from "@/hooks/use-mobile"
@@ -49,7 +51,8 @@ import {
 export function FolderTitleBar() {
   const tTitleBar = useTranslations("Folder.folderTitleBar")
   const tPet = useTranslations("Pet")
-  const { openFolder } = useAppWorkspace()
+  const { openFolder, allFolders } = useAppWorkspace()
+  const { activeProjectId, activeProject } = usePlatform()
   const { activeFolder } = useActiveFolder()
   const isChatMode = useIsActiveChatMode()
   const { isOpen, toggle } = useSidebarContext()
@@ -141,9 +144,17 @@ export function FolderTitleBar() {
       if (matchShortcutEvent(e, shortcuts.new_conversation)) {
         if (!activeFolder) return
         e.preventDefault()
-        // Return to the conversation workspace if a route (e.g. Automations)
-        // was covering the content region, else the new tab opens unseen.
         openConversations()
+        // When project context is active, force conversation to root folder
+        if (activeProjectId && activeProject?.folderId) {
+          const rootFolder = allFolders.find(
+            (f) => f.id === activeProject.folderId
+          )
+          if (rootFolder) {
+            openNewConversationTab(rootFolder.id, rootFolder.path)
+            return
+          }
+        }
         openNewConversationTab(activeFolder.id, activeFolder.path)
         return
       }
@@ -161,6 +172,9 @@ export function FolderTitleBar() {
     return () => document.removeEventListener("keydown", handleKeyDown)
   }, [
     activeFolder,
+    activeProjectId,
+    activeProject,
+    allFolders,
     handleOpenFolder,
     handleOpenSettings,
     openConversations,
@@ -190,6 +204,7 @@ export function FolderTitleBar() {
               </Button>
               <NewFolderDropdown />
               <RemoteWorkspaceDropdown />
+              <RepoSelector />
               <BranchDropdown />
             </div>
           ) : (
@@ -222,6 +237,7 @@ export function FolderTitleBar() {
                   <PawPrint className="h-3.5 w-3.5" />
                 </Button>
               </div>
+              <RepoSelector />
               <BranchDropdown />
               <div data-tauri-drag-region className="h-8 flex-1" />
             </div>

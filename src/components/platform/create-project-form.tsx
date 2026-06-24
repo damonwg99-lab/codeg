@@ -2,8 +2,8 @@
 
 import { useState, useCallback } from "react"
 import { useTranslations } from "next-intl"
-import { FolderOpen, Loader2, Check } from "lucide-react"
-import { createProject, scanGitRepos } from "@/lib/platform/api"
+import { FolderOpen, Loader2, Check, ArrowLeft } from "lucide-react"
+import { createProject, scanGitRepos, addProjectRepo } from "@/lib/platform/api"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { usePlatform } from "@/contexts/platform-context"
 import type { GitRepoScanResult } from "@/lib/platform/types"
@@ -19,13 +19,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
 
 export function CreateProjectForm() {
   const t = useTranslations("Platform")
   const { setRoute } = useWorkbenchRoute()
-  const { setActiveProjectId, loadProjects } = usePlatform()
+  const { loadProjects } = usePlatform()
 
   // Form state
   const [name, setName] = useState("")
@@ -43,6 +43,7 @@ export function CreateProjectForm() {
   // Create state
   const [creating, setCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
+  const [failedRepos, setFailedRepos] = useState<string[]>([])
 
   const handleBrowse = useCallback(async () => {
     const result = await openFileDialog({
@@ -91,6 +92,7 @@ export function CreateProjectForm() {
     if (!name || !rootDir) return
     setCreating(true)
     setCreateError(null)
+    setFailedRepos([])
     try {
       const project = await createProject({
         name,
@@ -99,9 +101,32 @@ export function CreateProjectForm() {
         clientName: clientName || undefined,
         defaultAgentType: defaultAgentType || undefined,
       })
-      // Update project list + set active project, then navigate to detail
+
+      // Register selected repos (each repo gets auto-created as a platform_repo Folder on backend)
+      const selectedRepoData = scanResults.filter((r) =>
+        selectedRepos.has(r.localDir)
+      )
+      const failed: string[] = []
+      for (const repo of selectedRepoData) {
+        try {
+          await addProjectRepo({
+            projectId: project.id,
+            name: repo.name,
+            gitUrl: repo.gitUrl ?? "",
+            localDir: repo.localDir,
+            hasClaudeMd: repo.hasClaudeMd,
+          })
+        } catch (e) {
+          console.error("Failed to add repo:", repo.name, e)
+          failed.push(repo.name)
+        }
+      }
+      setFailedRepos(failed)
+
+      // Refresh project list (no implicit project switching)
       await loadProjects()
-      setActiveProjectId(project.id)
+
+      // Navigate to detail even if some repos failed — user can see errors there
       setRoute("project-detail", { id: project.id })
     } catch (e) {
       setCreateError(String(e))
@@ -113,184 +138,192 @@ export function CreateProjectForm() {
     description,
     clientName,
     defaultAgentType,
+    scanResults,
+    selectedRepos,
     setRoute,
-    setActiveProjectId,
     loadProjects,
   ])
 
   return (
-    <div className="mx-auto max-w-2xl">
-      <Card>
-        <CardHeader>
-          <CardTitle>{t("project.create")}</CardTitle>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-4">
-          {/* Project name */}
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="project-name">{t("project.name")}</Label>
+    <ScrollArea className="h-full">
+      <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 p-4 sm:p-6">
+        <div className="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            onClick={() => setRoute("project-list")}
+          >
+            <ArrowLeft className="h-4 w-4" />
+          </Button>
+          <h1 className="text-lg font-semibold">{t("project.create")}</h1>
+        </div>
+
+        {/* Project name */}
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="project-name">{t("project.name")}</Label>
+          <Input
+            id="project-name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder={t("project.namePlaceholder")}
+          />
+        </div>
+
+        {/* Root directory */}
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="project-root-dir">{t("project.rootDir")}</Label>
+          <div className="flex items-center gap-2">
             <Input
-              id="project-name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder={t("project.namePlaceholder")}
+              id="project-root-dir"
+              value={rootDir}
+              onChange={(e) => setRootDir(e.target.value)}
+              placeholder={t("project.rootDirPlaceholder")}
             />
-          </div>
-
-          {/* Root directory */}
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="project-root-dir">{t("project.rootDir")}</Label>
-            <div className="flex items-center gap-2">
-              <Input
-                id="project-root-dir"
-                value={rootDir}
-                onChange={(e) => setRootDir(e.target.value)}
-                placeholder={t("project.rootDirPlaceholder")}
-              />
-              {isDesktop() && (
-                <Button
-                  variant="outline"
-                  size="icon"
-                  onClick={handleBrowse}
-                  title={t("project.browse")}
-                >
-                  <FolderOpen className="h-4 w-4" />
-                </Button>
-              )}
-            </div>
-          </div>
-
-          {/* Description */}
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="project-description">
-              {t("project.description")}
-            </Label>
-            <Input
-              id="project-description"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-            />
-          </div>
-
-          {/* Client name */}
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="project-client">{t("project.clientName")}</Label>
-            <Input
-              id="project-client"
-              value={clientName}
-              onChange={(e) => setClientName(e.target.value)}
-            />
-          </div>
-
-          {/* Default agent type */}
-          <div className="flex flex-col gap-1.5">
-            <Label>{t("project.defaultAgentType")}</Label>
-            <Select
-              value={defaultAgentType}
-              onValueChange={setDefaultAgentType}
-            >
-              <SelectTrigger>
-                <SelectValue placeholder="Auto" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="">Auto</SelectItem>
-                <SelectItem value="claude_code">Claude Code</SelectItem>
-                <SelectItem value="codex">Codex</SelectItem>
-                <SelectItem value="open_code">OpenCode</SelectItem>
-                <SelectItem value="gemini">Gemini</SelectItem>
-                <SelectItem value="cline">Cline</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-
-          <Separator />
-
-          {/* Git scan section */}
-          <div className="flex flex-col gap-2">
-            <div className="flex items-center justify-between">
-              <h3 className="text-[0.9375rem] font-medium">
-                {t("project.scanRepos")}
-              </h3>
+            {isDesktop() && (
               <Button
                 variant="outline"
-                size="sm"
-                disabled={!rootDir || scanning}
-                onClick={handleScan}
+                size="icon"
+                onClick={handleBrowse}
+                title={t("project.browse")}
               >
-                {scanning ? (
-                  <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
-                ) : null}
-                {scanning ? t("project.scanning") : t("project.scanRepos")}
+                <FolderOpen className="h-4 w-4" />
               </Button>
-            </div>
-
-            {scanError && (
-              <p className="text-[0.8125rem] text-destructive">
-                {t("project.scanFailed")}: {scanError}
-              </p>
-            )}
-
-            {scanResults.length > 0 && (
-              <div className="flex flex-col gap-2">
-                <p className="text-[0.8125rem] text-muted-foreground">
-                  {t("project.reposFound", { count: scanResults.length })}
-                </p>
-                {scanResults.map((repo) => (
-                  <div
-                    key={repo.localDir}
-                    className="flex items-center gap-2 rounded-md border p-2"
-                  >
-                    <Checkbox
-                      checked={selectedRepos.has(repo.localDir)}
-                      onCheckedChange={() => toggleRepo(repo.localDir)}
-                    />
-                    <div className="flex flex-col gap-0.5 min-w-0">
-                      <span className="text-[0.875rem] font-medium truncate">
-                        {repo.name}
-                      </span>
-                      <span className="text-[0.75rem] text-muted-foreground truncate">
-                        {repo.localDir}
-                      </span>
-                    </div>
-                    {repo.gitUrl && (
-                      <span className="ml-auto text-[0.75rem] text-muted-foreground truncate">
-                        {repo.gitUrl}
-                      </span>
-                    )}
-                    {repo.hasClaudeMd && (
-                      <Check className="h-3.5 w-3.5 text-green-500 shrink-0" />
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {scanResults.length === 0 && !scanning && !scanError && rootDir && (
-              <p className="text-[0.8125rem] text-muted-foreground">
-                {t("project.noReposFound")}
-              </p>
             )}
           </div>
+        </div>
 
-          <Separator />
+        {/* Description */}
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="project-description">
+            {t("project.description")}
+          </Label>
+          <Input
+            id="project-description"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+          />
+        </div>
 
-          {/* Create button */}
-          {createError && (
+        {/* Client name */}
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="project-client">{t("project.clientName")}</Label>
+          <Input
+            id="project-client"
+            value={clientName}
+            onChange={(e) => setClientName(e.target.value)}
+          />
+        </div>
+
+        {/* Default agent type */}
+        <div className="flex flex-col gap-1.5">
+          <Label>{t("project.defaultAgentType")}</Label>
+          <Select value={defaultAgentType} onValueChange={setDefaultAgentType}>
+            <SelectTrigger>
+              <SelectValue placeholder="Auto" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="">Auto</SelectItem>
+              <SelectItem value="claude_code">Claude Code</SelectItem>
+              <SelectItem value="codex">Codex</SelectItem>
+              <SelectItem value="open_code">OpenCode</SelectItem>
+              <SelectItem value="gemini">Gemini</SelectItem>
+              <SelectItem value="cline">Cline</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <Separator />
+
+        {/* Git scan section */}
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-between">
+            <h3 className="text-[0.9375rem] font-medium">
+              {t("project.scanRepos")}
+            </h3>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!rootDir || scanning}
+              onClick={handleScan}
+            >
+              {scanning ? (
+                <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+              ) : null}
+              {scanning ? t("project.scanning") : t("project.scanRepos")}
+            </Button>
+          </div>
+
+          {scanError && (
             <p className="text-[0.8125rem] text-destructive">
-              {t("project.createFailed")}: {createError}
+              {t("project.scanFailed")}: {scanError}
             </p>
           )}
-          <Button
-            disabled={!name || !rootDir || creating}
-            onClick={handleCreate}
-            className="w-full"
-          >
-            {creating ? (
-              <Loader2 className="mr-1 h-4 w-4 animate-spin" />
-            ) : null}
-            {creating ? t("project.creating") : t("project.create")}
-          </Button>
-        </CardContent>
-      </Card>
-    </div>
+
+          {scanResults.length > 0 && (
+            <div className="flex flex-col gap-2 max-h-[50vh] overflow-y-auto rounded-md border p-2">
+              <p className="text-[0.8125rem] text-muted-foreground sticky top-0 bg-background pb-1">
+                {t("project.reposFound", { count: scanResults.length })}
+              </p>
+              {scanResults.map((repo) => (
+                <div
+                  key={repo.localDir}
+                  className="flex items-center gap-2 rounded-md border p-2"
+                >
+                  <Checkbox
+                    checked={selectedRepos.has(repo.localDir)}
+                    onCheckedChange={() => toggleRepo(repo.localDir)}
+                  />
+                  <div className="flex flex-col gap-0.5 min-w-0">
+                    <span className="text-[0.875rem] font-medium truncate">
+                      {repo.name}
+                    </span>
+                    <span className="text-[0.75rem] text-muted-foreground truncate">
+                      {repo.localDir}
+                    </span>
+                  </div>
+                  {repo.gitUrl && (
+                    <span className="ml-auto text-[0.75rem] text-muted-foreground truncate">
+                      {repo.gitUrl}
+                    </span>
+                  )}
+                  {repo.hasClaudeMd && (
+                    <Check className="h-3.5 w-3.5 text-green-500 shrink-0" />
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {scanResults.length === 0 && !scanning && !scanError && rootDir && (
+            <p className="text-[0.8125rem] text-muted-foreground">
+              {t("project.noReposFound")}
+            </p>
+          )}
+        </div>
+
+        <Separator />
+
+        {/* Create button */}
+        {createError && (
+          <p className="text-[0.8125rem] text-destructive">
+            {t("project.createFailed")}: {createError}
+          </p>
+        )}
+        {failedRepos.length > 0 && (
+          <p className="text-[0.8125rem] text-destructive">
+            {t("project.addRepoFailed", { repos: failedRepos.join(", ") })}
+          </p>
+        )}
+        <Button
+          disabled={!name || !rootDir || creating}
+          onClick={handleCreate}
+          className="w-full"
+        >
+          {creating ? <Loader2 className="mr-1 h-4 w-4 animate-spin" /> : null}
+          {creating ? t("project.creating") : t("project.create")}
+        </Button>
+      </div>
+    </ScrollArea>
   )
 }

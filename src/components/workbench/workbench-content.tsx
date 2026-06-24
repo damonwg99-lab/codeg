@@ -7,6 +7,7 @@ import { ProjectDetail } from "@/components/platform/project-detail"
 import { CreateProjectForm } from "@/components/platform/create-project-form"
 import { TaskKanban } from "@/components/platform/task-kanban"
 import { TaskDetail } from "@/components/platform/task-detail"
+import { CreateTaskForm } from "@/components/platform/create-task-form"
 
 /**
  * Registry of full-page routes that take over the main content region. The
@@ -34,6 +35,8 @@ export function WorkbenchRoutePage() {
       return <TaskKanban projectId={Number(routeParams.projectId)} />
     case "task-detail":
       return <TaskDetail taskId={Number(routeParams.taskId)} />
+    case "create-task":
+      return <CreateTaskForm projectId={Number(routeParams.projectId)} />
     default:
       return null
   }

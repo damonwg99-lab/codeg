@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 /// Folder classification. `regular` folders are user-facing; `chat` folders
 /// are hidden per-conversation scratch dirs backing folderless chat mode
 /// (excluded from folder lists; their conversations route to the sidebar
-/// "Chat" group). A `loop_worktree` variant is reserved for M2+ engine-created
-/// worktrees — add it then. Written once at insert, never updated.
+/// "Chat" group). `platform_repo` folders back project repos — they are
+/// excluded from the sidebar folder list but available for git / file-tree
+/// switching via RepoSelector. A `loop_worktree` variant is reserved for M2+
+/// engine-created worktrees — add it then. Written once at insert, never updated.
 #[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
 #[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
 #[serde(rename_all = "snake_case")]
@@ -14,6 +16,8 @@ pub enum FolderKind {
     Regular,
     #[sea_orm(string_value = "chat")]
     Chat,
+    #[sea_orm(string_value = "platform_repo")]
+    PlatformRepo,
 }
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]

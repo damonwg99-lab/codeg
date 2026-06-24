@@ -2989,7 +2989,8 @@
     "nav": {
       "projectList": "项目",
       "taskKanban": "任务",
-      "createProject": "新建项目"
+      "createProject": "新建项目",
+      "switchProject": "切换到此项目"
     },
     "switcher": {
       "placeholder": "选择项目",
@@ -3028,6 +3029,7 @@
       "delete": "删除项目",
       "deleteConfirm": "确定要删除此项目吗？",
       "addRepo": "添加仓库",
+      "addRepoFailed": "添加仓库失败: {repos}",
       "rescan": "重新扫描",
       "noRepos": "暂无关联仓库"
     },
@@ -3068,7 +3070,32 @@
       "openConversation": "打开对话",
       "moveTo": "移至{status}",
       "noTasks": "暂无任务",
-      "taskCount": "{count} 个任务"
+      "taskCount": "{count} 个任务",
+      "statusLabel": "状态",
+      "taskTypeOptions": {
+        "bug": "缺陷",
+        "feature": "功能",
+        "task": "任务",
+        "improvement": "改进"
+      },
+      "priorityOptions": {
+        "low": "低",
+        "medium": "中",
+        "high": "高",
+        "urgent": "紧急"
+      },
+      "statusOptions": {
+        "backlog": "待办",
+        "confirmed": "已确认",
+        "inProgress": "进行中",
+        "done": "已完成",
+        "released": "已发布"
+      }
+    },
+    "repoSelector": {
+      "root": "项目根目录",
+      "placeholder": "选择仓库",
+      "noRepos": "无仓库"
     }
   },
   "LogsSettings": {

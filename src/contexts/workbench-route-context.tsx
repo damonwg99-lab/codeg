@@ -26,6 +26,7 @@ export type WorkbenchRouteId =
   | "create-project"
   | "task-kanban"
   | "task-detail"
+  | "create-task"
 
 interface WorkbenchRouteContextValue {
   routeId: WorkbenchRouteId

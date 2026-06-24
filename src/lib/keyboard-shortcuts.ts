@@ -123,7 +123,8 @@ const KEY_LABELS: Record<string, string> = {
   delete: "Delete",
 }
 
-function normalizeKeyToken(rawKey: string): string | null {
+function normalizeKeyToken(rawKey: string | undefined): string | null {
+  if (!rawKey) return null
   const key = rawKey.toLowerCase()
   if (!key) return null
 

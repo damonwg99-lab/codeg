@@ -4,10 +4,11 @@ import { useEffect, useState, useCallback } from "react"
 import { useTranslations } from "next-intl"
 import {
   Loader2,
-  Pencil,
   Save,
-  X,
   ArrowRight,
+  ArrowLeft,
+  Pencil,
+  X,
   MessageSquare,
 } from "lucide-react"
 import {
@@ -28,22 +29,31 @@ import {
 } from "@/lib/platform/types"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { cn } from "@/lib/utils"
 
 export function TaskDetail({ taskId }: { taskId: number }) {
   const t = useTranslations("Platform")
-  const { setRoute, openConversations } = useWorkbenchRoute()
+  const { setRoute, routeParams, openConversations } = useWorkbenchRoute()
   const [detail, setDetail] = useState<TaskDetailType | null>(null)
   const [conversations, setConversations] = useState<TaskConversationInfo[]>([])
   const [loading, setLoading] = useState(true)
-  const [editing, setEditing] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [editing, setEditing] = useState(false)
 
-  // Edit state
+  // Edit form state
   const [editTitle, setEditTitle] = useState("")
   const [editDescription, setEditDescription] = useState("")
   const [editTaskType, setEditTaskType] = useState("")
@@ -64,7 +74,6 @@ export function TaskDetail({ taskId }: { taskId: number }) {
           setEditAssignee(d.task.assignee ?? "")
           setLoading(false)
         }
-        // Also load conversations
         const convs = await listTaskConversations(taskId)
         if (!cancelled) setConversations(convs)
       } catch {
@@ -104,6 +113,16 @@ export function TaskDetail({ taskId }: { taskId: number }) {
     editAssignee,
   ])
 
+  const handleCancelEdit = useCallback(() => {
+    if (!detail) return
+    setEditTitle(detail.task.title)
+    setEditDescription(detail.task.description ?? "")
+    setEditTaskType(detail.task.taskType)
+    setEditPriority(detail.task.priority ?? "")
+    setEditAssignee(detail.task.assignee ?? "")
+    setEditing(false)
+  }, [detail])
+
   const handleStatusChange = useCallback(
     async (newStatus: string) => {
       if (!detail) return
@@ -117,7 +136,6 @@ export function TaskDetail({ taskId }: { taskId: number }) {
     [detail]
   )
 
-  // Get the next status in the flow
   const getNextStatus = useCallback((current: string): string | null => {
     const idx = TASK_STATUS_LIST.indexOf(current as TaskStatus)
     if (idx >= 0 && idx < TASK_STATUS_LIST.length - 1) {
@@ -128,263 +146,342 @@ export function TaskDetail({ taskId }: { taskId: number }) {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center py-16 text-muted-foreground">
-        Loading…
-      </div>
+      <ScrollArea className="h-full">
+        <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 p-4 sm:p-6">
+          <div className="flex items-center justify-center py-16 text-muted-foreground">
+            Loading…
+          </div>
+        </div>
+      </ScrollArea>
     )
   }
 
   if (!detail) {
     return (
-      <div className="flex items-center justify-center py-16 text-destructive">
-        Task not found
-      </div>
+      <ScrollArea className="h-full">
+        <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 p-4 sm:p-6">
+          <div className="flex items-center justify-center py-16 text-destructive">
+            Task not found
+          </div>
+        </div>
+      </ScrollArea>
     )
   }
 
   const { task, subTasks } = detail
+  const projectId = Number(routeParams.projectId ?? task.projectId)
 
   return (
-    <div className="flex flex-col gap-4">
-      <div className="flex items-center justify-between">
-        <h2 className="text-lg font-semibold">{task.title}</h2>
-        <div className="flex items-center gap-1">
-          {editing ? (
-            <>
+    <ScrollArea className="h-full">
+      <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 p-4 sm:p-6">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7"
+              onClick={() => setRoute("task-kanban", { projectId })}
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </Button>
+            <h2 className="text-lg font-semibold">{task.title}</h2>
+          </div>
+          <div className="flex items-center gap-1">
+            {editing ? (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleCancelEdit}
+                  disabled={saving}
+                >
+                  <X className="mr-1 h-3.5 w-3.5" />
+                  {t("project.cancel")}
+                </Button>
+                <Button size="sm" onClick={handleSave} disabled={saving}>
+                  {saving ? (
+                    <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Save className="mr-1 h-3.5 w-3.5" />
+                  )}
+                  {t("project.save")}
+                </Button>
+              </>
+            ) : (
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => setEditing(false)}
-                disabled={saving}
+                onClick={() => setEditing(true)}
               >
-                <X className="mr-1 h-3.5 w-3.5" />
-                {t("project.cancel")}
-              </Button>
-              <Button size="sm" onClick={handleSave} disabled={saving}>
-                {saving ? (
-                  <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Save className="mr-1 h-3.5 w-3.5" />
-                )}
-                {t("project.save")}
-              </Button>
-            </>
-          ) : (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setEditing(true)}
-            >
-              <Pencil className="mr-1 h-3.5 w-3.5" />
-              {t("project.edit")}
-            </Button>
-          )}
-        </div>
-      </div>
-
-      {/* ─── Status Management ─── */}
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-[0.9375rem]">
-            {t("task.statusManagement")}
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="flex items-center gap-2">
-            {TASK_STATUS_LIST.map((status) => (
-              <Button
-                key={status}
-                variant={task.status === status ? "default" : "outline"}
-                size="sm"
-                className={cn(
-                  "text-[0.75rem]",
-                  task.status === status && TASK_STATUS_COLORS[status]
-                )}
-                onClick={() => handleStatusChange(status)}
-              >
-                {TASK_STATUS_LABELS[status]}
-              </Button>
-            ))}
-            {getNextStatus(task.status) && (
-              <Button
-                variant="default"
-                size="sm"
-                className="ml-2 text-[0.75rem]"
-                onClick={() => handleStatusChange(getNextStatus(task.status)!)}
-              >
-                <ArrowRight className="mr-1 h-3.5 w-3.5" />
-                {t("task.moveTo", {
-                  status:
-                    TASK_STATUS_LABELS[
-                      getNextStatus(task.status)! as TaskStatus
-                    ],
-                })}
+                <Pencil className="mr-1 h-3.5 w-3.5" />
+                {t("project.edit")}
               </Button>
             )}
           </div>
-        </CardContent>
-      </Card>
+        </div>
 
-      {/* ─── Basic Info ─── */}
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-[0.9375rem]">
-            {t("task.basicInfo")}
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-3">
-          {editing ? (
-            <>
-              <div className="flex flex-col gap-1.5">
-                <Label>{t("task.title")}</Label>
-                <Input
-                  value={editTitle}
-                  onChange={(e) => setEditTitle(e.target.value)}
-                />
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <Label>{t("task.description")}</Label>
-                <Input
-                  value={editDescription}
-                  onChange={(e) => setEditDescription(e.target.value)}
-                />
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <Label>{t("task.taskType")}</Label>
-                <Input
-                  value={editTaskType}
-                  onChange={(e) => setEditTaskType(e.target.value)}
-                />
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <Label>{t("task.priority")}</Label>
-                <Input
-                  value={editPriority}
-                  onChange={(e) => setEditPriority(e.target.value)}
-                />
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <Label>{t("task.assignee")}</Label>
-                <Input
-                  value={editAssignee}
-                  onChange={(e) => setEditAssignee(e.target.value)}
-                />
-              </div>
-            </>
-          ) : (
-            <>
-              <div className="flex flex-col gap-1">
-                <span className="text-[0.75rem] text-muted-foreground">
-                  {t("task.title")}
-                </span>
-                <span className="text-[0.875rem]">{task.title}</span>
-              </div>
-              {task.description && (
-                <div className="flex flex-col gap-1">
-                  <span className="text-[0.75rem] text-muted-foreground">
-                    {t("task.description")}
-                  </span>
-                  <span className="text-[0.875rem]">{task.description}</span>
-                </div>
-              )}
-              <div className="flex flex-col gap-1">
-                <span className="text-[0.75rem] text-muted-foreground">
-                  {t("task.taskType")}
-                </span>
-                <Badge variant="outline">{task.taskType}</Badge>
-              </div>
-              {task.priority && (
-                <div className="flex flex-col gap-1">
-                  <span className="text-[0.75rem] text-muted-foreground">
-                    {t("task.priority")}
-                  </span>
-                  <Badge variant="outline">{task.priority}</Badge>
-                </div>
-              )}
-              {task.assignee && (
-                <div className="flex flex-col gap-1">
-                  <span className="text-[0.75rem] text-muted-foreground">
-                    {t("task.assignee")}
-                  </span>
-                  <span className="text-[0.875rem]">{task.assignee}</span>
-                </div>
-              )}
-            </>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* ─── Linked Conversations ─── */}
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-[0.9375rem]">
-            {t("task.conversations")}
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          {conversations.length === 0 ? (
-            <p className="text-[0.8125rem] text-muted-foreground">
-              {t("task.noConversations")}
-            </p>
-          ) : (
-            <div className="flex flex-col gap-2">
-              {conversations.map((conv) => (
-                <div
-                  key={conv.id}
-                  className="flex items-center gap-2 rounded-md border p-2 cursor-pointer hover:bg-accent"
-                  onClick={() => openConversations()}
-                >
-                  <MessageSquare className="h-4 w-4 text-muted-foreground" />
-                  <div className="flex flex-col gap-0.5 min-w-0">
-                    <span className="text-[0.875rem] font-medium truncate">
-                      Conversation #{conv.conversationId}
-                    </span>
-                    <span className="text-[0.75rem] text-muted-foreground">
-                      Role: {conv.conversationRole}
-                    </span>
-                  </div>
-                  <Badge variant="outline" className="text-[0.625rem] shrink-0">
-                    {conv.conversationRole}
-                  </Badge>
-                </div>
-              ))}
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* ─── Sub Tasks ─── */}
-      {subTasks.length > 0 && (
+        {/* ─── Status Management ─── */}
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-[0.9375rem]">
-              {t("task.subTasks")}
+              {t("task.statusManagement")}
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="flex flex-col gap-2">
-              {subTasks.map((sub) => (
-                <div
-                  key={sub.id}
-                  className="flex items-center gap-2 rounded-md border p-2 cursor-pointer hover:bg-accent"
-                  onClick={() => setRoute("task-detail", { taskId: sub.id })}
+            <div className="flex items-center gap-2">
+              {TASK_STATUS_LIST.map((status) => (
+                <Button
+                  key={status}
+                  variant={task.status === status ? "default" : "outline"}
+                  size="sm"
+                  className={cn(
+                    "text-[0.75rem]",
+                    task.status === status && TASK_STATUS_COLORS[status]
+                  )}
+                  onClick={() => handleStatusChange(status)}
                 >
-                  <Badge
-                    variant="outline"
-                    className={cn(
-                      "text-[0.625rem]",
-                      TASK_STATUS_COLORS[sub.status as TaskStatus] ?? ""
-                    )}
-                  >
-                    {TASK_STATUS_LABELS[sub.status as TaskStatus] ?? sub.status}
-                  </Badge>
-                  <span className="text-[0.875rem] truncate">{sub.title}</span>
-                </div>
+                  {TASK_STATUS_LABELS[status]}
+                </Button>
               ))}
+              {getNextStatus(task.status) && (
+                <Button
+                  variant="default"
+                  size="sm"
+                  className="ml-2 text-[0.75rem]"
+                  onClick={() =>
+                    handleStatusChange(getNextStatus(task.status)!)
+                  }
+                >
+                  <ArrowRight className="mr-1 h-3.5 w-3.5" />
+                  {t("task.moveTo", {
+                    status:
+                      TASK_STATUS_LABELS[
+                        getNextStatus(task.status)! as TaskStatus
+                      ],
+                  })}
+                </Button>
+              )}
             </div>
           </CardContent>
         </Card>
-      )}
-    </div>
+
+        {/* ─── Basic Info ─── */}
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-[0.9375rem]">
+              {t("task.basicInfo")}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3">
+            {editing ? (
+              <>
+                <div className="flex flex-col gap-1.5">
+                  <Label>{t("task.title")}</Label>
+                  <Input
+                    value={editTitle}
+                    onChange={(e) => setEditTitle(e.target.value)}
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <Label>{t("task.description")}</Label>
+                  <Textarea
+                    value={editDescription}
+                    onChange={(e) => setEditDescription(e.target.value)}
+                    rows={4}
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <Label>{t("task.taskType")}</Label>
+                  <Select value={editTaskType} onValueChange={setEditTaskType}>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="bug">
+                        {t("task.taskTypeOptions.bug")}
+                      </SelectItem>
+                      <SelectItem value="feature">
+                        {t("task.taskTypeOptions.feature")}
+                      </SelectItem>
+                      <SelectItem value="task">
+                        {t("task.taskTypeOptions.task")}
+                      </SelectItem>
+                      <SelectItem value="improvement">
+                        {t("task.taskTypeOptions.improvement")}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <Label>{t("task.priority")}</Label>
+                  <Select value={editPriority} onValueChange={setEditPriority}>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="low">
+                        {t("task.priorityOptions.low")}
+                      </SelectItem>
+                      <SelectItem value="medium">
+                        {t("task.priorityOptions.medium")}
+                      </SelectItem>
+                      <SelectItem value="high">
+                        {t("task.priorityOptions.high")}
+                      </SelectItem>
+                      <SelectItem value="urgent">
+                        {t("task.priorityOptions.urgent")}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <Label>{t("task.assignee")}</Label>
+                  <Input
+                    value={editAssignee}
+                    onChange={(e) => setEditAssignee(e.target.value)}
+                  />
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="flex flex-col gap-1">
+                  <span className="text-[0.75rem] text-muted-foreground">
+                    {t("task.title")}
+                  </span>
+                  <span className="text-[0.875rem]">{task.title}</span>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <span className="text-[0.75rem] text-muted-foreground">
+                    {t("task.statusLabel")}
+                  </span>
+                  <Badge
+                    variant="outline"
+                    className={cn(
+                      TASK_STATUS_COLORS[task.status as TaskStatus] ?? ""
+                    )}
+                  >
+                    {TASK_STATUS_LABELS[task.status as TaskStatus] ??
+                      task.status}
+                  </Badge>
+                </div>
+                {task.description && (
+                  <div className="flex flex-col gap-1">
+                    <span className="text-[0.75rem] text-muted-foreground">
+                      {t("task.description")}
+                    </span>
+                    <span className="text-[0.875rem]">{task.description}</span>
+                  </div>
+                )}
+                <div className="flex flex-col gap-1">
+                  <span className="text-[0.75rem] text-muted-foreground">
+                    {t("task.taskType")}
+                  </span>
+                  <Badge variant="outline">{task.taskType}</Badge>
+                </div>
+                {task.priority && (
+                  <div className="flex flex-col gap-1">
+                    <span className="text-[0.75rem] text-muted-foreground">
+                      {t("task.priority")}
+                    </span>
+                    <Badge variant="outline">{task.priority}</Badge>
+                  </div>
+                )}
+                {task.assignee && (
+                  <div className="flex flex-col gap-1">
+                    <span className="text-[0.75rem] text-muted-foreground">
+                      {t("task.assignee")}
+                    </span>
+                    <span className="text-[0.875rem]">{task.assignee}</span>
+                  </div>
+                )}
+              </>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* ─── Linked Conversations ─── */}
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-[0.9375rem]">
+              {t("task.conversations")}
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            {conversations.length === 0 ? (
+              <p className="text-[0.8125rem] text-muted-foreground">
+                {t("task.noConversations")}
+              </p>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {conversations.map((conv) => (
+                  <div
+                    key={conv.id}
+                    className="flex items-center gap-2 rounded-md border p-2 cursor-pointer hover:bg-accent"
+                    onClick={() => openConversations()}
+                  >
+                    <MessageSquare className="h-4 w-4 text-muted-foreground" />
+                    <div className="flex flex-col gap-0.5 min-w-0">
+                      <span className="text-[0.875rem] font-medium truncate">
+                        Conversation #{conv.conversationId}
+                      </span>
+                      <span className="text-[0.75rem] text-muted-foreground">
+                        Role: {conv.conversationRole}
+                      </span>
+                    </div>
+                    <Badge
+                      variant="outline"
+                      className="text-[0.625rem] shrink-0"
+                    >
+                      {conv.conversationRole}
+                    </Badge>
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* ─── Sub Tasks ─── */}
+        {subTasks.length > 0 && (
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-[0.9375rem]">
+                {t("task.subTasks")}
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="flex flex-col gap-2">
+                {subTasks.map((sub) => (
+                  <div
+                    key={sub.id}
+                    className="flex items-center gap-2 rounded-md border p-2 cursor-pointer hover:bg-accent"
+                    onClick={() =>
+                      setRoute("task-detail", {
+                        taskId: sub.id,
+                        projectId,
+                      })
+                    }
+                  >
+                    <Badge
+                      variant="outline"
+                      className={cn(
+                        "text-[0.625rem]",
+                        TASK_STATUS_COLORS[sub.status as TaskStatus] ?? ""
+                      )}
+                    >
+                      {TASK_STATUS_LABELS[sub.status as TaskStatus] ??
+                        sub.status}
+                    </Badge>
+                    <span className="text-[0.875rem] truncate">
+                      {sub.title}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
+        )}
+      </div>
+    </ScrollArea>
   )
 }

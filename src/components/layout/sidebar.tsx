@@ -16,6 +16,7 @@ import {
 import { useTranslations } from "next-intl"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { usePlatform } from "@/contexts/platform-context"
+import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { useSidebarContext } from "@/contexts/sidebar-context"
 import { useTabContext } from "@/contexts/tab-context"
 import { useSearchDialog } from "@/contexts/search-dialog-context"
@@ -120,7 +121,8 @@ export function Sidebar({ headerContent }: SidebarProps) {
   const pt = useTranslations("Platform.nav")
   const { isOpen, toggle } = useSidebarContext()
   const { activeFolder } = useActiveFolder()
-  const { activeProjectId, activeFolderIds } = usePlatform()
+  const { activeProjectId, activeFolderIds, activeProject } = usePlatform()
+  const { allFolders } = useAppWorkspace()
   const { openNewConversationTab, openChatModeTab } = useTabContext()
   const { setOpen: setSearchOpen } = useSearchDialog()
   const { unseenFailures } = useAutomationsView()
@@ -178,6 +180,19 @@ export function Sidebar({ headerContent }: SidebarProps) {
     // Starting a conversation always returns to the conversation workspace (in
     // case a route like Automations was taking over the content region).
     openConversations()
+
+    // When a project context is active, force the conversation to the project's
+    // root Folder (not the current repo's folder). This ensures all project
+    // conversations live under the same root for grouping.
+    if (activeProjectId && activeProject?.folderId) {
+      // Find the root folder in allFolders to get its path
+      const rootFolder = allFolders.find((f) => f.id === activeProject.folderId)
+      if (rootFolder) {
+        openNewConversationTab(rootFolder.id, rootFolder.path)
+        return
+      }
+    }
+
     // Defense-in-depth: with no active folder (e.g. a cold start that recovered
     // to nothing, or all folders closed) fall back to folderless chat mode
     // rather than no-op, so this entry point is never a dead end.
@@ -186,7 +201,15 @@ export function Sidebar({ headerContent }: SidebarProps) {
       return
     }
     openNewConversationTab(activeFolder.id, activeFolder.path)
-  }, [activeFolder, openChatModeTab, openNewConversationTab, openConversations])
+  }, [
+    activeFolder,
+    activeProjectId,
+    activeProject,
+    allFolders,
+    openChatModeTab,
+    openNewConversationTab,
+    openConversations,
+  ])
 
   if (!isOpen) return null
 
