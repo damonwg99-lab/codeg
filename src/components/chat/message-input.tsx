@@ -155,6 +155,8 @@ import { usePlatform } from "@/contexts/platform-context"
 import { useTabContext } from "@/contexts/tab-context"
 import { linkConversation, unlinkConversation } from "@/lib/platform/api"
 import type { ReferenceAttrs } from "@/components/chat/composer/types"
+import type { TaskSuggestionController } from "@/components/chat/composer/suggestion/task-suggestion"
+import type { TaskInfo } from "@/lib/platform/types"
 import type { Editor, JSONContent } from "@tiptap/core"
 import {
   useReferenceSearch,
@@ -562,6 +564,25 @@ export function MessageInput({
     loading: linkedTaskLoading,
   } = useLinkedTask(activeConversationId)
   const { activeProject, activeProjectRepos } = usePlatform()
+
+  // ─── # task trigger controller ───
+  const taskControllerRef = useRef<TaskSuggestionController>({
+    onStart: () => {},
+    onUpdate: () => {},
+    onExit: () => {},
+    onKeyDown: () => false,
+  })
+
+  // When a task is selected in the # popup, the RichComposer already handles
+  // badge insertion via handleTaskSelect. This callback is for any additional
+  // side effects (e.g. logging, future auto-link).
+  const handleTaskSelectFromPopup = useCallback(
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    (_task: TaskInfo) => {
+      // No additional side effect needed — badge insertion is done in RichComposer
+    },
+    []
+  )
 
   // ─── Quick messages ───
   const [quickMessages, setQuickMessages] = useState<QuickMessage[]>([])
@@ -1847,25 +1868,6 @@ export function MessageInput({
     refreshLinkedTask()
   }, [linkedTaskInfo, activeConversationId, refreshLinkedTask])
 
-  // Experts always inject an expert badge at the very front of the input, never
-  // at the cursor — the expert skill is a whole-turn directive the agent inspects
-  // first. If an expert badge is already at the front (from a prior click), it is
-  // replaced instead of stacked (the agent only honors the first). The badge
-  // label matches the expert menu's localized name.
-  const handleExpertPopoverSelect = useCallback(
-    (expert: ExpertListItem) => {
-      const editor = editorRef.current?.getEditor()
-      if (!editor) return
-      const label =
-        pickExpertLocalized(expert.metadata.display_name, locale) ||
-        expert.metadata.id
-      applyExpertReference(
-        editor,
-        expertToReference(expert, expertPrefix, label)
-      )
-    },
-    [expertPrefix, locale]
-  )
   const handlePickFiles = useCallback(async () => {
     if (disabled) return
     // Only wired up when `showNativePaperclip` is true (i.e. local desktop),
@@ -2872,6 +2874,9 @@ export function MessageInput({
                 newlineShortcut={shortcuts.newline_in_message}
                 isExternalMenuOpen={slashMenuOpen && slashAutocompleteCount > 0}
                 onExternalMenuKeyDown={handleExternalMenuKeyDown}
+                taskController={taskControllerRef.current}
+                activeProjectId={activeProject?.id ?? null}
+                onTaskSelect={handleTaskSelectFromPopup}
                 className="min-h-0 flex-1"
               />
               <div className="flex shrink-0 items-end justify-between gap-1 px-2 pb-2">

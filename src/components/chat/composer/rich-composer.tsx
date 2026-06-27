@@ -15,6 +15,7 @@ import { EditorContent, useEditor } from "@tiptap/react"
 import { exitSuggestion } from "@tiptap/suggestion"
 
 import { cn } from "@/lib/utils"
+import type { TaskInfo } from "@/lib/platform/types"
 
 import { buildComposerExtensions } from "./editor-config"
 import { decideComposerKey } from "./submit-key"
@@ -26,6 +27,11 @@ import {
   MENTION_LISTBOX_ID,
   SuggestionPopup,
 } from "./suggestion/suggestion-popup"
+import { TaskSuggestionPopup } from "./suggestion/task-suggestion-popup"
+import type {
+  TaskSuggestionController,
+  TaskSuggestionRenderState,
+} from "./suggestion/task-suggestion"
 import type {
   MentionUiLabels,
   ReferenceSearch,
@@ -138,8 +144,23 @@ export interface RichComposerProps {
   /** Key binding that inserts a line break instead of sending. Default `"shift+enter"`. */
   newlineShortcut?: string
   /**
+   * When provided, enables the `#` task trigger panel. The suggestion plugin
+   * forwards lifecycle/keys to this controller, whose React popup owns task
+   * search and insertion. MUST be referentially stable (memoize it).
+   */
+  taskController?: TaskSuggestionController
+  /**
+   * Active project ID for the `#` task trigger — used by the popup to filter
+   * tasks by project. When null, the `#` trigger is inert.
+   */
+  activeProjectId?: number | null
+  /**
+   * Called when a task is selected in the `#` popup. The host decides how to
+   * handle the insertion (e.g. calling insertReference on the editor).
+   */
+  onTaskSelect?: (task: TaskInfo) => void
+  /**
    * When true, an external (parent-driven) menu — e.g. the `/` runtime command
-   * list — owns navigation/confirm keys, so the composer never submits or breaks
    * while it is open. The internal `@` panel does not need this flag.
    */
   isExternalMenuOpen?: boolean
@@ -188,6 +209,9 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       isExternalMenuOpen,
       onExternalMenuKeyDown,
       onPasteFiles,
+      taskController,
+      activeProjectId,
+      onTaskSelect,
     },
     ref
   ) {
@@ -257,6 +281,40 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       []
     )
 
+    // ── `#` task trigger panel state bridge ──
+    const [taskSuggestionState, setTaskSuggestionState] =
+      useState<TaskSuggestionRenderState | null>(null)
+    const taskSuggestionOpenRef = useRef(false)
+    // Stable controller object — identity never changes, the popup mutates
+    // its methods via Object.assign (same pattern as the `@` mention popup).
+    // A plain object avoids the React Compiler "refs during render" rule.
+    const taskPopupController: TaskSuggestionController = useMemo(
+      () => ({
+        onStart: () => {},
+        onUpdate: () => {},
+        onExit: () => {},
+        onKeyDown: () => false,
+      }),
+      []
+    )
+    const taskExtensionController = useMemo<TaskSuggestionController>(
+      () => ({
+        onStart: (s) => {
+          taskSuggestionOpenRef.current = true
+          setTaskSuggestionState(s)
+        },
+        onUpdate: (s) => {
+          setTaskSuggestionState(s)
+        },
+        onExit: () => {
+          taskSuggestionOpenRef.current = false
+          setTaskSuggestionState(null)
+        },
+        onKeyDown: (event) => taskPopupController.onKeyDown(event),
+      }),
+      [taskPopupController]
+    )
+
     const editor = useEditor({
       // Static export / SSR safety: never render on the server.
       immediatelyRender: false,
@@ -267,7 +325,11 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       // render — the React Compiler lint can't prove that. Mirrors Tiptap's own
       // React suggestion pattern (render() → component.ref.onKeyDown).
       // eslint-disable-next-line react-hooks/refs
-      extensions: buildComposerExtensions({ placeholder, mentionController }),
+      extensions: buildComposerExtensions({
+        placeholder,
+        mentionController,
+        taskController: taskExtensionController,
+      }),
       editable: !disabled,
       autofocus: autoFocus ? "end" : false,
       editorProps: {
@@ -281,6 +343,8 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
           // The internal `@` panel's suggestion plugin owns its navigation keys;
           // never submit/break while it is open.
           if (mentionOpenRef.current) return false
+          // The `#` task trigger panel also owns its navigation keys.
+          if (taskSuggestionOpenRef.current) return false
           // An external (host) menu — e.g. the `/` runtime command list — gets
           // first refusal on keys while open. ProseMirror's DOM handler runs
           // before any host capture handler could, so routing happens here: the
@@ -481,6 +545,47 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       [editor, closeMention]
     )
 
+    // ── `#` task trigger: handle task selection ──
+    const handleTaskSelect = useCallback(
+      (task: TaskInfo) => {
+        const reference: ReferenceAttrs = {
+          refType: "task",
+          id: String(task.id),
+          label: task.title,
+          uri: null,
+          meta: {
+            taskType: task.taskType,
+            taskStatus: task.status,
+            projectId: task.projectId,
+          },
+        }
+        // Use the range from the current suggestion state to delete the `#`
+        // trigger text before inserting the badge.
+        if (taskSuggestionState) {
+          editor
+            ?.chain()
+            .focus()
+            .deleteRange(taskSuggestionState.range)
+            .insertReference(reference)
+            .insertContent(" ")
+            .run()
+        } else {
+          editor
+            ?.chain()
+            .focus()
+            .insertReference(reference)
+            .insertContent(" ")
+            .run()
+        }
+        // Close the # panel
+        taskSuggestionOpenRef.current = false
+        setTaskSuggestionState(null)
+        // Also call the onTaskSelect prop so the parent can react
+        onTaskSelect?.(task)
+      },
+      [editor, taskSuggestionState, onTaskSelect]
+    )
+
     // Combobox ARIA on the editing surface: DOM focus stays in the editor while
     // the `@` panel is open, so the controlled-listbox relationship lives on the
     // contentEditable. `aria-activedescendant` is mirrored from the popup's
@@ -541,6 +646,13 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
             moreLabel={mentionUiLabels?.more}
             countLabel={mentionUiLabels?.count}
             tabLabels={tabLabels}
+          />
+        )}
+        {taskController && activeProjectId != null && (
+          <TaskSuggestionPopup
+            controller={taskPopupController}
+            activeProjectId={activeProjectId}
+            onSelect={handleTaskSelect}
           />
         )}
       </div>
