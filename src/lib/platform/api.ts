@@ -201,16 +201,6 @@ export async function deleteTask(id: number): Promise<void> {
   return getTransport().call("delete_task", { id })
 }
 
-export async function searchTasks(params: {
-  projectId: number
-  query: string
-}): Promise<TaskInfo[]> {
-  return getTransport().call("search_tasks", {
-    projectId: params.projectId,
-    query: params.query,
-  })
-}
-
 // ─── Task Conversation ───
 
 export async function linkConversation(params: {

@@ -9,10 +9,6 @@ import {
   MentionSuggestion,
   type MentionController,
 } from "./suggestion/mention-suggestion"
-import {
-  TaskSuggestion,
-  type TaskSuggestionController,
-} from "./suggestion/task-suggestion"
 
 /**
  * Options for the shared composer extension set.
@@ -26,12 +22,6 @@ export interface ComposerExtensionOptions {
    * insertion.
    */
   mentionController?: MentionController
-  /**
-   * When provided, enables the `#` task trigger panel: the suggestion plugin
-   * forwards lifecycle/keys to this controller, whose React popup owns task
-   * search and insertion.
-   */
-  taskController?: TaskSuggestionController
 }
 
 /**
@@ -102,11 +92,6 @@ export function buildComposerExtensions(
   if (options.mentionController) {
     extensions.push(
       MentionSuggestion.configure({ controller: options.mentionController })
-    )
-  }
-  if (options.taskController) {
-    extensions.push(
-      TaskSuggestion.configure({ controller: options.taskController })
     )
   }
   return extensions

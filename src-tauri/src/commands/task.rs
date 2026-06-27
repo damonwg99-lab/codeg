@@ -50,17 +50,6 @@ pub async fn list_tasks_core(
         .map_err(AppCommandError::from)
 }
 
-pub async fn search_tasks_core(
-    db: &AppDatabase,
-    project_id: i32,
-    query: &str,
-) -> Result<Vec<TaskInfo>, AppCommandError> {
-    let conn = &db.conn;
-    platform_task_service::search(conn, project_id, query)
-        .await
-        .map_err(AppCommandError::from)
-}
-
 pub async fn get_task_core(
     db: &AppDatabase,
     id: i32,
@@ -554,14 +543,4 @@ pub async fn create_decomposition(
     decomposition_json: Option<String>,
 ) -> Result<TaskDecompositionInfo, AppCommandError> {
     create_decomposition_core(&db, source_task_id, ai_generated, decomposition_json).await
-}
-
-#[cfg(feature = "tauri-runtime")]
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn search_tasks(
-    db: tauri::State<'_, AppDatabase>,
-    project_id: i32,
-    query: String,
-) -> Result<Vec<TaskInfo>, AppCommandError> {
-    search_tasks_core(&db, project_id, &query).await
 }

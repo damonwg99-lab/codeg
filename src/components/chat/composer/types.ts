@@ -1,13 +1,7 @@
 import type { AgentType } from "@/lib/types"
 
-/** The six kinds of inline reference the composer can embed. */
-export type ReferenceKind =
-  | "file"
-  | "agent"
-  | "session"
-  | "commit"
-  | "skill"
-  | "task"
+/** The five kinds of inline reference the composer can embed. */
+export type ReferenceKind = "file" | "agent" | "session" | "commit" | "skill"
 
 export const REFERENCE_KINDS: readonly ReferenceKind[] = [
   "file",
@@ -15,7 +9,6 @@ export const REFERENCE_KINDS: readonly ReferenceKind[] = [
   "session",
   "commit",
   "skill",
-  "task",
 ]
 
 /**
@@ -63,12 +56,6 @@ export interface ReferenceMeta {
    * `/` when absent.
    */
   invocationPrefix?: "/" | "$"
-  /** task: the task type (coding, bug, design, etc.). */
-  taskType?: string
-  /** task: the task status. */
-  taskStatus?: string
-  /** task: the project ID the task belongs to. */
-  projectId?: number
 }
 
 /**

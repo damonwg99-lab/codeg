@@ -123,11 +123,6 @@ export function referenceToMarkdown(attrs: ReferenceAttrs): string {
         ? `${prefix}${token}`
         : inlineText(`${prefix}${token}`)
     }
-    case "task": {
-      // Serialize as #taskId Title — agent can parse this to look up task context
-      const text = collapseNewlines(attrs.label || attrs.id)
-      return `#${inlineText(text)}`
-    }
     case "file":
     case "session":
     case "commit": {

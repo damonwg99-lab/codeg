@@ -1,6 +1,5 @@
 import {
   Bot,
-  ClipboardList,
   Command,
   FileText,
   Folder,
@@ -77,9 +76,6 @@ export function ReferenceIcon({
       // the editor's expert-replace logic, not the icon).
       icon = <Command className={ICON_CLASS} />
       break
-    case "task":
-      icon = <ClipboardList className={ICON_CLASS} />
-      break
     default:
       return null
   }
@@ -114,8 +110,6 @@ function badgeColorClass(data: ReferenceAttrs): string {
       return "text-amber-700 dark:text-amber-400"
     case "skill":
       return "text-rose-700 dark:text-rose-400"
-    case "task":
-      return "text-cyan-700 dark:text-cyan-400"
   }
 }
 
