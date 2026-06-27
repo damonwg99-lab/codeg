@@ -148,6 +148,13 @@ pub struct CreateDecompositionParams {
     pub decomposition_json: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchTasksParams {
+    pub project_id: i32,
+    pub query: String,
+}
+
 // ─── Handlers ───
 
 pub async fn list_tasks(
@@ -324,5 +331,14 @@ pub async fn create_decomposition(
 ) -> Result<Json<TaskDecompositionInfo>, AppCommandError> {
     Ok(Json(
         task_commands::create_decomposition_core(&state.db, params.source_task_id, params.ai_generated, params.decomposition_json).await?,
+    ))
+}
+
+pub async fn search_tasks(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<SearchTasksParams>,
+) -> Result<Json<Vec<TaskInfo>>, AppCommandError> {
+    Ok(Json(
+        task_commands::search_tasks_core(&state.db, params.project_id, &params.query).await?,
     ))
 }

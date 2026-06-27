@@ -1195,6 +1195,7 @@ mod tauri_app {
                 task_commands::update_task_type_mapping,
                 task_commands::delete_task_type_mapping,
                 task_commands::create_decomposition,
+                task_commands::search_tasks,
             ])
             .build(tauri::generate_context!())
             .expect("error while building tauri application")

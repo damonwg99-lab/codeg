@@ -4,6 +4,7 @@ use sea_orm::{
     QueryFilter, QueryOrder, Set, IntoActiveModel,
 };
 use sea_orm::entity::prelude::DateTimeUtc;
+use sea_orm::Condition;
 
 use crate::db::entities::platform_task;
 use crate::db::error::DbError;
@@ -251,4 +252,29 @@ pub async fn update_status(
     active.updated_at = Set(Utc::now());
     let result = active.update(conn).await?;
     Ok(to_info(result))
+}
+
+pub async fn search(
+    conn: &DatabaseConnection,
+    project_id: i32,
+    query: &str,
+) -> Result<Vec<TaskInfo>, DbError> {
+    let mut filter = Condition::all()
+        .add(platform_task::Column::ProjectId.eq(project_id))
+        .add(platform_task::Column::DeletedAt.is_null());
+
+    if !query.is_empty() {
+        filter = filter.add(
+            Condition::any()
+                .add(platform_task::Column::Title.contains(query))
+                .add(platform_task::Column::TaskType.contains(query)),
+        );
+    }
+
+    let rows = platform_task::Entity::find()
+        .filter(filter)
+        .order_by_desc(platform_task::Column::UpdatedAt)
+        .all(conn)
+        .await?;
+    Ok(rows.into_iter().map(to_info).collect())
 }

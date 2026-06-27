@@ -1111,6 +1111,7 @@ pub fn build_router(
         .route("/platform/update_task_type_mapping", post(handlers::task::update_task_type_mapping))
         .route("/platform/delete_task_type_mapping", post(handlers::task::delete_task_type_mapping))
         .route("/platform/create_decomposition", post(handlers::task::create_decomposition))
+        .route("/platform/search_tasks", post(handlers::task::search_tasks))
         // Catch-all
         .fallback(api_not_found)
         .layer(middleware::from_fn(move |req, next| {
