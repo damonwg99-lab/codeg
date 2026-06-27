@@ -18,6 +18,8 @@ interface RepoOption {
   id: string
   name: string
   folderId: number | null | undefined
+  /** Whether this option represents the project root directory */
+  isRoot: boolean
 }
 
 export function RepoSelector() {
@@ -30,23 +32,52 @@ export function RepoSelector() {
     allFolders,
   } = useAppWorkspace()
 
-  // Build option list: [Project root] + [all repos]
+  // Count total git repos: root (if git) + registered sub-repos with folders.
   // Must call hooks before any early return (react-hooks/rules-of-hooks)
+  const gitRepoCount = useMemo(() => {
+    if (!activeProject) return 0
+    const rootFolder = allFolders.find((f) => f.id === activeProject.folderId)
+    const rootIsGit = rootFolder?.git_branch != null ? 1 : 0
+    const subRepoCount = activeProjectRepos.filter(
+      (r) => r.folderId != null
+    ).length
+    return rootIsGit + subRepoCount
+  }, [activeProject, activeProjectRepos, allFolders])
+
+  // Build option list: root (always first) + all sub-repos.
+  // Root is always included when there are ≥2 git repos so the user can
+  // navigate back to the project base directory from a sub-repo.
+  // Labeled with the actual folder name.
   const options = useMemo<RepoOption[]>(() => {
     if (!activeProject) return []
-    const rootOption: RepoOption = {
-      id: "root",
-      name: activeProject.name,
-      folderId: activeProject.folderId ?? undefined,
+    const result: RepoOption[] = []
+
+    // Always include root as first option when repos exist
+    const rootFolder = allFolders.find((f) => f.id === activeProject.folderId)
+    if (rootFolder) {
+      result.push({
+        id: "root",
+        name: rootFolder.name,
+        folderId: activeProject.folderId ?? undefined,
+        isRoot: true,
+      })
     }
-    const repoOptions: RepoOption[] = activeProjectRepos.map((r) => ({
-      id: String(r.id),
-      name: r.name,
-      folderId: r.folderId ?? undefined,
-    }))
-    // Only include repos that have a folder (backend auto-creates them)
-    return [rootOption, ...repoOptions]
-  }, [activeProject, activeProjectRepos])
+
+    // Add registered repos that have a folder (backend auto-creates them)
+    for (const r of activeProjectRepos) {
+      if (r.folderId != null) {
+        const repoFolder = allFolders.find((f) => f.id === r.folderId)
+        result.push({
+          id: String(r.id),
+          name: repoFolder?.name ?? r.name,
+          folderId: r.folderId ?? undefined,
+          isRoot: false,
+        })
+      }
+    }
+
+    return result
+  }, [activeProject, activeProjectRepos, allFolders])
 
   // Determine current selection: match activeFolderId to an option
   const current = useMemo(
@@ -69,8 +100,8 @@ export function RepoSelector() {
   // No project context → hide entirely
   if (!activeProjectId || !activeProject) return null
 
-  // No options at all → hide
-  if (options.length === 0) return null
+  // Only 1 git repo or none → hide; switching projects suffices
+  if (gitRepoCount <= 1) return null
 
   return (
     <DropdownMenu>
@@ -100,7 +131,7 @@ export function RepoSelector() {
                 if (opt.folderId) handleSelect(opt.folderId)
               }}
             >
-              {opt.id === "root" ? t("repoSelector.root") : opt.name}
+              {opt.name}
             </DropdownMenuItem>
           )
         })}

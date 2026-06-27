@@ -16,6 +16,7 @@ import {
   updateTask,
   updateTaskStatus,
   listTaskConversations,
+  createConversationForTask,
 } from "@/lib/platform/api"
 import type {
   TaskDetail as TaskDetailType,
@@ -42,16 +43,24 @@ import {
 } from "@/components/ui/select"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
+import { usePlatform } from "@/contexts/platform-context"
+import { useTabContext } from "@/contexts/tab-context"
+import { ContextInjectPanel } from "@/components/platform/context-inject-panel"
+import type { ContextInjectPayload } from "@/components/platform/context-inject-panel-utils"
 import { cn } from "@/lib/utils"
 
 export function TaskDetail({ taskId }: { taskId: number }) {
   const t = useTranslations("Platform")
   const { setRoute, routeParams, openConversations } = useWorkbenchRoute()
+  const { activeProject, activeProjectRepos } = usePlatform()
+  const { openTab, setPendingInitialDraft } = useTabContext()
   const [detail, setDetail] = useState<TaskDetailType | null>(null)
   const [conversations, setConversations] = useState<TaskConversationInfo[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [editing, setEditing] = useState(false)
+  const [contextPanelOpen, setContextPanelOpen] = useState(false)
+  const [creatingConversation, setCreatingConversation] = useState(false)
 
   // Edit form state
   const [editTitle, setEditTitle] = useState("")
@@ -134,6 +143,38 @@ export function TaskDetail({ taskId }: { taskId: number }) {
       }
     },
     [detail]
+  )
+
+  const handleCreateConversation = useCallback(
+    async (payload: ContextInjectPayload) => {
+      if (!detail) return
+      setCreatingConversation(true)
+      try {
+        const result = await createConversationForTask({
+          taskId: detail.task.id,
+          injectedDocsJson: payload.injectedDocsJson,
+        })
+        setConversations((prev) => [result.link, ...prev])
+        setContextPanelOpen(false)
+        openConversations()
+        openTab(
+          result.folderId,
+          result.conversationId,
+          result.agentType,
+          false,
+          result.title
+        )
+        // Pre-fill the new conversation's composer with the context prefix
+        if (payload.prefix) {
+          setPendingInitialDraft(result.conversationId, payload.prefix)
+        }
+      } catch (e) {
+        console.error("Create task conversation failed:", e)
+      } finally {
+        setCreatingConversation(false)
+      }
+    },
+    [detail, openConversations, openTab, setPendingInitialDraft]
   )
 
   const getNextStatus = useCallback((current: string): string | null => {
@@ -401,10 +442,23 @@ export function TaskDetail({ taskId }: { taskId: number }) {
 
         {/* ─── Linked Conversations ─── */}
         <Card>
-          <CardHeader className="pb-2">
+          <CardHeader className="flex flex-row items-center justify-between gap-3 pb-2">
             <CardTitle className="text-[0.9375rem]">
               {t("task.conversations")}
             </CardTitle>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setContextPanelOpen(true)}
+              disabled={creatingConversation}
+            >
+              {creatingConversation ? (
+                <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <MessageSquare className="mr-1 h-3.5 w-3.5" />
+              )}
+              New conversation
+            </Button>
           </CardHeader>
           <CardContent>
             {conversations.length === 0 ? (
@@ -481,6 +535,17 @@ export function TaskDetail({ taskId }: { taskId: number }) {
             </CardContent>
           </Card>
         )}
+
+        <ContextInjectPanel
+          open={contextPanelOpen}
+          onOpenChange={setContextPanelOpen}
+          task={detail.task}
+          project={activeProject}
+          repos={activeProjectRepos}
+          conversations={conversations}
+          submitting={creatingConversation}
+          onConfirm={handleCreateConversation}
+        />
       </div>
     </ScrollArea>
   )

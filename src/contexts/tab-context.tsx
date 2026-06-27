@@ -194,6 +194,13 @@ interface TabContextValue {
   ) => void
   reorderTabs: (reorderedTabs: TabItem[]) => void
   onPreviewTabReplaced: (callback: (tabId: string) => void) => () => void
+  /**
+   * Pending initial content for newly created conversation tabs. Used by
+   * the task→conversation flow to pre-fill the composer with a context prefix.
+   */
+  pendingInitialDrafts: Map<number, string>
+  setPendingInitialDraft: (conversationId: number, content: string) => void
+  clearPendingInitialDraft: (conversationId: number) => void
 }
 
 const TabContext = createContext<TabContextValue | null>(null)
@@ -307,6 +314,34 @@ export function TabProvider({ children }: TabProviderProps) {
   const { rawTabs, activeTabId, previewReplacedTabIds, draftRetargetRequests } =
     tabState
   const [tabsHydrated, setTabsHydrated] = useState(false)
+
+  /**
+   * Pending initial drafts keyed by conversationId. When a task→conversation
+   * flow creates a new tab and wants to pre-fill the composer with a prefix,
+   * it stores the prefix here. The MessageInput reads and clears it on mount.
+   */
+  const [pendingInitialDrafts, setPendingInitialDrafts] = useState<
+    Map<number, string>
+  >(new Map())
+
+  const setPendingInitialDraft = useCallback(
+    (conversationId: number, content: string) => {
+      setPendingInitialDrafts((prev) => {
+        const next = new Map(prev)
+        next.set(conversationId, content)
+        return next
+      })
+    },
+    []
+  )
+
+  const clearPendingInitialDraft = useCallback((conversationId: number) => {
+    setPendingInitialDrafts((prev) => {
+      const next = new Map(prev)
+      next.delete(conversationId)
+      return next
+    })
+  }, [])
 
   // ── Cross-client open-tab sync (see TAB_ORIGIN / `tabs://changed`) ──────────
   // `versionRef` — last workspace tab version this client has observed/applied;
@@ -1856,6 +1891,9 @@ export function TabProvider({ children }: TabProviderProps) {
       setTabRuntimeConversationId,
       reorderTabs,
       onPreviewTabReplaced,
+      pendingInitialDrafts,
+      setPendingInitialDraft,
+      clearPendingInitialDraft,
     }),
     [
       tabs,
@@ -1881,6 +1919,9 @@ export function TabProvider({ children }: TabProviderProps) {
       setTabRuntimeConversationId,
       reorderTabs,
       onPreviewTabReplaced,
+      pendingInitialDrafts,
+      setPendingInitialDraft,
+      clearPendingInitialDraft,
     ]
   )
 

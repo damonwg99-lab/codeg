@@ -74,6 +74,23 @@ INSTA_UPDATE=auto cargo test --features test-utils    # 自动写新 .snap
 
 Rust 集成测试在 `src-tauri/tests/*.rs`，需 `--features test-utils` 才能访问 test scaffolding（`AppState::new_for_test` 等）。
 
+## Codegraph 代码探索（优先使用）
+
+项目已配置 Codegraph MCP（`.codegraph/` 目录），索引了 ~876 文件、17k+ 符号、53k+ 边。**探索代码时必须优先使用 Codegraph 工具，而非 grep/read 手动搜索**：
+
+- **`codegraph_explore`** — 主要工具。用自然语言问题或符号名查询，一次调用返回相关符号的源码 + 调用关系，等效于 Read + 多文件搜索，绝大多数场景只需这一步
+- **`codegraph_search`** — 仅查符号位置（不返回源码），用于快速定位
+- **`codegraph_callers` / `codegraph_callees`** — 查调用链（谁调用了 X / X 调用了谁）
+- **`codegraph_impact`** — 变更影响分析（修改 X 会影响哪些符号）
+- **`codegraph_node`** — 获取单个符号完整源码（当 explore 截断了某个函数体时补充查看）
+
+**使用规则**：
+
+1. 任何"X 怎么工作"、"X 在哪"、"架构"类问题 → 先 `codegraph_explore`，不要先 grep/read
+2. 需要追踪调用链或理解数据流 → `codegraph_explore` 列出路径符号名
+3. 只有 codegraph 未覆盖的细节才用 Read/Grep 补充确认
+4. 文件 watcher 自动同步变更，新文件和修改都会实时反映到索引中
+
 ## 架构
 
 ### 三种二进制

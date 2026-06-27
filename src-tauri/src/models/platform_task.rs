@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use super::AgentType;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -46,6 +47,16 @@ pub struct TaskConversationInfo {
     pub injected_docs_json: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskConversationLaunchInfo {
+    pub conversation_id: i32,
+    pub folder_id: i32,
+    pub agent_type: AgentType,
+    pub title: String,
+    pub link: TaskConversationInfo,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -10,7 +10,8 @@ use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::task as task_commands;
 use crate::models::{
-    TaskConversationInfo, TaskDecompositionInfo, TaskDetail, TaskInfo, TaskTypeMappingInfo,
+    TaskConversationInfo, TaskConversationLaunchInfo, TaskDecompositionInfo, TaskDetail, TaskInfo,
+    TaskTypeMappingInfo,
 };
 
 // ─── Param structs ───
@@ -81,6 +82,13 @@ pub struct LinkConversationParams {
     pub task_id: i32,
     pub conversation_id: i32,
     pub role: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateConversationForTaskParams {
+    pub task_id: i32,
+    pub injected_docs_json: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -237,6 +245,21 @@ pub async fn link_conversation(
 ) -> Result<Json<TaskConversationInfo>, AppCommandError> {
     Ok(Json(
         task_commands::link_conversation_core(&state.db, &state.emitter, params.task_id, params.conversation_id, &params.role).await?,
+    ))
+}
+
+pub async fn create_conversation_for_task(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<CreateConversationForTaskParams>,
+) -> Result<Json<TaskConversationLaunchInfo>, AppCommandError> {
+    Ok(Json(
+        task_commands::create_conversation_for_task_core(
+            &state.db,
+            &state.emitter,
+            params.task_id,
+            params.injected_docs_json,
+        )
+        .await?,
     ))
 }
 

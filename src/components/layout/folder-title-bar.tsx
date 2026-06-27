@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import {
   EllipsisVertical,
   Menu,
@@ -25,6 +25,8 @@ import { useAuxPanelContext } from "@/contexts/aux-panel-context"
 import { useTerminalContext } from "@/contexts/terminal-context"
 import { useTabContext } from "@/contexts/tab-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
+import { useLinkedTask } from "@/hooks/use-linked-task"
+import { Badge } from "@/components/ui/badge"
 import { useSearchDialog } from "@/contexts/search-dialog-context"
 import { useIsMac } from "@/hooks/use-is-mac"
 import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
@@ -38,9 +40,11 @@ import { CommandDropdown } from "./command-dropdown"
 import { NewFolderDropdown } from "./new-folder-dropdown"
 import { RemoteWorkspaceDropdown } from "./remote-workspace-dropdown"
 import { RepoSelector } from "@/components/platform/repo-selector"
+import { ProjectSwitcher } from "@/components/platform/project-switcher"
 import { SearchCommandDialog } from "@/components/conversations/search-command-dialog"
 import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-dialog"
 import { useIsMobile } from "@/hooks/use-mobile"
+import { useProjectSwitchCoordinator } from "@/hooks/use-project-switch-coordinator"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -59,7 +63,14 @@ export function FolderTitleBar() {
   const { isOpen: auxPanelOpen, toggle: toggleAuxPanel } = useAuxPanelContext()
   const { isOpen: terminalOpen, toggle: toggleTerminal } = useTerminalContext()
   const { openNewConversationTab } = useTabContext()
-  const { openConversations } = useWorkbenchRoute()
+  const { tabs, activeTabId } = useTabContext()
+  const { switchProject } = useProjectSwitchCoordinator()
+  const activeConversationId = useMemo(() => {
+    const activeTab = tabs.find((tab) => tab.id === activeTabId)
+    return activeTab?.conversationId ?? null
+  }, [tabs, activeTabId])
+  const { linkedTask } = useLinkedTask(activeConversationId)
+  const { openConversations, setRoute } = useWorkbenchRoute()
   const isMac = useIsMac()
   const { shortcuts } = useShortcutSettings()
   // Search open-state is shared (see search-dialog-context): the trigger now
@@ -67,6 +78,13 @@ export function FolderTitleBar() {
   // and the ⌘K shortcut so search works even when the sidebar is collapsed.
   const { open: searchOpen, setOpen: setSearchOpen } = useSearchDialog()
   const [browserOpen, setBrowserOpen] = useState(false)
+
+  const handleProjectSwitch = useCallback(
+    (newProjectId: number) => {
+      switchProject(newProjectId)
+    },
+    [switchProject]
+  )
 
   const handleOpenPet = useCallback(async () => {
     if (!isDesktop()) return
@@ -204,7 +222,7 @@ export function FolderTitleBar() {
               </Button>
               <NewFolderDropdown />
               <RemoteWorkspaceDropdown />
-              <RepoSelector />
+              <ProjectSwitcher onSwitch={handleProjectSwitch} />
               <BranchDropdown />
             </div>
           ) : (
@@ -237,6 +255,7 @@ export function FolderTitleBar() {
                   <PawPrint className="h-3.5 w-3.5" />
                 </Button>
               </div>
+              <ProjectSwitcher onSwitch={handleProjectSwitch} />
               <RepoSelector />
               <BranchDropdown />
               <div data-tauri-drag-region className="h-8 flex-1" />
@@ -321,6 +340,21 @@ export function FolderTitleBar() {
                   >
                     <PanelRight className="h-3.5 w-3.5" />
                   </Button>
+                )}
+                {/* Linked task badge — shows when the active conversation has a linked task */}
+                {linkedTask && (
+                  <Badge
+                    variant="outline"
+                    className="h-6 cursor-pointer gap-1 px-2 text-[0.6875rem] hover:bg-accent"
+                    onClick={() =>
+                      setRoute("task-detail", {
+                        taskId: linkedTask.id,
+                        projectId: linkedTask.projectId,
+                      })
+                    }
+                  >
+                    📌 {linkedTask.title}
+                  </Badge>
                 )}
                 {/* Desktop search moved into the sidebar's fixed top region;
                     the dialog + ⌘K shortcut still live here. */}

@@ -1156,6 +1156,7 @@ mod tauri_app {
                 task_commands::update_task_status,
                 task_commands::delete_task,
                 task_commands::link_conversation,
+                task_commands::create_conversation_for_task,
                 task_commands::unlink_conversation,
                 task_commands::list_task_conversations,
                 task_commands::get_task_by_conversation,

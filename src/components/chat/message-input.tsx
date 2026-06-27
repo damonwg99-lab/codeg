@@ -27,6 +27,7 @@ import {
   TextSelect,
   Upload,
   X,
+  ClipboardList,
 } from "lucide-react"
 import {
   DropdownMenu,
@@ -158,6 +159,12 @@ import {
 } from "@/components/chat/composer/invocation-reference"
 import { cutSelectionToClipboard } from "@/components/chat/composer/clipboard-actions"
 import { referenceToMarkdown } from "@/components/chat/composer/reference-text"
+import { TaskContextPopover } from "@/components/platform/task-context-popover"
+import type { ContextInjectPayload } from "@/components/platform/context-inject-panel-utils"
+import { useLinkedTask } from "@/hooks/use-linked-task"
+import { usePlatform } from "@/contexts/platform-context"
+import { useTabContext } from "@/contexts/tab-context"
+import { linkConversation, unlinkConversation } from "@/lib/platform/api"
 import type { ReferenceAttrs } from "@/components/chat/composer/types"
 import type { Editor, JSONContent } from "@tiptap/core"
 import {
@@ -607,6 +614,24 @@ export function MessageInput({
   // pick closes it explicitly — matching the prior cog menu, which also closed
   // on every selection.
   const [collapsedSelectorsOpen, setCollapsedSelectorsOpen] = useState(false)
+  const [taskPopoverOpen, setTaskPopoverOpen] = useState(false)
+
+  // ─── Task context hooks ───
+  const { tabs, activeTabId, pendingInitialDrafts, clearPendingInitialDraft } =
+    useTabContext()
+  const activeConversationId = useMemo(() => {
+    const activeTab = tabs.find((tab) => tab.id === activeTabId)
+    return activeTab?.conversationId ?? null
+  }, [tabs, activeTabId])
+  const {
+    linkedTaskInfo,
+    linkedTask,
+    refresh: refreshLinkedTask,
+    loading: linkedTaskLoading,
+  } = useLinkedTask(activeConversationId)
+  const { activeProject, activeProjectRepos } = usePlatform()
+
+  // ─── Quick messages ───
   const [quickMessages, setQuickMessages] = useState<QuickMessage[]>([])
   const [quickMessagesLoading, setQuickMessagesLoading] = useState(false)
   // Whether the async Clipboard read API is usable here. It's absent in
@@ -869,6 +894,20 @@ export function MessageInput({
   const handleComposerReady = useCallback(() => {
     setComposerReady(true)
   }, [])
+
+  // ─── Consume pending initial draft (from task→conversation flow) ───
+  useEffect(() => {
+    if (!composerReady || !activeConversationId) return
+    const pending = pendingInitialDrafts.get(activeConversationId)
+    if (!pending) return
+    editorRef.current?.prependMarkdown(pending)
+    clearPendingInitialDraft(activeConversationId)
+  }, [
+    composerReady,
+    activeConversationId,
+    pendingInitialDrafts,
+    clearPendingInitialDraft,
+  ])
 
   const availableModes = useMemo(() => modes ?? [], [modes])
   const availableConfigOptions = useMemo(
@@ -1797,6 +1836,36 @@ export function MessageInput({
     if (needsSpace) chain = chain.insertContent(" ")
     chain.insertReference(commandToReference(cmd)).insertContent(" ").run()
   }, [])
+
+  // ─── Task context: inject prefix into editor ───
+  const handleTaskInject = useCallback((payload: ContextInjectPayload) => {
+    if (payload.prefix) {
+      editorRef.current?.prependMarkdown(payload.prefix)
+    }
+    setTaskPopoverOpen(false)
+  }, [])
+
+  const handleTaskLink = useCallback(
+    async (taskId: number, role: string) => {
+      if (!activeConversationId) return
+      await linkConversation({
+        taskId,
+        conversationId: activeConversationId,
+        role,
+      })
+      refreshLinkedTask()
+    },
+    [activeConversationId, refreshLinkedTask]
+  )
+
+  const handleTaskUnlink = useCallback(async () => {
+    if (!linkedTaskInfo || !activeConversationId) return
+    await unlinkConversation({
+      taskId: linkedTaskInfo.taskId,
+      conversationId: activeConversationId,
+    })
+    refreshLinkedTask()
+  }, [linkedTaskInfo, activeConversationId, refreshLinkedTask])
 
   // Experts always inject an expert badge at the very front of the input, never
   // at the cursor — the expert skill is a whole-turn directive the agent inspects
@@ -3098,6 +3167,40 @@ export function MessageInput({
                       </DropdownMenuSub>
                     </DropdownMenuContent>
                   </DropdownMenu>
+                  <Popover
+                    open={taskPopoverOpen}
+                    onOpenChange={setTaskPopoverOpen}
+                  >
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        className="shrink-0 text-muted-foreground"
+                        title="Task context"
+                        aria-label="Task context"
+                      >
+                        <ClipboardList className="size-4" />
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent
+                      side="top"
+                      align="start"
+                      className="w-[22rem] max-w-[calc(100vw-1rem)] p-0"
+                    >
+                      <TaskContextPopover
+                        conversationId={activeConversationId}
+                        project={activeProject}
+                        repos={activeProjectRepos}
+                        linkedTaskInfo={linkedTaskInfo}
+                        linkedTask={linkedTask}
+                        loading={linkedTaskLoading}
+                        onInject={handleTaskInject}
+                        onLink={handleTaskLink}
+                        onUnlink={handleTaskUnlink}
+                        activeProjectId={activeProject?.id ?? null}
+                      />
+                    </PopoverContent>
+                  </Popover>
                   {hasInlineSelectors && (
                     <div className="hidden min-w-0 items-end gap-1 @[30rem]:flex">
                       {inlineSelectorItems}

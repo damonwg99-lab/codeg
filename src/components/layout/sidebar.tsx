@@ -216,7 +216,7 @@ export function Sidebar({ headerContent }: SidebarProps) {
   return (
     <aside className="@container/sidebar flex h-full min-h-0 flex-col overflow-hidden bg-sidebar text-sidebar-foreground select-none">
       <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border pl-4 pr-2">
-        {/* ── Header slot: default title or custom content (project switcher) ── */}
+        {/* ── Header slot: custom content or default title ── */}
         <div className="flex min-w-0 items-center gap-2 flex-1">
           {headerContent ?? (
             <h2 className="truncate text-[0.875rem] font-bold tracking-[-0.00625rem] text-sidebar-foreground">

@@ -7,6 +7,7 @@ import type {
   TaskInfo,
   TaskDetail,
   TaskConversationInfo,
+  TaskConversationLaunchInfo,
   TaskTypeMappingInfo,
   TaskDecompositionInfo,
   GlobalConfigInfo,
@@ -211,6 +212,16 @@ export async function linkConversation(params: {
     taskId: params.taskId,
     conversationId: params.conversationId,
     role: params.role,
+  })
+}
+
+export async function createConversationForTask(params: {
+  taskId: number
+  injectedDocsJson?: string | null
+}): Promise<TaskConversationLaunchInfo> {
+  return getTransport().call("create_conversation_for_task", {
+    taskId: params.taskId,
+    injectedDocsJson: params.injectedDocsJson ?? null,
   })
 }
 

@@ -1026,6 +1026,10 @@ pub fn build_router(
         .route("/platform/update_task_status", post(handlers::task::update_task_status))
         .route("/platform/delete_task", post(handlers::task::delete_task))
         .route("/platform/link_conversation", post(handlers::task::link_conversation))
+        .route(
+            "/platform/create_conversation_for_task",
+            post(handlers::task::create_conversation_for_task),
+        )
         .route("/platform/unlink_conversation", post(handlers::task::unlink_conversation))
         .route("/platform/list_task_conversations", post(handlers::task::list_task_conversations))
         .route("/platform/get_task_by_conversation", post(handlers::task::get_task_by_conversation))

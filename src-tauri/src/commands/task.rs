@@ -1,16 +1,42 @@
 use crate::app_error::AppCommandError;
+use crate::commands::conversations::create_conversation_core;
 use crate::db::service::{
-    platform_task_conversation_service, platform_task_decomposition_service,
-    platform_task_service, platform_task_type_mapping_service,
+    platform_project_service, platform_task_conversation_service,
+    platform_task_decomposition_service, platform_task_service, platform_task_type_mapping_service,
 };
 use crate::db::AppDatabase;
 use crate::models::{
-    TaskConversationInfo, TaskDecompositionInfo, TaskDetail, TaskInfo, TaskTypeMappingInfo,
+    AgentType, TaskConversationInfo, TaskConversationLaunchInfo, TaskDecompositionInfo,
+    TaskDetail, TaskInfo, TaskTypeMappingInfo,
 };
 use crate::web::event_bridge::emit_event;
 
 const PLATFORM_TASK_CHANGED_EVENT: &str = "platform_task://changed";
 const PLATFORM_TASK_CONVERSATION_CHANGED_EVENT: &str = "platform_task_conversation://changed";
+
+fn infer_conversation_role(task_type: &str) -> &'static str {
+    match task_type {
+        "bug" => "implementation",
+        "feature" | "improvement" | "task" => "implementation",
+        "testing" | "test" => "test",
+        "review" => "review",
+        "design" | "requirement" => "analysis",
+        _ => "discussion",
+    }
+}
+
+fn resolve_agent_type(value: Option<&str>) -> AgentType {
+    match value {
+        Some("claude_code") => AgentType::ClaudeCode,
+        Some("codex") => AgentType::Codex,
+        Some("opencode") | Some("open_code") => AgentType::OpenCode,
+        Some("gemini") => AgentType::Gemini,
+        Some("openclaw") | Some("open_claw") => AgentType::OpenClaw,
+        Some("cline") => AgentType::Cline,
+        Some("hermes") => AgentType::Hermes,
+        _ => AgentType::Codex,
+    }
+}
 
 // ─── Task CRUD ───
 
@@ -178,6 +204,50 @@ pub async fn link_conversation_core(
 
     emit_event(emitter, PLATFORM_TASK_CONVERSATION_CHANGED_EVENT, &link);
     Ok(link)
+}
+
+pub async fn create_conversation_for_task_core(
+    db: &AppDatabase,
+    emitter: &crate::web::event_bridge::EventEmitter,
+    task_id: i32,
+    injected_docs_json: Option<String>,
+) -> Result<TaskConversationLaunchInfo, AppCommandError> {
+    let conn = &db.conn;
+    let task = platform_task_service::get_by_id(conn, task_id)
+        .await
+        .map_err(AppCommandError::from)?
+        .ok_or_else(|| AppCommandError::not_found(format!("Task not found: {task_id}")))?;
+    let project = platform_project_service::get_by_id(conn, task.project_id)
+        .await
+        .map_err(AppCommandError::from)?
+        .ok_or_else(|| AppCommandError::not_found(format!("Project not found: {}", task.project_id)))?;
+    let folder_id = project
+        .folder_id
+        .ok_or_else(|| AppCommandError::invalid_input("Project has no root folder"))?;
+    let agent_type = resolve_agent_type(project.default_agent_type.as_deref());
+    let title = format!("{} #{}", task.title, task.id);
+
+    let conversation_id =
+        create_conversation_core(conn, folder_id, agent_type.clone(), Some(title.clone())).await?;
+    let role = infer_conversation_role(&task.task_type);
+    let link = platform_task_conversation_service::create(
+        conn,
+        task.id,
+        conversation_id,
+        role,
+        injected_docs_json,
+    )
+    .await
+    .map_err(AppCommandError::from)?;
+
+    emit_event(emitter, PLATFORM_TASK_CONVERSATION_CHANGED_EVENT, &link);
+    Ok(TaskConversationLaunchInfo {
+        conversation_id,
+        folder_id,
+        agent_type,
+        title,
+        link,
+    })
 }
 
 pub async fn unlink_conversation_core(
@@ -380,6 +450,17 @@ pub async fn link_conversation(
     role: String,
 ) -> Result<TaskConversationInfo, AppCommandError> {
     link_conversation_core(&db, &emitter, task_id, conversation_id, &role).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn create_conversation_for_task(
+    db: tauri::State<'_, AppDatabase>,
+    emitter: tauri::State<'_, crate::web::event_bridge::EventEmitter>,
+    task_id: i32,
+    injected_docs_json: Option<String>,
+) -> Result<TaskConversationLaunchInfo, AppCommandError> {
+    create_conversation_for_task_core(&db, &emitter, task_id, injected_docs_json).await
 }
 
 #[cfg(feature = "tauri-runtime")]

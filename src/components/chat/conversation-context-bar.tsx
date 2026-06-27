@@ -24,6 +24,8 @@ import type { OverlayScrollbarsComponentRef } from "overlayscrollbars-react"
 import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { useTabContext } from "@/contexts/tab-context"
 import { useTaskContext } from "@/contexts/task-context"
+import { usePlatform } from "@/contexts/platform-context"
+import { useProjectSwitchCoordinator } from "@/hooks/use-project-switch-coordinator"
 import { gitListAllBranches, gitCheckout } from "@/lib/api"
 import {
   buildBranchTree,
@@ -146,6 +148,8 @@ export const ConversationFolderBranchPicker = memo(
       useAppWorkspace()
     const { addTask, updateTask } = useTaskContext()
     const switchToBranch = useSwitchToBranch()
+    const { projects } = usePlatform()
+    const { switchProject } = useProjectSwitchCoordinator()
 
     const ownTab = useMemo(() => {
       const lookupId = tabId ?? activeTabId
@@ -169,6 +173,18 @@ export const ConversationFolderBranchPicker = memo(
       () => excludeChatFolders(filterTopLevelFolders(folders)),
       [folders]
     )
+
+    // Build a reverse lookup: folderId → projectId so that switching to a
+    // folder in a different project also switches the project context.
+    const folderToProject = useMemo(() => {
+      const map = new Map<number, number>()
+      for (const p of projects) {
+        if (p.folderId != null) {
+          map.set(p.folderId, p.id)
+        }
+      }
+      return map
+    }, [projects])
 
     if (!ownTab) return null
     // Chat mode: either a draft flagged `isChat` (no folder yet) or a bound
@@ -209,16 +225,18 @@ export const ConversationFolderBranchPicker = memo(
             const target = folders.find((f) => f.id === folderId)
             if (!target) return
             try {
-              // Route through openNewConversationTab so the target folder's
-              // saved default agent is applied. The function's existing-
-              // draft branch reuses ownTab via the singleton invariant and
-              // runs the disconnect-then-patch dance for folder+agent
-              // changes. `inheritFromActive: true` preserves the user's
-              // current agent when the target folder has no pinned default
-              // — "I'm switching folders, keep my workflow".
-              openNewConversationTab(target.id, target.path, {
-                inheritFromActive: true,
-              })
+              // If the selected folder belongs to a different project,
+              // switch the project context too — this triggers the tab
+              // coordinator (close existing + new draft or retarget draft).
+              const targetProjectId = folderToProject.get(folderId)
+              if (targetProjectId != null) {
+                switchProject(targetProjectId)
+              } else {
+                // Folder doesn't belong to any project — just switch folders
+                openNewConversationTab(target.id, target.path, {
+                  inheritFromActive: true,
+                })
+              }
               toast.success(t("toasts.folderChanged", { name: target.name }))
             } catch (err) {
               console.error(

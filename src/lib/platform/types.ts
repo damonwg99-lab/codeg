@@ -1,6 +1,7 @@
 // Platform TypeScript types — mirrors Rust models from
 // src-tauri/src/models/platform_project.rs, platform_task.rs, platform_config.rs
 // Rust serde uses rename_all = "camelCase", so JSON fields are camelCase.
+import type { AgentType } from "@/lib/types"
 
 // ─── Project ───
 
@@ -134,6 +135,14 @@ export interface TaskConversationInfo {
   injectedDocsJson: string | null
   createdAt: string
   updatedAt: string
+}
+
+export interface TaskConversationLaunchInfo {
+  conversationId: number
+  folderId: number
+  agentType: AgentType
+  title: string
+  link: TaskConversationInfo
 }
 
 export interface TaskTypeMappingInfo {

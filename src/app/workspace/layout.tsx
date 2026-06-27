@@ -12,7 +12,6 @@ import type { ImperativePanelGroupHandle } from "react-resizable-panels"
 import { FolderTitleBar } from "@/components/layout/folder-title-bar"
 import { useIsActiveChatMode } from "@/hooks/use-is-active-chat-mode"
 import { Sidebar } from "@/components/layout/sidebar"
-import { ProjectSwitcher } from "@/components/platform/project-switcher"
 import { StatusBar } from "@/components/layout/status-bar"
 import {
   AppWorkspaceProvider,
@@ -368,7 +367,7 @@ function MobileFolderWorkspaceShell({
           className="w-[85%] max-w-[360px] p-0"
         >
           <SheetTitle className="sr-only">Sidebar</SheetTitle>
-          <Sidebar headerContent={<ProjectSwitcher />} />
+          <Sidebar />
         </SheetContent>
       </Sheet>
 
@@ -733,7 +732,7 @@ function FolderWorkspaceShell({ children }: { children: React.ReactNode }) {
           maxSize={sidebarOpen ? sidebarSizeRange.maxSize : 0}
         >
           <div className="h-full min-h-0 overflow-hidden">
-            <Sidebar headerContent={<ProjectSwitcher />} />
+            <Sidebar />
           </div>
         </ResizablePanel>
 
