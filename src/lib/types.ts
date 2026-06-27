@@ -6,6 +6,8 @@ export type AgentType =
   | "open_claw"
   | "cline"
   | "hermes"
+  | "code_buddy"
+  | "kimi_code"
 
 export type AppErrorCode =
   | "invalid_input"
@@ -151,6 +153,16 @@ export type ContentBlock =
       output_preview: string | null
       is_error: boolean
       agent_stats?: AgentExecutionStats | null
+      /**
+       * Images returned in a tool result (e.g. Claude Code's `Read` of a
+       * PNG/JPEG, or a multi-page PDF read returning one image per page).
+       * Mirror of Rust `ContentBlock::ToolResult.images`. The adapter renders
+       * these in-position as `generated-image` cards so the historical (JSONL
+       * replay) path matches the live ACP stream — which surfaces the same
+       * bytes via `ToolCallInfo.images` and an `image_generation` block.
+       * Absent/empty for the common text-only tool result.
+       */
+      images?: ImageData[] | null
     }
   | { type: "thinking"; text: string }
   /**
@@ -438,6 +450,8 @@ export const AGENT_DISPLAY_ORDER: AgentType[] = [
   "open_claw",
   "cline",
   "hermes",
+  "code_buddy",
+  "kimi_code",
 ]
 
 const AGENT_DISPLAY_ORDER_INDEX = new Map(
@@ -458,6 +472,8 @@ export const ALL_AGENT_TYPES: AgentType[] = [
   "open_claw",
   "cline",
   "hermes",
+  "code_buddy",
+  "kimi_code",
 ]
 
 export const MODEL_PROVIDER_AGENT_TYPES: AgentType[] = [
@@ -745,6 +761,8 @@ export const AGENT_LABELS: Record<AgentType, string> = {
   open_claw: "OpenClaw",
   cline: "Cline",
   hermes: "Hermes Agent",
+  code_buddy: "CodeBuddy",
+  kimi_code: "Kimi Code",
 }
 
 export const AGENT_COLORS: Record<AgentType, string> = {
@@ -755,6 +773,8 @@ export const AGENT_COLORS: Record<AgentType, string> = {
   open_claw: "bg-emerald-600",
   cline: "bg-purple-500",
   hermes: "bg-amber-500",
+  code_buddy: "bg-[#0052D9]",
+  kimi_code: "bg-[#1783FF]",
 }
 
 // ACP connection status (matches Rust ConnectionStatus)
@@ -1544,6 +1564,49 @@ export interface ExpertInstallStatus {
   copyMode: boolean
 }
 
+/** A single enable/disable request for one (skill, agent) pair. For office
+ *  tools, `expertId` carries the office skill id. */
+export interface LinkOp {
+  expertId: string
+  agentType: AgentType
+  enable: boolean
+}
+
+/** Per-op outcome of a batch apply. A failed op never aborts the rest. */
+export interface LinkOpResult {
+  expertId: string
+  agentType: AgentType
+  ok: boolean
+  /** Present on a successful enable; null for disables and failures. */
+  status: ExpertInstallStatus | null
+  error: string | null
+}
+
+export interface OfficecliInfo {
+  installed: boolean
+  version: string | null
+  path: string | null
+  // Set when the binary file is present (`installed = true`) but running it
+  // failed — e.g. a missing system library (libicu) on a slim Linux server.
+  // Carries an actionable diagnostic; null when officecli runs fine.
+  runtimeError: string | null
+}
+
+export interface OfficecliSkill {
+  id: string
+  category: string
+  icon: string
+  sortOrder: number
+  displayName: Record<string, string>
+  description: Record<string, string>
+  installedCentrally: boolean
+}
+
+export interface SkillSyncReport {
+  synced: number
+  errors: string[]
+}
+
 export interface SystemProxySettings {
   enabled: boolean
   proxy_url: string | null
@@ -1700,6 +1763,8 @@ export type McpAppType =
   | "open_code"
   | "cline"
   | "hermes"
+  | "code_buddy"
+  | "kimi_code"
 
 export interface LocalMcpServer {
   id: string
@@ -2076,6 +2141,34 @@ export interface PluginCheckSummary {
   has_project_config_hint: boolean
 }
 
+// ─── OpenCode Provider Catalog (models.dev) ───
+
+/** A model entry under a catalog provider, normalized from models.dev. */
+export interface OpenCodeCatalogModel {
+  id: string
+  name: string
+  reasoning: boolean
+  tool_call: boolean
+  context: number | null
+  cost_in: number | null
+  cost_out: number | null
+}
+
+/**
+ * One provider from the models.dev catalog (the same registry OpenCode reads).
+ * `auth_kind` is `"oauth"` for providers OpenCode signs into via a browser flow
+ * (ChatGPT, GitHub Copilot, GitLab Duo), `"api"` otherwise.
+ */
+export interface OpenCodeCatalogProvider {
+  id: string
+  name: string
+  npm: string | null
+  env: string[]
+  doc: string | null
+  auth_kind: "api" | "oauth"
+  models: OpenCodeCatalogModel[]
+}
+
 export type PluginInstallEventKind = "started" | "log" | "completed" | "failed"
 
 export interface PluginInstallEvent {
@@ -2089,6 +2182,18 @@ export type AgentInstallEventKind = "started" | "log" | "completed" | "failed"
 export interface AgentInstallEvent {
   task_id: string
   kind: AgentInstallEventKind
+  payload: string
+}
+
+export type OfficecliInstallEventKind =
+  | "started"
+  | "log"
+  | "completed"
+  | "failed"
+
+export interface OfficecliInstallEvent {
+  task_id: string
+  kind: OfficecliInstallEventKind
   payload: string
 }
 

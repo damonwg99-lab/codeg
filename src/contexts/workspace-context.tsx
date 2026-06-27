@@ -24,8 +24,14 @@ import {
   saveFileContent,
 } from "@/lib/api"
 import type { FileEditContent } from "@/lib/types"
-import { languageFromPath } from "@/lib/language-detect"
+import {
+  isHtmlPreviewable,
+  isOfficePreviewable,
+  languageFromPath,
+} from "@/lib/language-detect"
 import { toErrorMessage } from "@/lib/app-error"
+import { useWorkspaceStateStore } from "@/hooks/use-workspace-state-store"
+import { useOfficeAutoPreview } from "@/lib/office-preview-prefs"
 
 export type WorkspaceMode = "conversation" | "fusion"
 export type WorkspacePane = "conversation" | "files"
@@ -338,6 +344,23 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       })
       setActiveFileTabId(nextTab.id)
       activateFilePane()
+      // Open HTML/Markdown file tabs in the rendered preview by default rather
+      // than the source editor. Only runs on first seed: reloads go through
+      // markTabRefreshing (never here), so if the user later switches to the
+      // source view it survives an external change. Restricted to real file
+      // tabs — diffs never enter preview, and .vue/.svelte (language "html"
+      // but not isHtmlPreviewable) stay on source.
+      if (
+        nextTab.kind === "file" &&
+        (nextTab.language === "markdown" || isHtmlPreviewable(nextTab.path))
+      ) {
+        setPreviewFileTabIds((prev) => {
+          if (prev.has(nextTab.id)) return prev
+          const next = new Set(prev)
+          next.add(nextTab.id)
+          return next
+        })
+      }
     },
     [activateFilePane]
   )
@@ -856,13 +879,14 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       }
       const tabId = `file:${path}`
       const image = isImageFile(path)
+      const office = !image && isOfficePreviewable(path)
       const seed = loadingTab(
         tabId,
         "file",
         fileName(path),
         path,
         path,
-        image ? "image" : languageFromPath(path)
+        image ? "image" : office ? "office" : languageFromPath(path)
       )
 
       const decision = decideLoad(seed, options?.reload ?? false)
@@ -870,6 +894,29 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       const { gen } = decision
 
       try {
+        // Office files (.docx/.xlsx/.pptx) are binary OpenXML — never read as
+        // text. The OfficePreview component renders them via the OfficeCLI
+        // backend on its own, so just settle the tab as a ready preview shell.
+        if (office) {
+          if (!settleFetch(tabId, gen)) return
+          setFileTabs((prev) =>
+            prev.map((tab) =>
+              tab.id === tabId
+                ? {
+                    ...tab,
+                    content: "",
+                    readonly: true,
+                    loading: false,
+                    saveState: "idle",
+                    saveError: null,
+                    stale: false,
+                  }
+                : tab
+            )
+          )
+          return
+        }
+
         if (image) {
           const absPath = `${folderPath}/${path}`
           const ext = path.split(".").pop()?.toLowerCase() ?? ""
@@ -946,6 +993,47 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     },
     [folderPath, decideLoad, rejectTab, settleFetch, t]
   )
+
+  // Auto-surface office files (.docx/.xlsx/.pptx) the agent produces. This used
+  // to live in the file-tree aux panel, but that panel is closed by default and
+  // unmounts its subscription with it — so the preview never opened unless the
+  // user happened to have the sidebar open. The preview itself lands in the
+  // files pane (openFilePreview → seedLoadingTab activates it), which is owned
+  // here and always mounted, so the trigger belongs here too.
+  //
+  // We retain the workspace watch stream from this always-mounted provider so
+  // change envelopes keep flowing regardless of the aux panel. The store is a
+  // per-path refcounted singleton, so this shares the same backend stream the
+  // aux panel tabs use. Gated on the preference: with auto-preview off we hold
+  // no extra ref, leaving today's aux-panel-scoped lifecycle untouched.
+  const officeAutoPreview = useOfficeAutoPreview()
+  const officeWatchStore = useWorkspaceStateStore(
+    officeAutoPreview ? (folderPath ?? null) : null
+  )
+  const subscribeOfficeEnvelopes = officeWatchStore.subscribeEnvelopes
+  useEffect(() => {
+    if (!folderPath || !officeAutoPreview) return
+    // Leading-edge with dedup: an agent building a doc fires a burst of writes,
+    // so we open on first sighting and remember it in `autoOpened` (which also
+    // keeps a tab the user has since closed from popping back open).
+    const autoOpened = new Set<string>()
+    const unsubscribe = subscribeOfficeEnvelopes(({ changed_paths }) => {
+      if (!changed_paths || changed_paths.length === 0) return
+      const openPaths = new Set(
+        fileTabsRef.current
+          .filter((tab) => tab.kind === "file" && tab.path)
+          .map((tab) => normalizePath(tab.path as string))
+      )
+      for (const changed of changed_paths) {
+        if (!isOfficePreviewable(changed)) continue
+        const norm = normalizePath(changed)
+        if (autoOpened.has(norm) || openPaths.has(norm)) continue
+        autoOpened.add(norm)
+        void openFilePreview(changed)
+      }
+    })
+    return unsubscribe
+  }, [folderPath, officeAutoPreview, subscribeOfficeEnvelopes, openFilePreview])
 
   const openWorkingTreeDiff = useCallback(
     async (

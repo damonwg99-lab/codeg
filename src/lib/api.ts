@@ -38,6 +38,8 @@ import type {
   AgentSkillContent,
   ExpertListItem,
   ExpertInstallStatus,
+  LinkOp,
+  LinkOpResult,
   FolderHistoryEntry,
   FolderDetail,
   CreateChatConversationResult,
@@ -102,7 +104,11 @@ import type {
   ModelProviderInfo,
   UpdateModelProviderResult,
   PluginCheckSummary,
+  OpenCodeCatalogProvider,
   QuickMessage,
+  OfficecliInfo,
+  OfficecliSkill,
+  SkillSyncReport,
 } from "./types"
 
 export async function listConversations(params?: {
@@ -437,6 +443,56 @@ export async function acpUpdateHermesConfig(params: {
 }
 
 /**
+ * Persist a Kimi Code config update, keeping exactly one source authoritative.
+ * `mode` "apikey" writes the codeg-managed ~/.kimi-code/config.toml provider/model
+ * block AND seeds a synthetic gate token so the API key authenticates `kimi acp`
+ * (its session gate only checks for a stored token); "login" clears the managed
+ * block + removes our synthetic token so a real OAuth login governs; "raw" writes
+ * a verbatim config.toml then seeds the gate token. Returns the number of running
+ * Kimi sessions left on stale config.
+ */
+export async function acpUpdateKimiCodeConfig(params: {
+  mode: "apikey" | "login" | "raw"
+  interfaceType?: string | null
+  authType?: string | null
+  baseUrl?: string | null
+  apiKey?: string | null
+  model?: string | null
+  maxContextSize?: number | null
+  vertexProject?: string | null
+  vertexLocation?: string | null
+  rawConfigToml?: string | null
+}): Promise<number> {
+  return getTransport().call("acp_update_kimi_code_config", {
+    mode: params.mode,
+    interfaceType: params.interfaceType ?? null,
+    authType: params.authType ?? null,
+    baseUrl: params.baseUrl ?? null,
+    apiKey: params.apiKey ?? null,
+    model: params.model ?? null,
+    maxContextSize: params.maxContextSize ?? null,
+    vertexProject: params.vertexProject ?? null,
+    vertexLocation: params.vertexLocation ?? null,
+    rawConfigToml: params.rawConfigToml ?? null,
+  })
+}
+
+/**
+ * List the models an API key + endpoint can access (GET `<baseUrl>/models`).
+ * Validates the key and powers the Kimi settings model picker; throws with the
+ * provider's error message on failure.
+ */
+export async function acpFetchKimiModels(params: {
+  baseUrl: string
+  apiKey: string
+}): Promise<string[]> {
+  return getTransport().call("acp_fetch_kimi_models", {
+    baseUrl: params.baseUrl,
+    apiKey: params.apiKey,
+  })
+}
+
+/**
  * Launch Hermes's interactive setup in the OS terminal (desktop only). `kind`
  * picks the flow; the backend constructs the exact command from the registry
  * recipe (no arbitrary shell text crosses the boundary).
@@ -494,6 +550,14 @@ export async function acpPreflight(
 
 export async function opencodeListPlugins(): Promise<PluginCheckSummary> {
   return getTransport().call("opencode_list_plugins", {})
+}
+
+export async function opencodeProviderCatalog(
+  forceRefresh?: boolean
+): Promise<OpenCodeCatalogProvider[]> {
+  return getTransport().call("opencode_provider_catalog", {
+    forceRefresh: forceRefresh ?? null,
+  })
 }
 
 export async function opencodeInstallPlugins(
@@ -574,16 +638,24 @@ export async function expertsList(): Promise<ExpertListItem[]> {
   return getTransport().call("experts_list")
 }
 
-export async function expertsListForAgent(
-  agentType: AgentType
-): Promise<ExpertListItem[]> {
-  return getTransport().call("experts_list_for_agent", { agentType })
-}
-
 export async function expertsGetInstallStatus(
   expertId: string
 ): Promise<ExpertInstallStatus[]> {
   return getTransport().call("experts_get_install_status", { expertId })
+}
+
+/** One round-trip snapshot of every (expert, agent) link state for the matrix. */
+export async function expertsListAllInstallStatuses(): Promise<
+  ExpertInstallStatus[]
+> {
+  return getTransport().call("experts_list_all_install_statuses")
+}
+
+/** Apply a batch of enable/disable ops; returns one result per op. */
+export async function expertsApplyLinks(
+  ops: LinkOp[]
+): Promise<LinkOpResult[]> {
+  return getTransport().call("experts_apply_links", { ops })
 }
 
 export async function expertsLinkToAgent(params: {
@@ -612,6 +684,115 @@ export async function expertsReadContent(expertId: string): Promise<string> {
 
 export async function expertsOpenCentralDir(): Promise<string> {
   return getTransport().call("experts_open_central_dir")
+}
+
+// ─── Office tools ───
+
+export async function officecliDetect(): Promise<OfficecliInfo> {
+  return getTransport().call("officecli_detect")
+}
+
+export async function officecliInstall(taskId: string): Promise<OfficecliInfo> {
+  // The vendor installer downloads + extracts a multi-MB binary; allow well
+  // beyond the default 60s web-call timeout so slow networks don't surface a
+  // spurious timeout while progress is still streaming. Sits 30s ABOVE the
+  // backend's own 600s deadline so the backend's structured timeout error wins
+  // the race instead of a generic transport abort. `taskId` correlates the
+  // `app://officecli-install` stream the settings page subscribes to.
+  return getTransport().call(
+    "officecli_install",
+    { taskId },
+    { timeoutMs: 630_000 }
+  )
+}
+
+export async function officecliUninstall(): Promise<OfficecliInfo> {
+  return getTransport().call("officecli_uninstall")
+}
+
+export async function officecliListSkills(): Promise<OfficecliSkill[]> {
+  return getTransport().call("officecli_list_skills")
+}
+
+export async function officecliSyncSkills(): Promise<SkillSyncReport> {
+  return getTransport().call("officecli_sync_skills")
+}
+
+export async function officecliSkillLinkToAgent(params: {
+  skillId: string
+  agentType: AgentType
+}): Promise<ExpertInstallStatus> {
+  return getTransport().call("officecli_skill_link_to_agent", params)
+}
+
+export async function officecliSkillUnlinkFromAgent(params: {
+  skillId: string
+  agentType: AgentType
+}): Promise<void> {
+  return getTransport().call("officecli_skill_unlink_from_agent", params)
+}
+
+export async function officecliSkillGetInstallStatus(
+  skillId: string
+): Promise<ExpertInstallStatus[]> {
+  return getTransport().call("officecli_skill_get_install_status", { skillId })
+}
+
+/** One round-trip snapshot of every (skill, agent) link state for the matrix. */
+export async function officecliSkillListAllInstallStatuses(): Promise<
+  ExpertInstallStatus[]
+> {
+  return getTransport().call("officecli_skill_list_all_install_statuses")
+}
+
+/** Apply a batch of enable/disable ops; returns one result per op. */
+export async function officecliSkillApplyLinks(
+  ops: LinkOp[]
+): Promise<LinkOpResult[]> {
+  return getTransport().call("officecli_skill_apply_links", { ops })
+}
+
+export async function officecliSkillReadContent(
+  skillId: string
+): Promise<string> {
+  return getTransport().call("officecli_skill_read_content", { skillId })
+}
+
+/**
+ * Render an office file (.docx/.xlsx/.pptx) to self-contained HTML via the
+ * OfficeCLI backend, for the in-app preview. `path` is relative to `rootPath`.
+ */
+export async function officecliRenderHtml(
+  rootPath: string,
+  path: string
+): Promise<string> {
+  return getTransport().call("officecli_render_html", { rootPath, path })
+}
+
+/**
+ * Start (or share, by ref-count) a long-lived `officecli watch` preview server
+ * for an office file and return its loopback `port` plus a per-watch `cap`
+ * capability. `path` is relative to `rootPath`. Live refresh is driven by
+ * officecli's own SSE channel, so the preview no longer re-reads (and locks)
+ * the file the way the one-shot {@link officecliRenderHtml} did.
+ *
+ * `cap` is only used by web/server mode, where the iframe loads the preview
+ * through the `/api/office-watch-proxy/{port}` reverse proxy and authenticates
+ * with `?cap=` (the master token never enters the iframe). Desktop ignores it.
+ */
+export async function startOfficeWatch(
+  rootPath: string,
+  path: string
+): Promise<{ port: number; cap: string }> {
+  return getTransport().call("start_office_watch", { rootPath, path })
+}
+
+/** Release one reference to an office file's watch preview server. */
+export async function stopOfficeWatch(
+  rootPath: string,
+  path: string
+): Promise<void> {
+  return getTransport().call("stop_office_watch", { rootPath, path })
 }
 
 export async function getSystemProxySettings(): Promise<SystemProxySettings> {
@@ -1441,6 +1622,8 @@ export type SettingsSection =
   | "agents"
   | "mcp"
   | "skills"
+  | "experts"
+  | "office-tools"
   | "shortcuts"
   | "system"
 
