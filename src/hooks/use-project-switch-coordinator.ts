@@ -32,7 +32,7 @@ export function useProjectSwitchCoordinator() {
       const isDraft = activeTab?.conversationId == null
 
       // Existing conversation → close it first
-      if (!isDraft && activeTab) {
+      if (!isDraft && activeTab && activeTabId) {
         closeTab(activeTabId)
       }
 

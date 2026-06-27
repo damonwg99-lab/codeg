@@ -1,4 +1,5 @@
 import { Extension } from "@tiptap/core"
+import { PluginKey } from "@tiptap/pm/state"
 import Suggestion, { type SuggestionProps } from "@tiptap/suggestion"
 
 /** Live render state the plugin pushes to React while the `@` panel is open. */
@@ -67,6 +68,7 @@ export const MentionSuggestion = Extension.create<MentionSuggestionOptions>({
       Suggestion({
         editor: this.editor,
         char: "@",
+        pluginKey: new PluginKey("mentionSuggestion"),
         allowSpaces: false,
         items: () => [],
         command: () => {},

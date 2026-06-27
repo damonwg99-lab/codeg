@@ -1077,40 +1077,43 @@ pub fn build_router(
         )
         .route("/terminal_kill", post(handlers::terminal::terminal_kill))
         .route("/terminal_list", post(handlers::terminal::terminal_list))
-        // ─── Platform ───
-        .route("/platform/list_projects", post(handlers::project::list_projects))
-        .route("/platform/get_project", post(handlers::project::get_project))
-        .route("/platform/create_project", post(handlers::project::create_project))
-        .route("/platform/update_project", post(handlers::project::update_project))
-        .route("/platform/delete_project", post(handlers::project::delete_project))
-        .route("/platform/list_project_repos", post(handlers::project::list_project_repos))
-        .route("/platform/add_project_repo", post(handlers::project::add_project_repo))
-        .route("/platform/remove_project_repo", post(handlers::project::remove_project_repo))
-        .route("/platform/scan_git_repos", post(handlers::project::scan_git_repos))
-        .route("/platform/get_global_config", post(handlers::project::get_global_config))
-        .route("/platform/set_global_config", post(handlers::project::set_global_config))
-        .route("/platform/save_credential", post(handlers::project::save_credential))
-        .route("/platform/delete_credential", post(handlers::project::delete_credential))
-        .route("/platform/check_credential_exists", post(handlers::project::check_credential_exists))
-        .route("/platform/list_tasks", post(handlers::task::list_tasks))
-        .route("/platform/get_task", post(handlers::task::get_task))
-        .route("/platform/create_task", post(handlers::task::create_task))
-        .route("/platform/update_task", post(handlers::task::update_task))
-        .route("/platform/update_task_status", post(handlers::task::update_task_status))
-        .route("/platform/delete_task", post(handlers::task::delete_task))
-        .route("/platform/link_conversation", post(handlers::task::link_conversation))
+        // ─── Platform (project + task) ───
+        // Routes match the command names used by WebTransport.call()
+        // (call("list_projects") → POST /api/list_projects), so no /platform/
+        // prefix — consistent with all other API routes in this router.
+        .route("/list_projects", post(handlers::project::list_projects))
+        .route("/get_project", post(handlers::project::get_project))
+        .route("/create_project", post(handlers::project::create_project))
+        .route("/update_project", post(handlers::project::update_project))
+        .route("/delete_project", post(handlers::project::delete_project))
+        .route("/list_project_repos", post(handlers::project::list_project_repos))
+        .route("/add_project_repo", post(handlers::project::add_project_repo))
+        .route("/remove_project_repo", post(handlers::project::remove_project_repo))
+        .route("/scan_git_repos", post(handlers::project::scan_git_repos))
+        .route("/get_global_config", post(handlers::project::get_global_config))
+        .route("/set_global_config", post(handlers::project::set_global_config))
+        .route("/save_credential", post(handlers::project::save_credential))
+        .route("/delete_credential", post(handlers::project::delete_credential))
+        .route("/check_credential_exists", post(handlers::project::check_credential_exists))
+        .route("/list_tasks", post(handlers::task::list_tasks))
+        .route("/get_task", post(handlers::task::get_task))
+        .route("/create_task", post(handlers::task::create_task))
+        .route("/update_task", post(handlers::task::update_task))
+        .route("/update_task_status", post(handlers::task::update_task_status))
+        .route("/delete_task", post(handlers::task::delete_task))
+        .route("/link_conversation", post(handlers::task::link_conversation))
         .route(
-            "/platform/create_conversation_for_task",
+            "/create_conversation_for_task",
             post(handlers::task::create_conversation_for_task),
         )
-        .route("/platform/unlink_conversation", post(handlers::task::unlink_conversation))
-        .route("/platform/list_task_conversations", post(handlers::task::list_task_conversations))
-        .route("/platform/get_task_by_conversation", post(handlers::task::get_task_by_conversation))
-        .route("/platform/list_task_type_mappings", post(handlers::task::list_task_type_mappings))
-        .route("/platform/create_task_type_mapping", post(handlers::task::create_task_type_mapping))
-        .route("/platform/update_task_type_mapping", post(handlers::task::update_task_type_mapping))
-        .route("/platform/delete_task_type_mapping", post(handlers::task::delete_task_type_mapping))
-        .route("/platform/create_decomposition", post(handlers::task::create_decomposition))
+        .route("/unlink_conversation", post(handlers::task::unlink_conversation))
+        .route("/list_task_conversations", post(handlers::task::list_task_conversations))
+        .route("/get_task_by_conversation", post(handlers::task::get_task_by_conversation))
+        .route("/list_task_type_mappings", post(handlers::task::list_task_type_mappings))
+        .route("/create_task_type_mapping", post(handlers::task::create_task_type_mapping))
+        .route("/update_task_type_mapping", post(handlers::task::update_task_type_mapping))
+        .route("/delete_task_type_mapping", post(handlers::task::delete_task_type_mapping))
+        .route("/create_decomposition", post(handlers::task::create_decomposition))
         // Catch-all
         .fallback(api_not_found)
         .layer(middleware::from_fn(move |req, next| {
@@ -1185,6 +1188,21 @@ pub fn build_router(
         ServeDir::new(&static_dir).fallback(ServeFile::new(static_dir.join("index.html")));
 
     let static_dir_for_mw = static_dir.clone();
+    // In dev mode (debug profile) add Cache-Control: no-store so the browser
+    // always fetches fresh static files — critical for iterating on the web UI
+    // without restarting the server. In release builds this middleware is
+    // absent so CDN/browser caching works normally for production.
+    #[cfg(debug_assertions)]
+    let no_cache = middleware::from_fn(
+        |req: axum::extract::Request, next: Next| async move {
+            let mut res = next.run(req).await;
+            res.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            res
+        },
+    );
     let html_rewrite = middleware::from_fn(move |req: axum::extract::Request, next: Next| {
         let dir = static_dir_for_mw.clone();
         async move {
@@ -1216,12 +1234,18 @@ pub fn build_router(
         }
     });
 
-    Router::new()
+    let router = Router::new()
         .nest("/api", api)
         .merge(ws_route)
         .fallback_service(fallback)
         .layer(html_rewrite)
-        .layer(cors)
+        .layer(cors);
+    // In dev builds (debug profile), add Cache-Control: no-store so the browser
+    // always fetches fresh static files — critical for iterating on the web UI
+    // without restarting. In release builds this layer is absent so caching works.
+    #[cfg(debug_assertions)]
+    let router = router.layer(no_cache);
+    router
         .layer(Extension(state))
         .layer(Extension(shutdown_signal))
 }

@@ -23,10 +23,9 @@ import {
 import type { OverlayScrollbarsComponentRef } from "overlayscrollbars-react"
 import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { useTabContext } from "@/contexts/tab-context"
-import { useTaskContext } from "@/contexts/task-context"
 import { usePlatform } from "@/contexts/platform-context"
 import { useProjectSwitchCoordinator } from "@/hooks/use-project-switch-coordinator"
-import { gitListAllBranches, gitCheckout } from "@/lib/api"
+import { gitListAllBranches } from "@/lib/api"
 import {
   buildBranchTree,
   buildRemoteBranchSections,

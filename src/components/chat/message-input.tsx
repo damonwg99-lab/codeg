@@ -1847,25 +1847,6 @@ export function MessageInput({
     refreshLinkedTask()
   }, [linkedTaskInfo, activeConversationId, refreshLinkedTask])
 
-  // Experts always inject an expert badge at the very front of the input, never
-  // at the cursor — the expert skill is a whole-turn directive the agent inspects
-  // first. If an expert badge is already at the front (from a prior click), it is
-  // replaced instead of stacked (the agent only honors the first). The badge
-  // label matches the expert menu's localized name.
-  const handleExpertPopoverSelect = useCallback(
-    (expert: ExpertListItem) => {
-      const editor = editorRef.current?.getEditor()
-      if (!editor) return
-      const label =
-        pickExpertLocalized(expert.metadata.display_name, locale) ||
-        expert.metadata.id
-      applyExpertReference(
-        editor,
-        expertToReference(expert, expertPrefix, label)
-      )
-    },
-    [expertPrefix, locale]
-  )
   const handlePickFiles = useCallback(async () => {
     if (disabled) return
     // Only wired up when `showNativePaperclip` is true (i.e. local desktop),
