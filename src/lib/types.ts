@@ -8,6 +8,7 @@ export type AgentType =
   | "hermes"
   | "code_buddy"
   | "kimi_code"
+  | "pi"
 
 export type AppErrorCode =
   | "invalid_input"
@@ -452,6 +453,7 @@ export const AGENT_DISPLAY_ORDER: AgentType[] = [
   "hermes",
   "code_buddy",
   "kimi_code",
+  "pi",
 ]
 
 const AGENT_DISPLAY_ORDER_INDEX = new Map(
@@ -474,6 +476,7 @@ export const ALL_AGENT_TYPES: AgentType[] = [
   "hermes",
   "code_buddy",
   "kimi_code",
+  "pi",
 ]
 
 export const MODEL_PROVIDER_AGENT_TYPES: AgentType[] = [
@@ -763,6 +766,7 @@ export const AGENT_LABELS: Record<AgentType, string> = {
   hermes: "Hermes Agent",
   code_buddy: "CodeBuddy",
   kimi_code: "Kimi Code",
+  pi: "Pi",
 }
 
 export const AGENT_COLORS: Record<AgentType, string> = {
@@ -775,6 +779,7 @@ export const AGENT_COLORS: Record<AgentType, string> = {
   hermes: "bg-amber-500",
   code_buddy: "bg-[#0052D9]",
   kimi_code: "bg-[#1783FF]",
+  pi: "bg-[#0D9488]",
 }
 
 // ACP connection status (matches Rust ConnectionStatus)
