@@ -24,3 +24,4 @@ pub use super::platform_task_decomposition::Entity as PlatformTaskDecomposition;
 pub use super::platform_global_config::Entity as PlatformGlobalConfig;
 pub use super::platform_credential::Entity as PlatformCredential;
 pub use super::platform_activity_log::Entity as PlatformActivityLog;
+pub use super::platform_knowledge_doc::Entity as PlatformKnowledgeDoc;
