@@ -43,6 +43,7 @@ pub use system::{
 pub mod platform_project;
 pub mod platform_task;
 pub mod platform_config;
+pub mod platform_knowledge_doc;
 pub use platform_project::{
     GitRepoScanResult, ProjectDetail, ProjectInfo, ProjectRepoInfo, TaskCountByStatus,
 };
@@ -51,3 +52,8 @@ pub use platform_task::{
     TaskTypeMappingInfo,
 };
 pub use platform_config::{CredentialInfo, GlobalConfigInfo};
+pub use platform_knowledge_doc::{
+    CreateKnowledgeDocDraft, KnowledgeDocInfo, UpdateKnowledgeDocDraft, UpsertKnowledgeDocDraft,
+};
+pub mod platform_knowledge;
+pub use platform_knowledge::{KbInitResult, ScannedDoc, SkillInfo};

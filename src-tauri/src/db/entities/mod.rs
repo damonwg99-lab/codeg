@@ -23,3 +23,4 @@ pub mod platform_task_decomposition;
 pub mod platform_global_config;
 pub mod platform_credential;
 pub mod platform_activity_log;
+pub mod platform_knowledge_doc;

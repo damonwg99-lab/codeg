@@ -26,6 +26,7 @@ mod m20260621_000001_automation;
 mod m20260622_platform_000001_create_core_tables;
 mod m20260622_platform_000002_create_config_tables;
 mod m20260622_platform_000003_create_activity_log;
+mod m20260627_platform_000004_create_knowledge_doc;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -58,6 +59,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260622_platform_000001_create_core_tables::Migration),
             Box::new(m20260622_platform_000002_create_config_tables::Migration),
             Box::new(m20260622_platform_000003_create_activity_log::Migration),
+            Box::new(m20260627_platform_000004_create_knowledge_doc::Migration),
         ]
     }
 }
