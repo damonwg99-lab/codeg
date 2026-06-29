@@ -55,3 +55,5 @@ pub use platform_config::{CredentialInfo, GlobalConfigInfo};
 pub use platform_knowledge_doc::{
     CreateKnowledgeDocDraft, KnowledgeDocInfo, UpdateKnowledgeDocDraft, UpsertKnowledgeDocDraft,
 };
+pub mod platform_knowledge;
+pub use platform_knowledge::{KbInitResult, ScannedDoc, SkillInfo};
