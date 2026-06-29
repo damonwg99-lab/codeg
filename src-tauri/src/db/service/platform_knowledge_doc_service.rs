@@ -3,6 +3,7 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait,
     IntoActiveModel, QueryFilter, QueryOrder, Set,
 };
+use sea_orm::sea_query::LikeExpr;
 
 use crate::db::entities::platform_knowledge_doc;
 use crate::db::error::DbError;
@@ -28,29 +29,59 @@ fn to_info(m: platform_knowledge_doc::Model) -> KnowledgeDocInfo {
     }
 }
 
+/// Escape LIKE special characters (`%` and `_`) so they are treated as literals.
+fn escape_like(keyword: &str) -> String {
+    keyword.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
 pub async fn create(
     conn: &DatabaseConnection,
     draft: CreateKnowledgeDocDraft,
 ) -> Result<KnowledgeDocInfo, DbError> {
-    let now = Utc::now();
-    let model = platform_knowledge_doc::ActiveModel {
-        id: NotSet,
-        project_id: Set(draft.project_id),
-        doc_type: Set(draft.doc_type),
-        title: Set(draft.title),
-        file_path: Set(draft.file_path),
-        is_shared: Set(draft.is_shared),
-        tags_json: Set(draft.tags_json),
-        description: Set(draft.description),
-        skill_name: Set(draft.skill_name),
-        task_id: Set(draft.task_id),
-        last_scanned_at: Set(None),
-        created_at: Set(now),
-        updated_at: Set(now),
-        deleted_at: Set(None),
-    };
-    let result = model.insert(conn).await?;
-    Ok(to_info(result))
+    // C1: If a soft-deleted row with the same (project_id, file_path) exists,
+    // revive it instead of inserting a new row (unique constraint conflict).
+    let existing = platform_knowledge_doc::Entity::find()
+        .filter(platform_knowledge_doc::Column::ProjectId.eq(draft.project_id))
+        .filter(platform_knowledge_doc::Column::FilePath.eq(&draft.file_path))
+        .one(conn)
+        .await?;
+
+    if let Some(row) = existing {
+        // Row exists (may be soft-deleted) — revive and update
+        let mut active = row.into_active_model();
+        active.doc_type = Set(draft.doc_type);
+        active.title = Set(draft.title);
+        active.is_shared = Set(draft.is_shared);
+        active.tags_json = Set(draft.tags_json);
+        active.description = Set(draft.description);
+        active.skill_name = Set(draft.skill_name);
+        active.task_id = Set(draft.task_id);
+        active.last_scanned_at = Set(None);
+        active.deleted_at = Set(None);
+        active.updated_at = Set(Utc::now());
+        let result = active.update(conn).await?;
+        Ok(to_info(result))
+    } else {
+        let now = Utc::now();
+        let model = platform_knowledge_doc::ActiveModel {
+            id: NotSet,
+            project_id: Set(draft.project_id),
+            doc_type: Set(draft.doc_type),
+            title: Set(draft.title),
+            file_path: Set(draft.file_path),
+            is_shared: Set(draft.is_shared),
+            tags_json: Set(draft.tags_json),
+            description: Set(draft.description),
+            skill_name: Set(draft.skill_name),
+            task_id: Set(draft.task_id),
+            last_scanned_at: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+        };
+        let result = model.insert(conn).await?;
+        Ok(to_info(result))
+    }
 }
 
 pub async fn update(
@@ -123,15 +154,16 @@ pub async fn search(
     project_id: i32,
     keyword: &str,
 ) -> Result<Vec<KnowledgeDocInfo>, DbError> {
-    let pattern = format!("%{keyword}%");
+    // W1: Escape LIKE special characters so % and _ in keyword are treated as literals.
+    let pattern = LikeExpr::new(format!("%{}%", escape_like(keyword))).escape('\\');
     let rows = platform_knowledge_doc::Entity::find()
         .filter(platform_knowledge_doc::Column::ProjectId.eq(project_id))
         .filter(platform_knowledge_doc::Column::DeletedAt.is_null())
         .filter(
             sea_orm::Condition::any()
-                .add(platform_knowledge_doc::Column::Title.like(&pattern))
-                .add(platform_knowledge_doc::Column::Description.like(&pattern))
-                .add(platform_knowledge_doc::Column::TagsJson.like(&pattern)),
+                .add(platform_knowledge_doc::Column::Title.like(pattern.clone()))
+                .add(platform_knowledge_doc::Column::Description.like(pattern.clone()))
+                .add(platform_knowledge_doc::Column::TagsJson.like(pattern)),
         )
         .order_by_desc(platform_knowledge_doc::Column::UpdatedAt)
         .all(conn)
@@ -169,10 +201,11 @@ pub async fn upsert_by_path(
     conn: &DatabaseConnection,
     draft: UpsertKnowledgeDocDraft,
 ) -> Result<KnowledgeDocInfo, DbError> {
+    // C1: Search including soft-deleted rows; if a deleted row exists at
+    // the same path, revive it (clear deleted_at) instead of inserting.
     let existing = platform_knowledge_doc::Entity::find()
         .filter(platform_knowledge_doc::Column::ProjectId.eq(draft.project_id))
         .filter(platform_knowledge_doc::Column::FilePath.eq(&draft.file_path))
-        .filter(platform_knowledge_doc::Column::DeletedAt.is_null())
         .one(conn)
         .await?;
 
@@ -186,6 +219,8 @@ pub async fn upsert_by_path(
         active.skill_name = Set(draft.skill_name);
         active.task_id = Set(draft.task_id);
         active.last_scanned_at = Set(Some(Utc::now()));
+        // Revive if soft-deleted
+        active.deleted_at = Set(None);
         active.updated_at = Set(Utc::now());
         let result = active.update(conn).await?;
         Ok(to_info(result))
