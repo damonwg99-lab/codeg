@@ -1134,6 +1134,26 @@ pub fn build_router(
         .route("/update_task_type_mapping", post(handlers::task::update_task_type_mapping))
         .route("/delete_task_type_mapping", post(handlers::task::delete_task_type_mapping))
         .route("/create_decomposition", post(handlers::task::create_decomposition))
+        // ─── Knowledge Base ───
+        .route("/scan_knowledge_repo", post(handlers::knowledge::scan_knowledge_repo))
+        .route("/list_knowledge_docs", post(handlers::knowledge::list_knowledge_docs))
+        .route("/search_knowledge_docs", post(handlers::knowledge::search_knowledge_docs))
+        .route("/get_knowledge_doc", post(handlers::knowledge::get_knowledge_doc))
+        .route("/update_knowledge_doc", post(handlers::knowledge::update_knowledge_doc))
+        .route("/delete_knowledge_doc", post(handlers::knowledge::delete_knowledge_doc))
+        .route("/list_skills", post(handlers::knowledge::list_skills))
+        .route("/init_knowledge_repo", post(handlers::knowledge::init_knowledge_repo))
+        .route("/read_kb_doc_content", post(handlers::knowledge::read_kb_doc_content))
+        .route(
+            "/upload_kb_doc",
+            post(handlers::knowledge::upload_kb_doc)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/upload_task_attachment",
+            post(handlers::knowledge::upload_task_attachment)
+                .layer(DefaultBodyLimit::disable()),
+        )
         // Catch-all
         .fallback(api_not_found)
         .layer(middleware::from_fn(move |req, next| {

@@ -181,3 +181,72 @@ export interface CredentialInfo {
   createdAt: string
   updatedAt: string
 }
+
+// ─── Knowledge Base ───
+
+export type KbDocType =
+  | "tech_doc"
+  | "template"
+  | "skill"
+  | "requirement"
+  | "ai_intermediate"
+  | "task_attachment"
+
+export interface KnowledgeDocInfo {
+  id: number
+  projectId: number
+  docType: KbDocType | string
+  title: string
+  filePath: string
+  isShared: boolean
+  tagsJson: string | null
+  description: string | null
+  skillName: string | null
+  taskId: number | null
+  lastScannedAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ScanResultInfo {
+  projectId: number
+  scannedCount: number
+  newCount: number
+  updatedCount: number
+  deletedCount: number
+}
+
+export interface SkillInfo {
+  name: string
+  description: string
+  triggerTaskType: string | null
+  inject: string[]
+  agentHint: string | null
+}
+
+export interface KbInitResult {
+  kbDir: string
+  subDirs: string[]
+  gitignoreCreated: boolean
+  readmeCreated: boolean
+}
+
+/** KB doc type → directory mapping */
+export const KB_DOC_TYPE_DIRS: Record<KbDocType, string> = {
+  tech_doc: "docs",
+  template: "templates",
+  skill: "skills",
+  requirement: "requirements",
+  ai_intermediate: ".private/ai-intermediate",
+  task_attachment: ".private/tasks",
+}
+
+/** KB doc type → display label (for i18n keys) */
+export const KB_DOC_TYPE_LABELS: Record<KbDocType, string> = {
+  tech_doc: "Tech Doc",
+  template: "Template",
+  skill: "Skill",
+  requirement: "Requirement",
+  ai_intermediate: "AI Intermediate",
+  task_attachment: "Task Attachment",
+}

@@ -1,4 +1,5 @@
 import { getTransport } from "@/lib/transport"
+import { getCodegToken } from "@/lib/transport/web-auth"
 import type {
   ProjectInfo,
   ProjectDetail,
@@ -12,6 +13,11 @@ import type {
   TaskDecompositionInfo,
   GlobalConfigInfo,
   CredentialInfo,
+  KnowledgeDocInfo,
+  ScanResultInfo,
+  SkillInfo,
+  KbInitResult,
+  KbDocType,
 } from "./types"
 
 // ─── Project ───
@@ -347,4 +353,181 @@ export async function checkCredentialExists(params: {
     credentialType: params.credentialType,
     projectId: params.projectId ?? null,
   })
+}
+
+// ─── Knowledge Base ───
+
+export async function scanKnowledgeRepo(
+  projectId: number
+): Promise<ScanResultInfo> {
+  return getTransport().call("scan_knowledge_repo", { projectId })
+}
+
+export async function listKnowledgeDocs(params: {
+  projectId: number
+  docTypeFilter?: KbDocType | string
+}): Promise<KnowledgeDocInfo[]> {
+  return getTransport().call("list_knowledge_docs", {
+    projectId: params.projectId,
+    docTypeFilter: params.docTypeFilter ?? null,
+  })
+}
+
+export async function searchKnowledgeDocs(params: {
+  projectId: number
+  query: string
+}): Promise<KnowledgeDocInfo[]> {
+  return getTransport().call("search_knowledge_docs", {
+    projectId: params.projectId,
+    query: params.query,
+  })
+}
+
+export async function getKnowledgeDoc(id: number): Promise<KnowledgeDocInfo> {
+  return getTransport().call("get_knowledge_doc", { id })
+}
+
+export async function updateKnowledgeDoc(params: {
+  id: number
+  docType?: string
+  title?: string
+  isShared?: boolean
+  tagsJson?: string | null
+  description?: string | null
+  skillName?: string | null
+  taskId?: number | null
+}): Promise<KnowledgeDocInfo> {
+  return getTransport().call("update_knowledge_doc", {
+    id: params.id,
+    docType: params.docType ?? null,
+    title: params.title ?? null,
+    isShared: params.isShared ?? null,
+    tagsJson: params.tagsJson ?? null,
+    description: params.description ?? null,
+    skillName: params.skillName ?? null,
+    taskId: params.taskId ?? null,
+  })
+}
+
+export async function deleteKnowledgeDoc(id: number): Promise<void> {
+  return getTransport().call("delete_knowledge_doc", { id })
+}
+
+export async function listSkills(projectId: number): Promise<SkillInfo[]> {
+  return getTransport().call("list_skills", { projectId })
+}
+
+export async function initKnowledgeRepo(
+  projectId: number
+): Promise<KbInitResult> {
+  return getTransport().call("init_knowledge_repo", { projectId })
+}
+
+export async function readKbDocContent(id: number): Promise<string> {
+  return getTransport().call("read_kb_doc_content", { id })
+}
+
+// ─── KB Upload (multipart — web mode only, desktop uses Tauri invoke) ───
+
+/**
+ * Upload a document to the knowledge base via multipart form-data.
+ * In desktop mode, use `uploadKbDocTauri` instead (Tauri invoke with bytes).
+ */
+export async function uploadKbDoc(params: {
+  projectId: number
+  targetDir: string
+  file: File
+}): Promise<KnowledgeDocInfo> {
+  const transport = getTransport()
+
+  if (transport.isDesktop()) {
+    // Desktop: read file as bytes and use Tauri invoke
+    const contentBytes = Array.from(
+      new Uint8Array(await params.file.arrayBuffer())
+    )
+    return transport.call("upload_kb_doc", {
+      projectId: params.projectId,
+      targetDir: params.targetDir,
+      filename: params.file.name,
+      contentBytes,
+    })
+  }
+
+  // Web/server: multipart upload
+  const formData = new FormData()
+  formData.append("project_id", String(params.projectId))
+  formData.append("target_dir", params.targetDir)
+  formData.append("file", params.file)
+
+  const token = getUploadToken()
+  const baseUrl = getUploadBaseUrl()
+  const res = await fetch(`${baseUrl}/api/upload_kb_doc`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  })
+  if (!res.ok) {
+    const error = await res
+      .json()
+      .catch(() => ({ message: `HTTP ${res.status}` }))
+    throw error
+  }
+  return res.json()
+}
+
+/**
+ * Upload a task attachment via multipart form-data.
+ * In desktop mode, uses Tauri invoke with bytes.
+ */
+export async function uploadTaskAttachment(params: {
+  projectId: number
+  taskId: number
+  file: File
+}): Promise<KnowledgeDocInfo> {
+  const transport = getTransport()
+
+  if (transport.isDesktop()) {
+    const contentBytes = Array.from(
+      new Uint8Array(await params.file.arrayBuffer())
+    )
+    return transport.call("upload_task_attachment", {
+      projectId: params.projectId,
+      taskId: params.taskId,
+      filename: params.file.name,
+      contentBytes,
+    })
+  }
+
+  // Web/server: multipart upload
+  const formData = new FormData()
+  formData.append("project_id", String(params.projectId))
+  formData.append("task_id", String(params.taskId))
+  formData.append("file", params.file)
+
+  const token = getUploadToken()
+  const baseUrl = getUploadBaseUrl()
+  const res = await fetch(`${baseUrl}/api/upload_task_attachment`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  })
+  if (!res.ok) {
+    const error = await res
+      .json()
+      .catch(() => ({ message: `HTTP ${res.status}` }))
+    throw error
+  }
+  return res.json()
+}
+
+// ─── Upload helpers (web mode multipart) ───
+
+/** Get the auth token for multipart uploads (shared with main api.ts). */
+function getUploadToken(): string {
+  return getCodegToken()
+}
+
+/** Get the base URL for multipart uploads (same origin). */
+function getUploadBaseUrl(): string {
+  return window.location.origin
 }

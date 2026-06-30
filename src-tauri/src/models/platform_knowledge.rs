@@ -49,3 +49,19 @@ pub struct ScannedDoc {
     /// Associated skill name (if under `skills/`).
     pub skill_name: Option<String>,
 }
+
+/// Result of scanning a knowledge base directory.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanResultInfo {
+    /// The project whose KB was scanned.
+    pub project_id: i32,
+    /// Total number of files found on disk.
+    pub scanned_count: i32,
+    /// Number of new records inserted.
+    pub new_count: i32,
+    /// Number of existing records updated.
+    pub updated_count: i32,
+    /// Number of records soft-deleted (file no longer on disk).
+    pub deleted_count: i32,
+}

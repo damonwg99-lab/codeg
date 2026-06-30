@@ -55,6 +55,7 @@ mod tauri_app {
         folders, logging as logging_commands, mcp as mcp_commands,
         model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
         project as project_commands, task as task_commands,
+        knowledge as knowledge_commands,
         question as question_commands, quick_messages as quick_messages_commands,
         remote_proxy as remote_proxy_commands,
         remote_workspace as remote_workspace_commands, session_info as session_info_commands,
@@ -1200,6 +1201,17 @@ mod tauri_app {
                 task_commands::update_task_type_mapping,
                 task_commands::delete_task_type_mapping,
                 task_commands::create_decomposition,
+                knowledge_commands::scan_knowledge_repo,
+                knowledge_commands::list_knowledge_docs,
+                knowledge_commands::search_knowledge_docs,
+                knowledge_commands::get_knowledge_doc,
+                knowledge_commands::update_knowledge_doc,
+                knowledge_commands::delete_knowledge_doc,
+                knowledge_commands::list_skills,
+                knowledge_commands::upload_kb_doc,
+                knowledge_commands::upload_task_attachment,
+                knowledge_commands::init_knowledge_repo,
+                knowledge_commands::read_kb_doc_content,
             ])
             .build(tauri::generate_context!())
             .expect("error while building tauri application")

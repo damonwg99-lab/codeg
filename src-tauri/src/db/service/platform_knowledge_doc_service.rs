@@ -149,6 +149,17 @@ pub async fn list_by_project(
     Ok(rows.into_iter().map(to_info).collect())
 }
 
+pub async fn get_by_id(
+    conn: &DatabaseConnection,
+    id: i32,
+) -> Result<Option<KnowledgeDocInfo>, DbError> {
+    let row = platform_knowledge_doc::Entity::find_by_id(id)
+        .filter(platform_knowledge_doc::Column::DeletedAt.is_null())
+        .one(conn)
+        .await?;
+    Ok(row.map(to_info))
+}
+
 pub async fn search(
     conn: &DatabaseConnection,
     project_id: i32,
