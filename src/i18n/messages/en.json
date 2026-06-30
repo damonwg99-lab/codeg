@@ -3525,7 +3525,15 @@
       "skillTrigger": "Trigger: {type}",
       "skillInject": "Inject: {items}",
       "skillDescription": "Description",
-      "skillAgentHint": "Agent hint"
+      "skillAgentHint": "Agent hint",
+      "taskAttachments": "Task Attachments",
+      "addAttachment": "Add attachment",
+      "uploadingAttachment": "Uploading…",
+      "attachmentUploadFailed": "Attachment upload failed",
+      "noAttachments": "No attachments",
+      "stagedFiles": "Staged files",
+      "removeFile": "Remove",
+      "viewAttachment": "View"
     }
   },
   "LogsSettings": {

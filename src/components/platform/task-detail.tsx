@@ -10,6 +10,10 @@ import {
   Pencil,
   X,
   MessageSquare,
+  FileText,
+  Upload,
+  Trash2,
+  Eye,
 } from "lucide-react"
 import {
   getTask,
@@ -17,11 +21,15 @@ import {
   updateTaskStatus,
   listTaskConversations,
   createConversationForTask,
+  uploadTaskAttachment,
+  listKnowledgeDocs,
+  deleteKnowledgeDoc,
 } from "@/lib/platform/api"
 import type {
   TaskDetail as TaskDetailType,
   TaskConversationInfo,
   TaskStatus,
+  KnowledgeDocInfo,
 } from "@/lib/platform/types"
 import {
   TASK_STATUS_LIST,
@@ -47,6 +55,17 @@ import { usePlatform } from "@/contexts/platform-context"
 import { useTabContext } from "@/contexts/tab-context"
 import { ContextInjectPanel } from "@/components/platform/context-inject-panel"
 import type { ContextInjectPayload } from "@/components/platform/context-inject-panel-utils"
+import { KnowledgeDocDetailDialog } from "@/components/platform/knowledge-doc-detail-dialog"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { cn } from "@/lib/utils"
 
 export function TaskDetail({ taskId }: { taskId: number }) {
@@ -61,6 +80,15 @@ export function TaskDetail({ taskId }: { taskId: number }) {
   const [editing, setEditing] = useState(false)
   const [contextPanelOpen, setContextPanelOpen] = useState(false)
   const [creatingConversation, setCreatingConversation] = useState(false)
+
+  // Attachments state
+  const [attachments, setAttachments] = useState<KnowledgeDocInfo[]>([])
+  const [selectedAttachment, setSelectedAttachment] =
+    useState<KnowledgeDocInfo | null>(null)
+  const [deleteAttachmentTarget, setDeleteAttachmentTarget] =
+    useState<KnowledgeDocInfo | null>(null)
+  const [deletingAttachment, setDeletingAttachment] = useState(false)
+  const [uploadingAttachment, setUploadingAttachment] = useState(false)
 
   // Edit form state
   const [editTitle, setEditTitle] = useState("")
@@ -94,6 +122,58 @@ export function TaskDetail({ taskId }: { taskId: number }) {
       cancelled = true
     }
   }, [taskId])
+
+  // ─── Load attachments ───
+  const loadAttachments = useCallback(async () => {
+    if (!activeProject) return
+    try {
+      const allDocs = await listKnowledgeDocs({
+        projectId: activeProject.id,
+        docTypeFilter: "task_attachment",
+      })
+      setAttachments(allDocs.filter((d) => d.taskId === taskId))
+    } catch (e) {
+      console.error("Failed to load attachments:", e)
+    }
+  }, [activeProject, taskId])
+
+  useEffect(() => {
+    void loadAttachments()
+  }, [loadAttachments])
+
+  // ─── Upload attachment ───
+  const handleUploadAttachment = useCallback(
+    async (file: File) => {
+      if (!activeProject) return
+      setUploadingAttachment(true)
+      try {
+        await uploadTaskAttachment({
+          projectId: activeProject.id,
+          taskId,
+          file,
+        })
+        await loadAttachments()
+      } catch (e) {
+        console.error("Attachment upload failed:", e)
+      }
+      setUploadingAttachment(false)
+    },
+    [activeProject, taskId, loadAttachments]
+  )
+
+  // ─── Delete attachment ───
+  const handleDeleteAttachment = useCallback(async () => {
+    if (!deleteAttachmentTarget) return
+    setDeletingAttachment(true)
+    try {
+      await deleteKnowledgeDoc(deleteAttachmentTarget.id)
+      setDeleteAttachmentTarget(null)
+      await loadAttachments()
+    } catch (e) {
+      console.error("Delete attachment failed:", e)
+    }
+    setDeletingAttachment(false)
+  }, [deleteAttachmentTarget, loadAttachments])
 
   const handleSave = useCallback(async () => {
     if (!detail) return
@@ -440,6 +520,82 @@ export function TaskDetail({ taskId }: { taskId: number }) {
           </CardContent>
         </Card>
 
+        {/* ─── Attachments ─── */}
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between gap-3 pb-2">
+            <CardTitle className="text-[0.9375rem]">
+              {t("kb.taskAttachments")}
+            </CardTitle>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={uploadingAttachment}
+              onClick={() => {
+                const input = document.createElement("input")
+                input.type = "file"
+                input.onchange = (e) => {
+                  const f = (e.target as HTMLInputElement).files?.[0]
+                  if (f) void handleUploadAttachment(f)
+                }
+                input.click()
+              }}
+            >
+              {uploadingAttachment ? (
+                <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Upload className="mr-1 h-3.5 w-3.5" />
+              )}
+              {uploadingAttachment
+                ? t("kb.uploadingAttachment")
+                : t("kb.addAttachment")}
+            </Button>
+          </CardHeader>
+          <CardContent>
+            {attachments.length === 0 ? (
+              <p className="text-[0.8125rem] text-muted-foreground py-2 text-center">
+                {t("kb.noAttachments")}
+              </p>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {attachments.map((att) => (
+                  <div
+                    key={att.id}
+                    className="flex items-center gap-2 rounded-md border p-2"
+                  >
+                    <FileText className="h-4 w-4 text-muted-foreground" />
+                    <div className="flex flex-col gap-0.5 min-w-0">
+                      <span className="text-[0.875rem] font-medium truncate">
+                        {att.title}
+                      </span>
+                      <span className="text-[0.75rem] text-muted-foreground truncate">
+                        {att.filePath}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0 ml-auto">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-6 w-6"
+                        onClick={() => setSelectedAttachment(att)}
+                      >
+                        <Eye className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-6 w-6 text-muted-foreground hover:text-destructive"
+                        onClick={() => setDeleteAttachmentTarget(att)}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
         {/* ─── Linked Conversations ─── */}
         <Card>
           <CardHeader className="flex flex-row items-center justify-between gap-3 pb-2">
@@ -546,6 +702,52 @@ export function TaskDetail({ taskId }: { taskId: number }) {
           submitting={creatingConversation}
           onConfirm={handleCreateConversation}
         />
+
+        {/* ─── Attachment Detail Dialog ─── */}
+        {selectedAttachment && (
+          <KnowledgeDocDetailDialog
+            doc={selectedAttachment}
+            projectId={projectId}
+            open={selectedAttachment !== null}
+            onClose={() => setSelectedAttachment(null)}
+            onDeleted={() => {
+              setSelectedAttachment(null)
+              void loadAttachments()
+            }}
+            onUpdated={() => {
+              void loadAttachments()
+            }}
+          />
+        )}
+
+        {/* ─── Delete Attachment Confirm ─── */}
+        <AlertDialog
+          open={deleteAttachmentTarget !== null}
+          onOpenChange={(open) => {
+            if (!open) setDeleteAttachmentTarget(null)
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{t("kb.deleteDoc")}</AlertDialogTitle>
+              <AlertDialogDescription>
+                {t("kb.deleteConfirm")}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>{t("project.cancel")}</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={() => void handleDeleteAttachment()}
+                disabled={deletingAttachment}
+              >
+                {deletingAttachment ? (
+                  <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                ) : null}
+                {t("kb.deleteDoc")}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </div>
     </ScrollArea>
   )
