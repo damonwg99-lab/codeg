@@ -11,6 +11,7 @@ import {
   removeProjectRepo,
 } from "@/lib/platform/api"
 import type { ProjectDetail, GitRepoScanResult } from "@/lib/platform/types"
+import { KnowledgeManager } from "./knowledge-manager"
 import { usePlatform } from "@/contexts/platform-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { Button } from "@/components/ui/button"
@@ -281,9 +282,7 @@ export function ProjectDetail({ id }: { id: number }) {
             <TabsTrigger value="cicd" disabled>
               {t("project.cicd")}
             </TabsTrigger>
-            <TabsTrigger value="kb" disabled>
-              {t("project.knowledgeBase")}
-            </TabsTrigger>
+            <TabsTrigger value="kb">{t("project.knowledgeBase")}</TabsTrigger>
           </TabsList>
 
           {/* Basic Info Tab */}
@@ -541,11 +540,7 @@ export function ProjectDetail({ id }: { id: number }) {
             </Card>
           </TabsContent>
           <TabsContent value="kb">
-            <Card>
-              <CardContent className="py-8 text-center text-muted-foreground">
-                {t("project.comingSoon")}
-              </CardContent>
-            </Card>
+            <KnowledgeManager projectId={id} project={project} />
           </TabsContent>
         </Tabs>
       </div>
