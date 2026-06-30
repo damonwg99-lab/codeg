@@ -3526,6 +3526,7 @@
       "skillInject": "Inject: {items}",
       "skillDescription": "Description",
       "skillAgentHint": "Agent hint",
+      "attachments": "Attachments",
       "taskAttachments": "Task Attachments",
       "addAttachment": "Add attachment",
       "uploadingAttachment": "Uploading…",

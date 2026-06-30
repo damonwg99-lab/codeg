@@ -524,7 +524,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
         <Card>
           <CardHeader className="flex flex-row items-center justify-between gap-3 pb-2">
             <CardTitle className="text-[0.9375rem]">
-              {t("kb.taskAttachments")}
+              {t("kb.attachments")}
             </CardTitle>
             <Button
               variant="outline"
@@ -550,9 +550,9 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                 : t("kb.addAttachment")}
             </Button>
           </CardHeader>
-          <CardContent>
+          <CardContent className={attachments.length === 0 ? "pb-3" : ""}>
             {attachments.length === 0 ? (
-              <p className="text-[0.8125rem] text-muted-foreground py-2 text-center">
+              <p className="text-[0.75rem] text-muted-foreground">
                 {t("kb.noAttachments")}
               </p>
             ) : (

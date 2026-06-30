@@ -212,7 +212,7 @@ export function CreateTaskForm({ projectId }: { projectId: number }) {
 
         {/* Staged attachments */}
         <div className="flex flex-col gap-1.5">
-          <Label>{t("kb.taskAttachments")}</Label>
+          <Label>{t("kb.attachments")}</Label>
           <div className="flex items-center gap-2">
             <Input
               type="file"

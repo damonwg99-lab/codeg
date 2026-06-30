@@ -3526,6 +3526,7 @@
       "skillInject": "注入项：{items}",
       "skillDescription": "描述",
       "skillAgentHint": "代理提示",
+      "attachments": "附件",
       "taskAttachments": "任务附件",
       "addAttachment": "添加附件",
       "uploadingAttachment": "上传中…",
