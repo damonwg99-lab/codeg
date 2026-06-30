@@ -276,13 +276,13 @@ export function ProjectDetail({ id }: { id: number }) {
               {t("project.basicInfo")}
             </TabsTrigger>
             <TabsTrigger value="repos">{t("project.repos")}</TabsTrigger>
+            <TabsTrigger value="kb">{t("project.knowledgeBase")}</TabsTrigger>
             <TabsTrigger value="zentao" disabled>
               {t("project.zentaoConfig")}
             </TabsTrigger>
             <TabsTrigger value="cicd" disabled>
               {t("project.cicd")}
             </TabsTrigger>
-            <TabsTrigger value="kb">{t("project.knowledgeBase")}</TabsTrigger>
           </TabsList>
 
           {/* Basic Info Tab */}
