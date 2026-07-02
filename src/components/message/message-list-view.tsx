@@ -22,6 +22,10 @@ import { UserImageAttachments } from "./user-image-attachments"
 import { useSessionStats } from "@/contexts/session-stats-context"
 import { AgentPlanOverlay } from "@/components/chat/agent-plan-overlay"
 import { SubAgentOverlay } from "@/components/chat/sub-agent-overlay"
+import { DecompositionOverlay } from "@/components/chat/decomposition-overlay"
+import { useDecompositionDetector } from "@/hooks/use-decomposition-detector"
+import type { TaskInfo, ProjectInfo } from "@/lib/platform/types"
+import { createTask, createDecomposition } from "@/lib/platform/api"
 import { normalizeToolName } from "@/lib/tool-call-normalization"
 import { isDelegateToAgentToolName } from "@/lib/delegation-card"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
@@ -88,6 +92,12 @@ interface MessageListViewProps {
    * conversation view; disabled in compact embeds (e.g. the sub-agent dialog).
    */
   showMessageNav?: boolean
+  /** Linked task for decomposition overlay context. */
+  linkedTask?: TaskInfo | null
+  /** Available projects for task creation. */
+  projects?: ProjectInfo[]
+  /** Active project id for default selection. */
+  activeProjectId?: number | null
 }
 
 interface ResolvedMessageGroup {
@@ -501,6 +511,9 @@ export function MessageListView({
   onReload,
   onNewSession,
   showMessageNav = true,
+  linkedTask = null,
+  projects = [],
+  activeProjectId = null,
 }: MessageListViewProps) {
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
@@ -508,6 +521,48 @@ export function MessageListView({
   const session = getSession(conversationId)
   const liveMessage = session?.liveMessage ?? null
   const timelineTurns = getTimelineTurns(conversationId)
+
+  // Decomposition detection: scan assistant messages for sub-task proposals
+  const {
+    proposedSubTasks: decompSubTasks,
+    clearProposal: clearDecomp,
+    updateSubTasks: updateDecompSubTasks,
+  } = useDecompositionDetector(session?.localTurns)
+
+  // Handler for confirming decomposition: batch-create sub-tasks
+  const handleDecompConfirm = useCallback(
+    async (params: {
+      projectId: number
+      parentTaskId: number | null
+      subTasks: import("@/lib/platform/decomposition-parser").ProposedSubTask[]
+    }) => {
+      try {
+        // Store decomposition record for audit
+        if (params.parentTaskId) {
+          await createDecomposition({
+            sourceTaskId: params.parentTaskId,
+            aiGenerated: true,
+            decompositionJson: JSON.stringify(params.subTasks),
+          })
+        }
+        // Create each sub-task
+        for (const sub of params.subTasks) {
+          await createTask({
+            projectId: params.projectId,
+            parentTaskId: params.parentTaskId ?? null,
+            title: sub.title,
+            taskType: sub.taskType,
+            description: sub.description || undefined,
+            priority: sub.priority,
+          })
+        }
+        clearDecomp()
+      } catch (err) {
+        console.error("Failed to create sub-tasks:", err)
+      }
+    },
+    [clearDecomp]
+  )
 
   const { setSessionStats } = useSessionStats()
 
@@ -927,6 +982,17 @@ export function MessageListView({
           delegations={lastAssistantDelegations}
           overlayKey={subAgentOverlayKey}
         />
+        {decompSubTasks && decompSubTasks.length > 0 && (
+          <DecompositionOverlay
+            proposedSubTasks={decompSubTasks}
+            linkedTask={linkedTask ?? null}
+            projects={projects}
+            activeProjectId={activeProjectId ?? null}
+            onUpdateSubTasks={updateDecompSubTasks}
+            onConfirm={handleDecompConfirm}
+            onDismiss={clearDecomp}
+          />
+        )}
       </div>
     </div>
   )

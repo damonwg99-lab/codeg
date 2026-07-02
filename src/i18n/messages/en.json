@@ -3486,7 +3486,21 @@
         "inProgress": "In Progress",
         "done": "Done",
         "released": "Released"
-      }
+      },
+      "reviewDecomposition": "Review Decomposition",
+      "confirmCreate": "Confirm & Create",
+      "continueDiscussion": "Continue Discussion",
+      "addTask": "Add task",
+      "removeTask": "Remove",
+      "decompositionApplied": "Tasks created",
+      "decompositionFailed": "Failed to create",
+      "proposedTasks": "{count} proposed tasks",
+      "selectProject": "Select project",
+      "createAsSubTasksOf": "Create as sub-tasks of \"{taskName}\"",
+      "taskTitle": "Title",
+      "taskDescription": "Description",
+      "taskType": "Type",
+      "taskPriority": "Priority"
     },
     "repoSelector": {
       "root": "Project root",

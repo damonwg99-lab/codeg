@@ -53,6 +53,9 @@ import {
   openSettingsWindow,
 } from "@/lib/api"
 import { linkConversation } from "@/lib/platform/api"
+import { wrapDecompositionDraft } from "@/hooks/use-decomposition-sender"
+import { useLinkedTask } from "@/hooks/use-linked-task"
+import { usePlatform } from "@/contexts/platform-context"
 import {
   flushRetryDelayMs,
   forkSendBlockedByQueue,
@@ -227,6 +230,10 @@ const ConversationTabView = memo(function ConversationTabView({
     setSyncState,
   } = useConversationRuntime()
   const acpActions = useAcpActions()
+
+  // Decomposition overlay data: linked task + available projects
+  const { linkedTask } = useLinkedTask(conversationId ?? null)
+  const { projects, activeProjectId } = usePlatform()
 
   // Stable runtime session key — set once at mount, never changes.
   // For new conversations this is a virtual (negative) ID; for existing
@@ -810,9 +817,14 @@ const ConversationTabView = memo(function ConversationTabView({
       // (and `onTurnInProgress` requeue / failure re-seed, which use `draft`)
       // keep the user's own words.
       const reminder = feedbackReminderRef.current
+      // Wrap with decomposition instruction if user message has decomposition intent
+      const decompWrapped = wrapDecompositionDraft(draft)
       const sendDraft: PromptDraft = reminder
-        ? { ...draft, blocks: appendFeedbackReminder(draft.blocks, reminder) }
-        : draft
+        ? {
+            ...decompWrapped,
+            blocks: appendFeedbackReminder(decompWrapped.blocks, reminder),
+          }
+        : decompWrapped
 
       // Single-flight the unbound new-tab create. A second direct submit fired
       // before the first create resolves (a double Enter / double click) would
@@ -1342,6 +1354,9 @@ const ConversationTabView = memo(function ConversationTabView({
       onNewSession={
         canShowDetailErrorActions ? handleOpenNewSession : undefined
       }
+      linkedTask={linkedTask}
+      projects={projects}
+      activeProjectId={activeProjectId}
     />
   )
 

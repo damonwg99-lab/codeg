@@ -3486,7 +3486,21 @@
         "inProgress": "进行中",
         "done": "已完成",
         "released": "已发布"
-      }
+      },
+      "reviewDecomposition": "审查分解",
+      "confirmCreate": "确认创建",
+      "continueDiscussion": "继续讨论",
+      "addTask": "添加任务",
+      "removeTask": "删除",
+      "decompositionApplied": "任务创建成功",
+      "decompositionFailed": "创建任务失败",
+      "proposedTasks": "{count} 个任务提案",
+      "selectProject": "选择项目",
+      "createAsSubTasksOf": "创建为「{taskName}」的子任务",
+      "taskTitle": "标题",
+      "taskDescription": "描述",
+      "taskType": "类型",
+      "taskPriority": "优先级"
     },
     "repoSelector": {
       "root": "项目根目录",
