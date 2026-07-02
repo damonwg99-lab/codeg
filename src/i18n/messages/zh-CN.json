@@ -2077,7 +2077,8 @@
         "mentionGroupAgent": "智能体",
         "mentionGroupSession": "会话",
         "mentionGroupCommit": "提交",
-        "mentionGroupSkill": "技能"
+        "mentionGroupSkill": "技能",
+        "mentionGroupContext": "上下文"
       },
       "messageQueue": {
         "addToQueue": "加入队列",
@@ -3452,6 +3453,17 @@
       "noConversations": "暂无关联对话",
       "noSubTasks": "暂无子任务",
       "openConversation": "打开对话",
+      "untitledConversation": "无标题对话",
+      "continueConversation": "继续会话",
+      "deleteConversation": "删除会话",
+      "deleteConversationConfirm": "删除后该会话将从列表中永久移除，且无法恢复。确定要删除吗？",
+      "conversationRoleLabels": {
+        "implementation": "实施",
+        "test": "测试",
+        "review": "评审",
+        "analysis": "分析",
+        "discussion": "讨论"
+      },
       "moveTo": "移至{status}",
       "noTasks": "暂无任务",
       "taskCount": "{count} 个任务",
@@ -3483,6 +3495,7 @@
     },
     "kb": {
       "path": "KB 路径",
+      "description": "描述",
       "docCount": "{count} 个文档",
       "refreshIndex": "刷新索引",
       "initKB": "初始化 KB",
@@ -3491,7 +3504,6 @@
       "initSuccess": "KB 已初始化",
       "scanSuccess": "索引已刷新：{new} 新增，{updated} 更新，{deleted} 删除",
       "documents": "文档",
-      "skills": "技能",
       "search": "搜索文档…",
       "filterType": "按类型筛选",
       "allTypes": "全部类型",
@@ -3520,12 +3532,6 @@
       "contentLoading": "加载内容…",
       "contentFailed": "加载内容失败",
       "noDocs": "KB 中暂无文档",
-      "noSkills": "暂未发现技能",
-      "skillName": "技能",
-      "skillTrigger": "触发类型：{type}",
-      "skillInject": "注入项：{items}",
-      "skillDescription": "描述",
-      "skillAgentHint": "代理提示",
       "attachments": "附件",
       "taskAttachments": "任务附件",
       "addAttachment": "添加附件",
@@ -3534,7 +3540,58 @@
       "noAttachments": "暂无附件",
       "stagedFiles": "暂存文件",
       "removeFile": "移除",
-      "viewAttachment": "查看"
+      "viewAttachment": "查看",
+      "typeTechDoc": "技术文档",
+      "typeTemplate": "模板文档",
+      "typeSkill": "技能",
+      "typeRequirement": "需求文档",
+      "typeAiIntermediate": "AI 中间产物",
+      "typeTaskAttachment": "任务附件"
+    },
+    "inject": {
+      "groupLabel": {
+        "basic": "任务信息",
+        "conversations": "关联对话",
+        "kb_docs": "知识库文档",
+        "attachments": "附件"
+      },
+      "searchDocs": "搜索文档…",
+      "noDocs": "暂无知识库文档",
+      "noAttachments": "此任务暂无附件",
+      "injectContext": "注入上下文",
+      "injecting": "注入中…",
+      "createConversation": "创建对话",
+      "selectContext": "选择要附加的上下文。",
+      "needConversation": "请先发送一条消息创建对话，然后才能关联任务。",
+      "linkTask": "关联任务",
+      "willAutoLink": "对话创建后自动关联",
+      "noTasksFound": "暂无任务",
+      "cancel": "取消",
+      "unlink": "取消关联",
+      "searchTasks": "搜索任务…",
+      "loading": "加载中…",
+      "optionLabel": {
+        "taskDescription": "任务描述",
+        "conversation": "对话 #{id}",
+        "knowledgeDocFallback": "知识文档",
+        "taskAttachmentFallback": "任务附件"
+      },
+      "optionDesc": {
+        "taskDescription": "包含任务标题和描述。"
+      },
+      "taskTypeLabel": {
+        "bug": "缺陷",
+        "feature": "功能",
+        "task": "任务",
+        "improvement": "改进"
+      },
+      "taskStatusLabel": {
+        "backlog": "待办",
+        "confirmed": "已确认",
+        "in_progress": "进行中",
+        "done": "已完成",
+        "released": "已发布"
+      }
     }
   },
   "LogsSettings": {

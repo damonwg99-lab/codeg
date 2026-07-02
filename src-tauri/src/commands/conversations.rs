@@ -3,7 +3,11 @@ use std::collections::{HashMap, HashSet};
 use crate::app_error::AppCommandError;
 use crate::db::entities::conversation;
 use crate::db::entities::folder::FolderKind;
-use crate::db::service::{conversation_service, folder_service, import_service, tab_service};
+
+/// Event emitted when task-conversation links change (unlink / delete cleanup).
+/// Must match the constant in task.rs so the frontend receives the same event.
+const PLATFORM_TASK_CONVERSATION_CHANGED_EVENT: &str = "platform_task_conversation://changed";
+use crate::db::service::{conversation_service, folder_service, import_service, platform_task_conversation_service, tab_service};
 #[cfg(feature = "tauri-runtime")]
 use crate::db::AppDatabase;
 use crate::models::*;
@@ -1413,6 +1417,12 @@ pub async fn delete_conversation_with_cleanup_core(
     if let Some(folder_id) = folder_id {
         cleanup_chat_folder_for_deleted_conversation(conn, folder_id).await;
     }
+    // Remove all task-conversation links referencing this conversation so the
+    // task detail page no longer shows a link to a deleted conversation.
+    platform_task_conversation_service::delete_by_conversation(conn, conversation_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    emit_event(emitter, PLATFORM_TASK_CONVERSATION_CHANGED_EVENT, &());
     Ok(())
 }
 

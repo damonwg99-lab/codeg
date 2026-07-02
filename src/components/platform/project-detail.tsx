@@ -31,6 +31,19 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 
+/** Resolve task status label using i18n (same pattern as task-detail/kanban). */
+function resolveStatusLabel(t: (key: never) => string, status: string): string {
+  const keyMap: Record<string, string> = {
+    backlog: "task.status.backlog",
+    confirmed: "task.status.confirmed",
+    in_progress: "task.status.in_progress",
+    done: "task.status.done",
+    released: "task.status.released",
+  }
+  const key = keyMap[status]
+  return key ? (t(key as never) ?? status) : status
+}
+
 export function ProjectDetail({ id }: { id: number }) {
   const t = useTranslations("Platform")
   const { activeProjectId, loadProjectDetail } = usePlatform()
@@ -192,7 +205,7 @@ export function ProjectDetail({ id }: { id: number }) {
 
   return (
     <ScrollArea className="h-full">
-      <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 p-4 sm:p-6">
+      <div className="flex flex-col gap-6 p-4 sm:p-6">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Button
@@ -241,32 +254,36 @@ export function ProjectDetail({ id }: { id: number }) {
 
         {/* Task count summary */}
         <div className="flex items-center gap-2 text-[0.8125rem]">
-          <Badge variant="outline" className="text-[0.625rem]">
-            {taskCountByStatus.backlog} Backlog
+          <Badge
+            variant="outline"
+            className="text-[0.625rem] bg-muted text-muted-foreground"
+          >
+            {taskCountByStatus.backlog} {resolveStatusLabel(t, "backlog")}
           </Badge>
           <Badge
             variant="outline"
             className="text-[0.625rem] bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300"
           >
-            {taskCountByStatus.confirmed} Confirmed
+            {taskCountByStatus.confirmed} {resolveStatusLabel(t, "confirmed")}
           </Badge>
           <Badge
             variant="outline"
             className="text-[0.625rem] bg-yellow-50 text-yellow-700 dark:bg-yellow-950 dark:text-yellow-300"
           >
-            {taskCountByStatus.inProgress} In Progress
+            {taskCountByStatus.inProgress}{" "}
+            {resolveStatusLabel(t, "in_progress")}
           </Badge>
           <Badge
             variant="outline"
             className="text-[0.625rem] bg-green-50 text-green-700 dark:bg-green-950 dark:text-green-300"
           >
-            {taskCountByStatus.done} Done
+            {taskCountByStatus.done} {resolveStatusLabel(t, "done")}
           </Badge>
           <Badge
             variant="outline"
             className="text-[0.625rem] bg-purple-50 text-purple-700 dark:bg-purple-950 dark:text-purple-300"
           >
-            {taskCountByStatus.released} Released
+            {taskCountByStatus.released} {resolveStatusLabel(t, "released")}
           </Badge>
         </div>
 
@@ -288,7 +305,7 @@ export function ProjectDetail({ id }: { id: number }) {
           {/* Basic Info Tab */}
           <TabsContent value="basic-info">
             <Card>
-              <CardContent className="pt-4 flex flex-col gap-4">
+              <CardContent className="pt-4 flex flex-col gap-3">
                 {editing ? (
                   <>
                     <div className="flex flex-col gap-1.5">

@@ -44,6 +44,9 @@ interface ChatInputProps {
   /** Show the composer's flowing active-session border. Set only for the active
    *  tab when tiled across multiple sessions; passed through to MessageInput. */
   showActiveFlow?: boolean
+  /** The conversation ID this ChatInput belongs to. Passed through to MessageInput
+   *  to prevent badge drafts from leaking across tabs. */
+  conversationId?: number | null
   queue?: QueuedMessage[]
   onEnqueue?: (draft: PromptDraft, modeId: string | null) => void
   onQueueReorder?: (items: QueuedMessage[]) => void
@@ -118,6 +121,7 @@ export const ChatInput = memo(function ChatInput({
   onInjectConsumed,
   flush = false,
   tall = false,
+  conversationId,
 }: ChatInputProps) {
   const t = useTranslations("Folder.chat.chatInput")
   const isConnected = status === "connected"
@@ -179,6 +183,7 @@ export const ChatInput = memo(function ChatInput({
         feedbackAddDisabled={feedbackAddDisabled}
         injectContent={injectContent}
         onInjectConsumed={onInjectConsumed}
+        conversationId={conversationId}
         placeholder={
           isConnecting
             ? t("connecting")

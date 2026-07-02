@@ -103,3 +103,17 @@ pub async fn delete_by_task_and_conversation(
         .await?;
     Ok(())
 }
+
+/// Delete all task-conversation links referencing a given conversation_id.
+/// Called when a conversation is deleted to prevent orphaned links from
+/// appearing in the task detail's "Associated conversations" section.
+pub async fn delete_by_conversation(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<(), DbError> {
+    platform_task_conversation::Entity::delete_many()
+        .filter(platform_task_conversation::Column::ConversationId.eq(conversation_id))
+        .exec(conn)
+        .await?;
+    Ok(())
+}

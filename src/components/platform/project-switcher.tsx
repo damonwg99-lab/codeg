@@ -49,6 +49,9 @@ export function ProjectSwitcher({ onSwitch }: ProjectSwitcherProps) {
 
   const handleSelect = (id: number) => {
     if (id === activeProjectId) return
+    // Route navigation is handled by useProjectSwitchCoordinator
+    // (via the onSwitch callback in FolderTitleBar) — it redirects
+    // project-specific pages to their list/kanban views on project switch.
     if (onSwitch) {
       onSwitch(id)
     } else {

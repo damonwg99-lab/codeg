@@ -22,7 +22,7 @@ export function useProjectSwitchCoordinator() {
     useTabContext()
   const { setActiveProjectId, activeProject } = usePlatform()
   const { allFolders } = useAppWorkspace()
-  const { routeId, routeParams, setRoute } = useWorkbenchRoute()
+  const { routeId, setRoute } = useWorkbenchRoute()
   const pendingSwitchRef = useRef<number | null>(null)
 
   const switchProject = useCallback(
@@ -36,14 +36,16 @@ export function useProjectSwitchCoordinator() {
         closeTab(activeTabId)
       }
 
-      // If currently on task kanban or task detail, update the route's
-      // projectId so the view refreshes for the new project
-      if (
-        routeId === "task-kanban" ||
-        routeId === "task-detail" ||
-        routeId === "create-task"
-      ) {
-        setRoute(routeId, { ...routeParams, projectId: newId })
+      // When switching project from a project-specific page, navigate to
+      // the corresponding list/kanban view so the page data is consistent
+      // with the new project.
+      if (routeId === "project-detail" || routeId === "create-project") {
+        setRoute("project-list")
+      } else if (routeId === "task-detail" || routeId === "create-task") {
+        setRoute("task-kanban", { projectId: newId })
+      } else if (routeId === "task-kanban") {
+        // Kanban already project-specific — just update projectId
+        setRoute("task-kanban", { projectId: newId })
       }
 
       // Mark pending so the effect knows to create/retarget a draft after
@@ -51,15 +53,7 @@ export function useProjectSwitchCoordinator() {
       pendingSwitchRef.current = newId
       setActiveProjectId(newId)
     },
-    [
-      tabs,
-      activeTabId,
-      closeTab,
-      setActiveProjectId,
-      routeId,
-      routeParams,
-      setRoute,
-    ]
+    [tabs, activeTabId, closeTab, setActiveProjectId, routeId, setRoute]
   )
 
   // After the project detail loads, create or retarget a draft tab in the

@@ -222,86 +222,70 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="relative h-full min-h-0 overflow-hidden">
-      {/* Kept mounted (and only hidden) when a workbench route takes over, so
-          background conversations keep streaming. `inert` drops it from the tab
-          order behind the opaque route overlay. */}
-      <div className="h-full min-h-0" inert={!isConversations || undefined}>
-        <ResizablePanelGroup
-          id={WORKSPACE_PANEL_GROUP_ID}
-          ref={panelGroupRef}
-          direction="horizontal"
-          onLayout={handleLayout}
+      <ResizablePanelGroup
+        id={WORKSPACE_PANEL_GROUP_ID}
+        ref={panelGroupRef}
+        direction="horizontal"
+        onLayout={handleLayout}
+      >
+        <ResizablePanel
+          id={WORKSPACE_CONVERSATION_PANEL_ID}
+          order={1}
+          defaultSize={56}
+          minSize={mode === "fusion" ? 25 : 0}
         >
-          <ResizablePanel
-            id={WORKSPACE_CONVERSATION_PANEL_ID}
-            order={1}
-            defaultSize={56}
-            minSize={mode === "fusion" ? 25 : 0}
+          <section
+            className={cn(
+              "flex h-full min-h-0 flex-col overflow-hidden",
+              mode === "conversation" && "absolute inset-0 z-30 bg-background"
+            )}
+            onPointerDownCapture={markConversationActive}
+            onFocusCapture={markConversationActive}
+            inert={filesMaximized || undefined}
           >
-            <section
-              className={cn(
-                "flex h-full min-h-0 flex-col overflow-hidden",
-                mode === "conversation" && "absolute inset-0 z-30 bg-background"
-              )}
-              onPointerDownCapture={markConversationActive}
-              onFocusCapture={markConversationActive}
-              inert={filesMaximized || undefined}
-            >
-              <TabBar />
-              <div className="relative flex-1 min-h-0 overflow-hidden">
-                {children}
-              </div>
-            </section>
-          </ResizablePanel>
-          <ResizableHandle
-            withHandle
-            disabled={mode !== "fusion"}
-            className={
-              mode === "fusion"
-                ? ""
-                : "pointer-events-none w-0 opacity-0 after:w-0"
-            }
-          />
-          <ResizablePanel
-            id={WORKSPACE_FILES_PANEL_ID}
-            order={2}
-            defaultSize={44}
-            minSize={mode === "fusion" ? 20 : 0}
+            {isConversations ? (
+              <>
+                <TabBar />
+                <div className="relative flex-1 min-h-0 overflow-hidden">
+                  {children}
+                </div>
+              </>
+            ) : (
+              <WorkbenchRoutePage />
+            )}
+          </section>
+        </ResizablePanel>
+        <ResizableHandle
+          withHandle
+          disabled={mode !== "fusion"}
+          className={
+            mode === "fusion"
+              ? ""
+              : "pointer-events-none w-0 opacity-0 after:w-0"
+          }
+        />
+        <ResizablePanel
+          id={WORKSPACE_FILES_PANEL_ID}
+          order={2}
+          defaultSize={44}
+          minSize={mode === "fusion" ? 20 : 0}
+        >
+          <section
+            className={cn(
+              "flex h-full min-h-0 flex-col overflow-hidden",
+              filesMaximized && "absolute inset-0 z-30 bg-background"
+            )}
+            onPointerDownCapture={markFileActive}
+            onFocusCapture={markFileActive}
+            aria-hidden={mode === "conversation"}
           >
-            {/* When maximized, overlay the file section across the entire
-                workspace area instead of resizing the conversation panel — that
-                would fire ResizeObserver on the conversation's stick-to-bottom
-                scroll container and reset its position.
-                The `absolute inset-0` resolves to the outer `relative` wrapper
-                (the static `h-full` wrapper here is skipped), not the Panel
-                root. This depends on react-resizable-panels keeping the Panel
-                root at `position: static`; if a future version sets
-                `position: relative` there, this overlay (and the mirrored
-                `mode === "conversation"` overlay above) would clip to the
-                Panel's allocated slice and need to be lifted outside the panel
-                group. */}
-            <section
-              className={cn(
-                "flex h-full min-h-0 flex-col overflow-hidden",
-                filesMaximized && "absolute inset-0 z-30 bg-background"
-              )}
-              onPointerDownCapture={markFileActive}
-              onFocusCapture={markFileActive}
-              aria-hidden={mode === "conversation"}
-            >
-              <FileWorkspaceTabBar />
-              <div className="flex-1 min-h-0 overflow-hidden">
-                <FileWorkspacePanel />
-              </div>
-            </section>
-          </ResizablePanel>
-        </ResizablePanelGroup>
-      </div>
-      {!isConversations ? (
-        <div className="absolute inset-0 z-40 bg-background">
-          <WorkbenchRoutePage />
-        </div>
-      ) : null}
+            <FileWorkspaceTabBar />
+            <div className="flex-1 min-h-0 overflow-hidden">
+              <FileWorkspacePanel />
+            </div>
+          </section>
+        </ResizablePanel>
+      </ResizablePanelGroup>
     </div>
   )
 }
@@ -315,8 +299,8 @@ function MobileWorkspaceContent({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="relative h-full min-h-0 overflow-hidden">
-      <div className="h-full min-h-0" inert={!isConversations || undefined}>
-        {showConversation ? (
+      {isConversations ? (
+        showConversation ? (
           <section className="flex h-full min-h-0 flex-col overflow-hidden">
             <TabBar />
             <div className="relative flex-1 min-h-0 overflow-hidden">
@@ -330,13 +314,10 @@ function MobileWorkspaceContent({ children }: { children: React.ReactNode }) {
               <FileWorkspacePanel />
             </div>
           </section>
-        )}
-      </div>
-      {!isConversations ? (
-        <div className="absolute inset-0 z-40 bg-background">
-          <WorkbenchRoutePage />
-        </div>
-      ) : null}
+        )
+      ) : (
+        <WorkbenchRoutePage />
+      )}
     </div>
   )
 }

@@ -131,18 +131,10 @@ export function KnowledgeDocDetailDialog({
                   {doc.isShared ? "✓" : "—"}
                 </span>
               </div>
-              {doc.skillName && (
-                <div className="flex items-center gap-2">
-                  <span className="text-[0.75rem] text-muted-foreground">
-                    {t("kb.skillName")}:
-                  </span>
-                  <span className="text-[0.8125rem]">{doc.skillName}</span>
-                </div>
-              )}
               {doc.description && (
                 <div className="flex flex-col gap-0.5">
                   <span className="text-[0.75rem] text-muted-foreground">
-                    Description:
+                    {t("kb.description")}:
                   </span>
                   <span className="text-[0.8125rem]">{doc.description}</span>
                 </div>

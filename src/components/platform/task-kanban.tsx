@@ -11,11 +11,11 @@ import {
 } from "@dnd-kit/sortable"
 import { listTasks, updateTaskStatus } from "@/lib/platform/api"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
-import type { TaskInfo, TaskStatus } from "@/lib/platform/types"
+import type { TaskInfo, TaskPriority, TaskStatus } from "@/lib/platform/types"
 import {
   TASK_STATUS_LIST,
-  TASK_STATUS_LABELS,
   TASK_STATUS_COLORS,
+  TASK_PRIORITY_COLORS,
 } from "@/lib/platform/types"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -23,8 +23,49 @@ import { Card, CardContent } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { cn } from "@/lib/utils"
 
+/** Resolve task status label using i18n (same pattern as task-detail). */
+function resolveStatusLabel(t: (key: never) => string, status: string): string {
+  const keyMap: Record<string, string> = {
+    backlog: "task.status.backlog",
+    confirmed: "task.status.confirmed",
+    in_progress: "task.status.in_progress",
+    done: "task.status.done",
+    released: "task.status.released",
+  }
+  const key = keyMap[status]
+  return key ? (t(key as never) ?? status) : status
+}
+
+/** Resolve task type label using i18n. */
+function resolveTypeLabel(t: (key: never) => string, taskType: string): string {
+  const keyMap: Record<string, string> = {
+    bug: "task.taskTypeOptions.bug",
+    feature: "task.taskTypeOptions.feature",
+    task: "task.taskTypeOptions.task",
+    improvement: "task.taskTypeOptions.improvement",
+  }
+  const key = keyMap[taskType]
+  return key ? (t(key as never) ?? taskType) : taskType
+}
+
+/** Resolve task priority label using i18n. */
+function resolvePriorityLabel(
+  t: (key: never) => string,
+  priority: string
+): string {
+  const keyMap: Record<string, string> = {
+    low: "task.priorityOptions.low",
+    medium: "task.priorityOptions.medium",
+    high: "task.priorityOptions.high",
+    urgent: "task.priorityOptions.urgent",
+  }
+  const key = keyMap[priority]
+  return key ? (t(key as never) ?? priority) : priority
+}
+
 function TaskCard({ task }: { task: TaskInfo }) {
   const { setRoute } = useWorkbenchRoute()
+  const t = useTranslations("Platform")
   const {
     attributes,
     listeners,
@@ -48,7 +89,7 @@ function TaskCard({ task }: { task: TaskInfo }) {
       style={style}
       className={cn(
         "cursor-pointer transition-colors hover:bg-accent",
-        "touch-none select-none"
+        "touch-none select-none rounded-md"
       )}
       onClick={() => setRoute("task-detail", { taskId: task.id })}
     >
@@ -61,27 +102,24 @@ function TaskCard({ task }: { task: TaskInfo }) {
         >
           <GripVertical className="h-3.5 w-3.5" />
         </div>
-        {/* Clickable content area */}
+        {/* Clickable content area — no status badge before title */}
         <div className="flex flex-col gap-0.5 py-2 pr-2.5 min-w-0 flex-1">
-          <div className="flex items-center gap-1.5">
-            <Badge
-              variant="outline"
-              className={cn(
-                "h-5 shrink-0 px-1.5 text-[0.625rem]",
-                TASK_STATUS_COLORS[task.status as TaskStatus] ?? ""
-              )}
-            >
-              {TASK_STATUS_LABELS[task.status as TaskStatus] ?? task.status}
-            </Badge>
-            <span className="truncate text-[0.8125rem]">{task.title}</span>
-          </div>
+          <span className="truncate text-[0.8125rem] font-medium">
+            {task.title}
+          </span>
           <div className="flex items-center gap-1 text-[0.625rem] text-muted-foreground">
             <Badge variant="outline" className="text-[0.625rem]">
-              {task.taskType}
+              {resolveTypeLabel(t, task.taskType)}
             </Badge>
             {task.priority && (
-              <Badge variant="outline" className="text-[0.625rem]">
-                {task.priority}
+              <Badge
+                variant="outline"
+                className={cn(
+                  "text-[0.625rem]",
+                  TASK_PRIORITY_COLORS[task.priority as TaskPriority] ?? ""
+                )}
+              >
+                {resolvePriorityLabel(t, task.priority)}
               </Badge>
             )}
           </div>
@@ -111,7 +149,7 @@ function KanbanColumn({
           variant="outline"
           className={cn("px-2 text-[0.75rem]", TASK_STATUS_COLORS[status])}
         >
-          {TASK_STATUS_LABELS[status]}
+          {resolveStatusLabel(t, status)}
         </Badge>
         <span className="text-[0.75rem] text-muted-foreground">
           {taskCount}

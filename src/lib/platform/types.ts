@@ -96,6 +96,22 @@ export const TASK_STATUS_COLORS: Record<TaskStatus, string> = {
     "bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300",
 }
 
+export const TASK_PRIORITY_COLORS: Record<TaskPriority, string> = {
+  low: "bg-muted text-muted-foreground",
+  medium: "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300",
+  high: "bg-orange-100 text-orange-700 dark:bg-orange-900 dark:text-orange-300",
+  urgent: "bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300",
+}
+
+/** Filenames to exclude from KB display and context injection.
+ *  These are project-level metadata or VCS config that don't belong as KB docs.
+ *  The backend scanner already skips these; this filter ensures they are also
+ *  excluded from any stale DB rows that might still exist. */
+export const KB_SKIP_FILENAMES: ReadonlySet<string> = new Set([
+  "README.md",
+  ".gitignore",
+])
+
 export interface TaskInfo {
   id: number
   projectId: number
@@ -241,7 +257,7 @@ export const KB_DOC_TYPE_DIRS: Record<KbDocType, string> = {
   task_attachment: ".private/tasks",
 }
 
-/** KB doc type → display label (for i18n keys) */
+/** KB doc type → display label (English fallback) */
 export const KB_DOC_TYPE_LABELS: Record<KbDocType, string> = {
   tech_doc: "Tech Doc",
   template: "Template",
@@ -249,4 +265,14 @@ export const KB_DOC_TYPE_LABELS: Record<KbDocType, string> = {
   requirement: "Requirement",
   ai_intermediate: "AI Intermediate",
   task_attachment: "Task Attachment",
+}
+
+/** KB doc type → i18n key for localized label resolution */
+export const KB_DOC_TYPE_I18N_KEYS: Record<KbDocType, string> = {
+  tech_doc: "kb.typeTechDoc",
+  template: "kb.typeTemplate",
+  skill: "kb.typeSkill",
+  requirement: "kb.typeRequirement",
+  ai_intermediate: "kb.typeAiIntermediate",
+  task_attachment: "kb.typeTaskAttachment",
 }

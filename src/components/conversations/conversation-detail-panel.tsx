@@ -52,6 +52,7 @@ import {
   createConversation,
   openSettingsWindow,
 } from "@/lib/api"
+import { linkConversation } from "@/lib/platform/api"
 import {
   flushRetryDelayMs,
   forkSendBlockedByQueue,
@@ -206,6 +207,8 @@ const ConversationTabView = memo(function ConversationTabView({
     closeTab,
     confirmDraftAgent,
     setDraftAgentFromFallback,
+    pendingTaskLink,
+    clearPendingTaskLink,
   } = useTabContext()
   const { setSessionStats } = useSessionStats()
   const {
@@ -965,6 +968,23 @@ const ConversationTabView = memo(function ConversationTabView({
             )
           }
           clearMessageInputDraft(buildNewConversationDraftStorageKey())
+
+          // Auto-execute pending task link if user linked a task
+          // before sending (new-conversation Popover flow).
+          const pendingLink = pendingTaskLink.get(tabId)
+          if (pendingLink) {
+            try {
+              await linkConversation({
+                taskId: pendingLink.taskId,
+                conversationId: newConversationId,
+                role: pendingLink.role,
+              })
+            } catch (e) {
+              console.error("[ConversationTabView] auto link task:", e)
+            }
+            clearPendingTaskLink(tabId)
+          }
+
           refreshConversations()
 
           // Now that the row exists, kick off the actual prompt with the
@@ -1019,6 +1039,8 @@ const ConversationTabView = memo(function ConversationTabView({
       hasPersistedConversation,
       lifecycleSend,
       pinTab,
+      pendingTaskLink,
+      clearPendingTaskLink,
       refreshConversations,
       selectedAgent,
       setExternalId,
@@ -1484,6 +1506,7 @@ const ConversationTabView = memo(function ConversationTabView({
               draftStorageKey={draftStorageKey}
               isActive={isActive}
               showActiveFlow={showActiveFlow}
+              conversationId={effectiveConversationId}
               onAddFeedback={
                 feedback.featureEnabled ? feedback.openDialog : undefined
               }

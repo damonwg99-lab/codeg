@@ -34,7 +34,8 @@ fn resolve_agent_type(value: Option<&str>) -> AgentType {
         Some("openclaw") | Some("open_claw") => AgentType::OpenClaw,
         Some("cline") => AgentType::Cline,
         Some("hermes") => AgentType::Hermes,
-        _ => AgentType::Codex,
+        // "auto" or null → default to Claude Code (first in AGENT_DISPLAY_ORDER)
+        _ => AgentType::ClaudeCode,
     }
 }
 
@@ -225,7 +226,7 @@ pub async fn create_conversation_for_task_core(
         .folder_id
         .ok_or_else(|| AppCommandError::invalid_input("Project has no root folder"))?;
     let agent_type = resolve_agent_type(project.default_agent_type.as_deref());
-    let title = format!("{} #{}", task.title, task.id);
+    let title = task.title.clone();
 
     let conversation_id =
         create_conversation_core(conn, folder_id, agent_type.clone(), Some(title.clone())).await?;

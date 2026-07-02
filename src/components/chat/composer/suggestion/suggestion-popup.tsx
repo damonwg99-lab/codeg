@@ -38,13 +38,15 @@ const TAB_ORDER: readonly ReferenceKind[] = [
 ]
 
 // English fallbacks for the tab labels; the host injects localized ones. `skill`
-// is kept for type completeness (`ReferenceKind`) though it is not a shown tab.
+// and `context` are kept for type completeness (`ReferenceKind`) though they are
+// not shown tabs in the suggestion popup.
 const DEFAULT_TAB_LABELS: Record<ReferenceKind, string> = {
   agent: "Agents",
   file: "Files",
   session: "Sessions",
   commit: "Commits",
   skill: "Skills",
+  context: "Context",
 }
 
 // Commit-synchronous in the browser so the panel is positioned before paint (no

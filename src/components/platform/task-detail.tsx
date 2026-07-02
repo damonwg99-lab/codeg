@@ -24,17 +24,20 @@ import {
   uploadTaskAttachment,
   listKnowledgeDocs,
   deleteKnowledgeDoc,
+  unlinkConversation,
 } from "@/lib/platform/api"
+import { deleteConversation } from "@/lib/api"
 import type {
   TaskDetail as TaskDetailType,
   TaskConversationInfo,
   TaskStatus,
+  TaskPriority,
   KnowledgeDocInfo,
 } from "@/lib/platform/types"
 import {
   TASK_STATUS_LIST,
-  TASK_STATUS_LABELS,
   TASK_STATUS_COLORS,
+  TASK_PRIORITY_COLORS,
 } from "@/lib/platform/types"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -52,10 +55,15 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { usePlatform } from "@/contexts/platform-context"
-import { useTabContext } from "@/contexts/tab-context"
+import { useTabContext, makeConversationTabId } from "@/contexts/tab-context"
+import { useAppWorkspace } from "@/contexts/app-workspace-context"
+import { useWorkspaceContext } from "@/contexts/workspace-context"
+import { useActiveFolder } from "@/contexts/active-folder-context"
 import { ContextInjectPanel } from "@/components/platform/context-inject-panel"
-import type { ContextInjectPayload } from "@/components/platform/context-inject-panel-utils"
-import { KnowledgeDocDetailDialog } from "@/components/platform/knowledge-doc-detail-dialog"
+import {
+  optionToReferenceAttrs,
+  type ContextInjectPayload,
+} from "@/components/platform/context-inject-panel-utils"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -68,11 +76,91 @@ import {
 } from "@/components/ui/alert-dialog"
 import { cn } from "@/lib/utils"
 
+/** Resolve task status label using i18n.
+ *  next-intl requires static keys at compile time; this does an explicit lookup
+ *  with a raw-value fallback. */
+function resolveStatusLabel(t: (key: never) => string, status: string): string {
+  const keyMap: Record<string, string> = {
+    backlog: "task.status.backlog",
+    confirmed: "task.status.confirmed",
+    in_progress: "task.status.in_progress",
+    done: "task.status.done",
+    released: "task.status.released",
+  }
+  const key = keyMap[status]
+  return key ? (t(key as never) ?? status) : status
+}
+
+/** Resolve task type label using i18n. */
+function resolveTypeLabel(t: (key: never) => string, taskType: string): string {
+  const keyMap: Record<string, string> = {
+    bug: "task.taskTypeOptions.bug",
+    feature: "task.taskTypeOptions.feature",
+    task: "task.taskTypeOptions.task",
+    improvement: "task.taskTypeOptions.improvement",
+  }
+  const key = keyMap[taskType]
+  return key ? (t(key as never) ?? taskType) : taskType
+}
+
+/** Resolve task priority label using i18n. */
+function resolvePriorityLabel(
+  t: (key: never) => string,
+  priority: string
+): string {
+  const keyMap: Record<string, string> = {
+    low: "task.priorityOptions.low",
+    medium: "task.priorityOptions.medium",
+    high: "task.priorityOptions.high",
+    urgent: "task.priorityOptions.urgent",
+  }
+  const key = keyMap[priority]
+  return key ? (t(key as never) ?? priority) : priority
+}
+
+/** Compute a path relative to the folder root from a KB doc's filePath.
+ *  KB docs store filePath relative to the _knowledge/ directory (e.g. "docs/arch.md").
+ *  To open in the file panel via openFilePreview (which uses folderPath as root),
+ *  we need the path relative to the folder root: "_knowledge/docs/arch.md".
+ *  For custom kbLocalDir outside the folder root, we can't use openFilePreview
+ *  (it requires a relative path) — return null to signal this case. */
+function kbDocRelPath(
+  kbLocalDir: string | null,
+  rootDir: string,
+  folderPath: string | null,
+  filePath: string
+): string | null {
+  // Normalize everything to forward slashes for consistent comparison.
+  // On Windows, kbLocalDir and rootDir may contain backslashes from
+  // PathBuf::to_string_lossy(); filePath may also have backslashes
+  // from the scanner's strip_prefix + to_string_lossy.
+  const kbDir = (
+    kbLocalDir ?? `${rootDir.replace(/\\/g, "/")}/_knowledge`
+  ).replace(/\\/g, "/")
+  const fp = folderPath?.replace(/\\/g, "/") ?? ""
+  const normalizedFilePath = filePath.replace(/\\/g, "/")
+  if (!fp) return null // No folder context → can't compute relative path
+  if (kbDir.startsWith(fp + "/") || kbDir === fp + "/_knowledge") {
+    const kbRel = kbDir.slice(fp.length + 1) // "_knowledge"
+    return `${kbRel}/${normalizedFilePath}`
+  }
+  // KB dir is outside folder root — can't open via openFilePreview
+  // (it requires path relative to folderPath, rejects absolute paths)
+  return null
+}
+
 export function TaskDetail({ taskId }: { taskId: number }) {
   const t = useTranslations("Platform")
   const { setRoute, routeParams, openConversations } = useWorkbenchRoute()
-  const { activeProject, activeProjectRepos } = usePlatform()
-  const { openTab, setPendingInitialDraft } = useTabContext()
+  const { activeProject } = usePlatform()
+  const { openTab, setPendingInitialDraft, closeConversationTab } =
+    useTabContext()
+  const { conversations: allConversations, refreshConversations } =
+    useAppWorkspace()
+  const { openFilePreview } = useWorkspaceContext()
+  const { activeFolder } = useActiveFolder()
+  // Import makeConversationTabId to compute the tab's id for pendingInitialDraft
+  // (keyed by tabId instead of conversationId to prevent badge leaking across tabs)
   const [detail, setDetail] = useState<TaskDetailType | null>(null)
   const [conversations, setConversations] = useState<TaskConversationInfo[]>([])
   const [loading, setLoading] = useState(true)
@@ -83,12 +171,19 @@ export function TaskDetail({ taskId }: { taskId: number }) {
 
   // Attachments state
   const [attachments, setAttachments] = useState<KnowledgeDocInfo[]>([])
-  const [selectedAttachment, setSelectedAttachment] =
-    useState<KnowledgeDocInfo | null>(null)
   const [deleteAttachmentTarget, setDeleteAttachmentTarget] =
     useState<KnowledgeDocInfo | null>(null)
   const [deletingAttachment, setDeletingAttachment] = useState(false)
   const [uploadingAttachment, setUploadingAttachment] = useState(false)
+
+  // Delete conversation dialog state
+  const [deleteConvTarget, setDeleteConvTarget] =
+    useState<TaskConversationInfo | null>(null)
+  const [deletingConversation, setDeletingConversation] = useState(false)
+
+  // KB docs + skills state (lazy loaded when context panel opens)
+  const [kbDocs, setKbDocs] = useState<KnowledgeDocInfo[]>([])
+  const [kbLoading, setKbLoading] = useState(false)
 
   // Edit form state
   const [editTitle, setEditTitle] = useState("")
@@ -141,6 +236,30 @@ export function TaskDetail({ taskId }: { taskId: number }) {
     void loadAttachments()
   }, [loadAttachments])
 
+  // ─── Load KB docs when context panel opens ───
+  useEffect(() => {
+    if (!contextPanelOpen || !activeProject) return
+    let cancelled = false
+    setKbLoading(true)
+    async function loadKB() {
+      try {
+        const allDocs = await listKnowledgeDocs({
+          projectId: activeProject!.id,
+        })
+        if (!cancelled) {
+          setKbDocs(allDocs.filter((d) => d.docType !== "task_attachment"))
+          setKbLoading(false)
+        }
+      } catch {
+        if (!cancelled) setKbLoading(false)
+      }
+    }
+    void loadKB()
+    return () => {
+      cancelled = true
+    }
+  }, [contextPanelOpen, activeProject])
+
   // ─── Upload attachment ───
   const handleUploadAttachment = useCallback(
     async (file: File) => {
@@ -174,6 +293,46 @@ export function TaskDetail({ taskId }: { taskId: number }) {
     }
     setDeletingAttachment(false)
   }, [deleteAttachmentTarget, loadAttachments])
+
+  // ─── Delete linked conversation ───
+  // If the conversation still exists (not soft-deleted), delete it entirely
+  // (removing from sidebar and closing any tab). If it's already gone
+  // (soft-deleted but the link still remains), just unlink the stale link.
+  const handleDeleteConversation = useCallback(async () => {
+    if (!deleteConvTarget || !detail) return
+    setDeletingConversation(true)
+    try {
+      const conv = allConversations.find(
+        (c) => c.id === deleteConvTarget!.conversationId
+      )
+      if (conv) {
+        // Conversation is alive — delete it entirely (backend also cleans
+        // task-conversation links via delete_conversation_with_cleanup_core)
+        await deleteConversation(deleteConvTarget.conversationId)
+        closeConversationTab(conv.folder_id, conv.id, conv.agent_type)
+      } else {
+        // Conversation is already soft-deleted but the stale link remains.
+        // Just unlink the task-conversation association so it stops showing.
+        await unlinkConversation({
+          taskId: detail.task.id,
+          conversationId: deleteConvTarget.conversationId,
+        })
+      }
+      setDeleteConvTarget(null)
+      await refreshConversations()
+      const convs = await listTaskConversations(detail.task.id)
+      setConversations(convs)
+    } catch (e) {
+      console.error("Delete conversation failed:", e)
+    }
+    setDeletingConversation(false)
+  }, [
+    deleteConvTarget,
+    detail,
+    allConversations,
+    closeConversationTab,
+    refreshConversations,
+  ])
 
   const handleSave = useCallback(async () => {
     if (!detail) return
@@ -244,9 +403,18 @@ export function TaskDetail({ taskId }: { taskId: number }) {
           false,
           result.title
         )
-        // Pre-fill the new conversation's composer with the context prefix
-        if (payload.prefix) {
-          setPendingInitialDraft(result.conversationId, payload.prefix)
+        // Pre-fill the new conversation's composer with context badges
+        // (stored as JSON of ReferenceAttrs[] for badge insertion).
+        // Key by tabId instead of conversationId to prevent badge leaking
+        // across tabs — only the target tab's MessageInput will consume it.
+        if (payload.options.length > 0) {
+          const refs = payload.options.map(optionToReferenceAttrs)
+          const tabId = makeConversationTabId(
+            result.folderId,
+            result.agentType,
+            result.conversationId
+          )
+          setPendingInitialDraft(tabId, JSON.stringify(refs))
         }
       } catch (e) {
         console.error("Create task conversation failed:", e)
@@ -292,9 +460,25 @@ export function TaskDetail({ taskId }: { taskId: number }) {
   const { task, subTasks } = detail
   const projectId = Number(routeParams.projectId ?? task.projectId)
 
+  // Compute the KB directory path relative to the project root, for
+  // prefixing doc filePaths in inject context (filePath is stored relative
+  // to _knowledge dir; the agent needs project-root-relative paths).
+  const kbDirPrefix = (() => {
+    const kbDir = (
+      activeProject?.kbLocalDir ??
+      `${activeProject?.rootDir.replace(/\\/g, "/") ?? ""}/_knowledge`
+    ).replace(/\\/g, "/")
+    const fp = activeFolder?.path?.replace(/\\/g, "/") ?? ""
+    if (!fp) return "_knowledge" // fallback: standard dir name
+    if (kbDir.startsWith(fp + "/") || kbDir === fp + "/_knowledge") {
+      return kbDir.slice(fp.length + 1) // e.g., "_knowledge"
+    }
+    return "_knowledge" // fallback for external KB dirs
+  })()
+
   return (
     <ScrollArea className="h-full">
-      <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 p-4 sm:p-6">
+      <div className="flex flex-col gap-6 p-4 sm:p-6">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Button
@@ -361,7 +545,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                   )}
                   onClick={() => handleStatusChange(status)}
                 >
-                  {TASK_STATUS_LABELS[status]}
+                  {resolveStatusLabel(t, status)}
                 </Button>
               ))}
               {getNextStatus(task.status) && (
@@ -375,10 +559,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                 >
                   <ArrowRight className="mr-1 h-3.5 w-3.5" />
                   {t("task.moveTo", {
-                    status:
-                      TASK_STATUS_LABELS[
-                        getNextStatus(task.status)! as TaskStatus
-                      ],
+                    status: resolveStatusLabel(t, getNextStatus(task.status)!),
                   })}
                 </Button>
               )}
@@ -481,8 +662,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                       TASK_STATUS_COLORS[task.status as TaskStatus] ?? ""
                     )}
                   >
-                    {TASK_STATUS_LABELS[task.status as TaskStatus] ??
-                      task.status}
+                    {resolveStatusLabel(t, task.status)}
                   </Badge>
                 </div>
                 {task.description && (
@@ -497,14 +677,24 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                   <span className="text-[0.75rem] text-muted-foreground">
                     {t("task.taskType")}
                   </span>
-                  <Badge variant="outline">{task.taskType}</Badge>
+                  <Badge variant="outline">
+                    {resolveTypeLabel(t, task.taskType)}
+                  </Badge>
                 </div>
                 {task.priority && (
                   <div className="flex flex-col gap-1">
                     <span className="text-[0.75rem] text-muted-foreground">
                       {t("task.priority")}
                     </span>
-                    <Badge variant="outline">{task.priority}</Badge>
+                    <Badge
+                      variant="outline"
+                      className={cn(
+                        TASK_PRIORITY_COLORS[task.priority as TaskPriority] ??
+                          ""
+                      )}
+                    >
+                      {resolvePriorityLabel(t, task.priority)}
+                    </Badge>
                   </div>
                 )}
                 {task.assignee && (
@@ -576,7 +766,16 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                         variant="ghost"
                         size="icon"
                         className="h-6 w-6"
-                        onClick={() => setSelectedAttachment(att)}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          const relPath = kbDocRelPath(
+                            activeProject?.kbLocalDir ?? null,
+                            activeProject?.rootDir ?? "",
+                            activeFolder?.path ?? null,
+                            att.filePath
+                          )
+                          if (relPath) void openFilePreview(relPath)
+                        }}
                       >
                         <Eye className="h-3.5 w-3.5" />
                       </Button>
@@ -613,7 +812,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
               ) : (
                 <MessageSquare className="mr-1 h-3.5 w-3.5" />
               )}
-              New conversation
+              {t("task.newConversation")}
             </Button>
           </CardHeader>
           <CardContent>
@@ -623,29 +822,60 @@ export function TaskDetail({ taskId }: { taskId: number }) {
               </p>
             ) : (
               <div className="flex flex-col gap-2">
-                {conversations.map((conv) => (
-                  <div
-                    key={conv.id}
-                    className="flex items-center gap-2 rounded-md border p-2 cursor-pointer hover:bg-accent"
-                    onClick={() => openConversations()}
-                  >
-                    <MessageSquare className="h-4 w-4 text-muted-foreground" />
-                    <div className="flex flex-col gap-0.5 min-w-0">
-                      <span className="text-[0.875rem] font-medium truncate">
-                        Conversation #{conv.conversationId}
-                      </span>
-                      <span className="text-[0.75rem] text-muted-foreground">
-                        Role: {conv.conversationRole}
-                      </span>
-                    </div>
-                    <Badge
-                      variant="outline"
-                      className="text-[0.625rem] shrink-0"
+                {conversations.map((conv) => {
+                  // Look up actual conversation title from sidebar data
+                  const convSummary = allConversations.find(
+                    (c) => c.id === conv.conversationId
+                  )
+                  const convTitle =
+                    convSummary?.title ||
+                    conv.summary ||
+                    t("task.untitledConversation")
+                  return (
+                    <div
+                      key={conv.id}
+                      className="flex items-center gap-2 rounded-md border p-2 hover:bg-accent/50"
                     >
-                      {conv.conversationRole}
-                    </Badge>
-                  </div>
-                ))}
+                      <MessageSquare className="h-4 w-4 shrink-0 text-muted-foreground" />
+                      <span className="text-[0.875rem] font-medium truncate min-w-0">
+                        {convTitle}
+                      </span>
+                      <div className="flex items-center gap-1 shrink-0 ml-auto">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-6 text-[0.625rem] px-2"
+                          onClick={() => {
+                            if (convSummary) {
+                              openTab(
+                                convSummary.folder_id,
+                                convSummary.id,
+                                convSummary.agent_type
+                              )
+                              // Must switch to conversations view — openTab
+                              // only changes the active tab, but the workbench
+                              // route stays on the platform page unless we
+                              // explicitly navigate to conversations.
+                              openConversations()
+                            } else {
+                              openConversations()
+                            }
+                          }}
+                        >
+                          {t("task.continueConversation")}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-6 w-6 text-muted-foreground hover:text-destructive"
+                          onClick={() => setDeleteConvTarget(conv)}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  )
+                })}
               </div>
             )}
           </CardContent>
@@ -679,8 +909,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                         TASK_STATUS_COLORS[sub.status as TaskStatus] ?? ""
                       )}
                     >
-                      {TASK_STATUS_LABELS[sub.status as TaskStatus] ??
-                        sub.status}
+                      {resolveStatusLabel(t, sub.status)}
                     </Badge>
                     <span className="text-[0.875rem] truncate">
                       {sub.title}
@@ -696,29 +925,14 @@ export function TaskDetail({ taskId }: { taskId: number }) {
           open={contextPanelOpen}
           onOpenChange={setContextPanelOpen}
           task={detail.task}
-          project={activeProject}
-          repos={activeProjectRepos}
           conversations={conversations}
+          kbDocs={kbDocs}
+          attachments={attachments}
+          kbLoading={kbLoading}
           submitting={creatingConversation}
+          kbDirPrefix={kbDirPrefix}
           onConfirm={handleCreateConversation}
         />
-
-        {/* ─── Attachment Detail Dialog ─── */}
-        {selectedAttachment && (
-          <KnowledgeDocDetailDialog
-            doc={selectedAttachment}
-            projectId={projectId}
-            open={selectedAttachment !== null}
-            onClose={() => setSelectedAttachment(null)}
-            onDeleted={() => {
-              setSelectedAttachment(null)
-              void loadAttachments()
-            }}
-            onUpdated={() => {
-              void loadAttachments()
-            }}
-          />
-        )}
 
         {/* ─── Delete Attachment Confirm ─── */}
         <AlertDialog
@@ -744,6 +958,38 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                   <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
                 ) : null}
                 {t("kb.deleteDoc")}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        {/* ─── Delete Conversation Confirm ─── */}
+        <AlertDialog
+          open={deleteConvTarget !== null}
+          onOpenChange={(open) => {
+            if (!open) setDeleteConvTarget(null)
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {t("task.deleteConversation")}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {t("task.deleteConversationConfirm")}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>{t("project.cancel")}</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={() => void handleDeleteConversation()}
+                disabled={deletingConversation}
+                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              >
+                {deletingConversation ? (
+                  <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                ) : null}
+                {t("task.deleteConversation")}
               </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>

@@ -10,29 +10,27 @@ import {
   Trash2,
   FolderOpen,
   Search,
-  Wrench,
   FileText,
 } from "lucide-react"
 import {
   scanKnowledgeRepo,
   listKnowledgeDocs,
   searchKnowledgeDocs,
-  listSkills,
   initKnowledgeRepo,
   deleteKnowledgeDoc,
 } from "@/lib/platform/api"
 import type {
   KnowledgeDocInfo,
   ScanResultInfo,
-  SkillInfo,
   KbDocType,
   ProjectInfo,
 } from "@/lib/platform/types"
-import { KB_DOC_TYPE_LABELS } from "@/lib/platform/types"
+import { KB_DOC_TYPE_LABELS, KB_SKIP_FILENAMES } from "@/lib/platform/types"
+import { useWorkspaceContext } from "@/contexts/workspace-context"
+import { useActiveFolder } from "@/contexts/active-folder-context"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
   Select,
@@ -52,9 +50,59 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
-import { KnowledgeDocDetailDialog } from "./knowledge-doc-detail-dialog"
 
 type DocTypeFilter = KbDocType | "all"
+
+/** Doc types shown in the KB manager filter dropdown (excludes task_attachment) */
+const FILTER_DOC_TYPES: KbDocType[] = [
+  "tech_doc",
+  "template",
+  "skill",
+  "requirement",
+  "ai_intermediate",
+]
+
+/** Resolve KB doc type label using i18n. Each key is explicitly mapped
+ *  to satisfy next-intl's strict type-safe `t()` function. */
+function resolveKbDocTypeLabel(
+  t: (key: never) => string,
+  type: KbDocType
+): string {
+  const keyMap: Record<KbDocType, string> = {
+    tech_doc: "kb.typeTechDoc",
+    template: "kb.typeTemplate",
+    skill: "kb.typeSkill",
+    requirement: "kb.typeRequirement",
+    ai_intermediate: "kb.typeAiIntermediate",
+    task_attachment: "kb.typeTaskAttachment",
+  }
+  // Cast the resolved key to bypass next-intl's strict NamespacedMessageKeys
+  // — the keys are guaranteed to exist in the message files.
+  return t(keyMap[type] as never) ?? KB_DOC_TYPE_LABELS[type]
+}
+
+/** Compute KB doc path relative to the folder root for openFilePreview.
+ *  KB docs store filePath relative to the _knowledge/ directory.
+ *  Returns null when the path can't be resolved (no folder context or
+ *  KB dir outside project root). */
+function kbDocRelPath(
+  kbLocalDir: string | null,
+  rootDir: string,
+  folderPath: string | null,
+  filePath: string
+): string | null {
+  const kbDir = (
+    kbLocalDir ?? `${rootDir.replace(/\\/g, "/")}/_knowledge`
+  ).replace(/\\/g, "/")
+  const fp = folderPath?.replace(/\\/g, "/") ?? ""
+  const normFilePath = filePath.replace(/\\/g, "/")
+  if (!fp) return null
+  if (kbDir.startsWith(fp + "/") || kbDir === fp + "/_knowledge") {
+    const kbRel = kbDir.slice(fp.length + 1)
+    return `${kbRel}/${normFilePath}`
+  }
+  return null
+}
 
 export function KnowledgeManager({
   projectId,
@@ -64,16 +112,16 @@ export function KnowledgeManager({
   project: ProjectInfo
 }) {
   const t = useTranslations("Platform")
+  const { openFilePreview } = useWorkspaceContext()
+  const { activeFolder } = useActiveFolder()
 
   // ─── State ───
   const [docs, setDocs] = useState<KnowledgeDocInfo[]>([])
-  const [skills, setSkills] = useState<SkillInfo[]>([])
   const [loading, setLoading] = useState(true)
   const [scanning, setScanning] = useState(false)
   const [scanResult, setScanResult] = useState<ScanResultInfo | null>(null)
   const [searchQuery, setSearchQuery] = useState("")
   const [docTypeFilter, setDocTypeFilter] = useState<DocTypeFilter>("all")
-  const [selectedDoc, setSelectedDoc] = useState<KnowledgeDocInfo | null>(null)
   const [uploadOpen, setUploadOpen] = useState(false)
 
   // Delete dialog state
@@ -92,25 +140,14 @@ export function KnowledgeManager({
     }
   }, [projectId])
 
-  const loadSkills = useCallback(async () => {
-    try {
-      const result = await listSkills(projectId)
-      setSkills(result)
-    } catch (e) {
-      console.error("Failed to load skills:", e)
-    }
-  }, [projectId])
-
   useEffect(() => {
     let cancelled = false
     async function load() {
       setLoading(true)
       try {
         const docList = await listKnowledgeDocs({ projectId })
-        const skillList = await listSkills(projectId)
         if (!cancelled) {
           setDocs(docList)
-          setSkills(skillList)
           setLoading(false)
         }
       } catch {
@@ -130,24 +167,22 @@ export function KnowledgeManager({
       const result = await scanKnowledgeRepo(projectId)
       setScanResult(result)
       await loadDocs()
-      await loadSkills()
     } catch (e) {
       console.error("Scan failed:", e)
       setScanResult(null)
     }
     setScanning(false)
-  }, [projectId, loadDocs, loadSkills])
+  }, [projectId, loadDocs])
 
   // ─── Init KB ───
   const handleInit = useCallback(async () => {
     try {
       await initKnowledgeRepo(projectId)
       await loadDocs()
-      await loadSkills()
     } catch (e) {
       console.error("Init failed:", e)
     }
-  }, [projectId, loadDocs, loadSkills])
+  }, [projectId, loadDocs])
 
   // ─── Delete ───
   const handleDelete = useCallback(async () => {
@@ -183,16 +218,30 @@ export function KnowledgeManager({
   // ─── Filter ───
   const filteredDocs =
     docTypeFilter === "all"
-      ? docs
-      : docs.filter((d) => d.docType === docTypeFilter)
+      ? docs.filter(
+          (d) =>
+            !KB_SKIP_FILENAMES.has(
+              d.filePath.replace(/\\/g, "/").split("/").pop() ?? ""
+            )
+        )
+      : docs.filter(
+          (d) =>
+            d.docType === docTypeFilter &&
+            !KB_SKIP_FILENAMES.has(
+              d.filePath.replace(/\\/g, "/").split("/").pop() ?? ""
+            )
+        )
 
   // ─── Doc counts by type ───
-  const docCounts = docs.reduce<Record<string, number>>((acc, doc) => {
+  const docCounts = filteredDocs.reduce<Record<string, number>>((acc, doc) => {
     acc[doc.docType] = (acc[doc.docType] ?? 0) + 1
     return acc
   }, {})
 
-  const kbPath = project.kbLocalDir ?? `${project.rootDir}/_knowledge`
+  // Normalize to forward slashes for consistent display and comparison
+  const kbPath = (
+    project.kbLocalDir ?? `${project.rootDir.replace(/\\/g, "/")}/_knowledge`
+  ).replace(/\\/g, "/")
 
   if (loading) {
     return (
@@ -263,7 +312,7 @@ export function KnowledgeManager({
                     variant="outline"
                     className="text-[0.625rem]"
                   >
-                    {count} {KB_DOC_TYPE_LABELS[type]}
+                    {count} {resolveKbDocTypeLabel(t, type)}
                   </Badge>
                 )
               )}
@@ -272,210 +321,111 @@ export function KnowledgeManager({
         </CardContent>
       </Card>
 
-      {/* ── Content Tabs ── */}
-      <Tabs defaultValue="documents">
-        <TabsList>
-          <TabsTrigger value="documents">
-            <FileText className="mr-1 h-3.5 w-3.5" />
-            {t("kb.documents")}
-          </TabsTrigger>
-          <TabsTrigger value="skills">
-            <Wrench className="mr-1 h-3.5 w-3.5" />
-            {t("kb.skills")}
-          </TabsTrigger>
-        </TabsList>
-
-        {/* ── Documents Tab ── */}
-        <TabsContent value="documents">
-          <Card>
-            <CardHeader className="pb-2">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2 flex-1 min-w-0">
-                  <div className="relative flex-1 max-w-[200px]">
-                    <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                    <Input
-                      className="h-7 pl-7 text-[0.8125rem]"
-                      placeholder={t("kb.search")}
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") void handleSearch()
-                      }}
-                    />
-                  </div>
-                  <Select
-                    value={docTypeFilter}
-                    onValueChange={(v) => setDocTypeFilter(v as DocTypeFilter)}
-                  >
-                    <SelectTrigger className="h-7 w-[140px] text-[0.8125rem]">
-                      <SelectValue placeholder={t("kb.filterType")} />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">{t("kb.allTypes")}</SelectItem>
-                      {(
-                        Object.entries(KB_DOC_TYPE_LABELS) as [
-                          KbDocType,
-                          string,
-                        ][]
-                      ).map(([type, label]) => (
-                        <SelectItem key={type} value={type}>
-                          {label}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setUploadOpen(true)}
-                >
-                  <Upload className="mr-1 h-3.5 w-3.5" />
-                  {t("kb.upload")}
-                </Button>
+      {/* ── Documents Card ── */}
+      <Card>
+        <CardHeader className="pb-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 flex-1 min-w-0">
+              <div className="relative flex-1 max-w-[200px]">
+                <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  className="h-7 pl-7 text-[0.8125rem]"
+                  placeholder={t("kb.search")}
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void handleSearch()
+                  }}
+                />
               </div>
-            </CardHeader>
-            <CardContent>
-              {filteredDocs.length === 0 ? (
-                <p className="text-[0.8125rem] text-muted-foreground py-4 text-center">
-                  {t("kb.noDocs")}
-                </p>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-[0.8125rem]">
-                    <thead>
-                      <tr className="border-b text-muted-foreground">
-                        <th className="py-1.5 pr-2 text-left font-medium">
-                          {t("kb.docTitle")}
-                        </th>
-                        <th className="py-1.5 pr-2 text-left font-medium">
-                          {t("kb.docType")}
-                        </th>
-                        <th className="py-1.5 pr-2 text-left font-medium">
-                          {t("kb.docShared")}
-                        </th>
-                        <th className="py-1.5 pr-2 text-left font-medium">
-                          {t("kb.docPath")}
-                        </th>
-                        <th className="py-1.5 text-right font-medium">
-                          {t("kb.docActions")}
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredDocs.map((doc) => (
-                        <tr
-                          key={doc.id}
-                          className="border-b hover:bg-accent/50 cursor-pointer"
-                          onClick={() => setSelectedDoc(doc)}
-                        >
-                          <td className="py-1.5 pr-2 font-medium truncate max-w-[200px]">
-                            {doc.title}
-                          </td>
-                          <td className="py-1.5 pr-2">
-                            <Badge
-                              variant="outline"
-                              className="text-[0.625rem]"
-                            >
-                              {KB_DOC_TYPE_LABELS[doc.docType as KbDocType] ??
-                                doc.docType}
-                            </Badge>
-                          </td>
-                          <td className="py-1.5 pr-2">
-                            {doc.isShared ? "✓" : "—"}
-                          </td>
-                          <td className="py-1.5 pr-2 text-muted-foreground truncate max-w-[200px]">
-                            {doc.filePath}
-                          </td>
-                          <td className="py-1.5 text-right">
-                            <div className="flex items-center justify-end gap-1">
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-6 w-6"
-                                onClick={(e) => {
-                                  e.stopPropagation()
-                                  setSelectedDoc(doc)
-                                }}
-                              >
-                                <Eye className="h-3.5 w-3.5" />
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-6 w-6 text-muted-foreground hover:text-destructive"
-                                onClick={(e) => {
-                                  e.stopPropagation()
-                                  setDeleteTarget(doc)
-                                }}
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </Button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </TabsContent>
-
-        {/* ── Skills Tab ── */}
-        <TabsContent value="skills">
-          <Card>
-            <CardContent className="pt-4">
-              {skills.length === 0 ? (
-                <p className="text-[0.8125rem] text-muted-foreground py-4 text-center">
-                  {t("kb.noSkills")}
-                </p>
-              ) : (
-                <div className="flex flex-col gap-3">
-                  {skills.map((skill) => (
-                    <div
-                      key={skill.name}
-                      className="rounded-md border p-3 flex flex-col gap-1.5"
-                    >
-                      <div className="flex items-center gap-2">
-                        <Wrench className="h-4 w-4 text-muted-foreground" />
-                        <span className="text-[0.875rem] font-medium">
-                          {skill.name}
-                        </span>
-                      </div>
-                      {skill.triggerTaskType && (
-                        <span className="text-[0.75rem] text-muted-foreground">
-                          {t("kb.skillTrigger", {
-                            type: skill.triggerTaskType,
-                          })}
-                        </span>
-                      )}
-                      {skill.inject.length > 0 && (
-                        <span className="text-[0.75rem] text-muted-foreground">
-                          {t("kb.skillInject", {
-                            items: skill.inject.join(", "),
-                          })}
-                        </span>
-                      )}
-                      {skill.description && (
-                        <span className="text-[0.8125rem]">
-                          {skill.description}
-                        </span>
-                      )}
-                      {skill.agentHint && (
-                        <span className="text-[0.75rem] text-muted-foreground italic">
-                          💡 {skill.agentHint}
-                        </span>
-                      )}
-                    </div>
+              <Select
+                value={docTypeFilter}
+                onValueChange={(v) => setDocTypeFilter(v as DocTypeFilter)}
+              >
+                <SelectTrigger className="h-7 w-[140px] text-[0.8125rem]">
+                  <SelectValue placeholder={t("kb.filterType")} />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">{t("kb.allTypes")}</SelectItem>
+                  {FILTER_DOC_TYPES.map((type) => (
+                    <SelectItem key={type} value={type}>
+                      {resolveKbDocTypeLabel(t, type)}
+                    </SelectItem>
                   ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setUploadOpen(true)}
+            >
+              <Upload className="mr-1 h-3.5 w-3.5" />
+              {t("kb.upload")}
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent>
+          {filteredDocs.length === 0 ? (
+            <p className="text-[0.75rem] text-muted-foreground">
+              {t("kb.noDocs")}
+            </p>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {filteredDocs.map((doc) => (
+                <div
+                  key={doc.id}
+                  className="flex items-center gap-2 rounded-md border p-2"
+                >
+                  <FileText className="h-4 w-4 text-muted-foreground" />
+                  <div className="flex flex-col gap-0.5 min-w-0">
+                    <span className="text-[0.875rem] font-medium truncate">
+                      {doc.title}
+                    </span>
+                    <span className="text-[0.75rem] text-muted-foreground truncate">
+                      {doc.filePath}
+                    </span>
+                  </div>
+                  <Badge
+                    variant="outline"
+                    className="text-[0.625rem] shrink-0 ml-1"
+                  >
+                    {resolveKbDocTypeLabel(t, doc.docType as KbDocType) ??
+                      doc.docType}
+                  </Badge>
+                  <div className="flex items-center gap-1 shrink-0 ml-auto">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        const relPath = kbDocRelPath(
+                          project.kbLocalDir,
+                          project.rootDir,
+                          activeFolder?.path ?? null,
+                          doc.filePath
+                        )
+                        if (relPath) void openFilePreview(relPath)
+                      }}
+                    >
+                      <Eye className="h-3.5 w-3.5" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6 text-muted-foreground hover:text-destructive"
+                      onClick={() => setDeleteTarget(doc)}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
                 </div>
-              )}
-            </CardContent>
-          </Card>
-        </TabsContent>
-      </Tabs>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       {/* ── Upload Dialog ── */}
       <KnowledgeUploadDialog
@@ -487,23 +437,6 @@ export function KnowledgeManager({
           void loadDocs()
         }}
       />
-
-      {/* ── Doc Detail Dialog ── */}
-      {selectedDoc && (
-        <KnowledgeDocDetailDialog
-          doc={selectedDoc}
-          projectId={projectId}
-          open={selectedDoc !== null}
-          onClose={() => setSelectedDoc(null)}
-          onDeleted={() => {
-            setSelectedDoc(null)
-            void loadDocs()
-          }}
-          onUpdated={() => {
-            void loadDocs()
-          }}
-        />
-      )}
 
       {/* ── Delete Confirm ── */}
       <AlertDialog

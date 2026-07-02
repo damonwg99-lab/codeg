@@ -22,6 +22,10 @@ const SKIP_DIRS: &[&str] = &[
     ".turbo",
 ];
 
+/// Files to skip during KB scanning — project-level metadata or VCS
+/// configuration that should not appear as knowledge docs.
+const SKIP_FILES: &[&str] = &["README.md", ".gitignore"];
+
 /// Maximum recursion depth for KB scanning.
 const MAX_DEPTH: u32 = 10;
 
@@ -228,6 +232,15 @@ fn scan_recursive(
 
             scan_recursive(&path, root, depth + 1, results)?;
         } else if path.is_file() {
+            // Skip well-known project-level metadata files
+            let file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if SKIP_FILES.contains(&file_name.as_str()) {
+                continue;
+            }
+
             // Process file: compute relative path from root
             let rel_path = path.strip_prefix(&canon_root).map_err(|_| {
                 AppCommandError::permission_denied("File path cannot be resolved relative to KB root")

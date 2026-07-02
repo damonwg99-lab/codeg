@@ -1,7 +1,13 @@
 import type { AgentType } from "@/lib/types"
 
-/** The five kinds of inline reference the composer can embed. */
-export type ReferenceKind = "file" | "agent" | "session" | "commit" | "skill"
+/** The kinds of inline reference the composer can embed. */
+export type ReferenceKind =
+  | "file"
+  | "agent"
+  | "session"
+  | "commit"
+  | "skill"
+  | "context"
 
 export const REFERENCE_KINDS: readonly ReferenceKind[] = [
   "file",
@@ -9,6 +15,7 @@ export const REFERENCE_KINDS: readonly ReferenceKind[] = [
   "session",
   "commit",
   "skill",
+  "context",
 ]
 
 /**
@@ -56,6 +63,21 @@ export interface ReferenceMeta {
    * `/` when absent.
    */
   invocationPrefix?: "/" | "$"
+  /**
+   * context: inject option group ("basic" | "conversations" | "kb_docs" |
+   * "attachments"). Read by `referenceToMarkdown` for context badge serialization.
+   */
+  injectGroup?: string
+  /**
+   * context: the full prefix text to serialize on send (e.g.
+   * "Task: Fix login bug\nDescription: …"). When present, `referenceToMarkdown`
+   * emits this verbatim; when absent, it falls back to `[label]`.
+   */
+  injectPrefix?: string
+  /** context: file path for kb_docs/attachments (carried for injectedDocsJson). */
+  injectDocPath?: string
+  /** context: KB doc ID for kb_docs/attachments (carried for injectedDocsJson). */
+  injectDocId?: number
 }
 
 /**

@@ -1,7 +1,7 @@
 //! Knowledge base commands — _core functions shared by Tauri and web handlers,
 //! plus Tauri-specific wrappers (desktop mode only).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::app_error::AppCommandError;
 use crate::db::service::{platform_knowledge_doc_service, platform_project_service};
@@ -29,7 +29,11 @@ async fn ensure_kb_dir(db: &AppDatabase, project_id: i32) -> Result<String, AppC
     let kb_dir = project
         .kb_local_dir
         .clone()
-        .unwrap_or_else(|| format!("{}/{}", project.root_dir, KNOWLEDGE_DIR_NAME));
+        .unwrap_or_else(|| {
+            let mut buf = PathBuf::from(&project.root_dir);
+            buf.push(KNOWLEDGE_DIR_NAME);
+            buf.to_string_lossy().to_string()
+        });
 
     // If the directory doesn't exist on disk, auto-init
     if !Path::new(&kb_dir).is_dir() {
@@ -374,7 +378,11 @@ pub async fn read_kb_doc_content_core(
     let kb_dir = project
         .kb_local_dir
         .clone()
-        .unwrap_or_else(|| format!("{}/{}", project.root_dir, KNOWLEDGE_DIR_NAME));
+        .unwrap_or_else(|| {
+            let mut buf = PathBuf::from(&project.root_dir);
+            buf.push(KNOWLEDGE_DIR_NAME);
+            buf.to_string_lossy().to_string()
+        });
 
     let abs_path = Path::new(&kb_dir).join(&doc.file_path);
 

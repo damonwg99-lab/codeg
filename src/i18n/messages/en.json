@@ -2077,7 +2077,8 @@
         "mentionGroupAgent": "Agents",
         "mentionGroupSession": "Sessions",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Skills"
+        "mentionGroupSkill": "Skills",
+        "mentionGroupContext": "Context"
       },
       "messageQueue": {
         "addToQueue": "Queue message",
@@ -3452,6 +3453,17 @@
       "noConversations": "No linked conversations",
       "noSubTasks": "No sub-tasks",
       "openConversation": "Open conversation",
+      "untitledConversation": "Untitled conversation",
+      "continueConversation": "Continue",
+      "deleteConversation": "Delete conversation",
+      "deleteConversationConfirm": "This conversation will be permanently removed from the sidebar and cannot be recovered. Are you sure?",
+      "conversationRoleLabels": {
+        "implementation": "Implementation",
+        "test": "Test",
+        "review": "Review",
+        "analysis": "Analysis",
+        "discussion": "Discussion"
+      },
       "moveTo": "Move to {status}",
       "noTasks": "No tasks",
       "taskCount": "{count} task(s)",
@@ -3483,6 +3495,7 @@
     },
     "kb": {
       "path": "KB Path",
+      "description": "Description",
       "docCount": "{count} docs",
       "refreshIndex": "Refresh Index",
       "initKB": "Init KB",
@@ -3491,7 +3504,6 @@
       "initSuccess": "KB initialized",
       "scanSuccess": "Index refreshed: {new} new, {updated} updated, {deleted} deleted",
       "documents": "Documents",
-      "skills": "Skills",
       "search": "Search docs…",
       "filterType": "Filter by type",
       "allTypes": "All types",
@@ -3520,12 +3532,6 @@
       "contentLoading": "Loading content…",
       "contentFailed": "Failed to load content",
       "noDocs": "No documents in KB",
-      "noSkills": "No skills discovered",
-      "skillName": "Skill",
-      "skillTrigger": "Trigger: {type}",
-      "skillInject": "Inject: {items}",
-      "skillDescription": "Description",
-      "skillAgentHint": "Agent hint",
       "attachments": "Attachments",
       "taskAttachments": "Task Attachments",
       "addAttachment": "Add attachment",
@@ -3534,7 +3540,58 @@
       "noAttachments": "No attachments",
       "stagedFiles": "Staged files",
       "removeFile": "Remove",
-      "viewAttachment": "View"
+      "viewAttachment": "View",
+      "typeTechDoc": "Tech Doc",
+      "typeTemplate": "Template",
+      "typeSkill": "Skill",
+      "typeRequirement": "Requirement",
+      "typeAiIntermediate": "AI Intermediate",
+      "typeTaskAttachment": "Task Attachment"
+    },
+    "inject": {
+      "groupLabel": {
+        "basic": "Task Info",
+        "conversations": "Linked Conversations",
+        "kb_docs": "Knowledge Docs",
+        "attachments": "Attachments"
+      },
+      "searchDocs": "Search docs…",
+      "noDocs": "No KB docs available",
+      "noAttachments": "No attachments for this task",
+      "injectContext": "Inject context",
+      "injecting": "Injecting…",
+      "createConversation": "Create Conversation",
+      "selectContext": "Select the context to attach.",
+      "needConversation": "Send a message first to create a conversation, then you can link a task.",
+      "linkTask": "Link a task",
+      "willAutoLink": "Will auto-link when conversation is created",
+      "noTasksFound": "No tasks found",
+      "cancel": "Cancel",
+      "unlink": "Unlink",
+      "searchTasks": "Search tasks…",
+      "loading": "Loading…",
+      "optionLabel": {
+        "taskDescription": "Task description",
+        "conversation": "Conversation #{id}",
+        "knowledgeDocFallback": "Knowledge doc",
+        "taskAttachmentFallback": "Task attachment"
+      },
+      "optionDesc": {
+        "taskDescription": "Include the task title and description inline."
+      },
+      "taskTypeLabel": {
+        "bug": "Bug",
+        "feature": "Feature",
+        "task": "Task",
+        "improvement": "Improvement"
+      },
+      "taskStatusLabel": {
+        "backlog": "Backlog",
+        "confirmed": "Confirmed",
+        "in_progress": "In Progress",
+        "done": "Done",
+        "released": "Released"
+      }
     }
   },
   "LogsSettings": {

@@ -7,7 +7,6 @@ use crate::models::KbInitResult;
 const KB_SUB_DIRS: &[&str] = &[
     "docs",
     "templates",
-    "skills",
     "requirements",
     ".private",
 ];
@@ -25,7 +24,7 @@ const GITIGNORE_CONTENT: &str = "# 私有区域 — 不纳入 Git 版本管理\n
 const README_CONTENT: &str = "\
 # 📚 项目知识库
 
-本目录存放项目知识文档、模板和技能定义，供 AI 代理在对话中检索和引用。
+本目录存放项目知识文档和模板，供 AI 代理在对话中检索和引用。
 
 ## 目录结构
 
@@ -33,7 +32,6 @@ const README_CONTENT: &str = "\
 |------|------|------|------|
 | `docs/` | tech_doc | 技术文档（架构设计、API 规范、技术方案等） | ✅ |
 | `templates/` | template | 模板文档（PRD 模板、代码模板、提示词模板） | ✅ |
-| `skills/` | skill | AI 技能定义（每个技能是一个子目录，含 `skill.yaml`） | ✅ |
 | `requirements/` | requirement | 需求文档（产品需求、用户故事、功能规格） | ✅ |
 | `.private/ai-intermediate/` | ai_intermediate | AI 中间产物（代理生成的草稿、分析报告等） | ❌ 私有 |
 | `.private/tasks/` | task_attachment | 任务附件（截图、日志、数据文件，绑定到特定任务） | ❌ 私有 |
@@ -41,34 +39,6 @@ const README_CONTENT: &str = "\
 
 > **共享文档**不在 `.private/` 下，可被 Scanner 扫描后供所有任务检索引用。
 > **私有文档**仅在 `.private/` 下，仅对创建者或特定任务可见。
-
-## 技能定义格式
-
-每个技能是 `skills/` 下的一个**子目录**，核心文件为 `skill.yaml`：
-
-```
-skills/
-  debug-assist/
-    skill.yaml        ← 技能元数据
-    debug-steps.md    ← 技能引用的文档（可选）
-```
-
-`skill.yaml` 示例：
-
-```yaml
-name: debug-assist                       # 技能名称（省略则用目录名）
-description: 辅助调试，注入调试上下文       # 技能描述
-trigger:
-  task_type: bug                          # 触发条件：任务类型为 bug 时推荐此技能
-inject:                                   # 注入列表：创建对话时自动注入这些文档
-  - docs/architecture/product-arch.md
-  - templates/prd-template.md
-agent_hint: \"请根据注入的上下文协助定位问题\"  # 给代理的行为提示
-```
-
-- `trigger.task_type` — 当任务的 taskType 匹配时，系统推荐此技能
-- `inject` — 对话创建时自动注入的文档路径列表
-- `agent_hint` — 传递给代理的提示信息
 
 ## 文档元数据
 
@@ -185,7 +155,6 @@ mod tests {
         assert!(result.readme_created);
         assert!(result.sub_dirs.contains(&"docs".to_string()));
         assert!(result.sub_dirs.contains(&"templates".to_string()));
-        assert!(result.sub_dirs.contains(&"skills".to_string()));
         assert!(result.sub_dirs.contains(&"requirements".to_string()));
         assert!(result.sub_dirs.contains(&".private".to_string()));
 
@@ -220,7 +189,7 @@ mod tests {
 
         // Missing subdirs should be created
         assert!(kb_path.join("templates").is_dir());
-        assert!(kb_path.join("skills").is_dir());
+        assert!(kb_path.join("requirements").is_dir());
 
         // README should be created since it didn't exist
         assert!(result.readme_created);

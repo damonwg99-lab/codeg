@@ -1,15 +1,14 @@
 "use client"
 
 import { useMemo, useState } from "react"
-import { FileText, MessageSquare, ClipboardList } from "lucide-react"
+import { ClipboardList } from "lucide-react"
+import { useTranslations } from "next-intl"
 import type {
-  ProjectInfo,
-  ProjectRepoInfo,
+  KnowledgeDocInfo,
   TaskConversationInfo,
   TaskInfo,
 } from "@/lib/platform/types"
 import { Button } from "@/components/ui/button"
-import { Checkbox } from "@/components/ui/checkbox"
 import {
   Dialog,
   DialogContent,
@@ -18,15 +17,15 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { Badge } from "@/components/ui/badge"
-import { cn } from "@/lib/utils"
+import { InjectOptionList } from "@/components/platform/inject-option-list"
 import {
   buildInjectOptions,
   buildPayloadFromOptions,
-  optionGroupLabel,
   type ContextInjectPayload,
+  type InjectOptionGroup,
   type OptionId,
   type InjectOption,
+  type InjectI18nFn,
 } from "@/components/platform/context-inject-panel-utils"
 
 export type { ContextInjectPayload, OptionId, InjectOption }
@@ -35,10 +34,14 @@ interface ContextInjectPanelProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   task: TaskInfo
-  project: ProjectInfo | null
-  repos: ProjectRepoInfo[]
   conversations: TaskConversationInfo[]
+  kbDocs: KnowledgeDocInfo[]
+  attachments: KnowledgeDocInfo[]
+  kbLoading?: boolean
   submitting?: boolean
+  /** KB directory path relative to the project root (e.g., "_knowledge").
+   *  Used to prefix doc filePaths so they become project-root-relative. */
+  kbDirPrefix?: string
   onConfirm: (payload: ContextInjectPayload) => void
 }
 
@@ -46,15 +49,27 @@ export function ContextInjectPanel({
   open,
   onOpenChange,
   task,
-  project,
-  repos,
   conversations,
+  kbDocs,
+  attachments,
+  kbLoading,
   submitting,
+  kbDirPrefix,
   onConfirm,
 }: ContextInjectPanelProps) {
+  const t = useTranslations("Platform.inject")
+
   const options = useMemo<InjectOption[]>(
-    () => buildInjectOptions(task, project, repos, conversations),
-    [conversations, project, repos, task]
+    () =>
+      buildInjectOptions(
+        task,
+        kbDocs,
+        attachments,
+        conversations,
+        t as InjectI18nFn,
+        kbDirPrefix
+      ),
+    [conversations, kbDocs, attachments, task, t, kbDirPrefix]
   )
 
   const defaultIds = useMemo(
@@ -67,18 +82,7 @@ export function ContextInjectPanel({
     [options]
   )
   const [checked, setChecked] = useState<Set<OptionId>>(defaultIds)
-
-  const grouped = useMemo(
-    () =>
-      options.reduce<Record<InjectOption["group"], InjectOption[]>>(
-        (acc, option) => {
-          acc[option.group].push(option)
-          return acc
-        },
-        { basic: [], project: [], repos: [], conversations: [] }
-      ),
-    [options]
-  )
+  const [kbDocSearchQuery, setKbDocSearchQuery] = useState("")
 
   function toggle(id: OptionId, value: boolean) {
     setChecked((prev) => {
@@ -93,98 +97,67 @@ export function ContextInjectPanel({
     return buildPayloadFromOptions(options, checked)
   }
 
+  // Filter kb_docs options by search query
+  const filteredOptions = useMemo(() => {
+    if (!kbDocSearchQuery) return options
+    const q = kbDocSearchQuery.toLowerCase()
+    return options.filter(
+      (opt) =>
+        opt.group !== "kb_docs" ||
+        opt.label.toLowerCase().includes(q) ||
+        opt.description.toLowerCase().includes(q)
+    )
+  }, [kbDocSearchQuery, options])
+
+  const groupLabelResolver = (group: InjectOptionGroup) =>
+    t(`groupLabel.${group}`)
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl rounded-lg">
+      <DialogContent className="max-w-2xl rounded-lg grid grid-rows-[auto_1fr_auto] max-h-[calc(100dvh-2rem)]">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2 text-base">
             <ClipboardList className="h-4 w-4" />
-            Create Task Conversation
+            {t("createConversation")}
           </DialogTitle>
-          <DialogDescription>
-            Select the context to attach before creating the conversation.
-          </DialogDescription>
+          <DialogDescription>{t("selectContext")}</DialogDescription>
         </DialogHeader>
 
-        <div className="flex flex-col gap-4">
-          <div className="rounded-md border bg-muted/30 p-3">
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <div className="truncate text-sm font-medium">{task.title}</div>
-                <div className="mt-1 text-xs text-muted-foreground">
-                  {task.taskType} / {task.status}
-                </div>
-              </div>
-              {task.priority && (
-                <Badge variant="outline" className="shrink-0">
-                  {task.priority}
-                </Badge>
-              )}
+        <div className="overflow-y-auto min-h-0 py-2">
+          {kbLoading ? (
+            <div className="flex items-center justify-center py-4 text-xs text-muted-foreground">
+              {t("loading")}
             </div>
-          </div>
-
-          {(["basic", "project", "repos", "conversations"] as const).map(
-            (group) => {
-              const items = grouped[group]
-              if (items.length === 0) return null
-              return (
-                <section key={group} className="space-y-2">
-                  <h3 className="text-xs font-medium uppercase text-muted-foreground">
-                    {optionGroupLabel(group)}
-                  </h3>
-                  <div className="space-y-1.5">
-                    {items.map((option) => (
-                      <label
-                        key={option.id}
-                        className={cn(
-                          "flex cursor-pointer items-start gap-3 rounded-md border p-3",
-                          "hover:bg-accent/50"
-                        )}
-                      >
-                        <Checkbox
-                          checked={checked.has(option.id)}
-                          onCheckedChange={(value) =>
-                            toggle(option.id, value === true)
-                          }
-                          className="mt-0.5"
-                        />
-                        <span className="flex min-w-0 flex-1 gap-2">
-                          {option.docPath ? (
-                            <FileText className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-                          ) : option.group === "conversations" ? (
-                            <MessageSquare className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-                          ) : null}
-                          <span className="min-w-0">
-                            <span className="block truncate text-sm font-medium">
-                              {option.label}
-                            </span>
-                            <span className="mt-0.5 block text-xs text-muted-foreground">
-                              {option.description}
-                            </span>
-                          </span>
-                        </span>
-                      </label>
-                    ))}
-                  </div>
-                </section>
-              )
-            }
+          ) : (
+            <InjectOptionList
+              options={filteredOptions}
+              checked={checked}
+              onToggle={toggle}
+              variant="full"
+              groupLabelResolver={groupLabelResolver}
+              emptyMessages={{
+                kb_docs: t("noDocs"),
+                attachments: t("noAttachments"),
+              }}
+              kbDocSearchQuery={kbDocSearchQuery}
+              onKbDocSearchChange={setKbDocSearchQuery}
+            />
           )}
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="mt-4 shrink-0">
           <Button
             variant="outline"
             onClick={() => onOpenChange(false)}
             disabled={submitting}
           >
-            Cancel
+            {t("cancel")}
           </Button>
           <Button
             onClick={() => onConfirm(buildPayload())}
             disabled={submitting}
           >
-            Create Conversation
+            {t("createConversation")}
           </Button>
         </DialogFooter>
       </DialogContent>

@@ -197,10 +197,32 @@ interface TabContextValue {
   /**
    * Pending initial content for newly created conversation tabs. Used by
    * the task→conversation flow to pre-fill the composer with a context prefix.
+   * Keyed by tabId to prevent badge drafts leaking across tabs.
    */
-  pendingInitialDrafts: Map<number, string>
-  setPendingInitialDraft: (conversationId: number, content: string) => void
-  clearPendingInitialDraft: (conversationId: number) => void
+  pendingInitialDrafts: Map<string, string>
+  setPendingInitialDraft: (tabId: string, content: string) => void
+  clearPendingInitialDraft: (tabId: string) => void
+  /**
+   * Pending task link intent for draft tabs. Stored when user selects a task
+   * in the Popover before the conversation is created. Auto-executed after
+   * conversation creation. Keyed by tabId.
+   */
+  pendingTaskLink: Map<string, PendingTaskLink | null>
+  setPendingTaskLink: (
+    tabId: string,
+    taskId: number,
+    role: string,
+    title: string,
+    taskType: string
+  ) => void
+  clearPendingTaskLink: (tabId: string) => void
+}
+
+export interface PendingTaskLink {
+  taskId: number
+  role: string
+  title: string
+  taskType: string
 }
 
 const TabContext = createContext<TabContextValue | null>(null)
@@ -213,7 +235,7 @@ export function useTabContext() {
   return ctx
 }
 
-function makeConversationTabId(
+export function makeConversationTabId(
   folderId: number,
   agentType: AgentType,
   conversationId: number
@@ -316,29 +338,65 @@ export function TabProvider({ children }: TabProviderProps) {
   const [tabsHydrated, setTabsHydrated] = useState(false)
 
   /**
-   * Pending initial drafts keyed by conversationId. When a task→conversation
+   * Pending initial drafts keyed by tabId. When a task→conversation
    * flow creates a new tab and wants to pre-fill the composer with a prefix,
-   * it stores the prefix here. The MessageInput reads and clears it on mount.
+   * it stores the prefix here keyed by the new tab's id. The MessageInput
+   * reads and clears it based on its own attachmentTabId.
    */
   const [pendingInitialDrafts, setPendingInitialDrafts] = useState<
-    Map<number, string>
+    Map<string, string>
   >(new Map())
 
   const setPendingInitialDraft = useCallback(
-    (conversationId: number, content: string) => {
+    (tabId: string, content: string) => {
       setPendingInitialDrafts((prev) => {
         const next = new Map(prev)
-        next.set(conversationId, content)
+        next.set(tabId, content)
         return next
       })
     },
     []
   )
 
-  const clearPendingInitialDraft = useCallback((conversationId: number) => {
+  const clearPendingInitialDraft = useCallback((tabId: string) => {
     setPendingInitialDrafts((prev) => {
       const next = new Map(prev)
-      next.delete(conversationId)
+      next.delete(tabId)
+      return next
+    })
+  }, [])
+
+  /**
+   * Pending task link intents keyed by tabId. When a new-conversation
+   * Popover allows task linking before the conversation is persisted, the
+   * intent is stored here. Auto-executed by ConversationTabView after the
+   * DB row is created.
+   */
+  const [pendingTaskLink, setPendingTaskLinkState] = useState<
+    Map<string, PendingTaskLink | null>
+  >(new Map())
+
+  const setPendingTaskLink = useCallback(
+    (
+      tabId: string,
+      taskId: number,
+      role: string,
+      title: string,
+      taskType: string
+    ) => {
+      setPendingTaskLinkState((prev) => {
+        const next = new Map(prev)
+        next.set(tabId, { taskId, role, title, taskType })
+        return next
+      })
+    },
+    []
+  )
+
+  const clearPendingTaskLink = useCallback((tabId: string) => {
+    setPendingTaskLinkState((prev) => {
+      const next = new Map(prev)
+      next.delete(tabId)
       return next
     })
   }, [])
@@ -1894,6 +1952,9 @@ export function TabProvider({ children }: TabProviderProps) {
       pendingInitialDrafts,
       setPendingInitialDraft,
       clearPendingInitialDraft,
+      pendingTaskLink,
+      setPendingTaskLink,
+      clearPendingTaskLink,
     }),
     [
       tabs,
@@ -1922,6 +1983,9 @@ export function TabProvider({ children }: TabProviderProps) {
       pendingInitialDrafts,
       setPendingInitialDraft,
       clearPendingInitialDraft,
+      pendingTaskLink,
+      setPendingTaskLink,
+      clearPendingTaskLink,
     ]
   )
 

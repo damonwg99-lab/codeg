@@ -5,7 +5,7 @@ import { useTranslations } from "next-intl"
 import { Loader2, Upload } from "lucide-react"
 import { uploadKbDoc } from "@/lib/platform/api"
 import type { KbDocType } from "@/lib/platform/types"
-import { KB_DOC_TYPE_DIRS, KB_DOC_TYPE_LABELS } from "@/lib/platform/types"
+import { KB_DOC_TYPE_DIRS } from "@/lib/platform/types"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -31,6 +31,19 @@ const UPLOAD_DOC_TYPES: KbDocType[] = [
   "requirement",
   "ai_intermediate",
 ]
+
+/** Resolve KB doc type label using i18n for the upload dialog. */
+function resolveTypeLabel(t: (key: never) => string, type: KbDocType): string {
+  const keyMap: Record<KbDocType, string> = {
+    tech_doc: "kb.typeTechDoc",
+    template: "kb.typeTemplate",
+    skill: "kb.typeSkill",
+    requirement: "kb.typeRequirement",
+    ai_intermediate: "kb.typeAiIntermediate",
+    task_attachment: "kb.typeTaskAttachment",
+  }
+  return t(keyMap[type] as never)
+}
 
 interface KnowledgeUploadDialogProps {
   projectId: number
@@ -95,13 +108,13 @@ export function KnowledgeUploadDialog({
               value={docType}
               onValueChange={(v) => setDocType(v as KbDocType)}
             >
-              <SelectTrigger>
+              <SelectTrigger className="h-7 text-[0.8125rem]">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
                 {UPLOAD_DOC_TYPES.map((type) => (
                   <SelectItem key={type} value={type}>
-                    {KB_DOC_TYPE_LABELS[type]}
+                    {resolveTypeLabel(t, type)}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -120,6 +133,7 @@ export function KnowledgeUploadDialog({
           <div className="flex flex-col gap-1.5">
             <Label>{t("kb.subDir")}</Label>
             <Input
+              className="h-7 text-[0.8125rem]"
               placeholder={t("kb.subDirPlaceholder")}
               value={subDir}
               onChange={(e) => setSubDir(e.target.value)}
@@ -130,6 +144,7 @@ export function KnowledgeUploadDialog({
           <div className="flex flex-col gap-1.5">
             <Label>{t("kb.selectFile")}</Label>
             <Input
+              className="h-7 text-[0.8125rem]"
               type="file"
               onChange={(e) => {
                 const f = e.target.files?.[0]

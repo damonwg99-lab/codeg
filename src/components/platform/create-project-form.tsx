@@ -146,7 +146,7 @@ export function CreateProjectForm() {
 
   return (
     <ScrollArea className="h-full">
-      <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 p-4 sm:p-6">
+      <div className="flex flex-col gap-6 p-4 sm:p-6">
         <div className="flex items-center gap-2">
           <Button
             variant="ghost"

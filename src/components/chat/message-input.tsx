@@ -159,12 +159,21 @@ import {
 } from "@/components/chat/composer/invocation-reference"
 import { cutSelectionToClipboard } from "@/components/chat/composer/clipboard-actions"
 import { referenceToMarkdown } from "@/components/chat/composer/reference-text"
-import { TaskContextPopover } from "@/components/platform/task-context-popover"
-import type { ContextInjectPayload } from "@/components/platform/context-inject-panel-utils"
+import { ProjectResourcePicker } from "@/components/platform/task-context-popover"
+import {
+  optionToReferenceAttrs,
+  type ContextInjectPayload,
+} from "@/components/platform/context-inject-panel-utils"
 import { useLinkedTask } from "@/hooks/use-linked-task"
 import { usePlatform } from "@/contexts/platform-context"
+import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useTabContext } from "@/contexts/tab-context"
-import { linkConversation, unlinkConversation } from "@/lib/platform/api"
+import {
+  linkConversation,
+  unlinkConversation,
+  listKnowledgeDocs,
+} from "@/lib/platform/api"
+import type { KnowledgeDocInfo } from "@/lib/platform/types"
 import type { ReferenceAttrs } from "@/components/chat/composer/types"
 import type { Editor, JSONContent } from "@tiptap/core"
 import {
@@ -210,6 +219,10 @@ interface MessageInputProps {
   availableCommands?: AvailableCommandInfo[] | null
   promptCapabilities: PromptCapabilitiesInfo
   attachmentTabId?: string | null
+  /** The conversation ID this MessageInput belongs to. When provided,
+   *  overrides the global activeConversationId derived from TabContext —
+   *  prevents badge drafts from leaking into other tab's editors. */
+  conversationId?: number | null
   draftStorageKey?: string | null
   isActive?: boolean
   /** Paint the flowing active-session gradient on the composer border. Set only
@@ -423,6 +436,26 @@ function editorHasFileReference(editor: Editor, uri: string): boolean {
   return found
 }
 
+/** Whether the document already holds a context reference badge for the given
+ *  option id (e.g. "taskDescription", "kbDoc:5"). Prevents duplicate badge
+ *  insertion when the user injects context from the Popover a second time. */
+function editorHasContextReference(editor: Editor, id: string): boolean {
+  let found = false
+  editor.state.doc.descendants((node) => {
+    if (found) return false
+    if (
+      node.type.name === "reference" &&
+      node.attrs?.refType === "context" &&
+      node.attrs?.id === id
+    ) {
+      found = true
+      return false
+    }
+    return true
+  })
+  return found
+}
+
 /** Drop embedded-attachment reference badges from a draft document before it is
  *  persisted: their bytes live only in the in-memory `embeddedPayloadsRef` map
  *  (never serialized into the draft), so a restored badge would send nothing.
@@ -512,6 +545,7 @@ export function MessageInput({
   feedbackAddDisabled,
   injectContent,
   onInjectConsumed,
+  conversationId: propConversationId,
 }: MessageInputProps) {
   const t = useTranslations("Folder.chat.messageInput")
   const tQueue = useTranslations("Folder.chat.messageQueue")
@@ -577,19 +611,90 @@ export function MessageInput({
   const [taskPopoverOpen, setTaskPopoverOpen] = useState(false)
 
   // ─── Task context hooks ───
-  const { tabs, activeTabId, pendingInitialDrafts, clearPendingInitialDraft } =
-    useTabContext()
+  const {
+    tabs,
+    activeTabId,
+    pendingInitialDrafts,
+    clearPendingInitialDraft,
+    pendingTaskLink,
+    setPendingTaskLink,
+    clearPendingTaskLink,
+  } = useTabContext()
   const activeConversationId = useMemo(() => {
     const activeTab = tabs.find((tab) => tab.id === activeTabId)
     return activeTab?.conversationId ?? null
   }, [tabs, activeTabId])
+  // Use the prop-provided conversationId (specific to this tab) when available;
+  // fall back to the global activeConversationId for backward compatibility.
+  // This prevents pendingInitialDraft badge consumption from leaking across tabs.
+  const ownConversationId = propConversationId ?? activeConversationId
+  // Only positive IDs are real DB conversation IDs. Virtual (negative) IDs are
+  // placeholders for new conversations that haven't been persisted yet. Use this
+  // to gate backend calls like linkConversation that require a real DB row.
+  const hasPersistedConversation =
+    ownConversationId != null && ownConversationId > 0
   const {
     linkedTaskInfo,
     linkedTask,
     refresh: refreshLinkedTask,
-    loading: linkedTaskLoading,
-  } = useLinkedTask(activeConversationId)
-  const { activeProject, activeProjectRepos } = usePlatform()
+  } = useLinkedTask(ownConversationId)
+  const { activeProject } = usePlatform()
+  const { activeFolder } = useActiveFolder()
+
+  // Compute KB dir prefix relative to project root for context injection.
+  // doc.filePath is relative to _knowledge; the agent needs project-root-relative paths.
+  const kbDirPrefix = useMemo(() => {
+    const kbDir = (
+      activeProject?.kbLocalDir ??
+      `${activeProject?.rootDir.replace(/\\/g, "/") ?? ""}/_knowledge`
+    ).replace(/\\/g, "/")
+    const fp = activeFolder?.path?.replace(/\\/g, "/") ?? ""
+    if (!fp) return "_knowledge"
+    if (kbDir.startsWith(fp + "/") || kbDir === fp + "/_knowledge") {
+      return kbDir.slice(fp.length + 1)
+    }
+    return "_knowledge"
+  }, [activeProject?.kbLocalDir, activeProject?.rootDir, activeFolder?.path])
+
+  // ─── KB data for task popover (lazy loaded) ───
+  const [popoverKbDocs, setPopoverKbDocs] = useState<KnowledgeDocInfo[]>([])
+  const [popoverAttachments, setPopoverAttachments] = useState<
+    KnowledgeDocInfo[]
+  >([])
+  const [popoverKbLoading, setPopoverKbLoading] = useState(false)
+
+  useEffect(() => {
+    if (!taskPopoverOpen || !activeProject) return
+    let cancelled = false
+    setPopoverKbLoading(true)
+    async function loadKBData() {
+      try {
+        const projectId = activeProject!.id
+        const allDocs = await listKnowledgeDocs({ projectId })
+        if (!cancelled) {
+          setPopoverKbDocs(
+            allDocs.filter((d) => d.docType !== "task_attachment")
+          )
+          // Attachments: filter by linkedTask when available
+          const taskAttachments = allDocs.filter(
+            (d) => d.docType === "task_attachment"
+          )
+          setPopoverAttachments(
+            linkedTask
+              ? taskAttachments.filter((d) => d.taskId === linkedTask.id)
+              : []
+          )
+          setPopoverKbLoading(false)
+        }
+      } catch {
+        if (!cancelled) setPopoverKbLoading(false)
+      }
+    }
+    void loadKBData()
+    return () => {
+      cancelled = true
+    }
+  }, [taskPopoverOpen, activeProject, linkedTask])
 
   // ─── Quick messages ───
   const [quickMessages, setQuickMessages] = useState<QuickMessage[]>([])
@@ -615,6 +720,12 @@ export function MessageInput({
   const disabledRef = useRef(disabled)
   const isPromptingRef = useRef(isPrompting)
   const hydratedRef = useRef(false)
+  // One-time guard for pending draft consumption. When a flushSync re-render
+  // (triggered by insertReference NodeViewRenderer) re-runs the effect, the
+  // guard prevents duplicate badge insertion. Cleared after successful rAF
+  // execution; if the editor is unavailable, the guard is removed so the
+  // next effect run can retry.
+  const draftConsumedRef = useRef(new Set<string>())
   // Tracks the last queue-item id hydrated, so a re-edit of the *same* item
   // doesn't clobber the user's in-progress changes — keyed on id, not display
   // text (two attachment-only items share the text "Attached 1 attachment").
@@ -658,6 +769,7 @@ export function MessageInput({
       session: t("mentionGroupSession"),
       commit: t("mentionGroupCommit"),
       skill: t("mentionGroupSkill"),
+      context: t("mentionGroupContext"),
     }),
     [t]
   )
@@ -912,15 +1024,56 @@ export function MessageInput({
   }, [])
 
   // ─── Consume pending initial draft (from task→conversation flow) ───
+  // Keyed by tabId (attachmentTabId), not conversationId, to prevent badge
+  // drafts from leaking into other tab's editors. Only the tab whose id
+  // matches the draft key will consume and insert the badges.
   useEffect(() => {
-    if (!composerReady || !activeConversationId) return
-    const pending = pendingInitialDrafts.get(activeConversationId)
+    if (!composerReady || !attachmentTabId) return
+    const pending = pendingInitialDrafts.get(attachmentTabId)
     if (!pending) return
-    editorRef.current?.prependMarkdown(pending)
-    clearPendingInitialDraft(activeConversationId)
+    // One-time ref guard prevents duplicate insertions: when insertReference
+    // triggers a synchronous flushSync re-render (NodeViewRenderer), this
+    // effect re-runs. The ref already contains this tabId, so the re-run
+    // skips — breaking the cascade that caused triple duplication.
+    if (draftConsumedRef.current.has(attachmentTabId)) return
+    draftConsumedRef.current.add(attachmentTabId)
+
+    // Parse refs now (synchronous) — data is captured in the rAF closure.
+    let refs: ReferenceAttrs[]
+    let isLegacyMarkdown = false
+    try {
+      refs = JSON.parse(pending) as ReferenceAttrs[]
+    } catch {
+      isLegacyMarkdown = true
+    }
+
+    // Defer editor mutations to the next animation frame to avoid flushSync
+    // warnings during the commit phase. Same rAF pattern used by the
+    // hydration and inject effects elsewhere in this component.
+    const raf = requestAnimationFrame(() => {
+      const editor = editorRef.current?.getEditor()
+      if (!editor) {
+        // Editor unavailable — remove the guard so a future effect run
+        // (when the editor is ready) can retry.
+        draftConsumedRef.current.delete(attachmentTabId)
+        return
+      }
+      if (isLegacyMarkdown) {
+        editorRef.current?.insertMarkdownAtCursor(pending)
+      } else {
+        for (const ref of refs) {
+          editor.chain().insertReference(ref).insertContent(" ").run()
+        }
+      }
+      // Clear the draft after successful insertion. This triggers a state
+      // update, but the ref guard already prevents any re-trigger, and the
+      // rAF has completed so cancelAnimationFrame cleanup is a no-op.
+      clearPendingInitialDraft(attachmentTabId)
+    })
+    return () => cancelAnimationFrame(raf)
   }, [
     composerReady,
-    activeConversationId,
+    attachmentTabId,
     pendingInitialDrafts,
     clearPendingInitialDraft,
   ])
@@ -1845,35 +1998,79 @@ export function MessageInput({
     chain.insertReference(commandToReference(cmd)).insertContent(" ").run()
   }, [])
 
-  // ─── Task context: inject prefix into editor ───
+  // ─── Task context: inject badges into editor ───
+  // Skips options whose badge already exists in the editor (deduped by id),
+  // preventing duplicate context badges when the user injects a second time.
   const handleTaskInject = useCallback((payload: ContextInjectPayload) => {
-    if (payload.prefix) {
-      editorRef.current?.prependMarkdown(payload.prefix)
+    const editor = editorRef.current?.getEditor()
+    if (!editor) {
+      setTaskPopoverOpen(false)
+      return
     }
+    let chain = editor.chain().focus("end")
+    let inserted = 0
+    for (const option of payload.options) {
+      const ref = optionToReferenceAttrs(option)
+      // Skip if a context badge with this id already exists in the editor
+      if (editorHasContextReference(editor, String(option.id))) continue
+      chain = chain.insertReference(ref).insertContent(" ")
+      inserted++
+    }
+    if (inserted > 0) chain.run()
     setTaskPopoverOpen(false)
   }, [])
 
   const handleTaskLink = useCallback(
-    async (taskId: number, role: string) => {
-      if (!activeConversationId) return
-      await linkConversation({
-        taskId,
-        conversationId: activeConversationId,
-        role,
-      })
-      refreshLinkedTask()
+    async (
+      taskId: number,
+      role: string,
+      taskInfo?: { title: string; taskType: string }
+    ) => {
+      if (hasPersistedConversation) {
+        // Persisted conversation — link immediately
+        await linkConversation({
+          taskId,
+          conversationId: ownConversationId,
+          role,
+        })
+        refreshLinkedTask()
+      } else if (attachmentTabId && taskInfo) {
+        // New (unpersisted) conversation — store intent for later
+        setPendingTaskLink(
+          attachmentTabId,
+          taskId,
+          role,
+          taskInfo.title,
+          taskInfo.taskType
+        )
+      }
     },
-    [activeConversationId, refreshLinkedTask]
+    [
+      hasPersistedConversation,
+      ownConversationId,
+      refreshLinkedTask,
+      setPendingTaskLink,
+      attachmentTabId,
+    ]
   )
 
+  const handleClearPendingLink = useCallback(() => {
+    if (attachmentTabId) clearPendingTaskLink(attachmentTabId)
+  }, [clearPendingTaskLink, attachmentTabId])
+
   const handleTaskUnlink = useCallback(async () => {
-    if (!linkedTaskInfo || !activeConversationId) return
+    if (!linkedTaskInfo || !hasPersistedConversation) return
     await unlinkConversation({
       taskId: linkedTaskInfo.taskId,
-      conversationId: activeConversationId,
+      conversationId: ownConversationId,
     })
     refreshLinkedTask()
-  }, [linkedTaskInfo, activeConversationId, refreshLinkedTask])
+  }, [
+    linkedTaskInfo,
+    hasPersistedConversation,
+    ownConversationId,
+    refreshLinkedTask,
+  ])
 
   // ── "+" menu skill shortcuts (experts / daily office) ──
   //
@@ -3303,17 +3500,24 @@ export function MessageInput({
                       align="start"
                       className="w-[22rem] max-w-[calc(100vw-1rem)] p-0"
                     >
-                      <TaskContextPopover
-                        conversationId={activeConversationId}
-                        project={activeProject}
-                        repos={activeProjectRepos}
+                      <ProjectResourcePicker
+                        conversationId={ownConversationId}
                         linkedTaskInfo={linkedTaskInfo}
                         linkedTask={linkedTask}
-                        loading={linkedTaskLoading}
                         onInject={handleTaskInject}
                         onLink={handleTaskLink}
                         onUnlink={handleTaskUnlink}
                         activeProjectId={activeProject?.id ?? null}
+                        kbDocs={popoverKbDocs}
+                        attachments={popoverAttachments}
+                        kbLoading={popoverKbLoading}
+                        kbDirPrefix={kbDirPrefix}
+                        pendingTask={
+                          attachmentTabId
+                            ? (pendingTaskLink.get(attachmentTabId) ?? null)
+                            : null
+                        }
+                        onClearPendingLink={handleClearPendingLink}
                       />
                     </PopoverContent>
                   </Popover>

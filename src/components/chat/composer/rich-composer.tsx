@@ -69,12 +69,6 @@ export interface RichComposerHandle {
   insertMarkdownAtCursor: (markdown: string) => void
   /** Insert an inline reference badge at the current selection. */
   insertReference: (attrs: ReferenceAttrs) => void
-  /**
-   * Prepend Markdown at the start of the document — used by the task-context
-   * inject flow to insert a "[Task Context]" prefix before the user's text.
-   * Preserves existing content; the caret stays at the end.
-   */
-  prependMarkdown: (text: string) => void
   /** Escape hatch to the underlying editor (null until initialized). */
   getEditor: () => Editor | null
 }
@@ -433,18 +427,6 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
         },
         insertReference: (attrs) => {
           editor?.chain().focus().insertReference(attrs).run()
-        },
-        prependMarkdown: (text) => {
-          if (!editor) return
-          // Insert at document position 0 (before all existing content).
-          // Tiptap position 0 = just inside the doc node, before the first
-          // child. After insertion the editor focuses at the end so the
-          // user can continue typing their message below the prefix.
-          editor
-            .chain()
-            .insertContentAt(0, text, { contentType: "markdown" })
-            .focus("end")
-            .run()
         },
         getEditor: () => editor ?? null,
       }),
