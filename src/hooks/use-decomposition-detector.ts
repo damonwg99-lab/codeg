@@ -21,6 +21,11 @@ import {
  * - `confirmed`: { convId, key } — confirmation keyed to the conversation.
  *   Stale confirmations from a different conversation auto-expire.
  *
+ * Both dismissedKey and confirmedKey are persisted to sessionStorage so
+ * they survive component remounts (tab switches, navigation). Without
+ * persistence, reopening a conversation would always auto-pop the overlay
+ * for a previously-dismissed proposal.
+ *
  * When the user dismisses the overlay:
  * - proposedSubTasks becomes null (overlay closed)
  * - A CollapsedOverlayChip is shown so the user can re-open
@@ -36,6 +41,57 @@ import {
  * All keyed state is conversation-scoped via convId, so switching tabs
  * never carries stale overlay state from a previous conversation.
  */
+
+// ── sessionStorage persistence ──
+
+const STORAGE_KEY_PREFIX = "codeg:decomp:"
+
+function storageKey(convId: number | string | null | undefined): string {
+  return `${STORAGE_KEY_PREFIX}${convId ?? "none"}`
+}
+
+interface StoredState {
+  dismissedKey: string | null
+  confirmedKey: string | null
+}
+
+function readStoredState(
+  convId: number | string | null | undefined
+): StoredState {
+  try {
+    const raw = sessionStorage.getItem(storageKey(convId))
+    if (!raw) return { dismissedKey: null, confirmedKey: null }
+    const parsed = JSON.parse(raw) as StoredState
+    return {
+      dismissedKey: parsed.dismissedKey ?? null,
+      confirmedKey: parsed.confirmedKey ?? null,
+    }
+  } catch {
+    return { dismissedKey: null, confirmedKey: null }
+  }
+}
+
+function writeStoredState(
+  convId: number | string | null | undefined,
+  state: StoredState
+): void {
+  try {
+    sessionStorage.setItem(storageKey(convId), JSON.stringify(state))
+  } catch {
+    // sessionStorage may be unavailable (private browsing, quota)
+  }
+}
+
+function clearStoredState(convId: number | string | null | undefined): void {
+  try {
+    sessionStorage.removeItem(storageKey(convId))
+  } catch {
+    // ignore
+  }
+}
+
+// ── Hook types ──
+
 interface ScopedKey {
   convId: number | string | null | undefined
   key: string
@@ -114,9 +170,29 @@ export function useDecompositionDetector(
   // in the effective-value calculations below. This avoids the need for
   // useEffect + setState to reset on conversation switch (which ESLint
   // forbids).
+  //
+  // Dismissed and confirmed keys are ALSO persisted to sessionStorage so
+  // they survive component remounts (e.g., tab switches, navigation).
+  // On mount, we read the stored state; on change, we write it back.
 
-  const [dismissedScoped, setDismissedScoped] = useState<ScopedKey | null>(null)
-  const [confirmedScoped, setConfirmedScoped] = useState<ScopedKey | null>(null)
+  // Read persisted state once via useState initializer (ESLint allows
+  // this because the initializer only runs on mount).
+  const [dismissedScoped, setDismissedScoped] = useState<ScopedKey | null>(
+    () => {
+      const stored = readStoredState(conversationId)
+      return stored.dismissedKey
+        ? { convId: conversationId, key: stored.dismissedKey }
+        : null
+    }
+  )
+  const [confirmedScoped, setConfirmedScoped] = useState<ScopedKey | null>(
+    () => {
+      const stored = readStoredState(conversationId)
+      return stored.confirmedKey
+        ? { convId: conversationId, key: stored.confirmedKey }
+        : null
+    }
+  )
   const [editedScoped, setEditedScoped] = useState<ScopedEdit | null>(null)
 
   // ── Effective values (stale state auto-expired) ──
@@ -170,31 +246,52 @@ export function useDecompositionDetector(
       ? null
       : (userEditedSubTasks ?? detectedSubTasks)
 
+  // ── Actions ──
+
   const clearProposal = useCallback(() => {
     setEditedScoped(null)
     setDismissedScoped(null)
     setConfirmedScoped(null)
-  }, [])
+    clearStoredState(conversationId)
+  }, [conversationId])
 
   const dismissProposal = useCallback(() => {
     const key = proposalKey(userEditedSubTasks ?? detectedSubTasks)
     if (key) {
       setDismissedScoped({ convId: conversationId, key })
+      writeStoredState(conversationId, {
+        dismissedKey: key,
+        confirmedKey: isCurrentConv(confirmedScoped, conversationId)
+          ? confirmedScoped!.key
+          : null,
+      })
     }
     setEditedScoped(null)
-  }, [userEditedSubTasks, detectedSubTasks, conversationId])
+  }, [userEditedSubTasks, detectedSubTasks, conversationId, confirmedScoped])
 
   const confirmProposal = useCallback(() => {
     const key = proposalKey(userEditedSubTasks ?? detectedSubTasks)
     if (key) {
       setConfirmedScoped({ convId: conversationId, key })
+      writeStoredState(conversationId, {
+        dismissedKey: isCurrentConv(dismissedScoped, conversationId)
+          ? dismissedScoped!.key
+          : null,
+        confirmedKey: key,
+      })
     }
     setEditedScoped(null)
-  }, [userEditedSubTasks, detectedSubTasks, conversationId])
+  }, [userEditedSubTasks, detectedSubTasks, conversationId, dismissedScoped])
 
   const reopenProposal = useCallback(() => {
     setDismissedScoped(null)
-  }, [])
+    writeStoredState(conversationId, {
+      dismissedKey: null,
+      confirmedKey: isCurrentConv(confirmedScoped, conversationId)
+        ? confirmedScoped!.key
+        : null,
+    })
+  }, [conversationId, confirmedScoped])
 
   const updateSubTasks = useCallback(
     (subTasks: ProposedSubTask[]) => {
