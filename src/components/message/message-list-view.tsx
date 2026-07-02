@@ -982,18 +982,23 @@ export function MessageListView({
           delegations={lastAssistantDelegations}
           overlayKey={subAgentOverlayKey}
         />
-        {decompSubTasks && decompSubTasks.length > 0 && (
-          <DecompositionOverlay
-            proposedSubTasks={decompSubTasks}
-            linkedTask={linkedTask ?? null}
-            projects={projects}
-            activeProjectId={activeProjectId ?? null}
-            onUpdateSubTasks={updateDecompSubTasks}
-            onConfirm={handleDecompConfirm}
-            onDismiss={clearDecomp}
-          />
-        )}
       </div>
+      {/* Decomposition review dialog — rendered as a Dialog (not in the
+          narrow overlay stack) so it centers properly, matches conversation
+          width, and has a scrollable content area with fixed footer. */}
+      <DecompositionOverlay
+        open={decompSubTasks !== null && decompSubTasks.length > 0}
+        onOpenChange={(open) => {
+          if (!open) clearDecomp()
+        }}
+        proposedSubTasks={decompSubTasks ?? []}
+        linkedTask={linkedTask ?? null}
+        projects={projects}
+        activeProjectId={activeProjectId ?? null}
+        submitting={false}
+        onUpdateSubTasks={updateDecompSubTasks}
+        onConfirm={handleDecompConfirm}
+      />
     </div>
   )
 }

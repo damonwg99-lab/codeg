@@ -93,7 +93,7 @@ function normalizeEntry(
  * decomposition intent. Instructs the AI to output a structured JSON block
  * at the end of its response.
  */
-export const DECOMPOSITION_INSTRUCTION = `[SYSTEM: When proposing task decomposition, output a JSON block in a \`\`\`task_decomposition_json code fence at the END of your response with format: {"subTasks":[{"title":"...","description":"...","taskType":"bug|feature|task|improvement","priority":"low|medium|high|urgent"}]}]`
+export const DECOMPOSITION_INSTRUCTION = `[系统指令：当提出任务分解时，请在回复末尾的 \`\`\`task_decomposition_json 代码块中输出 JSON，格式为 {"subTasks":[{"title":"任务标题（中文）","description":"任务描述（中文）","taskType":"bug|feature|task|improvement","priority":"low|medium|high|urgent"}]}。title 和 description 必须用中文填写。]`
 
 // ─── JSON Extraction ───
 

@@ -3,8 +3,15 @@
 import { useCallback, useState } from "react"
 import { useTranslations } from "next-intl"
 import { Plus, Trash2, ListChecks, Loader2 } from "lucide-react"
-import { CollapsedOverlayChip } from "@/components/chat/collapsed-overlay-chip"
 import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import {
   Select,
   SelectContent,
@@ -25,33 +32,55 @@ interface ConfirmParams {
 }
 
 interface DecompositionOverlayProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
   proposedSubTasks: ProposedSubTask[]
   linkedTask: TaskInfo | null
   projects: ProjectInfo[]
   activeProjectId: number | null
+  submitting?: boolean
   onUpdateSubTasks: (subTasks: ProposedSubTask[]) => void
   onConfirm: (params: ConfirmParams) => void
-  onDismiss: () => void
 }
 
-const TASK_TYPE_OPTIONS = ["task", "feature", "bug", "improvement"] as const
-const PRIORITY_OPTIONS = ["low", "medium", "high", "urgent"] as const
+const TASK_TYPE_KEYS = ["bug", "feature", "task", "improvement"] as const
+const PRIORITY_KEYS = ["low", "medium", "high", "urgent"] as const
 
 export function DecompositionOverlay({
+  open,
+  onOpenChange,
   proposedSubTasks,
   linkedTask,
   projects,
   activeProjectId,
+  submitting = false,
   onUpdateSubTasks,
   onConfirm,
-  onDismiss,
 }: DecompositionOverlayProps) {
   const t = useTranslations("Platform.task")
-  const [isExpanded, setIsExpanded] = useState(true)
   const [selectedProjectId, setSelectedProjectId] = useState<number>(
     activeProjectId ?? projects[0]?.id ?? 0
   )
-  const [creating, setCreating] = useState(false)
+
+  const resolveTypeLabel = (key: string) => {
+    const map: Record<string, string> = {
+      bug: t("taskTypeOptions.bug"),
+      feature: t("taskTypeOptions.feature"),
+      task: t("taskTypeOptions.task"),
+      improvement: t("taskTypeOptions.improvement"),
+    }
+    return map[key] ?? key
+  }
+
+  const resolvePriorityLabel = (key: string) => {
+    const map: Record<string, string> = {
+      low: t("priorityOptions.low"),
+      medium: t("priorityOptions.medium"),
+      high: t("priorityOptions.high"),
+      urgent: t("priorityOptions.urgent"),
+    }
+    return map[key] ?? key
+  }
 
   const updateEntry = useCallback(
     (index: number, field: keyof ProposedSubTask, value: string) => {
@@ -79,66 +108,39 @@ export function DecompositionOverlay({
   }, [proposedSubTasks, onUpdateSubTasks])
 
   const handleConfirm = useCallback(() => {
-    if (creating) return
-    // Filter out entries with empty titles
+    if (submitting) return
     const validSubTasks = proposedSubTasks.filter(
       (entry) => entry.title.trim() !== ""
     )
     if (validSubTasks.length === 0) return
-    setCreating(true)
     onConfirm({
       projectId: selectedProjectId,
       parentTaskId: linkedTask?.id ?? null,
       subTasks: validSubTasks,
     })
-  }, [creating, proposedSubTasks, selectedProjectId, linkedTask, onConfirm])
+  }, [submitting, proposedSubTasks, selectedProjectId, linkedTask, onConfirm])
 
-  if (proposedSubTasks.length === 0) return null
-
-  if (!isExpanded) {
-    return (
-      <CollapsedOverlayChip
-        icon={<ListChecks className="size-3" />}
-        summary={t("proposedTasks", { count: proposedSubTasks.length })}
-        onClick={() => setIsExpanded(true)}
-      />
-    )
-  }
-
-  // Determine the parent task display name
+  // Determine parent task label
   const parentTaskLabel = linkedTask
     ? t("createAsSubTasksOf", { taskName: linkedTask.title })
     : null
 
   return (
-    <div
-      className={cn(
-        "pointer-events-auto w-[min(22rem,calc(100%-2rem))]",
-        "rounded-lg border bg-card shadow-lg",
-        "flex flex-col max-h-[calc(100dvh-8rem)]"
-      )}
-    >
-      {/* Header */}
-      <div className="flex items-center justify-between gap-2 px-3 py-2 border-b">
-        <div className="flex items-center gap-1.5 text-sm font-medium">
-          <ListChecks className="size-3.5" />
-          {t("reviewDecomposition")}
-        </div>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-6 w-6"
-          onClick={() => setIsExpanded(false)}
-        >
-          <span className="text-xs">✕</span>
-        </Button>
-      </div>
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-2xl rounded-lg grid grid-rows-[auto_1fr_auto] max-h-[calc(100dvh-2rem)]">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2 text-base">
+            <ListChecks className="h-4 w-4" />
+            {t("reviewDecomposition")}
+          </DialogTitle>
+          <DialogDescription>
+            {parentTaskLabel ?? t("selectProject")}
+          </DialogDescription>
+        </DialogHeader>
 
-      {/* Project & Parent Task */}
-      <div className="px-3 py-2 border-b space-y-2">
         {/* Project selector (only when no linked task) */}
         {!linkedTask && projects.length > 0 && (
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 px-1 py-1">
             <span className="text-xs text-muted-foreground shrink-0">
               {t("selectProject")}:
             </span>
@@ -160,123 +162,117 @@ export function DecompositionOverlay({
           </div>
         )}
 
-        {/* Parent task indicator */}
-        {parentTaskLabel && (
-          <p className="text-xs text-muted-foreground">{parentTaskLabel}</p>
-        )}
-      </div>
+        {/* Sub-task list — scrollable */}
+        <div className="overflow-y-auto min-h-0 py-2 space-y-3">
+          {proposedSubTasks.map((entry, index) => (
+            <div
+              key={index}
+              className="flex flex-col gap-1.5 rounded-md border p-2"
+            >
+              {/* Title row */}
+              <div className="flex items-center gap-1.5">
+                <Input
+                  value={entry.title}
+                  onChange={(e) => updateEntry(index, "title", e.target.value)}
+                  className="h-7 text-xs"
+                  placeholder={t("taskTitle")}
+                />
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-6 w-6 text-muted-foreground hover:text-destructive shrink-0"
+                  onClick={() => removeEntry(index)}
+                >
+                  <Trash2 className="size-3" />
+                </Button>
+              </div>
 
-      {/* Sub-task list — scrollable */}
-      <div className="overflow-y-auto min-h-0 flex-1 px-3 py-2 space-y-3">
-        {proposedSubTasks.map((entry, index) => (
-          <div
-            key={index}
-            className="flex flex-col gap-1.5 rounded-md border p-2"
-          >
-            {/* Title row */}
-            <div className="flex items-center gap-1.5">
+              {/* Description */}
               <Input
-                value={entry.title}
-                onChange={(e) => updateEntry(index, "title", e.target.value)}
+                value={entry.description}
+                onChange={(e) =>
+                  updateEntry(index, "description", e.target.value)
+                }
                 className="h-7 text-xs"
-                placeholder={t("taskTitle")}
+                placeholder={t("taskDescription")}
               />
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-6 w-6 text-muted-foreground hover:text-destructive shrink-0"
-                onClick={() => removeEntry(index)}
-              >
-                <Trash2 className="size-3" />
-              </Button>
+
+              {/* Type + Priority */}
+              <div className="flex items-center gap-2">
+                <Select
+                  value={entry.taskType}
+                  onValueChange={(v) => updateEntry(index, "taskType", v)}
+                >
+                  <SelectTrigger className="h-7 text-xs w-[100px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {TASK_TYPE_KEYS.map((type) => (
+                      <SelectItem key={type} value={type}>
+                        {resolveTypeLabel(type)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+
+                <Select
+                  value={entry.priority}
+                  onValueChange={(v) => updateEntry(index, "priority", v)}
+                >
+                  <SelectTrigger className="h-7 text-xs w-[100px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {PRIORITY_KEYS.map((p) => (
+                      <SelectItem key={p} value={p}>
+                        <span
+                          className={cn(
+                            TASK_PRIORITY_COLORS[p as TaskPriority] ?? ""
+                          )}
+                        >
+                          {resolvePriorityLabel(p)}
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
             </div>
+          ))}
 
-            {/* Description */}
-            <Input
-              value={entry.description}
-              onChange={(e) =>
-                updateEntry(index, "description", e.target.value)
-              }
-              className="h-7 text-xs"
-              placeholder={t("taskDescription")}
-            />
+          {/* Add sub-task button */}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 text-xs w-full"
+            onClick={addEntry}
+          >
+            <Plus className="size-3 mr-1" />
+            {t("addTask")}
+          </Button>
+        </div>
 
-            {/* Type + Priority */}
-            <div className="flex items-center gap-2">
-              <Select
-                value={entry.taskType}
-                onValueChange={(v) => updateEntry(index, "taskType", v)}
-              >
-                <SelectTrigger className="h-7 text-xs w-[90px]">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {TASK_TYPE_OPTIONS.map((type) => (
-                    <SelectItem key={type} value={type}>
-                      {type}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-
-              <Select
-                value={entry.priority}
-                onValueChange={(v) => updateEntry(index, "priority", v)}
-              >
-                <SelectTrigger className="h-7 text-xs w-[90px]">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {PRIORITY_OPTIONS.map((p) => (
-                    <SelectItem key={p} value={p}>
-                      <span
-                        className={cn(
-                          TASK_PRIORITY_COLORS[p as TaskPriority] ?? ""
-                        )}
-                      >
-                        {p}
-                      </span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-        ))}
-
-        {/* Add sub-task button */}
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-7 text-xs w-full"
-          onClick={addEntry}
-        >
-          <Plus className="size-3 mr-1" />
-          {t("addTask")}
-        </Button>
-      </div>
-
-      {/* Footer */}
-      <div className="flex items-center gap-2 px-3 py-2 border-t shrink-0">
-        <Button
-          variant="outline"
-          size="sm"
-          className="h-7 text-xs"
-          onClick={onDismiss}
-          disabled={creating}
-        >
-          {t("continueDiscussion")}
-        </Button>
-        <Button
-          size="sm"
-          className="h-7 text-xs"
-          onClick={handleConfirm}
-          disabled={creating || proposedSubTasks.every((e) => !e.title.trim())}
-        >
-          {creating && <Loader2 className="size-3 mr-1 animate-spin" />}
-          {t("confirmCreate")}
-        </Button>
-      </div>
-    </div>
+        <DialogFooter className="mt-4 shrink-0">
+          <Button
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+            disabled={submitting}
+          >
+            {t("continueDiscussion")}
+          </Button>
+          <Button
+            onClick={handleConfirm}
+            disabled={
+              submitting || proposedSubTasks.every((e) => !e.title.trim())
+            }
+          >
+            {submitting && (
+              <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+            )}
+            {t("confirmCreate")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
