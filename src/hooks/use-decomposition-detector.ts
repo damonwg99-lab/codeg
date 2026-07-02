@@ -30,10 +30,18 @@ interface UseDecompositionDetectorResult {
   detectedSubTasks: ProposedSubTask[] | null
   /** Whether the overlay was manually dismissed (chip should be shown). */
   isDismissed: boolean
+  /** Whether the proposal was confirmed (batch-created). Overlay stays
+   *  hidden until a new proposal arrives. */
+  isConfirmed: boolean
   /** Clear the proposal and reset dismissal state. */
   clearProposal: () => void
   /** Dismiss the overlay (keep proposal data, mark as dismissed). */
   dismissProposal: () => void
+  /** Confirm the proposal (after batch-creating tasks). Marks the
+   *  proposal as "consumed" so it won't re-appear even though the
+   *  AI message still contains the JSON fence. A NEW proposal with
+   *  different content will still auto-trigger the overlay. */
+  confirmProposal: () => void
   /** Re-open the overlay after dismissal. */
   reopenProposal: () => void
   /** Update sub-tasks (user edits in the overlay). */
@@ -81,6 +89,11 @@ export function useDecompositionDetector(
   // overridden.
   const [dismissedKey, setDismissedKey] = useState<string | null>(null)
 
+  // Track whether the user has confirmed (batch-created) a proposal.
+  // Same mechanism as dismissedKey: once confirmed, the overlay stays
+  // closed until a NEW proposal with different content arrives.
+  const [confirmedKey, setConfirmedKey] = useState<string | null>(null)
+
   const currentDetectedKey = proposalKey(detectedSubTasks)
 
   // If a new proposal arrives (different key from the dismissed one),
@@ -90,25 +103,46 @@ export function useDecompositionDetector(
       ? null // new proposal → override dismissal
       : dismissedKey
 
+  // Same for confirmed: a new proposal overrides the confirmation.
+  const effectiveConfirmedKey =
+    currentDetectedKey !== null && currentDetectedKey !== confirmedKey
+      ? null // new proposal → override confirmation
+      : confirmedKey
+
   // The effective proposed sub-tasks:
-  // - If dismissed (same key), return null → overlay hidden
+  // - If confirmed (same key), return null → overlay hidden permanently
+  // - If dismissed (same key), return null → overlay hidden, chip shown
   // - Otherwise, user-edited overrides detected
+  const isConfirmed =
+    effectiveConfirmedKey !== null &&
+    effectiveConfirmedKey === proposalKey(detectedSubTasks)
+
   const isDismissed =
+    !isConfirmed &&
     effectiveDismissedKey !== null &&
     effectiveDismissedKey === proposalKey(detectedSubTasks)
 
-  const proposedSubTasks = isDismissed
+  const proposedSubTasks = isConfirmed
     ? null
-    : (userEditedSubTasks ?? detectedSubTasks)
+    : isDismissed
+      ? null
+      : (userEditedSubTasks ?? detectedSubTasks)
 
   const clearProposal = useCallback(() => {
     setUserEditedSubTasks(null)
     setDismissedKey(null)
+    setConfirmedKey(null)
   }, [])
 
   const dismissProposal = useCallback(() => {
     // Mark the current proposal as dismissed by storing its key
     setDismissedKey(proposalKey(userEditedSubTasks ?? detectedSubTasks))
+    setUserEditedSubTasks(null)
+  }, [userEditedSubTasks, detectedSubTasks])
+
+  const confirmProposal = useCallback(() => {
+    // Mark the current proposal as confirmed (consumed) by storing its key
+    setConfirmedKey(proposalKey(userEditedSubTasks ?? detectedSubTasks))
     setUserEditedSubTasks(null)
   }, [userEditedSubTasks, detectedSubTasks])
 
@@ -124,8 +158,10 @@ export function useDecompositionDetector(
     proposedSubTasks,
     detectedSubTasks,
     isDismissed,
+    isConfirmed,
     clearProposal,
     dismissProposal,
+    confirmProposal,
     reopenProposal,
     updateSubTasks,
   }

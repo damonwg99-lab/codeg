@@ -26,6 +26,7 @@ import { DecompositionOverlay } from "@/components/chat/decomposition-overlay"
 import { useDecompositionDetector } from "@/hooks/use-decomposition-detector"
 import type { TaskInfo, ProjectInfo } from "@/lib/platform/types"
 import { createTask, createDecomposition } from "@/lib/platform/api"
+import { toast } from "sonner"
 import { normalizeToolName } from "@/lib/tool-call-normalization"
 import { isDelegateToAgentToolName } from "@/lib/delegation-card"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
@@ -530,7 +531,7 @@ export function MessageListView({
     proposedSubTasks: decompSubTasks,
     detectedSubTasks: decompDetected,
     isDismissed: decompDismissed,
-    clearProposal: clearDecomp,
+    confirmProposal: confirmDecomp,
     dismissProposal: dismissDecomp,
     reopenProposal: reopenDecomp,
     updateSubTasks: updateDecompSubTasks,
@@ -566,14 +567,16 @@ export function MessageListView({
             priority: sub.priority,
           })
         }
-        clearDecomp()
+        confirmDecomp()
+        toast.success(tDecomp("decompositionApplied"))
       } catch (err) {
         console.error("Failed to create sub-tasks:", err)
+        toast.error(tDecomp("decompositionFailed"))
       } finally {
         setDecompSubmitting(false)
       }
     },
-    [clearDecomp]
+    [confirmDecomp, tDecomp]
   )
 
   const { setSessionStats } = useSessionStats()
