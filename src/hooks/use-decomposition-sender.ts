@@ -4,6 +4,7 @@ import {
   hasDecompositionIntent,
   DECOMPOSITION_INSTRUCTION,
 } from "@/lib/platform/decomposition-parser"
+import { DECOMPOSITION_INSTRUCTION_SENTINEL } from "@/lib/feedback-reminder"
 import type { PromptDraft, PromptInputBlock } from "@/lib/types"
 
 /**
@@ -14,9 +15,12 @@ import type { PromptDraft, PromptInputBlock } from "@/lib/types"
  * existing components — the caller just replaces `draft` with
  * `wrapDecompositionDraft(draft)` at the single send chokepoint.
  *
- * The instruction is appended as a new text block at the end of
- * `draft.blocks`, and `displayText` is left unchanged so the user's
- * optimistic bubble still shows only their own words.
+ * The instruction is bracketed by the ⟦codeg:decomp-instruction⟧ sentinel
+ * and appended as a new text block at the end of `draft.blocks`.
+ * `displayText` is left unchanged so the user's optimistic bubble still
+ * shows only their own words. On reload, `stripFeedbackReminder` (which
+ * also strips the decomposition sentinel) hides the instruction from the
+ * displayed user message.
  */
 export function wrapDecompositionDraft(draft: PromptDraft): PromptDraft {
   // Extract plain text from blocks to check for decomposition intent
@@ -27,14 +31,22 @@ export function wrapDecompositionDraft(draft: PromptDraft): PromptDraft {
 
   if (!hasDecompositionIntent(userText)) return draft
 
-  // Append the instruction as a new text block at the end.
-  // displayText is NOT updated — the user's message bubble should
-  // only show their own text, not the system instruction.
+  // Append the instruction as a sentinel-bracketed text block.
+  // The sentinel ensures:
+  //  1. The agent recognizes it as a system note (not user prose)
+  //  2. stripFeedbackReminder removes it from the displayed user message
   return {
     ...draft,
     blocks: [
       ...draft.blocks,
-      { type: "text", text: "\n" + DECOMPOSITION_INSTRUCTION },
+      {
+        type: "text",
+        text:
+          "\n" +
+          DECOMPOSITION_INSTRUCTION_SENTINEL +
+          " " +
+          DECOMPOSITION_INSTRUCTION,
+      },
     ],
   }
 }
@@ -53,5 +65,15 @@ export function wrapDecompositionBlocks(
 
   if (!hasDecompositionIntent(userText)) return blocks
 
-  return [...blocks, { type: "text", text: "\n" + DECOMPOSITION_INSTRUCTION }]
+  return [
+    ...blocks,
+    {
+      type: "text",
+      text:
+        "\n" +
+        DECOMPOSITION_INSTRUCTION_SENTINEL +
+        " " +
+        DECOMPOSITION_INSTRUCTION,
+    },
+  ]
 }

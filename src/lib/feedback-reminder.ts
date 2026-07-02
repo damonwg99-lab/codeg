@@ -19,6 +19,14 @@ import type { PromptInputBlock } from "@/lib/types"
 export const FEEDBACK_REMINDER_SENTINEL = "⟦codeg:live-feedback⟧"
 
 /**
+ * Sentinel that brackets the auto-injected decomposition instruction.
+ * Same design as FEEDBACK_REMINDER_SENTINEL: labels the instruction as a
+ * Codeg system note for the agent and provides a strip anchor so it never
+ * surfaces in the user's displayed message.
+ */
+export const DECOMPOSITION_INSTRUCTION_SENTINEL = "⟦codeg:decomp-instruction⟧"
+
+/**
  * Append the live-feedback reminder to the end of a prompt's OUTGOING text,
  * bracketed by {@link FEEDBACK_REMINDER_SENTINEL}.
  *
@@ -63,16 +71,27 @@ export function appendFeedbackReminder(
 }
 
 /**
- * Remove an appended live-feedback reminder from a piece of DISPLAY text.
+ * Remove an appended live-feedback reminder OR decomposition instruction
+ * from a piece of DISPLAY text.
  *
- * The reminder is always the trailing content (joined to the end of the prose,
- * preceded by {@link FEEDBACK_REMINDER_SENTINEL}), so everything from the
- * sentinel onward is dropped and the trailing whitespace that joined it is
- * trimmed. Text that never carried a reminder is returned unchanged; a string
- * that is *only* the reminder collapses to "" (callers drop the emptied part).
+ * Both are trailing content bracketed by their respective sentinel markers.
+ * Everything from either sentinel onward is dropped and trailing whitespace
+ * is trimmed. Text that never carried either marker is returned unchanged;
+ * a string that is *only* the marker collapses to "" (callers drop the
+ * emptied part).
  */
 export function stripFeedbackReminder(text: string): string {
-  const idx = text.indexOf(FEEDBACK_REMINDER_SENTINEL)
-  if (idx === -1) return text
-  return text.slice(0, idx).replace(/\s+$/, "")
+  const feedbackIdx = text.indexOf(FEEDBACK_REMINDER_SENTINEL)
+  const decompIdx = text.indexOf(DECOMPOSITION_INSTRUCTION_SENTINEL)
+  // Pick the earliest sentinel position
+  let cutIdx = -1
+  if (feedbackIdx !== -1 && decompIdx !== -1) {
+    cutIdx = Math.min(feedbackIdx, decompIdx)
+  } else if (feedbackIdx !== -1) {
+    cutIdx = feedbackIdx
+  } else if (decompIdx !== -1) {
+    cutIdx = decompIdx
+  }
+  if (cutIdx === -1) return text
+  return text.slice(0, cutIdx).replace(/\s+$/, "")
 }
