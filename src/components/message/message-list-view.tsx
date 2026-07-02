@@ -45,11 +45,13 @@ import {
   ChevronRight,
   CopyIcon,
   Info,
+  ListChecks,
   Loader2,
   Plus,
   RefreshCw,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { CollapsedOverlayChip } from "@/components/chat/collapsed-overlay-chip"
 import { useTranslations } from "next-intl"
 import {
   buildPlanKey,
@@ -517,6 +519,7 @@ export function MessageListView({
 }: MessageListViewProps) {
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
+  const tDecomp = useTranslations("Platform.task")
   const { getSession, getTimelineTurns } = useConversationRuntime()
   const session = getSession(conversationId)
   const liveMessage = session?.liveMessage ?? null
@@ -525,9 +528,15 @@ export function MessageListView({
   // Decomposition detection: scan assistant messages for sub-task proposals
   const {
     proposedSubTasks: decompSubTasks,
+    detectedSubTasks: decompDetected,
+    isDismissed: decompDismissed,
     clearProposal: clearDecomp,
+    dismissProposal: dismissDecomp,
+    reopenProposal: reopenDecomp,
     updateSubTasks: updateDecompSubTasks,
   } = useDecompositionDetector(session?.localTurns)
+
+  const [decompSubmitting, setDecompSubmitting] = useState(false)
 
   // Handler for confirming decomposition: batch-create sub-tasks
   const handleDecompConfirm = useCallback(
@@ -536,6 +545,7 @@ export function MessageListView({
       parentTaskId: number | null
       subTasks: import("@/lib/platform/decomposition-parser").ProposedSubTask[]
     }) => {
+      setDecompSubmitting(true)
       try {
         // Store decomposition record for audit
         if (params.parentTaskId) {
@@ -559,6 +569,8 @@ export function MessageListView({
         clearDecomp()
       } catch (err) {
         console.error("Failed to create sub-tasks:", err)
+      } finally {
+        setDecompSubmitting(false)
       }
     },
     [clearDecomp]
@@ -982,6 +994,17 @@ export function MessageListView({
           delegations={lastAssistantDelegations}
           overlayKey={subAgentOverlayKey}
         />
+        {/* Dismissed decomposition chip: shows when user closed the dialog
+            but proposals still exist. Clicking re-opens the dialog. */}
+        {decompDismissed && decompDetected && decompDetected.length > 0 && (
+          <CollapsedOverlayChip
+            icon={<ListChecks className="size-3" />}
+            summary={tDecomp("proposedTasks", {
+              count: decompDetected.length,
+            })}
+            onClick={reopenDecomp}
+          />
+        )}
       </div>
       {/* Decomposition review dialog — rendered as a Dialog (not in the
           narrow overlay stack) so it centers properly, matches conversation
@@ -989,13 +1012,13 @@ export function MessageListView({
       <DecompositionOverlay
         open={decompSubTasks !== null && decompSubTasks.length > 0}
         onOpenChange={(open) => {
-          if (!open) clearDecomp()
+          if (!open) dismissDecomp()
         }}
         proposedSubTasks={decompSubTasks ?? []}
         linkedTask={linkedTask ?? null}
         projects={projects}
         activeProjectId={activeProjectId ?? null}
-        submitting={false}
+        submitting={decompSubmitting}
         onUpdateSubTasks={updateDecompSubTasks}
         onConfirm={handleDecompConfirm}
       />
