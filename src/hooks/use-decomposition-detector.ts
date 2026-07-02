@@ -21,10 +21,10 @@ import {
  * - `confirmed`: { convId, key } — confirmation keyed to the conversation.
  *   Stale confirmations from a different conversation auto-expire.
  *
- * Both dismissedKey and confirmedKey are persisted to sessionStorage so
- * they survive component remounts (tab switches, navigation). Without
- * persistence, reopening a conversation would always auto-pop the overlay
- * for a previously-dismissed proposal.
+ * Both dismissedKey and confirmedKey are persisted to localStorage so
+ * they survive component remounts (tab close/reopen) and app restarts.
+ * Without persistence, reopening a conversation would always auto-pop
+ * the overlay for a previously-dismissed proposal.
  *
  * When the user dismisses the overlay:
  * - proposedSubTasks becomes null (overlay closed)
@@ -59,7 +59,7 @@ function readStoredState(
   convId: number | string | null | undefined
 ): StoredState {
   try {
-    const raw = sessionStorage.getItem(storageKey(convId))
+    const raw = localStorage.getItem(storageKey(convId))
     if (!raw) return { dismissedKey: null, confirmedKey: null }
     const parsed = JSON.parse(raw) as StoredState
     return {
@@ -76,15 +76,15 @@ function writeStoredState(
   state: StoredState
 ): void {
   try {
-    sessionStorage.setItem(storageKey(convId), JSON.stringify(state))
+    localStorage.setItem(storageKey(convId), JSON.stringify(state))
   } catch {
-    // sessionStorage may be unavailable (private browsing, quota)
+    // localStorage may be unavailable (private browsing, quota)
   }
 }
 
 function clearStoredState(convId: number | string | null | undefined): void {
   try {
-    sessionStorage.removeItem(storageKey(convId))
+    localStorage.removeItem(storageKey(convId))
   } catch {
     // ignore
   }
@@ -171,9 +171,9 @@ export function useDecompositionDetector(
   // useEffect + setState to reset on conversation switch (which ESLint
   // forbids).
   //
-  // Dismissed and confirmed keys are ALSO persisted to sessionStorage so
-  // they survive component remounts (e.g., tab switches, navigation).
-  // On mount, we read the stored state; on change, we write it back.
+  // Dismissed and confirmed keys are ALSO persisted to localStorage so
+  // they survive component remounts and app restarts. On mount, we read
+  // the stored state; on change, we write it back.
 
   // Read persisted state once via useState initializer (ESLint allows
   // this because the initializer only runs on mount).
