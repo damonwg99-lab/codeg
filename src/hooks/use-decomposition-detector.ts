@@ -13,16 +13,39 @@ import {
  *
  * State model:
  * - `detectedSubTasks`: auto-derived from localTurns (useMemo)
- * - `userEditedSubTasks`: user's manual edits in the overlay (useState)
- * - `dismissedKey`: a hash of the proposal content when the user closed
- *   the overlay. Prevents the same proposal from auto-reopening.
+ * - `userEdited`: { convId, tasks } — user's manual edits, scoped to the
+ *   conversation where they were made. Stale edits from a different
+ *   conversation are automatically ignored.
+ * - `dismissed`: { convId, key } — dismissal keyed to the conversation.
+ *   Stale dismissals from a different conversation auto-expire.
+ * - `confirmed`: { convId, key } — confirmation keyed to the conversation.
+ *   Stale confirmations from a different conversation auto-expire.
  *
  * When the user dismisses the overlay:
  * - proposedSubTasks becomes null (overlay closed)
  * - A CollapsedOverlayChip is shown so the user can re-open
  * - If AI sends a NEW proposal (different content), the dismissal is
  *   overridden and the overlay re-appears automatically
+ *
+ * When the user confirms (batch-creates tasks):
+ * - proposedSubTasks becomes null (overlay closes)
+ * - The same proposal won't re-appear even though the AI message still
+ *   contains the JSON fence.
+ * - A NEW proposal with different content auto-triggers the overlay.
+ *
+ * All keyed state is conversation-scoped via convId, so switching tabs
+ * never carries stale overlay state from a previous conversation.
  */
+interface ScopedKey {
+  convId: number | string | null | undefined
+  key: string
+}
+
+interface ScopedEdit {
+  convId: number | string | null | undefined
+  tasks: ProposedSubTask[]
+}
+
 interface UseDecompositionDetectorResult {
   /** The effective sub-tasks to show in the overlay (null = hidden). */
   proposedSubTasks: ProposedSubTask[] | null
@@ -33,14 +56,11 @@ interface UseDecompositionDetectorResult {
   /** Whether the proposal was confirmed (batch-created). Overlay stays
    *  hidden until a new proposal arrives. */
   isConfirmed: boolean
-  /** Clear the proposal and reset dismissal state. */
+  /** Clear the proposal and reset all keyed state. */
   clearProposal: () => void
   /** Dismiss the overlay (keep proposal data, mark as dismissed). */
   dismissProposal: () => void
-  /** Confirm the proposal (after batch-creating tasks). Marks the
-   *  proposal as "consumed" so it won't re-appear even though the
-   *  AI message still contains the JSON fence. A NEW proposal with
-   *  different content will still auto-trigger the overlay. */
+  /** Confirm the proposal (after batch-creating tasks). */
   confirmProposal: () => void
   /** Re-open the overlay after dismissal. */
   reopenProposal: () => void
@@ -48,14 +68,24 @@ interface UseDecompositionDetectorResult {
   updateSubTasks: (subTasks: ProposedSubTask[]) => void
 }
 
-/** Create a simple hash key from proposal content for dismissal tracking. */
+/** Create a simple hash key from proposal content for tracking. */
 function proposalKey(tasks: ProposedSubTask[] | null): string | null {
   if (!tasks || tasks.length === 0) return null
   return tasks.map((t) => `${t.title}|${t.taskType}|${t.priority}`).join("::")
 }
 
+/** Check if a scoped key belongs to the current conversation. */
+function isCurrentConv(
+  scoped: ScopedKey | ScopedEdit | null,
+  convId: number | string | null | undefined
+): boolean {
+  if (!scoped) return false
+  return scoped.convId === convId
+}
+
 export function useDecompositionDetector(
-  localTurns: MessageTurn[] | undefined
+  localTurns: MessageTurn[] | undefined,
+  conversationId: number | string | null | undefined
 ): UseDecompositionDetectorResult {
   // Auto-detected sub-tasks from AI response (derived, not stored in state)
   const detectedSubTasks = useMemo<ProposedSubTask[] | null>(() => {
@@ -78,39 +108,51 @@ export function useDecompositionDetector(
     return parsed && parsed.length > 0 ? parsed : null
   }, [localTurns])
 
-  // Track whether the user has manually edited the proposal.
-  const [userEditedSubTasks, setUserEditedSubTasks] = useState<
-    ProposedSubTask[] | null
-  >(null)
+  // ── Conversation-scoped keyed state ──
+  // Each state stores the conversationId it was set for. When the current
+  // conversationId differs, the state is automatically stale and ignored
+  // in the effective-value calculations below. This avoids the need for
+  // useEffect + setState to reset on conversation switch (which ESLint
+  // forbids).
 
-  // Track whether the user has dismissed the current proposal.
-  // Stores the proposalKey of the dismissed proposal so we can compare
-  // against new proposals — if the content changes, the dismissal is
-  // overridden.
-  const [dismissedKey, setDismissedKey] = useState<string | null>(null)
+  const [dismissedScoped, setDismissedScoped] = useState<ScopedKey | null>(null)
+  const [confirmedScoped, setConfirmedScoped] = useState<ScopedKey | null>(null)
+  const [editedScoped, setEditedScoped] = useState<ScopedEdit | null>(null)
 
-  // Track whether the user has confirmed (batch-created) a proposal.
-  // Same mechanism as dismissedKey: once confirmed, the overlay stays
-  // closed until a NEW proposal with different content arrives.
-  const [confirmedKey, setConfirmedKey] = useState<string | null>(null)
+  // ── Effective values (stale state auto-expired) ──
+
+  // User edits: only valid if they belong to the current conversation
+  const userEditedSubTasks = isCurrentConv(editedScoped, conversationId)
+    ? editedScoped!.tasks
+    : null
+
+  // Dismissed key: only valid if it belongs to the current conversation
+  const dismissedKey = isCurrentConv(dismissedScoped, conversationId)
+    ? dismissedScoped!.key
+    : null
+
+  // Confirmed key: only valid if it belongs to the current conversation
+  const confirmedKey = isCurrentConv(confirmedScoped, conversationId)
+    ? confirmedScoped!.key
+    : null
 
   const currentDetectedKey = proposalKey(detectedSubTasks)
 
-  // If a new proposal arrives (different key from the dismissed one),
+  // If a new proposal arrives (different key from the stored one),
   // automatically override the dismissal so the overlay re-appears.
   const effectiveDismissedKey =
     currentDetectedKey !== null && currentDetectedKey !== dismissedKey
-      ? null // new proposal → override dismissal
+      ? null
       : dismissedKey
 
   // Same for confirmed: a new proposal overrides the confirmation.
   const effectiveConfirmedKey =
     currentDetectedKey !== null && currentDetectedKey !== confirmedKey
-      ? null // new proposal → override confirmation
+      ? null
       : confirmedKey
 
   // The effective proposed sub-tasks:
-  // - If confirmed (same key), return null → overlay hidden permanently
+  // - If confirmed (same key), return null → overlay hidden
   // - If dismissed (same key), return null → overlay hidden, chip shown
   // - Otherwise, user-edited overrides detected
   const isConfirmed =
@@ -129,30 +171,37 @@ export function useDecompositionDetector(
       : (userEditedSubTasks ?? detectedSubTasks)
 
   const clearProposal = useCallback(() => {
-    setUserEditedSubTasks(null)
-    setDismissedKey(null)
-    setConfirmedKey(null)
+    setEditedScoped(null)
+    setDismissedScoped(null)
+    setConfirmedScoped(null)
   }, [])
 
   const dismissProposal = useCallback(() => {
-    // Mark the current proposal as dismissed by storing its key
-    setDismissedKey(proposalKey(userEditedSubTasks ?? detectedSubTasks))
-    setUserEditedSubTasks(null)
-  }, [userEditedSubTasks, detectedSubTasks])
+    const key = proposalKey(userEditedSubTasks ?? detectedSubTasks)
+    if (key) {
+      setDismissedScoped({ convId: conversationId, key })
+    }
+    setEditedScoped(null)
+  }, [userEditedSubTasks, detectedSubTasks, conversationId])
 
   const confirmProposal = useCallback(() => {
-    // Mark the current proposal as confirmed (consumed) by storing its key
-    setConfirmedKey(proposalKey(userEditedSubTasks ?? detectedSubTasks))
-    setUserEditedSubTasks(null)
-  }, [userEditedSubTasks, detectedSubTasks])
+    const key = proposalKey(userEditedSubTasks ?? detectedSubTasks)
+    if (key) {
+      setConfirmedScoped({ convId: conversationId, key })
+    }
+    setEditedScoped(null)
+  }, [userEditedSubTasks, detectedSubTasks, conversationId])
 
   const reopenProposal = useCallback(() => {
-    setDismissedKey(null)
+    setDismissedScoped(null)
   }, [])
 
-  const updateSubTasks = useCallback((subTasks: ProposedSubTask[]) => {
-    setUserEditedSubTasks(subTasks)
-  }, [])
+  const updateSubTasks = useCallback(
+    (subTasks: ProposedSubTask[]) => {
+      setEditedScoped({ convId: conversationId, tasks: subTasks })
+    },
+    [conversationId]
+  )
 
   return {
     proposedSubTasks,

@@ -535,7 +535,7 @@ export function MessageListView({
     dismissProposal: dismissDecomp,
     reopenProposal: reopenDecomp,
     updateSubTasks: updateDecompSubTasks,
-  } = useDecompositionDetector(session?.localTurns)
+  } = useDecompositionDetector(session?.localTurns, conversationId)
 
   const [decompSubmitting, setDecompSubmitting] = useState(false)
 
