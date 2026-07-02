@@ -526,7 +526,10 @@ export function MessageListView({
   const liveMessage = session?.liveMessage ?? null
   const timelineTurns = getTimelineTurns(conversationId)
 
-  // Decomposition detection: scan assistant messages for sub-task proposals
+  // Decomposition detection: scan assistant messages for sub-task proposals.
+  // Use timelineTurns (which merges DB history + local + streaming) instead
+  // of session.localTurns, so detection works after reopening a conversation
+  // (where turns are loaded from DB, not in localTurns).
   const {
     proposedSubTasks: decompSubTasks,
     detectedSubTasks: decompDetected,
@@ -535,7 +538,7 @@ export function MessageListView({
     dismissProposal: dismissDecomp,
     reopenProposal: reopenDecomp,
     updateSubTasks: updateDecompSubTasks,
-  } = useDecompositionDetector(session?.localTurns, conversationId)
+  } = useDecompositionDetector(timelineTurns, conversationId)
 
   const [decompSubmitting, setDecompSubmitting] = useState(false)
 

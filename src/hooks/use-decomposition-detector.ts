@@ -147,10 +147,19 @@ export function useDecompositionDetector(
   const detectedSubTasks = useMemo<ProposedSubTask[] | null>(() => {
     if (!localTurns || localTurns.length === 0) return null
 
-    // Find the last completed assistant turn
+    // Find the last assistant turn that is "complete". For turns loaded
+    // from the database, `completed_at` may be omitted (Rust skips it
+    // when None via `skip_serializing_if`), but DB-loaded turns are
+    // always complete by definition. So we treat undefined/missing as
+    // truthy — only actively-streaming turns have completed_at set to
+    // a concrete timestamp.
     const lastAssistant = [...localTurns]
       .reverse()
-      .find((t) => t.role === "assistant" && t.completed_at)
+      .find(
+        (t) =>
+          t.role === "assistant" &&
+          (t.completed_at !== null || t.completed_at === undefined)
+      )
 
     if (!lastAssistant) return null
 
