@@ -802,23 +802,12 @@ const ConversationTabView = memo(function ConversationTabView({
         return
       }
 
-      // Past the queue guard this draft is actually delivered (a direct send or a
-      // queue flush). Append the live-feedback reminder to the OUTGOING blocks
-      // only, here at the single send chokepoint — so queued/edited drafts stay
-      // pristine (no editor leak, no double-append) and exactly one reminder
-      // reaches the agent. `displayText` is untouched, so the optimistic bubble
-      // (and `onTurnInProgress` requeue / failure re-seed, which use `draft`)
-      // keep the user's own words.
-      const reminder = feedbackReminderRef.current
-      // Wrap with decomposition instruction if user message has decomposition intent
-      const decompWrapped = wrapDecompositionDraft(draft)
-      const sendDraft: PromptDraft = reminder
-        ? {
-            ...decompWrapped,
-            blocks: appendFeedbackReminder(decompWrapped.blocks, reminder),
-          }
-        : decompWrapped
-
+      // Wrap with decomposition instruction if user message has
+      // decomposition intent. Applied after the queue guard so the
+      // original draft is preserved for queue/requeue (a bounce
+      // re-seeds the raw draft back into handleSend, which wraps it
+      // fresh on the retry).
+      const sendDraft = wrapDecompositionDraft(draft)
 
       // Single-flight the unbound new-tab create. A second direct submit fired
       // before the first create resolves (a double Enter / double click) would
@@ -879,7 +868,7 @@ const ConversationTabView = memo(function ConversationTabView({
         // Existing-tab path: row already exists, send immediately with the
         // conversation_id pinned so the backend reuses our row instead of
         // creating a duplicate.
-        lifecycleSend(draft, selectedModeIdArg, {
+        lifecycleSend(sendDraft, selectedModeIdArg, {
           folderId,
           conversationId: persistedId,
           // The backend echoes this as the broadcast UserMessage's message_id,
@@ -996,7 +985,7 @@ const ConversationTabView = memo(function ConversationTabView({
           // Now that the row exists, kick off the actual prompt with the
           // conversation_id pinned so the backend adopts our row instead of
           // creating a duplicate one.
-          lifecycleSend(draft, selectedModeIdArg, {
+          lifecycleSend(sendDraft, selectedModeIdArg, {
             folderId: sendFolderId,
             conversationId: newConversationId,
             clientMessageId: optimisticTurn.id,
@@ -1213,6 +1202,7 @@ const ConversationTabView = memo(function ConversationTabView({
         blocks: [{ type: "text", text: answer }],
         displayText: answer,
       }
+      const sendDraft = wrapDecompositionDraft(draft)
       appendOptimisticTurn(
         effectiveConversationId,
         optimisticTurn,
@@ -1220,7 +1210,7 @@ const ConversationTabView = memo(function ConversationTabView({
       )
       setSendSignal((prev) => prev + 1)
       setSyncState(effectiveConversationId, "awaiting_persist")
-      lifecycleSend(draft, null, {
+      lifecycleSend(sendDraft, null, {
         clientMessageId: optimisticTurn.id,
         // Rejected because a turn was already in flight — roll back the
         // optimistic turn and re-queue so it isn't stranded or lost.

@@ -51,6 +51,7 @@ import { BackgroundTaskCard } from "./background-task-card"
 import { GeneratedImagesBlock } from "./generated-images-block"
 import { GoalRunPart, GoalToolCallPart } from "./goal-tool-call"
 import { PlanCard, PlanEntriesList } from "./plan-card"
+import { DecompositionCard } from "./decomposition-card"
 import { PlanModeCard } from "./plan-mode-card"
 import {
   FileTextIcon,
@@ -2718,6 +2719,16 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
           revisedPrompt={part.revisedPrompt}
           image={part.image}
           status={part.status}
+        />
+      )
+    }
+
+    if (part.type === "decomposition") {
+      return (
+        <DecompositionCard
+          key={`decomp-${keyId}`}
+          tasks={part.tasks}
+          isStreaming={part.isStreaming}
         />
       )
     }

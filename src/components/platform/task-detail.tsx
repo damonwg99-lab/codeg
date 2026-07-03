@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react"
 import { useTranslations } from "next-intl"
+import { toast } from "sonner"
 import {
   Loader2,
   Save,
@@ -25,6 +26,7 @@ import {
   listKnowledgeDocs,
   deleteKnowledgeDoc,
   unlinkConversation,
+  deleteTask,
 } from "@/lib/platform/api"
 import { deleteConversation } from "@/lib/api"
 import type {
@@ -75,6 +77,12 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { cn } from "@/lib/utils"
+
+/** Format an ISO timestamp into a date string (same format as kanban: YYYY/MM/DD). */
+function formatShortDate(iso: string): string {
+  const date = new Date(iso)
+  return `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")}`
+}
 
 /** Resolve task status label using i18n.
  *  next-intl requires static keys at compile time; this does an explicit lookup
@@ -167,6 +175,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [editing, setEditing] = useState(false)
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [contextPanelOpen, setContextPanelOpen] = useState(false)
   const [creatingConversation, setCreatingConversation] = useState(false)
 
@@ -181,6 +190,40 @@ export function TaskDetail({ taskId }: { taskId: number }) {
   const [deleteConvTarget, setDeleteConvTarget] =
     useState<TaskConversationInfo | null>(null)
   const [deletingConversation, setDeletingConversation] = useState(false)
+
+  // Delete sub-task dialog state
+  const [deleteSubTarget, setDeleteSubTarget] = useState<number | null>(null)
+
+  // Delete task handler — uses routeParams.projectId as fallback so
+  // the hook can run before the detail early-return.
+  const projectIdForDelete = Number(
+    routeParams.projectId ?? detail?.task.projectId ?? 0
+  )
+  const handleDeleteTask = useCallback(async () => {
+    if (projectIdForDelete === 0) return
+    try {
+      await deleteTask(taskId)
+      toast.success(t("task.taskDeleted" as never))
+      setRoute("task-kanban", { projectId: projectIdForDelete })
+    } catch {
+      toast.error(t("task.deleteTaskFailed" as never))
+    }
+  }, [taskId, projectIdForDelete, setRoute, t])
+
+  // Delete sub-task handler (reloads detail after sub-task removal)
+  const handleDeleteSubTask = useCallback(
+    async (subTaskId: number) => {
+      try {
+        await deleteTask(subTaskId)
+        toast.success(t("task.taskDeleted" as never))
+        const d = await getTask(taskId)
+        setDetail(d)
+      } catch {
+        toast.error(t("task.deleteTaskFailed" as never))
+      }
+    },
+    [taskId]
+  )
 
   // KB docs + skills state (lazy loaded when context panel opens)
   const [kbDocs, setKbDocs] = useState<KnowledgeDocInfo[]>([])
@@ -520,14 +563,25 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                 </Button>
               </>
             ) : (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setEditing(true)}
-              >
-                <Pencil className="mr-1 h-3.5 w-3.5" />
-                {t("project.edit")}
-              </Button>
+              <>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground hover:text-destructive"
+                  onClick={() => setDeleteDialogOpen(true)}
+                >
+                  <Trash2 className="mr-1 h-3.5 w-3.5" />
+                  {t("task.deleteTask" as never)}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setEditing(true)}
+                >
+                  <Pencil className="mr-1 h-3.5 w-3.5" />
+                  {t("project.edit")}
+                </Button>
+              </>
             )}
           </div>
         </div>
@@ -829,60 +883,69 @@ export function TaskDetail({ taskId }: { taskId: number }) {
               </p>
             ) : (
               <div className="flex flex-col gap-2">
-                {conversations.map((conv) => {
-                  // Look up actual conversation title from sidebar data
-                  const convSummary = allConversations.find(
-                    (c) => c.id === conv.conversationId
+                {[...conversations]
+                  .sort(
+                    (a, b) =>
+                      new Date(b.createdAt).getTime() -
+                      new Date(a.createdAt).getTime()
                   )
-                  const convTitle =
-                    convSummary?.title ||
-                    conv.summary ||
-                    t("task.untitledConversation")
-                  return (
-                    <div
-                      key={conv.id}
-                      className="flex items-center gap-2 rounded-md border p-2 hover:bg-accent/50"
-                    >
-                      <MessageSquare className="h-4 w-4 shrink-0 text-muted-foreground" />
-                      <span className="text-[0.875rem] font-medium truncate min-w-0">
-                        {convTitle}
-                      </span>
-                      <div className="flex items-center gap-1 shrink-0 ml-auto">
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="h-6 text-[0.625rem] px-2"
-                          onClick={() => {
-                            if (convSummary) {
-                              openTab(
-                                convSummary.folder_id,
-                                convSummary.id,
-                                convSummary.agent_type
-                              )
-                              // Must switch to conversations view — openTab
-                              // only changes the active tab, but the workbench
-                              // route stays on the platform page unless we
-                              // explicitly navigate to conversations.
-                              openConversations()
-                            } else {
-                              openConversations()
-                            }
-                          }}
-                        >
-                          {t("task.continueConversation")}
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-6 w-6 text-muted-foreground hover:text-destructive"
-                          onClick={() => setDeleteConvTarget(conv)}
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </Button>
+                  .map((conv) => {
+                    // Look up actual conversation title from sidebar data
+                    const convSummary = allConversations.find(
+                      (c) => c.id === conv.conversationId
+                    )
+                    const convTitle =
+                      convSummary?.title ||
+                      conv.summary ||
+                      t("task.untitledConversation")
+                    return (
+                      <div
+                        key={conv.id}
+                        className="flex items-center gap-2 rounded-md border p-2 hover:bg-accent/50"
+                      >
+                        <MessageSquare className="h-4 w-4 shrink-0 text-muted-foreground" />
+                        <span className="text-[0.875rem] font-medium truncate min-w-0">
+                          {convTitle}
+                        </span>
+                        <span className="text-[0.625rem] text-muted-foreground shrink-0">
+                          {formatShortDate(conv.createdAt)}
+                        </span>
+                        <div className="flex items-center gap-1 shrink-0 ml-auto">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-6 text-[0.625rem] px-2"
+                            onClick={() => {
+                              if (convSummary) {
+                                openTab(
+                                  convSummary.folder_id,
+                                  convSummary.id,
+                                  convSummary.agent_type
+                                )
+                                // Must switch to conversations view — openTab
+                                // only changes the active tab, but the workbench
+                                // route stays on the platform page unless we
+                                // explicitly navigate to conversations.
+                                openConversations()
+                              } else {
+                                openConversations()
+                              }
+                            }}
+                          >
+                            {t("task.continueConversation")}
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-6 w-6 text-muted-foreground hover:text-destructive"
+                            onClick={() => setDeleteConvTarget(conv)}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
                       </div>
-                    </div>
-                  )
-                })}
+                    )
+                  })}
               </div>
             )}
           </CardContent>
@@ -898,35 +961,55 @@ export function TaskDetail({ taskId }: { taskId: number }) {
             </CardHeader>
             <CardContent>
               <div className="flex flex-col gap-2">
-                {subTasks.map((sub) => (
-                  <div
-                    key={sub.id}
-                    className="flex items-center gap-2 rounded-md border p-2 cursor-pointer hover:bg-accent"
-                    onClick={() =>
-                      setRoute(
-                        "task-detail",
-                        { taskId: sub.id, projectId },
-                        {
-                          routeId: "task-detail",
-                          params: { taskId: task.id, projectId },
-                        }
-                      )
-                    }
-                  >
-                    <Badge
-                      variant="outline"
-                      className={cn(
-                        "text-[0.625rem]",
-                        TASK_STATUS_COLORS[sub.status as TaskStatus] ?? ""
-                      )}
+                {[...subTasks]
+                  .sort(
+                    (a, b) =>
+                      new Date(b.createdAt).getTime() -
+                      new Date(a.createdAt).getTime()
+                  )
+                  .map((sub) => (
+                    <div
+                      key={sub.id}
+                      className="flex items-center gap-2 rounded-md border p-2 cursor-pointer hover:bg-accent"
+                      onClick={() =>
+                        setRoute(
+                          "task-detail",
+                          { taskId: sub.id, projectId },
+                          {
+                            routeId: "task-detail",
+                            params: { taskId: task.id, projectId },
+                          }
+                        )
+                      }
                     >
-                      {resolveStatusLabel(t, sub.status)}
-                    </Badge>
-                    <span className="text-[0.875rem] truncate">
-                      {sub.title}
-                    </span>
-                  </div>
-                ))}
+                      <Badge
+                        variant="outline"
+                        className={cn(
+                          "text-[0.625rem]",
+                          TASK_STATUS_COLORS[sub.status as TaskStatus] ?? ""
+                        )}
+                      >
+                        {resolveStatusLabel(t, sub.status)}
+                      </Badge>
+                      <span className="text-[0.875rem] truncate min-w-0">
+                        {sub.title}
+                      </span>
+                      <span className="text-[0.625rem] text-muted-foreground shrink-0">
+                        {formatShortDate(sub.createdAt)}
+                      </span>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive ml-auto"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setDeleteSubTarget(sub.id)
+                        }}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  ))}
               </div>
             </CardContent>
           </Card>
@@ -1001,6 +1084,62 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                   <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
                 ) : null}
                 {t("task.deleteConversation")}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        {/* ─── Delete Task Confirm ─── */}
+        <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {t("task.deleteTask" as never)}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {t("task.deleteTaskConfirm" as never)}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>{t("project.cancel")}</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={() => void handleDeleteTask()}
+                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              >
+                {t("task.deleteTask" as never)}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        {/* ─── Delete Sub-Task Confirm ─── */}
+        <AlertDialog
+          open={deleteSubTarget !== null}
+          onOpenChange={(open) => {
+            if (!open) setDeleteSubTarget(null)
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {t("task.deleteTask" as never)}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {t("task.deleteTaskConfirm" as never)}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>{t("project.cancel")}</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={() => {
+                  if (deleteSubTarget !== null) {
+                    void handleDeleteSubTask(deleteSubTarget)
+                    setDeleteSubTarget(null)
+                  }
+                }}
+                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              >
+                {t("task.deleteTask" as never)}
               </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>

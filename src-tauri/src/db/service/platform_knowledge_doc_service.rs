@@ -34,15 +34,31 @@ fn escape_like(keyword: &str) -> String {
     keyword.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
+/// Normalize a file_path to use forward slashes only.
+/// On Windows, paths may contain backslashes (e.g. from `Path::to_string_lossy()`),
+/// but all write APIs and the scanner now produce forward-slash paths.
+/// This ensures database lookups and uniqueness constraints work consistently.
+fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
 pub async fn create(
     conn: &DatabaseConnection,
-    draft: CreateKnowledgeDocDraft,
+    mut draft: CreateKnowledgeDocDraft,
 ) -> Result<KnowledgeDocInfo, DbError> {
+    // Normalize file_path to forward slashes for consistent storage and lookups
+    draft.file_path = normalize_path(&draft.file_path);
+
     // C1: If a soft-deleted row with the same (project_id, file_path) exists,
     // revive it instead of inserting a new row (unique constraint conflict).
+    // Also check the backslash variant to match legacy rows.
     let existing = platform_knowledge_doc::Entity::find()
         .filter(platform_knowledge_doc::Column::ProjectId.eq(draft.project_id))
-        .filter(platform_knowledge_doc::Column::FilePath.eq(&draft.file_path))
+        .filter(
+            sea_orm::Condition::any()
+                .add(platform_knowledge_doc::Column::FilePath.eq(&draft.file_path))
+                .add(platform_knowledge_doc::Column::FilePath.eq(draft.file_path.replace('/', "\\")))
+        )
         .one(conn)
         .await?;
 
@@ -210,13 +226,21 @@ pub async fn find_by_task_id(
 
 pub async fn upsert_by_path(
     conn: &DatabaseConnection,
-    draft: UpsertKnowledgeDocDraft,
+    mut draft: UpsertKnowledgeDocDraft,
 ) -> Result<KnowledgeDocInfo, DbError> {
+    // Normalize file_path to forward slashes for consistent storage and lookups
+    draft.file_path = normalize_path(&draft.file_path);
+
     // C1: Search including soft-deleted rows; if a deleted row exists at
     // the same path, revive it (clear deleted_at) instead of inserting.
+    // Also check the backslash variant to match legacy rows.
     let existing = platform_knowledge_doc::Entity::find()
         .filter(platform_knowledge_doc::Column::ProjectId.eq(draft.project_id))
-        .filter(platform_knowledge_doc::Column::FilePath.eq(&draft.file_path))
+        .filter(
+            sea_orm::Condition::any()
+                .add(platform_knowledge_doc::Column::FilePath.eq(&draft.file_path))
+                .add(platform_knowledge_doc::Column::FilePath.eq(draft.file_path.replace('/', "\\")))
+        )
         .one(conn)
         .await?;
 

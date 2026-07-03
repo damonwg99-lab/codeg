@@ -3514,7 +3514,19 @@
       "taskTitle": "Titel",
       "taskDescription": "Beschreibung",
       "taskType": "Typ",
-      "taskPriority": "Priorität"
+      "taskPriority": "Priorität",
+      "decompositionCardTitle": "Aufgabenzerlegung",
+      "decompositionSubTaskCount": "{count} Teilaufgaben",
+      "decompositionStatusCreated": "{count} Aufgaben erstellt",
+      "decompositionReopenOverlay": "Bearbeiten & Erstellen",
+      "decompositionStreaming": "Aufgabenzerlegung wird erstellt…",
+      "deleteTask": "Aufgabe löschen",
+      "deleteTaskConfirm": "Diese Aufgabe wird dauerhaft entfernt und kann nicht wiederhergestellt werden. Sind Sie sicher?",
+      "taskDeleted": "Aufgabe gelöscht",
+      "deleteTaskFailed": "Löschen der Aufgabe fehlgeschlagen",
+      "createdDaysAgo": "{count} Tage ago",
+      "createdWeeksAgo": "{count} Wochen ago",
+      "createdAt": "Erstellt"
     },
     "repoSelector": {
       "root": "Projekt-Root",

@@ -1,15 +1,21 @@
 "use client"
 
-import { useEffect, useState, useCallback } from "react"
+import { useEffect, useState, useCallback, useMemo } from "react"
 import { useTranslations } from "next-intl"
-import { Plus, GripVertical } from "lucide-react"
-import { DndContext, closestCorners, type DragEndEvent } from "@dnd-kit/core"
+import { toast } from "sonner"
+import { Plus, GripVertical, Trash2 } from "lucide-react"
+import {
+  DndContext,
+  closestCorners,
+  useDroppable,
+  type DragEndEvent,
+} from "@dnd-kit/core"
 import {
   SortableContext,
   verticalListSortingStrategy,
   useSortable,
 } from "@dnd-kit/sortable"
-import { listTasks, updateTaskStatus } from "@/lib/platform/api"
+import { listTasks, updateTaskStatus, deleteTask } from "@/lib/platform/api"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import type { TaskInfo, TaskPriority, TaskStatus } from "@/lib/platform/types"
 import {
@@ -21,9 +27,26 @@ import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { cn } from "@/lib/utils"
 
-/** Resolve task status label using i18n (same pattern as task-detail). */
+// ── Relative date helper ──
+
+function formatRelativeDate(iso: string): string {
+  const date = new Date(iso)
+  return `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")}`
+}
+
+// ── Label resolvers ──
+
 function resolveStatusLabel(t: (key: never) => string, status: string): string {
   const keyMap: Record<string, string> = {
     backlog: "task.status.backlog",
@@ -36,7 +59,6 @@ function resolveStatusLabel(t: (key: never) => string, status: string): string {
   return key ? (t(key as never) ?? status) : status
 }
 
-/** Resolve task type label using i18n. */
 function resolveTypeLabel(t: (key: never) => string, taskType: string): string {
   const keyMap: Record<string, string> = {
     bug: "task.taskTypeOptions.bug",
@@ -48,7 +70,6 @@ function resolveTypeLabel(t: (key: never) => string, taskType: string): string {
   return key ? (t(key as never) ?? taskType) : taskType
 }
 
-/** Resolve task priority label using i18n. */
 function resolvePriorityLabel(
   t: (key: never) => string,
   priority: string
@@ -63,9 +84,22 @@ function resolvePriorityLabel(
   return key ? (t(key as never) ?? priority) : priority
 }
 
-function TaskCard({ task, projectId }: { task: TaskInfo; projectId: number }) {
+// ── TaskCard ──
+
+function TaskCard({
+  task,
+  projectId,
+  onDelete,
+}: {
+  task: TaskInfo
+  projectId: number
+  onDelete: (taskId: number) => Promise<void>
+}) {
   const { setRoute } = useWorkbenchRoute()
   const t = useTranslations("Platform")
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+
   const {
     attributes,
     listeners,
@@ -80,77 +114,139 @@ function TaskCard({ task, projectId }: { task: TaskInfo; projectId: number }) {
         transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`,
         transition,
         opacity: isDragging ? 0.5 : 1,
+        zIndex: isDragging ? 50 : undefined,
       }
     : { transition, opacity: isDragging ? 0.5 : 1 }
 
+  const handleDelete = useCallback(async () => {
+    setDeleting(true)
+    try {
+      await onDelete(task.id)
+    } finally {
+      setDeleting(false)
+      setDeleteDialogOpen(false)
+    }
+  }, [onDelete, task.id])
+
+  const relativeDate = useMemo(
+    () => formatRelativeDate(task.createdAt),
+    [task.createdAt]
+  )
+
   return (
-    <Card
-      ref={setNodeRef}
-      style={style}
-      className={cn(
-        "cursor-pointer transition-colors hover:bg-accent",
-        "touch-none select-none rounded-md"
-      )}
-      onClick={() =>
-        setRoute(
-          "task-detail",
-          { taskId: task.id, projectId },
-          { routeId: "task-kanban", params: { projectId } }
-        )
-      }
-    >
-      <CardContent className="flex items-stretch p-0">
-        {/* Drag handle — separate from click target */}
-        <div
-          {...attributes}
-          {...listeners}
-          className="flex items-center px-1 cursor-grab active:cursor-grabbing text-muted-foreground hover:text-foreground shrink-0"
-        >
-          <GripVertical className="h-3.5 w-3.5" />
-        </div>
-        {/* Clickable content area — no status badge before title */}
-        <div className="flex flex-col gap-0.5 py-2 pr-2.5 min-w-0 flex-1">
-          <span className="truncate text-[0.8125rem] font-medium">
-            {task.title}
-          </span>
-          <div className="flex items-center gap-1 text-[0.625rem] text-muted-foreground">
-            <Badge variant="outline" className="text-[0.625rem]">
-              {resolveTypeLabel(t, task.taskType)}
-            </Badge>
-            {task.priority && (
-              <Badge
-                variant="outline"
-                className={cn(
-                  "text-[0.625rem]",
-                  TASK_PRIORITY_COLORS[task.priority as TaskPriority] ?? ""
-                )}
-              >
-                {resolvePriorityLabel(t, task.priority)}
-              </Badge>
-            )}
+    <>
+      <Card
+        ref={setNodeRef}
+        style={style}
+        className={cn(
+          "cursor-pointer transition-colors hover:bg-accent",
+          "touch-none select-none rounded-md"
+        )}
+        onClick={() =>
+          setRoute(
+            "task-detail",
+            { taskId: task.id, projectId },
+            { routeId: "task-kanban", params: { projectId } }
+          )
+        }
+      >
+        <CardContent className="flex items-stretch p-0">
+          {/* Drag handle — separate from click target */}
+          <div
+            {...attributes}
+            {...listeners}
+            className="flex items-center px-1 cursor-grab active:cursor-grabbing text-muted-foreground hover:text-foreground shrink-0"
+          >
+            <GripVertical className="h-3.5 w-3.5" />
           </div>
-        </div>
-      </CardContent>
-    </Card>
+          {/* Clickable content area */}
+          <div className="flex flex-col gap-0.5 py-2 pr-2.5 min-w-0 flex-1">
+            <div className="flex items-center gap-1">
+              <span className="truncate text-[0.8125rem] font-medium min-w-0">
+                {task.title}
+              </span>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-5 w-5 shrink-0 text-muted-foreground hover:text-destructive ml-auto"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setDeleteDialogOpen(true)
+                }}
+              >
+                <Trash2 className="h-3 w-3" />
+              </Button>
+            </div>
+            <div className="flex items-center gap-1 text-[0.625rem] text-muted-foreground">
+              <Badge variant="outline" className="text-[0.625rem]">
+                {resolveTypeLabel(t, task.taskType)}
+              </Badge>
+              {task.priority && (
+                <Badge
+                  variant="outline"
+                  className={cn(
+                    "text-[0.625rem]",
+                    TASK_PRIORITY_COLORS[task.priority as TaskPriority] ?? ""
+                  )}
+                >
+                  {resolvePriorityLabel(t, task.priority)}
+                </Badge>
+              )}
+              <span className="ml-auto">{relativeDate}</span>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogTitle>{t("task.deleteTask" as never)}</AlertDialogTitle>
+          <AlertDialogDescription>
+            {t("task.deleteTaskConfirm" as never)}
+          </AlertDialogDescription>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>
+              {t("project.cancel")}
+            </AlertDialogCancel>
+            <AlertDialogAction disabled={deleting} onClick={handleDelete}>
+              {deleting
+                ? t("task.deleteTask" as never) + "…"
+                : t("task.deleteTask" as never)}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   )
 }
+
+// ── KanbanColumn ──
 
 function KanbanColumn({
   status,
   tasks,
   projectId,
+  onDeleteTask,
 }: {
   status: TaskStatus
   tasks: TaskInfo[]
   projectId: number
+  onDeleteTask: (taskId: number) => Promise<void>
 }) {
   const t = useTranslations("Platform")
   const taskCount = tasks.length
+  const { setNodeRef: setDroppableRef, isOver } = useDroppable({ id: status })
 
   const sortableIds = tasks.map((task) => `task-${task.id}`)
 
   return (
-    <div className="flex flex-col flex-1 min-w-0">
+    <div
+      ref={setDroppableRef}
+      className={cn(
+        "flex flex-col flex-1 min-w-0 transition-colors",
+        isOver && "bg-accent/30"
+      )}
+    >
       {/* Column header — centered */}
       <div className="flex items-center justify-center gap-2 px-2 py-1.5 shrink-0">
         <Badge
@@ -171,7 +267,12 @@ function KanbanColumn({
         >
           <div className="flex flex-col gap-1.5 p-1">
             {tasks.map((task) => (
-              <TaskCard key={task.id} task={task} projectId={projectId} />
+              <TaskCard
+                key={task.id}
+                task={task}
+                projectId={projectId}
+                onDelete={onDeleteTask}
+              />
             ))}
             {tasks.length === 0 && (
               <div className="py-8 text-center text-[0.75rem] text-muted-foreground">
@@ -184,6 +285,8 @@ function KanbanColumn({
     </div>
   )
 }
+
+// ── Main kanban board ──
 
 export function TaskKanban({ projectId }: { projectId: number }) {
   const t = useTranslations("Platform")
@@ -209,6 +312,19 @@ export function TaskKanban({ projectId }: { projectId: number }) {
       cancelled = true
     }
   }, [projectId])
+
+  const handleDeleteTask = useCallback(
+    async (taskId: number) => {
+      try {
+        await deleteTask(taskId)
+        setTasks((prev) => prev.filter((t) => t.id !== taskId))
+        toast.success(t("task.taskDeleted" as never))
+      } catch {
+        toast.error(t("task.deleteTaskFailed" as never))
+      }
+    },
+    [t]
+  )
 
   const handleDragEnd = useCallback(
     async (event: DragEndEvent) => {
@@ -287,6 +403,7 @@ export function TaskKanban({ projectId }: { projectId: number }) {
               status={status}
               tasks={tasks.filter((task) => task.status === status)}
               projectId={projectId}
+              onDeleteTask={handleDeleteTask}
             />
           ))}
         </div>

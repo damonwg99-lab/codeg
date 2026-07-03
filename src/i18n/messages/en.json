@@ -3502,7 +3502,7 @@
         "done": "Done",
         "released": "Released"
       },
-      "reviewDecomposition": "Review Task Split",
+      "reviewDecomposition": "Task Breakdown",
       "confirmCreate": "Confirm & Create",
       "continueDiscussion": "Continue Discussion",
       "addTask": "Add task",
@@ -3515,7 +3515,19 @@
       "taskTitle": "Title",
       "taskDescription": "Description",
       "taskType": "Type",
-      "taskPriority": "Priority"
+      "taskPriority": "Priority",
+      "decompositionCardTitle": "Task Breakdown",
+      "decompositionSubTaskCount": "{count} sub-tasks",
+      "decompositionStatusCreated": "{count} tasks created",
+      "decompositionReopenOverlay": "Edit & Create",
+      "decompositionStreaming": "Generating task breakdown…",
+      "deleteTask": "Delete Task",
+      "deleteTaskConfirm": "This task will be permanently removed and cannot be recovered. Are you sure?",
+      "taskDeleted": "Task deleted",
+      "deleteTaskFailed": "Failed to delete task",
+      "createdDaysAgo": "{count} days ago",
+      "createdWeeksAgo": "{count} weeks ago",
+      "createdAt": "Created"
     },
     "repoSelector": {
       "root": "Project root",

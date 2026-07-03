@@ -125,6 +125,77 @@ export function parseDecompositionFromText(
   return null
 }
 
+// ─── Text Segmentation ───
+
+/**
+ * A segment produced by splitting text around decomposition code fences.
+ * Text segments carry raw prose; decomposition segments carry parsed sub-tasks.
+ */
+export interface DecompositionSegment {
+  kind: "text" | "decomposition"
+  /** Raw prose for text segments; raw JSON string for decomposition segments. */
+  value: string
+  /** Parsed sub-tasks (only set when kind === "decomposition"). */
+  tasks?: ProposedSubTask[]
+}
+
+/**
+ * Split text into alternating text / decomposition segments by extracting
+ * all ```task_decomposition_json code fences. Each matched fence becomes a
+ * "decomposition" segment with parsed sub-tasks; the surrounding prose
+ * becomes "text" segments.
+ *
+ * Returns `null` if no decomposition fences are found (so callers can skip
+ * processing and let the default text rendering path continue).
+ */
+export function extractDecompositionSegments(
+  text: string
+): DecompositionSegment[] | null {
+  if (!text) return null
+
+  const pattern = /```task_decomposition_json\s*\n([\s\S]*?)\n\s*```/g
+  const segments: DecompositionSegment[] = []
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+  let foundAny = false
+
+  while ((match = pattern.exec(text)) !== null) {
+    foundAny = true
+    // Text before this match
+    const before = text.slice(lastIndex, match.index)
+    if (before) {
+      segments.push({ kind: "text", value: before })
+    }
+
+    // Parse the JSON content
+    const jsonContent = match[1]
+    const parsed = tryParseSubTasksJson(jsonContent)
+    if (parsed && parsed.length > 0) {
+      segments.push({
+        kind: "decomposition",
+        value: jsonContent,
+        tasks: parsed,
+      })
+    } else {
+      // Failed to parse — keep the raw code block as text so it renders
+      // as a fallback code block rather than disappearing entirely
+      segments.push({ kind: "text", value: match[0] })
+    }
+
+    lastIndex = match.index + match[0].length
+  }
+
+  if (!foundAny) return null
+
+  // Trailing text after the last match
+  const trailing = text.slice(lastIndex)
+  if (trailing) {
+    segments.push({ kind: "text", value: trailing })
+  }
+
+  return segments
+}
+
 // ─── Internal helpers ───
 
 /** Extract content of the first ```lang code fence in text. */
@@ -153,7 +224,9 @@ function extractAllCodeFences(text: string, lang: string): string[] {
 }
 
 /** Try to parse a JSON string as { subTasks: [...] }. */
-function tryParseSubTasksJson(jsonStr: string): ProposedSubTask[] | null {
+export function tryParseSubTasksJson(
+  jsonStr: string
+): ProposedSubTask[] | null {
   try {
     const obj = JSON.parse(jsonStr)
     if (!obj || typeof obj !== "object") return null

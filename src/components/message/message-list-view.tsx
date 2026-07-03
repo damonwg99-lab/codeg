@@ -47,13 +47,16 @@ import {
   ChevronRight,
   CopyIcon,
   Info,
-  ListChecks,
   Loader2,
   Plus,
   RefreshCw,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { CollapsedOverlayChip } from "@/components/chat/collapsed-overlay-chip"
+import {
+  DecompositionOverlayContextProvider,
+  type DecompositionOverlayStatus,
+} from "@/components/chat/decomposition-overlay-context"
+import { proposalKey } from "@/hooks/use-decomposition-detector"
 import { useTranslations } from "next-intl"
 import {
   buildPlanKey,
@@ -919,6 +922,41 @@ export function MessageListView({
 
   const hasRenderableContent = threadItems.length > 0 || Boolean(liveMessage)
 
+  // ── Decomposition overlay context value ──
+  // Provides status/action for the latest decomposition card in the message stream.
+  // Must be computed before the error/loading early returns so React hooks stay
+  // in consistent order across renders.
+  const decompOverlayStatus: DecompositionOverlayStatus = decompViewingConfirmed
+    ? "open"
+    : decompConfirmed
+      ? "confirmed"
+      : decompDismissed
+        ? "dismissed"
+        : decompSubTasks && decompSubTasks.length > 0
+          ? "open"
+          : "none"
+
+  const decompCurrentProposalKey = proposalKey(decompDetected)
+
+  const decompOnOpenOverlay = decompConfirmed
+    ? viewDecompConfirmed
+    : reopenDecomp
+
+  const decompOverlayCtxValue = useMemo(
+    () => ({
+      currentProposalKey: decompCurrentProposalKey,
+      overlayStatus: decompOverlayStatus,
+      onOpenOverlay: decompOnOpenOverlay,
+      confirmedCount: decompDetected?.length ?? 0,
+    }),
+    [
+      decompCurrentProposalKey,
+      decompOverlayStatus,
+      decompOnOpenOverlay,
+      decompDetected,
+    ]
+  )
+
   if (detailLoading && !hasRenderableContent) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -935,6 +973,7 @@ export function MessageListView({
   // the history would mislead the user into thinking a follow-up message
   // would extend the same thread.
   const blockingLoadError = acpLoadError ?? null
+
   const fallbackLoadError =
     detailError && !hasRenderableContent ? detailError : null
   const renderedLoadError = blockingLoadError ?? fallbackLoadError
@@ -988,29 +1027,30 @@ export function MessageListView({
   }
 
   return (
-    <div className="relative flex h-full min-h-0 flex-col">
-      <MessageThread
-        className="flex-1 min-h-0"
-        resize={shouldUseSmoothResize ? "smooth" : undefined}
-      >
-        <AutoScrollOnSend signal={sendSignal} />
-        <VirtualizedMessageThread
-          items={threadItems}
-          getItemKey={getThreadItemKey}
-          renderItem={renderThreadItem}
-          emptyState={emptyState}
-          scrollApiRef={scrollApiRef}
-        />
-        <MessageThreadScrollButton />
-      </MessageThread>
-      {liveMessage && connStatus === "prompting" && (
-        <LiveTurnStats
-          message={liveMessage}
-          agentType={agentType}
-          isStreaming={connStatus === "prompting"}
-        />
-      )}
-      {/* Shared overlay stack pinned to the inline-start edge (top-left in LTR,
+    <DecompositionOverlayContextProvider value={decompOverlayCtxValue}>
+      <div className="relative flex h-full min-h-0 flex-col">
+        <MessageThread
+          className="flex-1 min-h-0"
+          resize={shouldUseSmoothResize ? "smooth" : undefined}
+        >
+          <AutoScrollOnSend signal={sendSignal} />
+          <VirtualizedMessageThread
+            items={threadItems}
+            getItemKey={getThreadItemKey}
+            renderItem={renderThreadItem}
+            emptyState={emptyState}
+            scrollApiRef={scrollApiRef}
+          />
+          <MessageThreadScrollButton />
+        </MessageThread>
+        {liveMessage && connStatus === "prompting" && (
+          <LiveTurnStats
+            message={liveMessage}
+            agentType={agentType}
+            isStreaming={connStatus === "prompting"}
+          />
+        )}
+        {/* Shared overlay stack pinned to the inline-start edge (top-left in LTR,
           top-right in RTL). A flex column keeps the order stable regardless of
           each panel's expand/collapse height: the message navigator first, then
           the plan panel, then the sub-agent panel. Empty panels render null and
@@ -1019,75 +1059,56 @@ export function MessageListView({
           edge), rounded on the end side — that expand toward the inline-end on
           hover. Logical `start-0` + `items-start` keep the anchor and the bullet
           on the same side, so the whole stack mirrors cleanly in RTL. */}
-      <div className="pointer-events-none absolute start-0 top-4 z-20 flex max-w-[min(22rem,calc(100%-2rem))] flex-col items-start gap-2">
-        {showMessageNav && userMessageCount > 0 && (
-          <ConversationMessageNav
-            count={userMessageCount}
-            expanded={navExpanded}
-            onToggle={setNavExpanded}
-            entries={navEntries}
-            scrollApiRef={scrollApiRef}
-          />
-        )}
-        <AgentPlanOverlay
-          key={agentPlanOverlayKey}
-          message={liveMessage ?? null}
-          entries={historicalPlanEntries}
-          planKey={historicalPlanKey}
-          defaultExpanded={false}
-          isStreaming={connStatus === "prompting"}
-        />
-        <SubAgentOverlay
-          key={subAgentOverlayKey}
-          delegations={lastAssistantDelegations}
-          overlayKey={subAgentOverlayKey}
-        />
-        {/* Dismissed/confirmed decomposition chip: shows when user closed
-            the dialog or confirmed creation. Clicking re-opens in read-only
-            mode (confirmed) or editable mode (dismissed). */}
-        {(decompDismissed || decompConfirmed) &&
-          decompDetected &&
-          decompDetected.length > 0 && (
-            <CollapsedOverlayChip
-              icon={<ListChecks className="size-3" />}
-              summary={
-                decompConfirmed
-                  ? tDecomp("decompositionApplied", {
-                      count: decompDetected.length,
-                    })
-                  : tDecomp("proposedTasks", { count: decompDetected.length })
-              }
-              onClick={decompConfirmed ? viewDecompConfirmed : reopenDecomp}
+        <div className="pointer-events-none absolute start-0 top-4 z-20 flex max-w-[min(22rem,calc(100%-2rem))] flex-col items-start gap-2">
+          {showMessageNav && userMessageCount > 0 && (
+            <ConversationMessageNav
+              count={userMessageCount}
+              expanded={navExpanded}
+              onToggle={setNavExpanded}
+              entries={navEntries}
+              scrollApiRef={scrollApiRef}
             />
           )}
-      </div>
-      {/* Decomposition review dialog — rendered as a Dialog (not in the
+          <AgentPlanOverlay
+            key={agentPlanOverlayKey}
+            message={liveMessage ?? null}
+            entries={historicalPlanEntries}
+            planKey={historicalPlanKey}
+            defaultExpanded={false}
+            isStreaming={connStatus === "prompting"}
+          />
+          <SubAgentOverlay
+            key={subAgentOverlayKey}
+            delegations={lastAssistantDelegations}
+            overlayKey={subAgentOverlayKey}
+          />
+        </div>
+        {/* Decomposition review dialog — rendered as a Dialog (not in the
           narrow overlay stack) so it centers properly, matches conversation
-          width, and has a scrollable content area with fixed footer.
-          When confirmed, overlay closes and a chip is shown instead.
-          Clicking the confirmed chip reopens overlay in read-only mode. */}
-      <DecompositionOverlay
-        open={
-          (decompSubTasks !== null &&
-            decompSubTasks.length > 0 &&
-            !decompConfirmed) ||
-          decompViewingConfirmed
-        }
-        onOpenChange={(open) => {
-          if (!open) {
-            if (decompViewingConfirmed) closeDecompConfirmedView()
-            else dismissDecomp()
+          width, and has a scrollable content area with fixed footer. */}
+        <DecompositionOverlay
+          open={
+            (decompSubTasks !== null &&
+              decompSubTasks.length > 0 &&
+              !decompConfirmed) ||
+            decompViewingConfirmed
           }
-        }}
-        proposedSubTasks={decompSubTasks ?? []}
-        linkedTask={linkedTask ?? null}
-        projects={projects}
-        activeProjectId={activeProjectId ?? null}
-        submitting={decompSubmitting}
-        readOnly={decompViewingConfirmed}
-        onUpdateSubTasks={updateDecompSubTasks}
-        onConfirm={handleDecompConfirm}
-      />
-    </div>
+          onOpenChange={(open) => {
+            if (!open) {
+              if (decompViewingConfirmed) closeDecompConfirmedView()
+              else dismissDecomp()
+            }
+          }}
+          proposedSubTasks={decompSubTasks ?? []}
+          linkedTask={linkedTask ?? null}
+          projects={projects}
+          activeProjectId={activeProjectId ?? null}
+          submitting={decompSubmitting}
+          readOnly={decompViewingConfirmed}
+          onUpdateSubTasks={updateDecompSubTasks}
+          onConfirm={handleDecompConfirm}
+        />
+      </div>
+    </DecompositionOverlayContextProvider>
   )
 }

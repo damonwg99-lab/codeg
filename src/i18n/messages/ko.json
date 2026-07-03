@@ -3514,7 +3514,19 @@
       "taskTitle": "제목",
       "taskDescription": "설명",
       "taskType": "유형",
-      "taskPriority": "우선순위"
+      "taskPriority": "우선순위",
+      "decompositionCardTitle": "작업 분해",
+      "decompositionSubTaskCount": "{count} 하위 작업",
+      "decompositionStatusCreated": "{count} 작업 생성됨",
+      "decompositionReopenOverlay": "편집 및 생성",
+      "decompositionStreaming": "작업 분해 생성 중…",
+      "deleteTask": "작업 삭제",
+      "deleteTaskConfirm": "작업이 영구적으로 삭제되며 복구할 수 없습니다. 삭제하시겠습니까?",
+      "taskDeleted": "작업 삭제됨",
+      "deleteTaskFailed": "작업 삭제 실패",
+      "createdDaysAgo": "{count}일 전",
+      "createdWeeksAgo": "{count}주 전",
+      "createdAt": "생성일"
     },
     "repoSelector": {
       "root": "프로젝트 루트",

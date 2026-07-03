@@ -3502,7 +3502,7 @@
         "done": "已完成",
         "released": "已发布"
       },
-      "reviewDecomposition": "任务拆分",
+      "reviewDecomposition": "任务分解",
       "confirmCreate": "确认创建",
       "continueDiscussion": "继续讨论",
       "addTask": "添加任务",
@@ -3515,7 +3515,19 @@
       "taskTitle": "标题",
       "taskDescription": "描述",
       "taskType": "类型",
-      "taskPriority": "优先级"
+      "taskPriority": "优先级",
+      "decompositionCardTitle": "任务分解",
+      "decompositionSubTaskCount": "{count} 个子任务",
+      "decompositionStatusCreated": "已创建 {count} 个任务",
+      "decompositionReopenOverlay": "编辑创建",
+      "decompositionStreaming": "正在生成分解…",
+      "deleteTask": "删除任务",
+      "deleteTaskConfirm": "删除后任务将永久移除，且无法恢复。确定要删除吗？",
+      "taskDeleted": "任务已删除",
+      "deleteTaskFailed": "删除任务失败",
+      "createdDaysAgo": "{count} 天前",
+      "createdWeeksAgo": "{count} 周前",
+      "createdAt": "创建于"
     },
     "repoSelector": {
       "root": "项目根目录",

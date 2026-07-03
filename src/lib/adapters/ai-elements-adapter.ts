@@ -24,6 +24,11 @@ import {
   tokenizeReferenceLinks,
   unescapeReferenceLabel,
 } from "@/lib/reference-link"
+import { stripFeedbackReminder } from "@/lib/feedback-reminder"
+import {
+  extractDecompositionSegments,
+  type ProposedSubTask,
+} from "@/lib/platform/decomposition-parser"
 
 /**
  * Adapted content part types for AI SDK Elements components
@@ -96,6 +101,21 @@ export type AdaptedPlanPart = {
   isStreaming: boolean
 }
 
+/**
+ * A structured task decomposition extracted from a ```task_decomposition_json
+ * code fence in the assistant's response. Rendered as a `<DecompositionCard>`
+ * instead of a raw JSON code block.
+ *
+ * When `isStreaming` is true, the fence is incomplete (still being written by
+ * the agent) — the card renders as a lightweight "generating…" placeholder
+ * instead of a full task list.
+ */
+export type AdaptedDecompositionPart = {
+  type: "decomposition"
+  tasks: ProposedSubTask[]
+  isStreaming: boolean
+}
+
 export type AdaptedContentPart =
   | { type: "text"; text: string }
   | AdaptedToolCallPart
@@ -138,6 +158,7 @@ export type AdaptedContentPart =
   | AdaptedGoalRunPart
   | AdaptedGeneratedImagePart
   | AdaptedPlanPart
+  | AdaptedDecompositionPart
 
 export interface UserResourceDisplay {
   name: string
@@ -471,6 +492,68 @@ function expandInlineToolText(
   }
 
   return parts
+}
+
+/**
+ * Extract ```task_decomposition_json code fences from assistant text and
+ * replace them with structured `AdaptedDecompositionPart` cards. Any prose
+ * before/after the fences is preserved as `text` parts.
+ *
+ * Also handles incomplete (streaming) fences: when the opening marker
+ * `````task_decomposition_json`` is present but the closing ``````` hasn't
+ * arrived yet, the text from the opening marker onward is suppressed so the
+ * raw JSON doesn't flash in the UI while streaming. Once the fence closes,
+ * the next adapt cycle will replace it with a proper card.
+ *
+ * Returns `null` when no decomposition fences (complete or incomplete) are
+ * found.
+ */
+function expandDecompositionText(text: string): AdaptedContentPart[] | null {
+  // First try complete fences
+  const segments = extractDecompositionSegments(text)
+  if (segments) {
+    const parts: AdaptedContentPart[] = []
+    for (const segment of segments) {
+      if (segment.kind === "text") {
+        if (segment.value.trim()) {
+          parts.push({ type: "text", text: segment.value })
+        }
+      } else {
+        parts.push({
+          type: "decomposition",
+          tasks: segment.tasks ?? [],
+          isStreaming: false,
+        })
+      }
+    }
+    return parts.length > 0 ? parts : null
+  }
+
+  // No complete fence found — check for an incomplete (streaming) fence.
+  // The opening marker `````task_decomposition_json`` may be present without
+  // its closing ```````. In that case, render a lightweight streaming
+  // placeholder card instead of showing raw JSON or suppressing entirely.
+  // Match two scenarios:
+  //   1. Marker followed by newline + partial JSON content (normal streaming)
+  //   2. Marker at end of text with no trailing newline (marker just arrived)
+  const incompletePattern = /```task_decomposition_json(?:\s*\n|\s*$)/
+  const incompleteMatch = incompletePattern.exec(text)
+  if (incompleteMatch) {
+    const before = text.slice(0, incompleteMatch.index)
+    const parts: AdaptedContentPart[] = []
+    if (before.trim()) {
+      parts.push({ type: "text", text: before })
+    }
+    // Streaming placeholder — empty tasks, isStreaming = true
+    parts.push({
+      type: "decomposition",
+      tasks: [],
+      isStreaming: true,
+    })
+    return parts
+  }
+
+  return null
 }
 
 function normalizeGoalStatusText(status: string): string {
@@ -1575,6 +1658,13 @@ export function adaptMessageTurn(
         adaptedContent.push(...expandedParts)
         continue
       }
+
+      // 3rd: extract task_decomposition_json code blocks → structured cards
+      const decompExpanded = expandDecompositionText(block.text)
+      if (decompExpanded) {
+        adaptedContent.push(...decompExpanded)
+        continue
+      }
     }
 
     if (block.type === "tool_use") {
@@ -1724,6 +1814,19 @@ export function adaptMessageTurn(
         !isStreaming
       ) {
         continue
+      }
+      // User-turn text blocks may carry auto-injected system instructions
+      // (decomposition format, live-feedback reminder) bracketed by ⟦codeg:⟧
+      // sentinels. The composer's displayText is untouched (optimistic bubbles
+      // show only the user's words), but the agent's session file contains the
+      // full blocks — including the injected text. On reload / reload-from-disk
+      // the parser recovers those blocks verbatim, so the sentinel content
+      // surfaces in the UI unless we strip it here at the adapter level.
+      if (turn.role === "user" && adapted.type === "text" && adapted.text) {
+        adapted.text = stripFeedbackReminder(adapted.text)
+        // If stripping emptied the block entirely (the message was *only* the
+        // injected instruction), drop it rather than rendering a blank bubble.
+        if (adapted.text.trim() === "") continue
       }
       adaptedContent.push(adapted)
     }

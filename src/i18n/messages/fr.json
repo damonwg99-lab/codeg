@@ -3514,7 +3514,19 @@
       "taskTitle": "Titre",
       "taskDescription": "Description",
       "taskType": "Type",
-      "taskPriority": "Priorité"
+      "taskPriority": "Priorité",
+      "decompositionCardTitle": "Décomposition des tâches",
+      "decompositionSubTaskCount": "{count} sous-tâches",
+      "decompositionStatusCreated": "{count} tâches créées",
+      "decompositionReopenOverlay": "Modifier et créer",
+      "decompositionStreaming": "Génération de la décomposition…",
+      "deleteTask": "Supprimer la tâche",
+      "deleteTaskConfirm": "Cette tâche sera supprimée définitivement et ne pourra pas être récupérée. Êtes-vous sûr ?",
+      "taskDeleted": "Tâche supprimée",
+      "deleteTaskFailed": "Échec de la suppression",
+      "createdDaysAgo": "{count} jours ago",
+      "createdWeeksAgo": "{count} semaines ago",
+      "createdAt": "Créée"
     },
     "repoSelector": {
       "root": "Racine du projet",

@@ -14,6 +14,18 @@ use crate::platform::knowledge::{init, scanner, skill_discovery};
 
 const KNOWLEDGE_DIR_NAME: &str = "_knowledge";
 
+/// Infer task_id from a file path that follows the pattern
+/// `.private/tasks/{task_id}/{filename}`.
+fn infer_task_id_from_path(file_path: &str) -> Option<i32> {
+    let parts: Vec<&str> = file_path.split('/').collect();
+    // Look for the pattern: .private / tasks / {task_id} / ...
+    if parts.len() >= 4 && parts[0] == ".private" && parts[1] == "tasks" {
+        parts[2].parse::<i32>().ok()
+    } else {
+        None
+    }
+}
+
 // ─── Helper: resolve kb_local_dir for a project, init if missing ───
 
 /// Get the KB local directory path for a project. If the project has
@@ -81,18 +93,32 @@ pub async fn scan_knowledge_repo_core(
     let scanned_paths: std::collections::HashSet<String> =
         scanned_docs.iter().map(|d| d.file_path.clone()).collect();
 
-    // Upsert each scanned doc
+    // Upsert each scanned doc, preserving task_id on existing rows
+    // (task attachments have a non-null task_id set by upload_task_attachment_core;
+    //  the scanner cannot infer it, so we must not overwrite it with None).
     let mut new_count = 0;
     let mut updated_count = 0;
 
-    // Get existing docs to distinguish new vs updated
+    // Get existing docs to distinguish new vs updated and to preserve task_id
     let existing_docs = platform_knowledge_doc_service::list_by_project(conn, project_id)
         .await
         .map_err(AppCommandError::from)?;
     let existing_paths: std::collections::HashSet<String> =
         existing_docs.iter().map(|d| d.file_path.clone()).collect();
+    // Also build a map for quick task_id lookup by file_path
+    let existing_task_ids: std::collections::HashMap<String, Option<i32>> =
+        existing_docs.iter().map(|d| (d.file_path.clone(), d.task_id)).collect();
 
     for doc in &scanned_docs {
+        // Preserve existing task_id if present; otherwise set None
+        let preserved_task_id = existing_task_ids.get(&doc.file_path)
+            .and_then(|tid| *tid)
+            .or_else(|| {
+                // Infer task_id from path for newly scanned task attachment files
+                // Path format: .private/tasks/{task_id}/{filename}
+                infer_task_id_from_path(&doc.file_path)
+            });
+
         let draft = UpsertKnowledgeDocDraft {
             project_id,
             doc_type: doc.doc_type.clone(),
@@ -102,7 +128,7 @@ pub async fn scan_knowledge_repo_core(
             tags_json: doc.tags_json.clone(),
             description: doc.description.clone(),
             skill_name: doc.skill_name.clone(),
-            task_id: None, // Task ID is inferred from path for task attachments
+            task_id: preserved_task_id,
         };
 
         let _result = platform_knowledge_doc_service::upsert_by_path(conn, draft)
@@ -116,9 +142,15 @@ pub async fn scan_knowledge_repo_core(
         }
     }
 
-    // Soft-delete docs whose files no longer exist on disk
+    // Soft-delete docs whose files no longer exist on disk,
+    // but EXCLUDE task attachments (doc_type = "task_attachment" or task_id != null)
+    // since they are independently uploaded and not part of the KB directory scan.
     let mut deleted_count = 0;
     for existing in &existing_docs {
+        // Skip task attachments — they should not be deleted by KB scan sweep
+        if existing.task_id.is_some() || existing.doc_type == "task_attachment" {
+            continue;
+        }
         if !scanned_paths.contains(&existing.file_path) {
             platform_knowledge_doc_service::delete(conn, existing.id)
                 .await

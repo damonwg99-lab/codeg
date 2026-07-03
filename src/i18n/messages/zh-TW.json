@@ -3501,7 +3501,7 @@
         "done": "已完成",
         "released": "已發佈"
       },
-      "reviewDecomposition": "任務拆分",
+      "reviewDecomposition": "任務分解",
       "confirmCreate": "確認建立",
       "continueDiscussion": "繼續討論",
       "addTask": "新增任務",
@@ -3514,7 +3514,19 @@
       "taskTitle": "標題",
       "taskDescription": "描述",
       "taskType": "類型",
-      "taskPriority": "優先順序"
+      "taskPriority": "優先順序",
+      "decompositionCardTitle": "任務分解",
+      "decompositionSubTaskCount": "{count} 個子任務",
+      "decompositionStatusCreated": "已建立 {count} 個任務",
+      "decompositionReopenOverlay": "編輯建立",
+      "decompositionStreaming": "正在生成分解…",
+      "deleteTask": "刪除任務",
+      "deleteTaskConfirm": "刪除後任務將永久移除，且無法恢復。確定要刪除嗎？",
+      "taskDeleted": "任務已刪除",
+      "deleteTaskFailed": "刪除任務失敗",
+      "createdDaysAgo": "{count} 天前",
+      "createdWeeksAgo": "{count} 週前",
+      "createdAt": "建立於"
     },
     "repoSelector": {
       "root": "專案根目錄",

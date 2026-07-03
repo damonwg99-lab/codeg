@@ -131,7 +131,7 @@ interface UseDecompositionDetectorResult {
 }
 
 /** Create a simple hash key from proposal content for tracking. */
-function proposalKey(tasks: ProposedSubTask[] | null): string | null {
+export function proposalKey(tasks: ProposedSubTask[] | null): string | null {
   if (!tasks || tasks.length === 0) return null
   return tasks.map((t) => `${t.title}|${t.taskType}|${t.priority}`).join("::")
 }
@@ -152,21 +152,8 @@ export function useDecompositionDetector(
   // Auto-detected sub-tasks from AI response (derived, not stored in state)
   const detectedSubTasks = useMemo<ProposedSubTask[] | null>(() => {
     if (!localTurns || localTurns.length === 0) {
-      console.log("[DecompDetector] useMemo: localTurns empty/undefined")
       return null
     }
-
-    console.log(
-      "[DecompDetector] useMemo: localTurns count:",
-      localTurns.length,
-      "turns:",
-      localTurns.map((t) => ({
-        role: t.role,
-        completed_at: t.completed_at,
-        type: typeof t.completed_at,
-        blocks: t.blocks?.length ?? 0,
-      }))
-    )
 
     // Find the last assistant turn that is "complete". For turns loaded
     // from the database, `completed_at` may be omitted (Rust skips it
@@ -181,11 +168,6 @@ export function useDecompositionDetector(
           t.role === "assistant" &&
           (t.completed_at !== null || t.completed_at === undefined)
       )
-
-    console.log(
-      "[DecompDetector] useMemo: lastAssistant found:",
-      !!lastAssistant
-    )
 
     if (!lastAssistant) return null
 
@@ -281,19 +263,6 @@ export function useDecompositionDetector(
     ? null
     : (userEditedSubTasks ?? detectedSubTasks)
 
-  console.log("[DecompDetector] decision:", {
-    convId: conversationId,
-    detectedSubTasks: detectedSubTasks?.length ?? null,
-    currentDetectedKey,
-    dismissedKey,
-    confirmedKey,
-    effectiveDismissedKey,
-    effectiveConfirmedKey,
-    isConfirmed,
-    isDismissed,
-    proposedSubTasks: proposedSubTasks?.length ?? null,
-  })
-
   // ── Actions ──
 
   const clearProposal = useCallback(() => {
@@ -304,7 +273,13 @@ export function useDecompositionDetector(
   }, [conversationId])
 
   const dismissProposal = useCallback(() => {
-    const key = proposalKey(userEditedSubTasks ?? detectedSubTasks)
+    // Always key on the ORIGINAL detected proposal, not the user-edited
+    // version. The edit key diverges from the re-computed detectedKey on
+    // every localTurns update, which would make the dismissal auto-expire
+    // and the overlay re-appear with the un-edited original tasks.
+    // Keying on detectedSubTasks keeps the dismissal stable until the AI
+    // sends a genuinely different proposal (different titles/types/priorities).
+    const key = proposalKey(detectedSubTasks)
     if (key) {
       setDismissedScoped({ convId: conversationId, key })
       writeStoredState(conversationId, {
@@ -314,11 +289,15 @@ export function useDecompositionDetector(
           : null,
       })
     }
-    setEditedScoped(null)
-  }, [userEditedSubTasks, detectedSubTasks, conversationId, confirmedScoped])
+    // Keep user edits intact — dismissing only hides the overlay, not
+    // discards the user's modifications. Re-opening via the chip restores
+    // the edited version.
+  }, [detectedSubTasks, conversationId, confirmedScoped])
 
   const confirmProposal = useCallback(() => {
-    const key = proposalKey(userEditedSubTasks ?? detectedSubTasks)
+    // Same reasoning as dismissProposal: key on the original detected
+    // proposal so the confirmation stays stable across localTurns updates.
+    const key = proposalKey(detectedSubTasks)
     if (key) {
       setConfirmedScoped({ convId: conversationId, key })
       writeStoredState(conversationId, {

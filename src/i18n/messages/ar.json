@@ -3514,7 +3514,19 @@
       "taskTitle": "العنوان",
       "taskDescription": "الوصف",
       "taskType": "النوع",
-      "taskPriority": "الأولوية"
+      "taskPriority": "الأولوية",
+      "decompositionCardTitle": "تحليل المهام",
+      "decompositionSubTaskCount": "{count} مهام فرعية",
+      "decompositionStatusCreated": "{count} مهام تم إنشاؤها",
+      "decompositionReopenOverlay": "تعديل وإنشاء",
+      "decompositionStreaming": "تحليل المهام قيد الإنشاء…",
+      "deleteTask": "حذف المهمة",
+      "deleteTaskConfirm": "سيتم حذف المهمة بشكل دائم ولا يمكن استرجاعها. هل أنت متأكد؟",
+      "taskDeleted": "تم حذف المهمة",
+      "deleteTaskFailed": "فشل حذف المهمة",
+      "createdDaysAgo": "{count} يوم مضى",
+      "createdWeeksAgo": "{count} أسبوع مضى",
+      "createdAt": "تاريخ الإنشاء"
     },
     "repoSelector": {
       "root": "جذر المشروع",

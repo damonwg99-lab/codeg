@@ -20,10 +20,9 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Input } from "@/components/ui/input"
-import type { TaskInfo, ProjectInfo, TaskPriority } from "@/lib/platform/types"
+import { Textarea } from "@/components/ui/textarea"
+import type { TaskInfo, ProjectInfo } from "@/lib/platform/types"
 import type { ProposedSubTask } from "@/lib/platform/decomposition-parser"
-import { TASK_PRIORITY_COLORS } from "@/lib/platform/types"
-import { cn } from "@/lib/utils"
 
 interface ConfirmParams {
   projectId: number
@@ -131,7 +130,10 @@ export function DecompositionOverlay({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl rounded-lg grid grid-rows-[auto_1fr_auto] max-h-[calc(100dvh-2rem)]">
+      <DialogContent
+        className="max-w-2xl rounded-lg grid grid-rows-[auto_1fr_auto] max-h-[calc(100dvh-2rem)]"
+        onInteractOutside={(e) => e.preventDefault()}
+      >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2 text-base">
             <ListChecks className="h-4 w-4" />
@@ -195,12 +197,12 @@ export function DecompositionOverlay({
               </div>
 
               {/* Description */}
-              <Input
+              <Textarea
                 value={entry.description}
                 onChange={(e) =>
                   updateEntry(index, "description", e.target.value)
                 }
-                className="h-7 text-xs"
+                className="text-xs min-h-14"
                 placeholder={t("taskDescription")}
                 disabled={readOnly}
               />
@@ -235,13 +237,7 @@ export function DecompositionOverlay({
                   <SelectContent>
                     {PRIORITY_KEYS.map((p) => (
                       <SelectItem key={p} value={p}>
-                        <span
-                          className={cn(
-                            TASK_PRIORITY_COLORS[p as TaskPriority] ?? ""
-                          )}
-                        >
-                          {resolvePriorityLabel(p)}
-                        </span>
+                        {resolvePriorityLabel(p)}
                       </SelectItem>
                     ))}
                   </SelectContent>

@@ -246,7 +246,14 @@ fn scan_recursive(
                 AppCommandError::permission_denied("File path cannot be resolved relative to KB root")
             })?;
 
-            let rel_path_str = rel_path.to_string_lossy().to_string();
+            // Normalize path separator to '/' for consistent database storage
+            // across platforms. On Windows, `to_string_lossy()` produces '\'
+            // separated paths (e.g. "docs\guide.md"), but the upload and
+            // creation APIs always use '/' (e.g. "docs/guide.md"). Without
+            // this normalization, upsert_by_path fails to match existing rows,
+            // and the soft-delete sweep in scan_knowledge_repo_core wrongly
+            // removes records whose file_path uses '/'.
+            let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
 
             // Determine doc type
             let doc_type = infer_doc_type(rel_path);
