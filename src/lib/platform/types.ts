@@ -140,6 +140,7 @@ export interface TaskDetail {
   task: TaskInfo
   conversations: TaskConversationInfo[]
   subTasks: TaskInfo[]
+  attachments: KnowledgeDocInfo[]
 }
 
 export interface TaskConversationInfo {

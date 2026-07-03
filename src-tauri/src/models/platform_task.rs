@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use super::AgentType;
+use super::platform_knowledge_doc::KnowledgeDocInfo;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -34,6 +35,7 @@ pub struct TaskDetail {
     pub task: TaskInfo,
     pub conversations: Vec<TaskConversationInfo>,
     pub sub_tasks: Vec<TaskInfo>,
+    pub attachments: Vec<KnowledgeDocInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]

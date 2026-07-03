@@ -1,6 +1,7 @@
 use crate::app_error::AppCommandError;
 use crate::commands::conversations::create_conversation_core;
 use crate::db::service::{
+    platform_knowledge_doc_service,
     platform_project_service, platform_task_conversation_service,
     platform_task_decomposition_service, platform_task_service, platform_task_type_mapping_service,
 };
@@ -69,10 +70,15 @@ pub async fn get_task_core(
         .await
         .map_err(AppCommandError::from)?;
 
+    let attachments = platform_knowledge_doc_service::find_by_task_id(conn, id)
+        .await
+        .map_err(AppCommandError::from)?;
+
     Ok(TaskDetail {
         task,
         conversations,
         sub_tasks,
+        attachments,
     })
 }
 

@@ -243,6 +243,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
         const d = await getTask(taskId)
         if (!cancelled) {
           setDetail(d)
+          setAttachments(d.attachments)
           setEditTitle(d.task.title)
           setEditDescription(d.task.description ?? "")
           setEditTaskType(d.task.taskType)
@@ -262,23 +263,19 @@ export function TaskDetail({ taskId }: { taskId: number }) {
     }
   }, [taskId])
 
-  // ─── Load attachments ───
+  // ─── Reload attachments (used after upload/delete) ───
   const loadAttachments = useCallback(async () => {
-    if (!activeProject) return
     try {
-      const allDocs = await listKnowledgeDocs({
-        projectId: activeProject.id,
-        docTypeFilter: "task_attachment",
-      })
-      setAttachments(allDocs.filter((d) => d.taskId === taskId))
+      const d = await getTask(taskId)
+      setDetail(d)
+      setAttachments(d.attachments)
     } catch (e) {
-      console.error("Failed to load attachments:", e)
+      console.error("Failed to reload attachments:", e)
     }
-  }, [activeProject, taskId])
+  }, [taskId])
 
-  useEffect(() => {
-    void loadAttachments()
-  }, [loadAttachments])
+  // Attachments are now loaded via getTask detail (find_by_task_id),
+  // so we no longer need the separate listKnowledgeDocs call here.
 
   // ─── Load KB docs when context panel opens ───
   useEffect(() => {
