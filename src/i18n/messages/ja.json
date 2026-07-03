@@ -3491,7 +3491,7 @@
       "continueDiscussion": "議論を続ける",
       "addTask": "タスクを追加",
       "removeTask": "削除",
-      "decompositionApplied": "タスクが作成されました",
+      "decompositionApplied": "{count}件のタスクを作成済み",
       "decompositionFailed": "タスクの作成に失敗しました",
       "proposedTasks": "{count}件のタスク提案",
       "selectProject": "プロジェクトを選択",

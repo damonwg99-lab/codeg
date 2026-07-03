@@ -3491,7 +3491,7 @@
       "continueDiscussion": "Continuer la discussion",
       "addTask": "Ajouter une tâche",
       "removeTask": "Supprimer",
-      "decompositionApplied": "Tâches créées",
+      "decompositionApplied": "{count} tâches créées",
       "decompositionFailed": "Échec de la création",
       "proposedTasks": "{count} tâches proposées",
       "selectProject": "Sélectionner un projet",

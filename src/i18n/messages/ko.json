@@ -3491,7 +3491,7 @@
       "continueDiscussion": "논의 계속",
       "addTask": "작업 추가",
       "removeTask": "삭제",
-      "decompositionApplied": "작업이 생성되었습니다",
+      "decompositionApplied": "{count}개 작업 생성 완료",
       "decompositionFailed": "작업 생성 실패",
       "proposedTasks": "{count}개 작업 제안",
       "selectProject": "프로젝트 선택",

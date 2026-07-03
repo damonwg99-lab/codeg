@@ -347,10 +347,14 @@ export function FolderTitleBar() {
                     variant="outline"
                     className="h-6 cursor-pointer gap-1 px-2 text-[0.6875rem] hover:bg-accent"
                     onClick={() =>
-                      setRoute("task-detail", {
-                        taskId: linkedTask.id,
-                        projectId: linkedTask.projectId,
-                      })
+                      setRoute(
+                        "task-detail",
+                        {
+                          taskId: linkedTask.id,
+                          projectId: linkedTask.projectId,
+                        },
+                        { routeId: "conversations" }
+                      )
                     }
                   >
                     📌 {linkedTask.title}

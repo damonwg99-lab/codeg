@@ -109,9 +109,11 @@ interface UseDecompositionDetectorResult {
   detectedSubTasks: ProposedSubTask[] | null
   /** Whether the overlay was manually dismissed (chip should be shown). */
   isDismissed: boolean
-  /** Whether the proposal was confirmed (batch-created). Overlay stays
-   *  hidden until a new proposal arrives. */
+  /** Whether the proposal was confirmed (batch-created). Chip shows
+   *  "已创建" label; clicking it opens overlay in read-only mode. */
   isConfirmed: boolean
+  /** Whether user is viewing a confirmed proposal (read-only overlay open). */
+  viewingConfirmed: boolean
   /** Clear the proposal and reset all keyed state. */
   clearProposal: () => void
   /** Dismiss the overlay (keep proposal data, mark as dismissed). */
@@ -120,6 +122,10 @@ interface UseDecompositionDetectorResult {
   confirmProposal: () => void
   /** Re-open the overlay after dismissal. */
   reopenProposal: () => void
+  /** Open overlay in read-only mode to view a confirmed proposal. */
+  viewConfirmedProposal: () => void
+  /** Close the read-only confirmed view. */
+  closeConfirmedView: () => void
   /** Update sub-tasks (user edits in the overlay). */
   updateSubTasks: (subTasks: ProposedSubTask[]) => void
 }
@@ -145,7 +151,22 @@ export function useDecompositionDetector(
 ): UseDecompositionDetectorResult {
   // Auto-detected sub-tasks from AI response (derived, not stored in state)
   const detectedSubTasks = useMemo<ProposedSubTask[] | null>(() => {
-    if (!localTurns || localTurns.length === 0) return null
+    if (!localTurns || localTurns.length === 0) {
+      console.log("[DecompDetector] useMemo: localTurns empty/undefined")
+      return null
+    }
+
+    console.log(
+      "[DecompDetector] useMemo: localTurns count:",
+      localTurns.length,
+      "turns:",
+      localTurns.map((t) => ({
+        role: t.role,
+        completed_at: t.completed_at,
+        type: typeof t.completed_at,
+        blocks: t.blocks?.length ?? 0,
+      }))
+    )
 
     // Find the last assistant turn that is "complete". For turns loaded
     // from the database, `completed_at` may be omitted (Rust skips it
@@ -161,10 +182,15 @@ export function useDecompositionDetector(
           (t.completed_at !== null || t.completed_at === undefined)
       )
 
+    console.log(
+      "[DecompDetector] useMemo: lastAssistant found:",
+      !!lastAssistant
+    )
+
     if (!lastAssistant) return null
 
     // Collect all text blocks from the assistant message
-    const textContent = lastAssistant.blocks
+    const textContent = (lastAssistant.blocks ?? [])
       .filter((b) => b.type === "text")
       .map((b) => b.text)
       .join("\n")
@@ -203,6 +229,8 @@ export function useDecompositionDetector(
     }
   )
   const [editedScoped, setEditedScoped] = useState<ScopedEdit | null>(null)
+  // Read-only viewing mode for confirmed proposals
+  const [viewingConfirmed, setViewingConfirmed] = useState(false)
 
   // ── Effective values (stale state auto-expired) ──
 
@@ -237,7 +265,7 @@ export function useDecompositionDetector(
       : confirmedKey
 
   // The effective proposed sub-tasks:
-  // - If confirmed (same key), return null → overlay hidden
+  // - If confirmed (same key), return tasks (read-only view, no action buttons)
   // - If dismissed (same key), return null → overlay hidden, chip shown
   // - Otherwise, user-edited overrides detected
   const isConfirmed =
@@ -249,11 +277,22 @@ export function useDecompositionDetector(
     effectiveDismissedKey !== null &&
     effectiveDismissedKey === proposalKey(detectedSubTasks)
 
-  const proposedSubTasks = isConfirmed
+  const proposedSubTasks = isDismissed
     ? null
-    : isDismissed
-      ? null
-      : (userEditedSubTasks ?? detectedSubTasks)
+    : (userEditedSubTasks ?? detectedSubTasks)
+
+  console.log("[DecompDetector] decision:", {
+    convId: conversationId,
+    detectedSubTasks: detectedSubTasks?.length ?? null,
+    currentDetectedKey,
+    dismissedKey,
+    confirmedKey,
+    effectiveDismissedKey,
+    effectiveConfirmedKey,
+    isConfirmed,
+    isDismissed,
+    proposedSubTasks: proposedSubTasks?.length ?? null,
+  })
 
   // ── Actions ──
 
@@ -294,6 +333,7 @@ export function useDecompositionDetector(
 
   const reopenProposal = useCallback(() => {
     setDismissedScoped(null)
+    setViewingConfirmed(false)
     writeStoredState(conversationId, {
       dismissedKey: null,
       confirmedKey: isCurrentConv(confirmedScoped, conversationId)
@@ -301,6 +341,14 @@ export function useDecompositionDetector(
         : null,
     })
   }, [conversationId, confirmedScoped])
+
+  const viewConfirmedProposal = useCallback(() => {
+    setViewingConfirmed(true)
+  }, [])
+
+  const closeConfirmedView = useCallback(() => {
+    setViewingConfirmed(false)
+  }, [])
 
   const updateSubTasks = useCallback(
     (subTasks: ProposedSubTask[]) => {
@@ -314,10 +362,13 @@ export function useDecompositionDetector(
     detectedSubTasks,
     isDismissed,
     isConfirmed,
+    viewingConfirmed,
     clearProposal,
     dismissProposal,
     confirmProposal,
     reopenProposal,
+    viewConfirmedProposal,
+    closeConfirmedView,
     updateSubTasks,
   }
 }

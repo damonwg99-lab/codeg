@@ -3491,7 +3491,7 @@
       "continueDiscussion": "Continuar discusión",
       "addTask": "Agregar tarea",
       "removeTask": "Eliminar",
-      "decompositionApplied": "Tareas creadas",
+      "decompositionApplied": "{count} tareas creadas",
       "decompositionFailed": "Error al crear",
       "proposedTasks": "{count} tareas propuestas",
       "selectProject": "Seleccionar proyecto",

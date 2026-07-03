@@ -71,7 +71,11 @@ export function CreateTaskForm({ projectId }: { projectId: number }) {
         }
         setAttachmentUploading(false)
       }
-      setRoute("task-detail", { taskId: task.id })
+      setRoute(
+        "task-detail",
+        { taskId: task.id },
+        { routeId: "create-task", params: { projectId } }
+      )
     } catch (e) {
       setCreateError(String(e))
     }

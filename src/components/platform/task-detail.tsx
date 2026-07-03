@@ -151,7 +151,8 @@ function kbDocRelPath(
 
 export function TaskDetail({ taskId }: { taskId: number }) {
   const t = useTranslations("Platform")
-  const { setRoute, routeParams, openConversations } = useWorkbenchRoute()
+  const { setRoute, routeParams, fromRoute, fromParams, openConversations } =
+    useWorkbenchRoute()
   const { activeProject } = usePlatform()
   const { openTab, setPendingInitialDraft, closeConversationTab } =
     useTabContext()
@@ -485,7 +486,13 @@ export function TaskDetail({ taskId }: { taskId: number }) {
               variant="ghost"
               size="icon"
               className="h-7 w-7"
-              onClick={() => setRoute("task-kanban", { projectId })}
+              onClick={() => {
+                if (fromRoute) {
+                  setRoute(fromRoute, fromParams)
+                } else {
+                  setRoute("task-kanban", { projectId })
+                }
+              }}
             >
               <ArrowLeft className="h-4 w-4" />
             </Button>
@@ -896,10 +903,14 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                     key={sub.id}
                     className="flex items-center gap-2 rounded-md border p-2 cursor-pointer hover:bg-accent"
                     onClick={() =>
-                      setRoute("task-detail", {
-                        taskId: sub.id,
-                        projectId,
-                      })
+                      setRoute(
+                        "task-detail",
+                        { taskId: sub.id, projectId },
+                        {
+                          routeId: "task-detail",
+                          params: { taskId: task.id, projectId },
+                        }
+                      )
                     }
                   >
                     <Badge

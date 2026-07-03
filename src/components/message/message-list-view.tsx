@@ -530,15 +530,27 @@ export function MessageListView({
   // Use timelineTurns (which merges DB history + local + streaming) instead
   // of session.localTurns, so detection works after reopening a conversation
   // (where turns are loaded from DB, not in localTurns).
+  // IMPORTANT: timelineTurns is ConversationTimelineTurn[] (wrapper with
+  // .turn/.phase/.key). The detector hook expects raw MessageTurn[], so we
+  // must extract .turn from each item. Memoize to avoid recreating the array
+  // on every render (which would bust the detector's useMemo dep).
+  const decompTurns = useMemo(
+    () => timelineTurns.map((item) => item.turn),
+    [timelineTurns]
+  )
   const {
     proposedSubTasks: decompSubTasks,
     detectedSubTasks: decompDetected,
     isDismissed: decompDismissed,
+    isConfirmed: decompConfirmed,
+    viewingConfirmed: decompViewingConfirmed,
     confirmProposal: confirmDecomp,
     dismissProposal: dismissDecomp,
     reopenProposal: reopenDecomp,
+    viewConfirmedProposal: viewDecompConfirmed,
+    closeConfirmedView: closeDecompConfirmedView,
     updateSubTasks: updateDecompSubTasks,
-  } = useDecompositionDetector(timelineTurns, conversationId)
+  } = useDecompositionDetector(decompTurns, conversationId)
 
   const [decompSubmitting, setDecompSubmitting] = useState(false)
 
@@ -571,7 +583,9 @@ export function MessageListView({
           })
         }
         confirmDecomp()
-        toast.success(tDecomp("decompositionApplied"))
+        toast.success(
+          tDecomp("decompositionApplied", { count: params.subTasks.length })
+        )
       } catch (err) {
         console.error("Failed to create sub-tasks:", err)
         toast.error(tDecomp("decompositionFailed"))
@@ -1000,31 +1014,49 @@ export function MessageListView({
           delegations={lastAssistantDelegations}
           overlayKey={subAgentOverlayKey}
         />
-        {/* Dismissed decomposition chip: shows when user closed the dialog
-            but proposals still exist. Clicking re-opens the dialog. */}
-        {decompDismissed && decompDetected && decompDetected.length > 0 && (
-          <CollapsedOverlayChip
-            icon={<ListChecks className="size-3" />}
-            summary={tDecomp("proposedTasks", {
-              count: decompDetected.length,
-            })}
-            onClick={reopenDecomp}
-          />
-        )}
+        {/* Dismissed/confirmed decomposition chip: shows when user closed
+            the dialog or confirmed creation. Clicking re-opens in read-only
+            mode (confirmed) or editable mode (dismissed). */}
+        {(decompDismissed || decompConfirmed) &&
+          decompDetected &&
+          decompDetected.length > 0 && (
+            <CollapsedOverlayChip
+              icon={<ListChecks className="size-3" />}
+              summary={
+                decompConfirmed
+                  ? tDecomp("decompositionApplied", {
+                      count: decompDetected.length,
+                    })
+                  : tDecomp("proposedTasks", { count: decompDetected.length })
+              }
+              onClick={decompConfirmed ? viewDecompConfirmed : reopenDecomp}
+            />
+          )}
       </div>
       {/* Decomposition review dialog — rendered as a Dialog (not in the
           narrow overlay stack) so it centers properly, matches conversation
-          width, and has a scrollable content area with fixed footer. */}
+          width, and has a scrollable content area with fixed footer.
+          When confirmed, overlay closes and a chip is shown instead.
+          Clicking the confirmed chip reopens overlay in read-only mode. */}
       <DecompositionOverlay
-        open={decompSubTasks !== null && decompSubTasks.length > 0}
+        open={
+          (decompSubTasks !== null &&
+            decompSubTasks.length > 0 &&
+            !decompConfirmed) ||
+          decompViewingConfirmed
+        }
         onOpenChange={(open) => {
-          if (!open) dismissDecomp()
+          if (!open) {
+            if (decompViewingConfirmed) closeDecompConfirmedView()
+            else dismissDecomp()
+          }
         }}
         proposedSubTasks={decompSubTasks ?? []}
         linkedTask={linkedTask ?? null}
         projects={projects}
         activeProjectId={activeProjectId ?? null}
         submitting={decompSubmitting}
+        readOnly={decompViewingConfirmed}
         onUpdateSubTasks={updateDecompSubTasks}
         onConfirm={handleDecompConfirm}
       />

@@ -32,11 +32,20 @@ interface WorkbenchRouteContextValue {
   routeId: WorkbenchRouteId
   /** Route params (id, projectId, taskId, etc.) for the active route. */
   routeParams: Record<string, string | number>
+  /** The route the user navigated FROM (for back-button logic).
+   *  Null means no recorded origin — fall back to default. */
+  fromRoute: WorkbenchRouteId | null
+  /** Params of the origin route (e.g. { projectId } for task-kanban). */
+  fromParams: Record<string, string | number>
   /** Convenience for the common branch — `routeId === "conversations"`. */
   isConversations: boolean
   setRoute: (
     id: WorkbenchRouteId,
-    params?: Record<string, string | number>
+    params?: Record<string, string | number>,
+    from?: {
+      routeId: WorkbenchRouteId
+      params?: Record<string, string | number>
+    }
   ) => void
   /** Sugar for returning to the conversation workspace. */
   openConversations: () => void
@@ -71,11 +80,29 @@ export function WorkbenchRouteProvider({ children }: { children: ReactNode }) {
   const [routeParams, setRouteParams] = useState<
     Record<string, string | number>
   >({})
+  const [fromRoute, setFromRoute] = useState<WorkbenchRouteId | null>(null)
+  const [fromParams, setFromParams] = useState<Record<string, string | number>>(
+    {}
+  )
 
   const setRoute = useCallback(
-    (id: WorkbenchRouteId, params?: Record<string, string | number>) => {
+    (
+      id: WorkbenchRouteId,
+      params?: Record<string, string | number>,
+      from?: {
+        routeId: WorkbenchRouteId
+        params?: Record<string, string | number>
+      }
+    ) => {
       setRouteId(id)
       setRouteParams(params ?? {})
+      if (from) {
+        setFromRoute(from.routeId)
+        setFromParams(from.params ?? {})
+      } else {
+        setFromRoute(null)
+        setFromParams({})
+      }
     },
     []
   )
@@ -83,17 +110,21 @@ export function WorkbenchRouteProvider({ children }: { children: ReactNode }) {
   const openConversations = useCallback(() => {
     setRouteId("conversations")
     setRouteParams({})
+    setFromRoute(null)
+    setFromParams({})
   }, [])
 
   const value = useMemo<WorkbenchRouteContextValue>(
     () => ({
       routeId,
       routeParams,
+      fromRoute,
+      fromParams,
       isConversations: routeId === "conversations",
       setRoute,
       openConversations,
     }),
-    [routeId, routeParams, setRoute, openConversations]
+    [routeId, routeParams, fromRoute, fromParams, setRoute, openConversations]
   )
 
   return (

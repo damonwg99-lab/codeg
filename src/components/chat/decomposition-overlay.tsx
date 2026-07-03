@@ -39,6 +39,9 @@ interface DecompositionOverlayProps {
   projects: ProjectInfo[]
   activeProjectId: number | null
   submitting?: boolean
+  /** Read-only mode: tasks were already created. Hide action buttons and
+   *  disable editing inputs. */
+  readOnly?: boolean
   onUpdateSubTasks: (subTasks: ProposedSubTask[]) => void
   onConfirm: (params: ConfirmParams) => void
 }
@@ -54,6 +57,7 @@ export function DecompositionOverlay({
   projects,
   activeProjectId,
   submitting = false,
+  readOnly = false,
   onUpdateSubTasks,
   onConfirm,
 }: DecompositionOverlayProps) {
@@ -176,15 +180,18 @@ export function DecompositionOverlay({
                   onChange={(e) => updateEntry(index, "title", e.target.value)}
                   className="h-7 text-xs"
                   placeholder={t("taskTitle")}
+                  disabled={readOnly}
                 />
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-6 w-6 text-muted-foreground hover:text-destructive shrink-0"
-                  onClick={() => removeEntry(index)}
-                >
-                  <Trash2 className="size-3" />
-                </Button>
+                {!readOnly && (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-6 w-6 text-muted-foreground hover:text-destructive shrink-0"
+                    onClick={() => removeEntry(index)}
+                  >
+                    <Trash2 className="size-3" />
+                  </Button>
+                )}
               </div>
 
               {/* Description */}
@@ -195,6 +202,7 @@ export function DecompositionOverlay({
                 }
                 className="h-7 text-xs"
                 placeholder={t("taskDescription")}
+                disabled={readOnly}
               />
 
               {/* Type + Priority */}
@@ -202,6 +210,7 @@ export function DecompositionOverlay({
                 <Select
                   value={entry.taskType}
                   onValueChange={(v) => updateEntry(index, "taskType", v)}
+                  disabled={readOnly}
                 >
                   <SelectTrigger className="h-7 text-xs w-[100px]">
                     <SelectValue />
@@ -218,6 +227,7 @@ export function DecompositionOverlay({
                 <Select
                   value={entry.priority}
                   onValueChange={(v) => updateEntry(index, "priority", v)}
+                  disabled={readOnly}
                 >
                   <SelectTrigger className="h-7 text-xs w-[100px]">
                     <SelectValue />
@@ -240,38 +250,43 @@ export function DecompositionOverlay({
             </div>
           ))}
 
-          {/* Add sub-task button */}
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 text-xs w-full"
-            onClick={addEntry}
-          >
-            <Plus className="size-3 mr-1" />
-            {t("addTask")}
-          </Button>
+          {/* Add sub-task button (hidden in read-only mode) */}
+          {!readOnly && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 text-xs w-full"
+              onClick={addEntry}
+            >
+              <Plus className="size-3 mr-1" />
+              {t("addTask")}
+            </Button>
+          )}
         </div>
 
-        <DialogFooter className="mt-4 shrink-0">
-          <Button
-            variant="outline"
-            onClick={() => onOpenChange(false)}
-            disabled={submitting}
-          >
-            {t("continueDiscussion")}
-          </Button>
-          <Button
-            onClick={handleConfirm}
-            disabled={
-              submitting || proposedSubTasks.every((e) => !e.title.trim())
-            }
-          >
-            {submitting && (
-              <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
-            )}
-            {t("confirmCreate")}
-          </Button>
-        </DialogFooter>
+        {/* Action buttons — hidden in read-only mode */}
+        {!readOnly && (
+          <DialogFooter className="mt-4 shrink-0">
+            <Button
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+              disabled={submitting}
+            >
+              {t("continueDiscussion")}
+            </Button>
+            <Button
+              onClick={handleConfirm}
+              disabled={
+                submitting || proposedSubTasks.every((e) => !e.title.trim())
+              }
+            >
+              {submitting && (
+                <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+              )}
+              {t("confirmCreate")}
+            </Button>
+          </DialogFooter>
+        )}
       </DialogContent>
     </Dialog>
   )

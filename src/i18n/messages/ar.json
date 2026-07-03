@@ -3491,7 +3491,7 @@
       "continueDiscussion": "متابعة المناقشة",
       "addTask": "إضافة مهمة",
       "removeTask": "إزالة",
-      "decompositionApplied": "تم إنشاء المهام",
+      "decompositionApplied": "تم إنشاء {count} مهمة",
       "decompositionFailed": "فشل الإنشاء",
       "proposedTasks": "{count} مهمة مقترحة",
       "selectProject": "اختيار المشروع",

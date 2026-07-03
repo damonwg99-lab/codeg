@@ -3492,7 +3492,7 @@
       "continueDiscussion": "Continue Discussion",
       "addTask": "Add task",
       "removeTask": "Remove",
-      "decompositionApplied": "Tasks created",
+      "decompositionApplied": "{count} tasks created",
       "decompositionFailed": "Failed to create",
       "proposedTasks": "{count} proposed tasks",
       "selectProject": "Select project",

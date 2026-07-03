@@ -63,7 +63,7 @@ function resolvePriorityLabel(
   return key ? (t(key as never) ?? priority) : priority
 }
 
-function TaskCard({ task }: { task: TaskInfo }) {
+function TaskCard({ task, projectId }: { task: TaskInfo; projectId: number }) {
   const { setRoute } = useWorkbenchRoute()
   const t = useTranslations("Platform")
   const {
@@ -91,7 +91,13 @@ function TaskCard({ task }: { task: TaskInfo }) {
         "cursor-pointer transition-colors hover:bg-accent",
         "touch-none select-none rounded-md"
       )}
-      onClick={() => setRoute("task-detail", { taskId: task.id })}
+      onClick={() =>
+        setRoute(
+          "task-detail",
+          { taskId: task.id, projectId },
+          { routeId: "task-kanban", params: { projectId } }
+        )
+      }
     >
       <CardContent className="flex items-stretch p-0">
         {/* Drag handle — separate from click target */}
@@ -132,9 +138,11 @@ function TaskCard({ task }: { task: TaskInfo }) {
 function KanbanColumn({
   status,
   tasks,
+  projectId,
 }: {
   status: TaskStatus
   tasks: TaskInfo[]
+  projectId: number
 }) {
   const t = useTranslations("Platform")
   const taskCount = tasks.length
@@ -163,7 +171,7 @@ function KanbanColumn({
         >
           <div className="flex flex-col gap-1.5 p-1">
             {tasks.map((task) => (
-              <TaskCard key={task.id} task={task} />
+              <TaskCard key={task.id} task={task} projectId={projectId} />
             ))}
             {tasks.length === 0 && (
               <div className="py-8 text-center text-[0.75rem] text-muted-foreground">
@@ -278,6 +286,7 @@ export function TaskKanban({ projectId }: { projectId: number }) {
               key={status}
               status={status}
               tasks={tasks.filter((task) => task.status === status)}
+              projectId={projectId}
             />
           ))}
         </div>

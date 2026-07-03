@@ -3491,7 +3491,7 @@
       "continueDiscussion": "繼續討論",
       "addTask": "新增任務",
       "removeTask": "刪除",
-      "decompositionApplied": "任務建立成功",
+      "decompositionApplied": "已創建 {count} 個任務",
       "decompositionFailed": "建立任務失敗",
       "proposedTasks": "{count} 個任務提案",
       "selectProject": "選擇專案",
