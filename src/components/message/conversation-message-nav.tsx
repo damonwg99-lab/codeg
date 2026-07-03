@@ -9,7 +9,7 @@ import {
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { useActiveFolder } from "@/contexts/active-folder-context"
-import { useWorkspaceContext } from "@/contexts/workspace-context"
+import { useWorkspaceActions } from "@/contexts/workspace-context"
 import type { FileChangeStat } from "@/lib/session-files"
 import type { MessageScrollContextValue } from "@/components/message/message-scroll-context"
 import { CollapsedOverlayChip } from "@/components/chat/collapsed-overlay-chip"
@@ -19,6 +19,12 @@ import {
 } from "@/components/ai-elements/commit"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import {
+  fileNameOf,
+  isRemovedFileDiff,
+  normalizeSlashPath,
+  toFolderRelativePath,
+} from "@/lib/file-path-display"
 import { cn } from "@/lib/utils"
 
 /** One navigable user message. Present for every user turn, even when it made
@@ -50,42 +56,6 @@ interface ConversationMessageNavProps {
   scrollApiRef: RefObject<MessageScrollContextValue | null>
 }
 
-function isRemovedFileDiff(diff: string | null): boolean {
-  if (!diff) return false
-  return (
-    /^\*\*\* Delete File:\s+/m.test(diff) ||
-    /^deleted file mode\b/m.test(diff) ||
-    /^\+\+\+\s+\/dev\/null$/m.test(diff)
-  )
-}
-
-function normalizeSlashPath(path: string): string {
-  return path.replace(/\\/g, "/")
-}
-
-function toFolderRelativePath(filePath: string, folderPath?: string): string {
-  const normalizedFilePath = normalizeSlashPath(filePath)
-  if (!folderPath) return normalizedFilePath
-
-  const normalizedFolderPath = normalizeSlashPath(folderPath).replace(
-    /\/+$/,
-    ""
-  )
-  if (!normalizedFolderPath) return normalizedFilePath
-
-  const folderPrefix = `${normalizedFolderPath}/`
-  if (normalizedFilePath.startsWith(folderPrefix)) {
-    return normalizedFilePath.slice(folderPrefix.length)
-  }
-
-  return normalizedFilePath
-}
-
-function fileNameOf(displayPath: string): string {
-  const lastSlash = displayPath.lastIndexOf("/")
-  return lastSlash >= 0 ? displayPath.slice(lastSlash + 1) : displayPath
-}
-
 /**
  * Per-conversation message navigator. Lives in the inline-start overlay stack
  * as the first chip (above the plan and sub-agent panels).
@@ -104,7 +74,7 @@ export const ConversationMessageNav = memo(function ConversationMessageNav({
   scrollApiRef,
 }: ConversationMessageNavProps) {
   const t = useTranslations("Folder.chat.messageNav")
-  const { openSessionFileDiff } = useWorkspaceContext()
+  const { openSessionFileDiff } = useWorkspaceActions()
   const { activeFolder: folder } = useActiveFolder()
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({})
 

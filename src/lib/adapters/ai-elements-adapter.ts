@@ -15,7 +15,6 @@ import {
 import { normalizeToolName } from "@/lib/tool-call-normalization"
 import { isBackgroundTaskToolCall } from "@/lib/background-task"
 import { feedbackCheckHasContent } from "@/lib/feedback-check"
-import { stripFeedbackReminder } from "@/lib/feedback-reminder"
 import {
   isPlanLikeToolName,
   isPlanModeToolName,
@@ -881,28 +880,6 @@ function splitUserTextAndResources(
   return { parts: nextParts, resources }
 }
 
-/**
- * Strip the auto-injected live-feedback reminder from a user turn's text parts.
- * The reminder rides the wire to the agent but is bracketed by a sentinel so it
- * can be hidden again on reload (codeg keeps no prompt copy, so the user turn is
- * reparsed from the agent's session file with the reminder still attached). A
- * text part that was nothing but the reminder collapses to empty and is dropped.
- */
-function stripFeedbackReminderFromParts(
-  parts: AdaptedContentPart[]
-): AdaptedContentPart[] {
-  const out: AdaptedContentPart[] = []
-  for (const part of parts) {
-    if (part.type !== "text") {
-      out.push(part)
-      continue
-    }
-    const stripped = stripFeedbackReminder(part.text)
-    if (stripped.length > 0) out.push({ ...part, text: stripped })
-  }
-  return out
-}
-
 function deriveImageNameFromBlock(
   block: Extract<ContentBlock, { type: "image" }>
 ): string {
@@ -1401,12 +1378,18 @@ function mergeGoalObjectiveHints(
 /**
  * Wrap a Codex `/goal` lifecycle into one card-style part:
  * `create_goal` starts the run, every intervening adapted part becomes card
- * body content, and `update_goal` closes the run. An unfinished run remains
- * wrapped with `isRunning=true` so the renderer can shimmer the title while the
- * agent is still working.
+ * body content, and `update_goal` closes the run.
+ *
+ * codex keeps a `/goal` active across turns and does NOT emit a closing
+ * `update_goal` when a turn ends or is interrupted, so an unfinished run must
+ * only shimmer while its turn is actually streaming — otherwise a stopped or
+ * reloaded goal capsule spins forever. `isStreaming` gates that: an unfinished
+ * run flushes with `isRunning: isStreaming`, so it settles (static) once the
+ * turn stops or on history reload, and shimmers only while live.
  */
 export function groupGoalRuns(
-  parts: AdaptedContentPart[]
+  parts: AdaptedContentPart[],
+  isStreaming: boolean = false
 ): AdaptedContentPart[] {
   const result: AdaptedContentPart[] = []
   let active: {
@@ -1437,7 +1420,9 @@ export function groupGoalRuns(
       start: active.start,
       end: null,
       items: [...active.items],
-      isRunning: true,
+      // Unfinished run: shimmer only while the turn is live. A stopped or
+      // reloaded goal (codex never emits a closing update_goal) settles static.
+      isRunning: isStreaming,
     })
     active = null
   }
@@ -1762,19 +1747,14 @@ export function adaptMessageTurn(
                 dropHiddenFeedbackChecks(adaptedContent)
               )
             )
-          )
+          ),
+          isStreaming
         )
       : adaptedContent
 
-  // Drop the live-feedback reminder (auto-appended to outgoing prompts) BEFORE
-  // resource extraction, so it never surfaces in the UI on reload and its body
-  // can't be misread as a resource mention.
   const userSplit =
     turn.role === "user"
-      ? splitUserTextAndResources(
-          stripFeedbackReminderFromParts(groupedContent),
-          text.attachedResources
-        )
+      ? splitUserTextAndResources(groupedContent, text.attachedResources)
       : { parts: groupedContent, resources: [] as UserResourceDisplay[] }
   // Only user-uploaded images surface as top-of-message attachments.
   // Assistant-side image_generation flows through the inline

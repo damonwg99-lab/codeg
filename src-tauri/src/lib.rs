@@ -54,8 +54,6 @@ mod tauri_app {
         office_tools as office_tools_commands,
         folders, logging as logging_commands, mcp as mcp_commands,
         model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
-        project as project_commands, task as task_commands,
-        knowledge as knowledge_commands,
         question as question_commands, quick_messages as quick_messages_commands,
         remote_proxy as remote_proxy_commands,
         remote_workspace as remote_workspace_commands, session_info as session_info_commands,
@@ -169,7 +167,21 @@ mod tauri_app {
         }));
 
         builder
-            .plugin(tauri_plugin_window_state::Builder::new().build())
+            // Persist every window flag EXCEPT decorations. Decorations are a
+            // per-platform decision made by `apply_platform_window_style`
+            // (undecorated on Windows/Linux so the app draws its own chrome),
+            // not a user preference. Restoring a stale `decorated: true` saved
+            // by an older build would call `set_decorations(true)` after the
+            // window is built and re-add the native title bar on top of the
+            // app's own toolbar — the Linux "double title bar".
+            .plugin(
+                tauri_plugin_window_state::Builder::new()
+                    .with_state_flags(
+                        tauri_plugin_window_state::StateFlags::all()
+                            & !tauri_plugin_window_state::StateFlags::DECORATIONS,
+                    )
+                    .build(),
+            )
             .plugin(tauri_plugin_opener::init())
             .plugin(tauri_plugin_dialog::init())
             .plugin(tauri_plugin_updater::Builder::new().build())
@@ -285,9 +297,6 @@ mod tauri_app {
                 ))
                 .map_err(|e| e.to_string())?;
                 app.manage(database);
-                app.manage(crate::web::event_bridge::EventEmitter::Tauri(
-                    app.handle().clone(),
-                ));
 
                 // Restore and apply saved system proxy settings before any network operation.
                 let db = app.state::<db::AppDatabase>();
@@ -1171,47 +1180,6 @@ mod tauri_app {
                 web::get_web_service_config,
                 web::update_web_service_config,
                 web::probe_web_service_port,
-                // ─── Platform ───
-                project_commands::list_projects,
-                project_commands::get_project,
-                project_commands::create_project,
-                project_commands::update_project,
-                project_commands::delete_project,
-                project_commands::list_project_repos,
-                project_commands::add_project_repo,
-                project_commands::remove_project_repo,
-                project_commands::scan_git_repos,
-                project_commands::get_global_config,
-                project_commands::set_global_config,
-                project_commands::save_credential,
-                project_commands::delete_credential,
-                task_commands::list_tasks,
-                task_commands::get_task,
-                task_commands::create_task,
-                task_commands::update_task,
-                task_commands::update_task_status,
-                task_commands::delete_task,
-                task_commands::link_conversation,
-                task_commands::create_conversation_for_task,
-                task_commands::unlink_conversation,
-                task_commands::list_task_conversations,
-                task_commands::get_task_by_conversation,
-                task_commands::list_task_type_mappings,
-                task_commands::create_task_type_mapping,
-                task_commands::update_task_type_mapping,
-                task_commands::delete_task_type_mapping,
-                task_commands::create_decomposition,
-                knowledge_commands::scan_knowledge_repo,
-                knowledge_commands::list_knowledge_docs,
-                knowledge_commands::search_knowledge_docs,
-                knowledge_commands::get_knowledge_doc,
-                knowledge_commands::update_knowledge_doc,
-                knowledge_commands::delete_knowledge_doc,
-                knowledge_commands::list_skills,
-                knowledge_commands::upload_kb_doc,
-                knowledge_commands::upload_task_attachment,
-                knowledge_commands::init_knowledge_repo,
-                knowledge_commands::read_kb_doc_content,
             ])
             .build(tauri::generate_context!())
             .expect("error while building tauri application")

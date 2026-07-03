@@ -29,7 +29,6 @@ import { useTabContext } from "@/contexts/tab-context"
 import { useSessionStats } from "@/contexts/session-stats-context"
 import { useTaskContext } from "@/contexts/task-context"
 import { cn, copyTextFromMenu, randomUUID } from "@/lib/utils"
-import { appendFeedbackReminder } from "@/lib/feedback-reminder"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
 import { MessageListView } from "@/components/message/message-list-view"
@@ -196,7 +195,6 @@ const ConversationTabView = memo(function ConversationTabView({
   const t = useTranslations("Folder.conversation")
   const tWelcome = useTranslations("Folder.chat.welcomeInputPanel")
   const sharedT = useTranslations("Folder.chat.shared")
-  const tLive = useTranslations("LiveFeedback")
   const { activeFolder: folder, activeFolderId } = useActiveFolder()
   const { refreshConversations, upsertFolder } = useAppWorkspace()
   const folderId = activeFolderId ?? 0
@@ -582,11 +580,6 @@ const ConversationTabView = memo(function ConversationTabView({
       opts?: { fromQueueFlush?: boolean }
     ) => void
   >(() => {})
-  // Latest live-feedback reminder, read inside `handleSend` (the send chokepoint
-  // for both direct sends and queue flushes). A ref — not a `handleSend` dep —
-  // because it is derived from `feedback` further down, after `handleSend` is
-  // declared; the value is only ever read at send time. Kept in sync below.
-  const feedbackReminderRef = useRef<string | null>(null)
   // Timestamp of the last send that bounced with TurnBusyError. The flush below
   // backs off after a bounce so repeated busy rejections (backend still running
   // another turn while this client believes it is idle) don't spin one failed
@@ -826,6 +819,7 @@ const ConversationTabView = memo(function ConversationTabView({
           }
         : decompWrapped
 
+
       // Single-flight the unbound new-tab create. A second direct submit fired
       // before the first create resolves (a double Enter / double click) would
       // otherwise append an optimistic turn it can never deliver: the
@@ -885,7 +879,7 @@ const ConversationTabView = memo(function ConversationTabView({
         // Existing-tab path: row already exists, send immediately with the
         // conversation_id pinned so the backend reuses our row instead of
         // creating a duplicate.
-        lifecycleSend(sendDraft, selectedModeIdArg, {
+        lifecycleSend(draft, selectedModeIdArg, {
           folderId,
           conversationId: persistedId,
           // The backend echoes this as the broadcast UserMessage's message_id,
@@ -1002,7 +996,7 @@ const ConversationTabView = memo(function ConversationTabView({
           // Now that the row exists, kick off the actual prompt with the
           // conversation_id pinned so the backend adopts our row instead of
           // creating a duplicate one.
-          lifecycleSend(sendDraft, selectedModeIdArg, {
+          lifecycleSend(draft, selectedModeIdArg, {
             folderId: sendFolderId,
             conversationId: newConversationId,
             clientMessageId: optimisticTurn.id,
@@ -1383,19 +1377,6 @@ const ConversationTabView = memo(function ConversationTabView({
     enabled: feedbackEnabled,
     onResendAsPrompt: resendFeedbackAsPrompt,
   })
-  // When live feedback is on AND this agent actually has the `check_user_feedback`
-  // tool, every outgoing prompt gets a localized reminder so the agent reliably
-  // polls for mid-turn guidance (automating the old "mention it in your prompt"
-  // tip). Null = leave the message untouched. The value is consumed at the send
-  // chokepoint (`handleSend`) via `feedbackReminderRef`, never threaded into the
-  // composer — so it never lands in a stored/queued/edited draft.
-  const feedbackReminder =
-    feedback.featureEnabled && feedback.toolAvailable
-      ? tLive("promptReminder")
-      : null
-  useEffect(() => {
-    feedbackReminderRef.current = feedbackReminder
-  }, [feedbackReminder])
 
   return (
     <ConversationShell
