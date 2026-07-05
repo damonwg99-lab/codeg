@@ -27,11 +27,22 @@ vi.mock("@/contexts/sidebar-context", () => ({
   useSidebarContext: () => ({ isOpen: true, toggle: vi.fn() }),
 }))
 vi.mock("@/contexts/platform-context", () => ({
-  usePlatform: () => ({ activeProjectId: null, activeFolderIds: [], activeProject: null, projects: [] }),
+  usePlatform: () => ({
+    activeProjectId: null,
+    activeFolderIds: [],
+    activeProject: null,
+    projects: [],
+  }),
 }))
 
 vi.mock("@/contexts/app-workspace-context", () => ({
-  useAppWorkspace: () => ({ folders: [], allFolders: [], branches: new Map(), addFolderToWorkspaceById: vi.fn(), setActiveFolderId: vi.fn() }),
+  useAppWorkspace: () => ({
+    folders: [],
+    allFolders: [],
+    branches: new Map(),
+    addFolderToWorkspaceById: vi.fn(),
+    setActiveFolderId: vi.fn(),
+  }),
 }))
 
 vi.mock("@/contexts/active-folder-context", () => ({
