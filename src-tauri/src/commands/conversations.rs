@@ -1430,7 +1430,7 @@ pub async fn delete_conversation_with_cleanup_core(
     platform_task_conversation_service::delete_by_conversation(conn, conversation_id)
         .await
         .map_err(AppCommandError::from)?;
-    emit_event(emitter, PLATFORM_TASK_CONVERSATION_CHANGED_EVENT, &());
+    emit_event(emitter, PLATFORM_TASK_CONVERSATION_CHANGED_EVENT, ());
     Ok(())
 }
 

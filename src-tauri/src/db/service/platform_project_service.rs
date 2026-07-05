@@ -96,6 +96,7 @@ pub async fn create(
     Ok(to_info(result))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update(
     conn: &DatabaseConnection,
     id: i32,

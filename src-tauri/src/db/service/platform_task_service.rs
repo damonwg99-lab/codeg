@@ -60,6 +60,7 @@ pub async fn get_by_id(
     Ok(row.map(to_info))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create(
     conn: &DatabaseConnection,
     project_id: i32,
@@ -99,6 +100,7 @@ pub async fn create(
     Ok(to_info(result))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update(
     conn: &DatabaseConnection,
     id: i32,

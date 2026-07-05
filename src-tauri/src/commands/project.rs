@@ -96,6 +96,7 @@ pub async fn create_project_core(
     Ok(project)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_project_core(
     db: &AppDatabase,
     emitter: &crate::web::event_bridge::EventEmitter,
@@ -169,6 +170,7 @@ pub async fn list_project_repos_core(
         .map_err(AppCommandError::from)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn add_project_repo_core(
     db: &AppDatabase,
     emitter: &crate::web::event_bridge::EventEmitter,
@@ -443,6 +445,7 @@ pub async fn create_project(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)]
 pub async fn update_project(
     db: tauri::State<'_, AppDatabase>,
     emitter: tauri::State<'_, crate::web::event_bridge::EventEmitter>,
@@ -489,6 +492,7 @@ pub async fn list_project_repos(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)]
 pub async fn add_project_repo(
     db: tauri::State<'_, AppDatabase>,
     emitter: tauri::State<'_, crate::web::event_bridge::EventEmitter>,

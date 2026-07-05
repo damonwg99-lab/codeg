@@ -82,6 +82,7 @@ pub async fn get_task_core(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create_task_core(
     db: &AppDatabase,
     emitter: &crate::web::event_bridge::EventEmitter,
@@ -111,6 +112,7 @@ pub async fn create_task_core(
     Ok(task)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_task_core(
     db: &AppDatabase,
     emitter: &crate::web::event_bridge::EventEmitter,
@@ -235,7 +237,7 @@ pub async fn create_conversation_for_task_core(
     let title = task.title.clone();
 
     let conversation_id =
-        create_conversation_core(conn, folder_id, agent_type.clone(), Some(title.clone())).await?;
+        create_conversation_core(conn, folder_id, agent_type, Some(title.clone())).await?;
     let role = infer_conversation_role(&task.task_type);
     let link = platform_task_conversation_service::create(
         conn,
@@ -380,6 +382,7 @@ pub async fn get_task(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)]
 pub async fn create_task(
     db: tauri::State<'_, AppDatabase>,
     emitter: tauri::State<'_, crate::web::event_bridge::EventEmitter>,
@@ -396,6 +399,7 @@ pub async fn create_task(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)]
 pub async fn update_task(
     db: tauri::State<'_, AppDatabase>,
     emitter: tauri::State<'_, crate::web::event_bridge::EventEmitter>,

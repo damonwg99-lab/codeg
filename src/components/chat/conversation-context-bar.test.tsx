@@ -45,6 +45,15 @@ let activeTabId: string | null = null
 let allFolders: FolderDetail[] = []
 let branches = new Map<number, string>()
 
+vi.mock("@/contexts/platform-context", () => ({
+  usePlatform: () => ({ projects: [], activeProject: null }),
+  usePlatformContext: () => ({ projects: [], activeProject: null }),
+}))
+
+vi.mock("@/hooks/use-project-switch-coordinator", () => ({
+  useProjectSwitchCoordinator: () => ({ switchProject: vi.fn() }),
+}))
+
 vi.mock("@/contexts/tab-context", () => ({
   useTabContext: () => ({
     tabs,

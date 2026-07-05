@@ -2084,7 +2084,8 @@
         "mentionGroupAgent": "에이전트",
         "mentionGroupSession": "세션",
         "mentionGroupCommit": "커밋",
-        "mentionGroupSkill": "스킬"
+        "mentionGroupSkill": "스킬",
+        "mentionGroupContext": "컨텍스트"
       },
       "messageQueue": {
         "addToQueue": "대기열에 추가",

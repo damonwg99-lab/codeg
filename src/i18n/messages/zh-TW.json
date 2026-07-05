@@ -2084,7 +2084,8 @@
         "mentionGroupAgent": "智能體",
         "mentionGroupSession": "工作階段",
         "mentionGroupCommit": "提交",
-        "mentionGroupSkill": "技能"
+        "mentionGroupSkill": "技能",
+        "mentionGroupContext": "上下文"
       },
       "messageQueue": {
         "addToQueue": "加入佇列",

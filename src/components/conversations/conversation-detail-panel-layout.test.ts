@@ -153,7 +153,7 @@ describe("ConversationDetailPanel chat-mode send path", () => {
     expect(sendEnd).toBeGreaterThan(sendStart)
     const block = source.slice(sendStart, sendEnd)
     // Inline delivery (the fix) — not an mqEnqueue that defers to the queue.
-    expect(block).toContain("lifecycleSend(draft, selectedModeIdArg, {")
+    expect(block).toContain("lifecycleSend(sendDraft, selectedModeIdArg, {")
     expect(block).not.toContain("mqEnqueue")
   })
 

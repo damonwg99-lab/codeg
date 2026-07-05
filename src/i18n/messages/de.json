@@ -2084,7 +2084,8 @@
         "mentionGroupAgent": "Agenten",
         "mentionGroupSession": "Sitzungen",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Fähigkeiten"
+        "mentionGroupSkill": "Fähigkeiten",
+        "mentionGroupContext": "Kontext"
       },
       "messageQueue": {
         "addToQueue": "Zur Warteschlange",

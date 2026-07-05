@@ -2084,7 +2084,8 @@
         "mentionGroupAgent": "エージェント",
         "mentionGroupSession": "セッション",
         "mentionGroupCommit": "コミット",
-        "mentionGroupSkill": "スキル"
+        "mentionGroupSkill": "スキル",
+        "mentionGroupContext": "コンテキスト"
       },
       "messageQueue": {
         "addToQueue": "キューに追加",

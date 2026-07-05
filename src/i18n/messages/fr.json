@@ -2084,7 +2084,8 @@
         "mentionGroupAgent": "Agents",
         "mentionGroupSession": "Sessions",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Compétences"
+        "mentionGroupSkill": "Compétences",
+        "mentionGroupContext": "Contexte"
       },
       "messageQueue": {
         "addToQueue": "Mettre en file",

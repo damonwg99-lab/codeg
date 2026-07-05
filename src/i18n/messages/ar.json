@@ -2084,7 +2084,8 @@
         "mentionGroupAgent": "الوكلاء",
         "mentionGroupSession": "الجلسات",
         "mentionGroupCommit": "عمليات الإيداع",
-        "mentionGroupSkill": "المهارات"
+        "mentionGroupSkill": "المهارات",
+        "mentionGroupContext": "السياق"
       },
       "messageQueue": {
         "addToQueue": "إضافة للقائمة",

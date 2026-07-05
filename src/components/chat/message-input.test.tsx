@@ -107,6 +107,26 @@ import type {
 
 import { MessageInput } from "./message-input"
 
+vi.mock("@/contexts/active-folder-context", () => ({
+  useActiveFolder: () => ({ activeFolder: { id: 1, path: "/repo" } }),
+}))
+
+vi.mock("@/contexts/tab-context", () => ({
+  useTabContext: () => ({
+    tabs: [],
+    activeTabId: null,
+    pendingInitialDrafts: new Map(),
+    clearPendingInitialDraft: vi.fn(),
+    pendingTaskLink: new Map<string, { taskId: string; role: string }>(),
+    setPendingTaskLink: vi.fn(),
+    clearPendingTaskLink: vi.fn(),
+  }),
+}))
+vi.mock("@/contexts/platform-context", () => ({
+  usePlatform: () => ({ activeProject: null }),
+  usePlatformContext: () => ({ activeProject: null }),
+}))
+
 const CAPS: PromptCapabilitiesInfo = {
   image: true,
   audio: false,

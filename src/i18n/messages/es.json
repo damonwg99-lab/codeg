@@ -2084,7 +2084,8 @@
         "mentionGroupAgent": "Agentes",
         "mentionGroupSession": "Sesiones",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Habilidades"
+        "mentionGroupSkill": "Habilidades",
+        "mentionGroupContext": "Contexto"
       },
       "messageQueue": {
         "addToQueue": "Agregar a la cola",

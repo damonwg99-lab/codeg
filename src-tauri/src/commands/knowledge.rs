@@ -468,6 +468,7 @@ pub async fn get_knowledge_doc(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)]
 pub async fn update_knowledge_doc(
     db: State<'_, AppDatabase>,
     id: i32,
