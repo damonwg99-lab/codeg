@@ -1,7 +1,7 @@
 # Codeg
 
-[![Release](https://img.shields.io/github/v/release/xintaofei/codeg)](https://github.com/xintaofei/codeg/releases)
-[![License](https://img.shields.io/github/license/xintaofei/codeg)](../../LICENSE)
+[![Release](https://img.shields.io/github/v/release/damonwg99-lab/codeg)](https://github.com/damonwg99-lab/codeg/releases)
+[![License](https://img.shields.io/github/license/damonwg99-lab/codeg)](../../LICENSE)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB)](https://tauri.app/)
 [![Next.js](https://img.shields.io/badge/Next.js-16-black)](https://nextjs.org/)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED)](../../Dockerfile)
@@ -247,13 +247,13 @@ Codeg peut fonctionner comme un serveur web autonome sans environnement de burea
 #### Option 1 : Installation en une ligne (Linux / macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xintaofei/codeg/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/damonwg99-lab/codeg/release/ai-platform/install.sh | bash
 ```
 
 Installer une version spécifique ou dans un répertoire personnalisé :
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xintaofei/codeg/main/install.sh | bash -s -- --version v0.5.2 --dir ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/damonwg99-lab/codeg/release/ai-platform/install.sh | bash -s -- --version v0.5.2 --dir ~/.local/bin
 ```
 
 Puis exécuter :
@@ -265,7 +265,7 @@ codeg-server
 #### Option 2 : Installation en une ligne (Windows PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/xintaofei/codeg/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/damonwg99-lab/codeg/release/ai-platform/install.ps1 | iex
 ```
 
 Ou installer une version spécifique :
@@ -276,7 +276,7 @@ Ou installer une version spécifique :
 
 #### Option 3 : Télécharger depuis GitHub Releases
 
-Les binaires pré-compilés (avec les ressources web incluses) sont disponibles sur la page [Releases](https://github.com/xintaofei/codeg/releases) :
+Les binaires pré-compilés (avec les ressources web incluses) sont disponibles sur la page [Releases](https://github.com/damonwg99-lab/codeg/releases) :
 
 | Plateforme  | Fichier                            |
 | ----------- | ---------------------------------- |
@@ -300,14 +300,14 @@ CODEG_STATIC_DIR=./web ./codeg-server
 docker compose up -d
 
 # Ou exécuter directement avec Docker
-docker run -d -p 3080:3080 -v codeg-data:/data ghcr.io/xintaofei/codeg:latest
+docker run -d -p 3080:3080 -v codeg-data:/data ghcr.io/damonwg99-lab/codeg:latest
 
 # Avec token personnalisé et répertoire de projet monté
 docker run -d -p 3080:3080 \
   -v codeg-data:/data \
   -v /path/to/projects:/projects \
   -e CODEG_TOKEN=your-secret-token \
-  ghcr.io/xintaofei/codeg:latest
+  ghcr.io/damonwg99-lab/codeg:latest
 ```
 
 L'image Docker utilise un build multi-stage (Node.js + Rust → runtime Debian allégé) et inclut `git` et `ssh` pour les opérations sur les dépôts. Les données sont persistées dans le volume `/data`. Vous pouvez optionnellement monter des répertoires de projets pour accéder aux dépôts locaux depuis le conteneur.

@@ -2,7 +2,7 @@ services:
   codeg:
     build: .
     # Or use a pre-built image:
-    # image: xintaofei/codeg:latest
+    # image: damonwg99-lab/codeg:latest
     ports:
       - "3080:3080"
     volumes:

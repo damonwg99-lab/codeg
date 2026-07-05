@@ -1,7 +1,7 @@
 # Codeg
 
-[![Release](https://img.shields.io/github/v/release/xintaofei/codeg)](https://github.com/xintaofei/codeg/releases)
-[![License](https://img.shields.io/github/license/xintaofei/codeg)](../../LICENSE)
+[![Release](https://img.shields.io/github/v/release/damonwg99-lab/codeg)](https://github.com/damonwg99-lab/codeg/releases)
+[![License](https://img.shields.io/github/license/damonwg99-lab/codeg)](../../LICENSE)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB)](https://tauri.app/)
 [![Next.js](https://img.shields.io/badge/Next.js-16-black)](https://nextjs.org/)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED)](../../Dockerfile)
@@ -247,13 +247,13 @@ Codeg는 데스크톱 환경 없이 독립형 웹 서버로 실행할 수 있습
 #### 옵션 1: 원라인 설치 (Linux / macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xintaofei/codeg/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/damonwg99-lab/codeg/release/ai-platform/install.sh | bash
 ```
 
 특정 버전 또는 사용자 지정 디렉토리에 설치:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xintaofei/codeg/main/install.sh | bash -s -- --version v0.5.2 --dir ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/damonwg99-lab/codeg/release/ai-platform/install.sh | bash -s -- --version v0.5.2 --dir ~/.local/bin
 ```
 
 실행:
@@ -265,7 +265,7 @@ codeg-server
 #### 옵션 2: 원라인 설치 (Windows PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/xintaofei/codeg/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/damonwg99-lab/codeg/release/ai-platform/install.ps1 | iex
 ```
 
 또는 특정 버전 설치:
@@ -276,7 +276,7 @@ irm https://raw.githubusercontent.com/xintaofei/codeg/main/install.ps1 | iex
 
 #### 옵션 3: GitHub Releases에서 다운로드
 
-사전 빌드된 바이너리(웹 에셋 포함)는 [Releases](https://github.com/xintaofei/codeg/releases) 페이지에서 다운로드할 수 있습니다:
+사전 빌드된 바이너리(웹 에셋 포함)는 [Releases](https://github.com/damonwg99-lab/codeg/releases) 페이지에서 다운로드할 수 있습니다:
 
 | 플랫폼      | 파일                               |
 | ----------- | ---------------------------------- |
@@ -300,14 +300,14 @@ CODEG_STATIC_DIR=./web ./codeg-server
 docker compose up -d
 
 # 또는 Docker로 직접 실행
-docker run -d -p 3080:3080 -v codeg-data:/data ghcr.io/xintaofei/codeg:latest
+docker run -d -p 3080:3080 -v codeg-data:/data ghcr.io/damonwg99-lab/codeg:latest
 
 # 사용자 정의 토큰 및 프로젝트 디렉토리 마운트
 docker run -d -p 3080:3080 \
   -v codeg-data:/data \
   -v /path/to/projects:/projects \
   -e CODEG_TOKEN=your-secret-token \
-  ghcr.io/xintaofei/codeg:latest
+  ghcr.io/damonwg99-lab/codeg:latest
 ```
 
 Docker 이미지는 멀티 스테이지 빌드(Node.js + Rust → 경량 Debian 런타임)를 사용하며, 저장소 작업을 위한 `git`과 `ssh`가 포함되어 있습니다. 데이터는 `/data` 볼륨에 영속적으로 저장됩니다. 선택적으로 프로젝트 디렉토리를 마운트하여 컨테이너 내에서 로컬 저장소에 접근할 수 있습니다.

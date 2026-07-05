@@ -1,7 +1,7 @@
 # Codeg
 
-[![Release](https://img.shields.io/github/v/release/xintaofei/codeg)](https://github.com/xintaofei/codeg/releases)
-[![License](https://img.shields.io/github/license/xintaofei/codeg)](../../LICENSE)
+[![Release](https://img.shields.io/github/v/release/damonwg99-lab/codeg)](https://github.com/damonwg99-lab/codeg/releases)
+[![License](https://img.shields.io/github/license/damonwg99-lab/codeg)](../../LICENSE)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB)](https://tauri.app/)
 [![Next.js](https://img.shields.io/badge/Next.js-16-black)](https://nextjs.org/)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED)](../../Dockerfile)
@@ -247,13 +247,13 @@ Codeg 可以作為獨立 Web 伺服器執行，無需桌面環境。
 #### 方式一：一鍵安裝（Linux / macOS）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xintaofei/codeg/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/damonwg99-lab/codeg/release/ai-platform/install.sh | bash
 ```
 
 安裝指定版本或到自訂目錄：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xintaofei/codeg/main/install.sh | bash -s -- --version v0.5.2 --dir ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/damonwg99-lab/codeg/release/ai-platform/install.sh | bash -s -- --version v0.5.2 --dir ~/.local/bin
 ```
 
 然後執行：
@@ -265,7 +265,7 @@ codeg-server
 #### 方式二：一鍵安裝（Windows PowerShell）
 
 ```powershell
-irm https://raw.githubusercontent.com/xintaofei/codeg/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/damonwg99-lab/codeg/release/ai-platform/install.ps1 | iex
 ```
 
 或安裝指定版本：
@@ -276,7 +276,7 @@ irm https://raw.githubusercontent.com/xintaofei/codeg/main/install.ps1 | iex
 
 #### 方式三：從 GitHub Releases 下載
 
-預建置二進位檔（已打包 Web 前端資源）可在 [Releases](https://github.com/xintaofei/codeg/releases) 頁面下載：
+預建置二進位檔（已打包 Web 前端資源）可在 [Releases](https://github.com/damonwg99-lab/codeg/releases) 頁面下載：
 
 | 平台        | 檔案                               |
 | ----------- | ---------------------------------- |
@@ -300,14 +300,14 @@ CODEG_STATIC_DIR=./web ./codeg-server
 docker compose up -d
 
 # 或直接使用 Docker 執行
-docker run -d -p 3080:3080 -v codeg-data:/data ghcr.io/xintaofei/codeg:latest
+docker run -d -p 3080:3080 -v codeg-data:/data ghcr.io/damonwg99-lab/codeg:latest
 
 # 自訂令牌並掛載專案目錄
 docker run -d -p 3080:3080 \
   -v codeg-data:/data \
   -v /path/to/projects:/projects \
   -e CODEG_TOKEN=your-secret-token \
-  ghcr.io/xintaofei/codeg:latest
+  ghcr.io/damonwg99-lab/codeg:latest
 ```
 
 Docker 映像採用多階段建置（Node.js + Rust → 精簡 Debian 執行環境），內建 `git` 和 `ssh` 以支援倉庫操作。資料持久化儲存在 `/data` 卷中。可選掛載專案目錄以從容器內存取本地倉庫。

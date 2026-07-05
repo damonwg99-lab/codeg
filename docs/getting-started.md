@@ -71,12 +71,12 @@ CODEG_STATIC_DIR=../out ./src-tauri/target/release/codeg-server
 
 **Linux/macOS:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xintaofei/codeg/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/damonwg99-lab/codeg/release/ai-platform/install.sh | bash
 ```
 
 **Windows PowerShell:**
 ```powershell
-irm https://raw.githubusercontent.com/xintaofei/codeg/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/damonwg99-lab/codeg/release/ai-platform/install.ps1 | iex
 ```
 
 ### 方式 5: Docker
@@ -86,12 +86,12 @@ irm https://raw.githubusercontent.com/xintaofei/codeg/main/install.ps1 | iex
 docker compose up -d
 
 # 或手动运行
-docker run -d -p 3080:3080 -v codeg-data:/data ghcr.io/xintaofei/codeg:latest
+docker run -d -p 3080:3080 -v codeg-data:/data ghcr.io/damonwg99-lab/codeg:latest
 ```
 
 ### 方式 6: 下载预编译二进制
 
-从 [GitHub Releases](https://github.com/xintaofei/codeg/releases) 下载对应平台的 `codeg-server` 压缩包。
+从 [GitHub Releases](https://github.com/damonwg99-lab/codeg/releases) 下载对应平台的 `codeg-server` 压缩包。
 
 ---
 

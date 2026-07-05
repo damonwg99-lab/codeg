@@ -1,7 +1,7 @@
 # Codeg
 
-[![Release](https://img.shields.io/github/v/release/xintaofei/codeg)](https://github.com/xintaofei/codeg/releases)
-[![License](https://img.shields.io/github/license/xintaofei/codeg)](../../LICENSE)
+[![Release](https://img.shields.io/github/v/release/damonwg99-lab/codeg)](https://github.com/damonwg99-lab/codeg/releases)
+[![License](https://img.shields.io/github/license/damonwg99-lab/codeg)](../../LICENSE)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB)](https://tauri.app/)
 [![Next.js](https://img.shields.io/badge/Next.js-16-black)](https://nextjs.org/)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED)](../../Dockerfile)
@@ -247,13 +247,13 @@ Codeg はデスクトップ環境なしでスタンドアロン Web サーバー
 #### オプション 1: ワンラインインストール（Linux / macOS）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xintaofei/codeg/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/damonwg99-lab/codeg/release/ai-platform/install.sh | bash
 ```
 
 特定のバージョンまたはカスタムディレクトリにインストール:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xintaofei/codeg/main/install.sh | bash -s -- --version v0.5.2 --dir ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/damonwg99-lab/codeg/release/ai-platform/install.sh | bash -s -- --version v0.5.2 --dir ~/.local/bin
 ```
 
 実行:
@@ -265,7 +265,7 @@ codeg-server
 #### オプション 2: ワンラインインストール（Windows PowerShell）
 
 ```powershell
-irm https://raw.githubusercontent.com/xintaofei/codeg/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/damonwg99-lab/codeg/release/ai-platform/install.ps1 | iex
 ```
 
 または特定のバージョンをインストール:
@@ -276,7 +276,7 @@ irm https://raw.githubusercontent.com/xintaofei/codeg/main/install.ps1 | iex
 
 #### オプション 3: GitHub Releases からダウンロード
 
-ビルド済みバイナリ（Web アセットをバンドル済み）は [Releases](https://github.com/xintaofei/codeg/releases) ページからダウンロードできます:
+ビルド済みバイナリ（Web アセットをバンドル済み）は [Releases](https://github.com/damonwg99-lab/codeg/releases) ページからダウンロードできます:
 
 | プラットフォーム | ファイル                           |
 | ---------------- | ---------------------------------- |
@@ -300,14 +300,14 @@ CODEG_STATIC_DIR=./web ./codeg-server
 docker compose up -d
 
 # または Docker で直接実行
-docker run -d -p 3080:3080 -v codeg-data:/data ghcr.io/xintaofei/codeg:latest
+docker run -d -p 3080:3080 -v codeg-data:/data ghcr.io/damonwg99-lab/codeg:latest
 
 # カスタムトークンとプロジェクトディレクトリのマウント
 docker run -d -p 3080:3080 \
   -v codeg-data:/data \
   -v /path/to/projects:/projects \
   -e CODEG_TOKEN=your-secret-token \
-  ghcr.io/xintaofei/codeg:latest
+  ghcr.io/damonwg99-lab/codeg:latest
 ```
 
 Docker イメージはマルチステージビルド（Node.js + Rust → 軽量 Debian ランタイム）を使用し、リポジトリ操作用の `git` と `ssh` を含みます。データは `/data` ボリュームに永続化されます。オプションでプロジェクトディレクトリをマウントして、コンテナ内からローカルリポジトリにアクセスできます。
