@@ -3431,7 +3431,13 @@
       "addRepo": "إضافة مستودع",
       "addRepoFailed": "فشل إضافة المستودعات: {repos}",
       "rescan": "إعادة الفحص",
-      "noRepos": "لا مستودعات مرتبطة"
+      "noRepos": "لا مستودعات مرتبطة",
+      "statusValues": {
+        "planning": "تخطيط",
+        "active": "نشط",
+        "completed": "مكتمل",
+        "archived": "مؤرشف"
+      }
     },
     "task": {
       "kanban": "كانبان",
@@ -3441,7 +3447,7 @@
       "createFailed": "فشل إنشاء المهمة",
       "title": "العنوان",
       "titlePlaceholder": "إدخال عنوان المهمة",
-      "taskType": "نوع المهمة",
+      "taskType": "النوع",
       "description": "الوصف",
       "priority": "الأولوية",
       "assignee": "المسؤول",
@@ -3514,7 +3520,6 @@
       "createAsSubTasksOf": "إنشاء كمهام فرعية لـ \"{taskName}\"",
       "taskTitle": "العنوان",
       "taskDescription": "الوصف",
-      "taskType": "النوع",
       "taskPriority": "الأولوية",
       "decompositionCardTitle": "تحليل المهام",
       "decompositionSubTaskCount": "{count} مهام فرعية",
@@ -3599,16 +3604,14 @@
       "searchDocs": "بحث المستندات…",
       "noDocs": "لا مستندات معرفة متاحة",
       "noAttachments": "لا مرفقات لهذه المهمة",
-      "injectContext": "إدخال السياق",
-      "injecting": "جارٍ الإدخال…",
+      "addToChat": "إضافة إلى المحادثة",
+      "adding": "جارٍ الإضافة…",
       "createConversation": "إنشاء محادثة",
+      "agentType": "نوع الذكاء",
       "selectContext": "اختر السياق لإرفاقه.",
-      "needConversation": "أرسل رسالة أولاً لإنشاء محادثة، ثم يمكنك ربط مهمة.",
-      "linkTask": "ربط مهمة",
-      "willAutoLink": "سيتم الربط تلقائياً عند إنشاء المحادثة",
+      "pendingTasks": "المهام المعلقة",
       "noTasksFound": "لا مهام موجودة",
       "cancel": "إلغاء",
-      "unlink": "إلغاء الربط",
       "searchTasks": "بحث المهام…",
       "loading": "جارٍ التحميل…",
       "optionLabel": {

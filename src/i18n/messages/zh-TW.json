@@ -3431,7 +3431,13 @@
       "addRepo": "新增倉庫",
       "addRepoFailed": "新增倉庫失敗: {repos}",
       "rescan": "重新掃描",
-      "noRepos": "暫無關聯倉庫"
+      "noRepos": "暫無關聯倉庫",
+      "statusValues": {
+        "planning": "規劃中",
+        "active": "進行中",
+        "completed": "已完成",
+        "archived": "已歸檔"
+      }
     },
     "task": {
       "kanban": "看板",
@@ -3441,7 +3447,7 @@
       "createFailed": "建立任務失敗",
       "title": "標題",
       "titlePlaceholder": "輸入任務標題",
-      "taskType": "任務類型",
+      "taskType": "類型",
       "description": "描述",
       "priority": "優先順序",
       "assignee": "負責人",
@@ -3514,7 +3520,6 @@
       "createAsSubTasksOf": "建立為「{taskName}」的子任務",
       "taskTitle": "標題",
       "taskDescription": "描述",
-      "taskType": "類型",
       "taskPriority": "優先順序",
       "decompositionCardTitle": "任務分解",
       "decompositionSubTaskCount": "{count} 個子任務",
@@ -3599,16 +3604,14 @@
       "searchDocs": "搜尋文件…",
       "noDocs": "暫無知識庫文件",
       "noAttachments": "此任務暫無附件",
-      "injectContext": "注入上下文",
-      "injecting": "注入中…",
+      "addToChat": "添加到對話",
+      "adding": "新增中…",
       "createConversation": "建立對話",
+      "agentType": "智能體類型",
       "selectContext": "選擇要附加的上下文。",
-      "needConversation": "請先發送一則訊息建立對話，然後才能關聯任務。",
-      "linkTask": "關聯任務",
-      "willAutoLink": "對話建立後自動關聯",
+      "pendingTasks": "待辦任務",
       "noTasksFound": "暫無任務",
       "cancel": "取消",
-      "unlink": "取消關聯",
       "searchTasks": "搜尋任務…",
       "loading": "載入中…",
       "optionLabel": {

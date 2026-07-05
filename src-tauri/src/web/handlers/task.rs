@@ -89,6 +89,8 @@ pub struct LinkConversationParams {
 pub struct CreateConversationForTaskParams {
     pub task_id: i32,
     pub injected_docs_json: Option<String>,
+    /// When provided, use this agent type instead of the project's default.
+    pub agent_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -258,6 +260,7 @@ pub async fn create_conversation_for_task(
             &state.emitter,
             params.task_id,
             params.injected_docs_json,
+            params.agent_type,
         )
         .await?,
     ))

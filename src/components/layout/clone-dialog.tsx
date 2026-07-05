@@ -10,6 +10,7 @@ import { isDesktop, openFileDialog } from "@/lib/platform"
 import { getActiveRemoteConnectionId } from "@/lib/transport"
 import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { useGitCredential } from "@/contexts/git-credential-context"
+import { useAutoCreateProject } from "@/hooks/use-auto-create-project"
 import {
   Dialog,
   DialogContent,
@@ -31,6 +32,7 @@ export function CloneDialog({ open, onOpenChange }: CloneDialogProps) {
   const t = useTranslations("Folder.cloneDialog")
   const tToasts = useTranslations("Folder.toasts")
   const { openFolder } = useAppWorkspace()
+  const { autoCreateProject } = useAutoCreateProject()
   const { withCredentialRetry } = useGitCredential()
   const [url, setUrl] = useState("")
   const [targetDir, setTargetDir] = useState("")
@@ -80,7 +82,8 @@ export function CloneDialog({ open, onOpenChange }: CloneDialogProps) {
         (creds) => cloneRepository(url, fullPath, creds),
         { remoteUrl: url }
       )
-      await openFolder(fullPath)
+      const detail = await openFolder(fullPath)
+      void autoCreateProject(detail)
       onOpenChange(false)
       resetForm()
     } catch (err) {

@@ -3,6 +3,10 @@
 import { useMemo, useState } from "react"
 import { ClipboardList } from "lucide-react"
 import { useTranslations } from "next-intl"
+import type { AgentType } from "@/lib/types"
+import { AGENT_LABELS } from "@/lib/types"
+import { useAcpAgents } from "@/hooks/use-acp-agents"
+import { AgentIcon } from "@/components/agent-icon"
 import type {
   KnowledgeDocInfo,
   TaskConversationInfo,
@@ -17,6 +21,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { InjectOptionList } from "@/components/platform/inject-option-list"
 import {
   buildInjectOptions,
@@ -42,7 +53,9 @@ interface ContextInjectPanelProps {
   /** KB directory path relative to the project root (e.g., "_knowledge").
    *  Used to prefix doc filePaths so they become project-root-relative. */
   kbDirPrefix?: string
-  onConfirm: (payload: ContextInjectPayload) => void
+  /** Project's default agent type — used as the initial selection. */
+  defaultAgentType?: AgentType | null
+  onConfirm: (payload: ContextInjectPayload, agentType: AgentType) => void
 }
 
 export function ContextInjectPanel({
@@ -55,9 +68,40 @@ export function ContextInjectPanel({
   kbLoading,
   submitting,
   kbDirPrefix,
+  defaultAgentType,
   onConfirm,
 }: ContextInjectPanelProps) {
   const t = useTranslations("Platform.inject")
+  const { agents: rawAgents } = useAcpAgents()
+  const agents = useMemo(
+    () => rawAgents.filter((a) => a.enabled && a.available),
+    [rawAgents]
+  )
+
+  // Resolve the initial agent type: project default → first available →
+  // AGENT_DISPLAY_ORDER[0] (claude_code).
+  const initialAgentType = useMemo<AgentType>(() => {
+    if (defaultAgentType) {
+      const found = agents.find((a) => a.agent_type === defaultAgentType)
+      if (found) return found.agent_type
+    }
+    const first = agents[0]
+    return first?.agent_type ?? "claude_code"
+  }, [defaultAgentType, agents])
+
+  const [selectedAgentType, setSelectedAgentType] = useState<AgentType | null>(
+    null
+  )
+
+  // The effective agent type: if the user has explicitly selected one (non-null),
+  // use it (with availability check); otherwise use the project default.
+  const effectiveAgentType = useMemo<AgentType>(() => {
+    if (selectedAgentType) {
+      const found = agents.find((a) => a.agent_type === selectedAgentType)
+      if (found) return found.agent_type
+    }
+    return initialAgentType
+  }, [selectedAgentType, agents, initialAgentType])
 
   const options = useMemo<InjectOption[]>(
     () =>
@@ -145,21 +189,52 @@ export function ContextInjectPanel({
           )}
         </div>
 
-        <DialogFooter className="mt-4 shrink-0">
-          <Button
-            variant="outline"
-            onClick={() => onOpenChange(false)}
-            disabled={submitting}
-          >
-            {t("cancel")}
-          </Button>
-          <Button
-            onClick={() => onConfirm(buildPayload())}
-            disabled={submitting}
-          >
-            {t("createConversation")}
-          </Button>
-        </DialogFooter>
+        {/* Agent type selector + action buttons */}
+        <div className="mt-4 shrink-0 flex flex-col gap-3">
+          {agents.length > 0 && (
+            <div className="flex items-center gap-2">
+              <span className="text-[0.75rem] text-muted-foreground shrink-0">
+                {t("agentType")}
+              </span>
+              <Select
+                value={effectiveAgentType}
+                onValueChange={(v) => setSelectedAgentType(v as AgentType)}
+              >
+                <SelectTrigger className="h-7 text-[0.8125rem] w-auto min-w-[10rem]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {agents.map((agent) => (
+                    <SelectItem key={agent.agent_type} value={agent.agent_type}>
+                      <span className="flex items-center gap-1.5">
+                        <AgentIcon
+                          agentType={agent.agent_type}
+                          className="w-3.5 h-3.5 shrink-0"
+                        />
+                        {AGENT_LABELS[agent.agent_type]}
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+              disabled={submitting}
+            >
+              {t("cancel")}
+            </Button>
+            <Button
+              onClick={() => onConfirm(buildPayload(), effectiveAgentType)}
+              disabled={submitting}
+            >
+              {t("createConversation")}
+            </Button>
+          </DialogFooter>
+        </div>
       </DialogContent>
     </Dialog>
   )

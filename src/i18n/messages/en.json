@@ -3431,7 +3431,13 @@
       "addRepo": "Add repo",
       "addRepoFailed": "Failed to add repos: {repos}",
       "rescan": "Rescan",
-      "noRepos": "No repos linked to this project"
+      "noRepos": "No repos linked to this project",
+      "statusValues": {
+        "planning": "Planning",
+        "active": "Active",
+        "completed": "Completed",
+        "archived": "Archived"
+      }
     },
     "task": {
       "kanban": "Kanban",
@@ -3441,7 +3447,7 @@
       "createFailed": "Failed to create task",
       "title": "Title",
       "titlePlaceholder": "Enter task title",
-      "taskType": "Task type",
+      "taskType": "Type",
       "description": "Description",
       "priority": "Priority",
       "assignee": "Assignee",
@@ -3514,7 +3520,6 @@
       "createAsSubTasksOf": "Create as sub-tasks of \"{taskName}\"",
       "taskTitle": "Title",
       "taskDescription": "Description",
-      "taskType": "Type",
       "taskPriority": "Priority",
       "decompositionCardTitle": "Task Breakdown",
       "decompositionSubTaskCount": "{count} sub-tasks",
@@ -3599,16 +3604,14 @@
       "searchDocs": "Search docs…",
       "noDocs": "No KB docs available",
       "noAttachments": "No attachments for this task",
-      "injectContext": "Inject context",
-      "injecting": "Injecting…",
+      "addToChat": "Add to Chat",
+      "adding": "Adding…",
       "createConversation": "Create Conversation",
+      "agentType": "Agent Type",
       "selectContext": "Select the context to attach.",
-      "needConversation": "Send a message first to create a conversation, then you can link a task.",
-      "linkTask": "Link a task",
-      "willAutoLink": "Will auto-link when conversation is created",
+      "pendingTasks": "Pending Tasks",
       "noTasksFound": "No tasks found",
       "cancel": "Cancel",
-      "unlink": "Unlink",
       "searchTasks": "Search tasks…",
       "loading": "Loading…",
       "optionLabel": {

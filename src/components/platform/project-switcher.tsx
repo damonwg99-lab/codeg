@@ -1,9 +1,8 @@
 "use client"
 
 import { useTranslations } from "next-intl"
-import { Briefcase, ChevronDown, Plus } from "lucide-react"
+import { Briefcase, ChevronDown } from "lucide-react"
 import { usePlatform } from "@/contexts/platform-context"
-import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -19,7 +18,7 @@ interface ProjectSwitcherProps {
 /**
  * Project switcher rendered in the title bar next to RepoSelector.
  * Uses DropdownMenu style to match RepoSelector.
- * - No projects: shows a "Create project" button.
+ * - No projects: hidden (returns null).
  * - Projects exist: shows a dropdown with project names.
  */
 export function ProjectSwitcher({ onSwitch }: ProjectSwitcherProps) {
@@ -31,20 +30,11 @@ export function ProjectSwitcher({ onSwitch }: ProjectSwitcherProps) {
     projects,
     hasProjects,
   } = usePlatform()
-  const { setRoute } = useWorkbenchRoute()
 
+  // Hide when no projects exist — the sidebar empty-state already provides
+  // a "Create project" entry point.
   if (!hasProjects) {
-    return (
-      <Button
-        variant="ghost"
-        size="sm"
-        className="h-7 gap-1 text-[0.8125rem]"
-        onClick={() => setRoute("create-project")}
-      >
-        <Plus className="h-3.5 w-3.5" />
-        {t("createFirst")}
-      </Button>
-    )
+    return null
   }
 
   const handleSelect = (id: number) => {

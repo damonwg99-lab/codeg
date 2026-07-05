@@ -168,11 +168,7 @@ import { useLinkedTask } from "@/hooks/use-linked-task"
 import { usePlatform } from "@/contexts/platform-context"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useTabContext } from "@/contexts/tab-context"
-import {
-  linkConversation,
-  unlinkConversation,
-  listKnowledgeDocs,
-} from "@/lib/platform/api"
+import { linkConversation, listKnowledgeDocs } from "@/lib/platform/api"
 import type { KnowledgeDocInfo } from "@/lib/platform/types"
 import type { ReferenceAttrs } from "@/components/chat/composer/types"
 import type { Editor, JSONContent } from "@tiptap/core"
@@ -616,9 +612,7 @@ export function MessageInput({
     activeTabId,
     pendingInitialDrafts,
     clearPendingInitialDraft,
-    pendingTaskLink,
     setPendingTaskLink,
-    clearPendingTaskLink,
   } = useTabContext()
   const activeConversationId = useMemo(() => {
     const activeTab = tabs.find((tab) => tab.id === activeTabId)
@@ -682,7 +676,7 @@ export function MessageInput({
           setPopoverAttachments(
             linkedTask
               ? taskAttachments.filter((d) => d.taskId === linkedTask.id)
-              : []
+              : taskAttachments
           )
           setPopoverKbLoading(false)
         }
@@ -2053,24 +2047,6 @@ export function MessageInput({
       attachmentTabId,
     ]
   )
-
-  const handleClearPendingLink = useCallback(() => {
-    if (attachmentTabId) clearPendingTaskLink(attachmentTabId)
-  }, [clearPendingTaskLink, attachmentTabId])
-
-  const handleTaskUnlink = useCallback(async () => {
-    if (!linkedTaskInfo || !hasPersistedConversation) return
-    await unlinkConversation({
-      taskId: linkedTaskInfo.taskId,
-      conversationId: ownConversationId,
-    })
-    refreshLinkedTask()
-  }, [
-    linkedTaskInfo,
-    hasPersistedConversation,
-    ownConversationId,
-    refreshLinkedTask,
-  ])
 
   // ── "+" menu skill shortcuts (experts / daily office) ──
   //
@@ -3481,6 +3457,7 @@ export function MessageInput({
                     </DropdownMenuContent>
                   </DropdownMenu>
                   <Popover
+                    modal
                     open={taskPopoverOpen}
                     onOpenChange={setTaskPopoverOpen}
                   >
@@ -3506,18 +3483,11 @@ export function MessageInput({
                         linkedTask={linkedTask}
                         onInject={handleTaskInject}
                         onLink={handleTaskLink}
-                        onUnlink={handleTaskUnlink}
                         activeProjectId={activeProject?.id ?? null}
                         kbDocs={popoverKbDocs}
                         attachments={popoverAttachments}
                         kbLoading={popoverKbLoading}
                         kbDirPrefix={kbDirPrefix}
-                        pendingTask={
-                          attachmentTabId
-                            ? (pendingTaskLink.get(attachmentTabId) ?? null)
-                            : null
-                        }
-                        onClearPendingLink={handleClearPendingLink}
                       />
                     </PopoverContent>
                   </Popover>

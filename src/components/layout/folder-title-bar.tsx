@@ -17,6 +17,7 @@ import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { usePlatform } from "@/contexts/platform-context"
 import { useIsActiveChatMode } from "@/hooks/use-is-active-chat-mode"
+import { useAutoCreateProject } from "@/hooks/use-auto-create-project"
 import { isDesktop, openFileDialog } from "@/lib/platform"
 import { getActiveRemoteConnectionId } from "@/lib/transport"
 import { Button } from "@/components/ui/button"
@@ -57,6 +58,7 @@ export function FolderTitleBar() {
   const tPet = useTranslations("Pet")
   const { openFolder, allFolders } = useAppWorkspace()
   const { activeProjectId, activeProject } = usePlatform()
+  const { autoCreateProject } = useAutoCreateProject()
   const { activeFolder } = useActiveFolder()
   const isChatMode = useIsActiveChatMode()
   const { isOpen, toggle } = useSidebarContext()
@@ -119,14 +121,15 @@ export function FolderTitleBar() {
         })
         if (!result) return
         const selected = Array.isArray(result) ? result[0] : result
-        await openFolder(selected)
+        const detail = await openFolder(selected)
+        void autoCreateProject(detail)
       } catch (err) {
         console.error("[FolderTitleBar] failed to open folder:", err)
       }
     } else {
       setBrowserOpen(true)
     }
-  }, [openFolder])
+  }, [openFolder, autoCreateProject])
 
   const handleOpenSettings = useCallback(() => {
     openSettingsWindow().catch((err) => {
@@ -245,10 +248,11 @@ export function FolderTitleBar() {
                 </Button>
                 <NewFolderDropdown />
                 <RemoteWorkspaceDropdown />
+                {/* Pet summon button — temporarily hidden */}
                 <Button
                   variant="ghost"
                   size="icon"
-                  className="h-6 w-6 hover:text-foreground/80"
+                  className="h-6 w-6 hover:text-foreground/80 hidden"
                   onClick={handleOpenPet}
                   title={tPet("manager.summon")}
                 >
@@ -387,9 +391,11 @@ export function FolderTitleBar() {
         open={browserOpen}
         onOpenChange={setBrowserOpen}
         onSelect={(path) => {
-          openFolder(path).catch((err) => {
-            console.error("[FolderTitleBar] failed to open folder:", err)
-          })
+          openFolder(path)
+            .then((detail) => void autoCreateProject(detail))
+            .catch((err) => {
+              console.error("[FolderTitleBar] failed to open folder:", err)
+            })
         }}
       />
     </>

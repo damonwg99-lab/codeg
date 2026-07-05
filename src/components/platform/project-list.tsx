@@ -1,45 +1,32 @@
 "use client"
 
-import { useEffect, useState } from "react"
 import { useTranslations } from "next-intl"
 import { Plus, FolderOpen, Check } from "lucide-react"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { usePlatform } from "@/contexts/platform-context"
-import { listProjects } from "@/lib/platform/api"
-import type { ProjectInfo } from "@/lib/platform/types"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { cn } from "@/lib/utils"
 
+/** Resolve project status label using i18n. Fallback to raw value if unknown. */
+function resolveProjectStatusLabel(
+  t: (key: never) => string,
+  status: string
+): string {
+  const key = `project.statusValues.${status}`
+  const label = t(key as never)
+  return label !== undefined && label !== key ? label : status
+}
+
 export function ProjectList() {
   const t = useTranslations("Platform")
   const { setRoute } = useWorkbenchRoute()
-  const { activeProjectId, setActiveProjectId } = usePlatform()
-  const [projects, setProjects] = useState<ProjectInfo[]>([])
-  const [loading, setLoading] = useState(true)
+  const { activeProjectId, setActiveProjectId, projects, loadingProjects } =
+    usePlatform()
 
-  useEffect(() => {
-    let cancelled = false
-    async function load() {
-      try {
-        const list = await listProjects()
-        if (!cancelled) {
-          setProjects(list)
-          setLoading(false)
-        }
-      } catch {
-        if (!cancelled) setLoading(false)
-      }
-    }
-    void load()
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
-  if (loading) {
+  if (loadingProjects) {
     return (
       <ScrollArea className="h-full">
         <div className="flex flex-col gap-6 p-4 sm:p-6">
@@ -119,11 +106,8 @@ export function ProjectList() {
                   </span>
                   <div className="flex items-center gap-1">
                     <Badge variant="outline" className="text-[0.625rem]">
-                      {project.status}
+                      {resolveProjectStatusLabel(t, project.status)}
                     </Badge>
-                    {project.clientName && (
-                      <span className="truncate">{project.clientName}</span>
-                    )}
                   </div>
                 </div>
               </CardContent>

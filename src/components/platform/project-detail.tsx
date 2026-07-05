@@ -44,9 +44,20 @@ function resolveStatusLabel(t: (key: never) => string, status: string): string {
   return key ? (t(key as never) ?? status) : status
 }
 
+/** Resolve project status label using i18n. Fallback to raw value if unknown. */
+function resolveProjectStatusLabel(
+  t: (key: never) => string,
+  status: string
+): string {
+  const key = `project.statusValues.${status}`
+  // next-intl t() returns undefined for unknown keys; fallback to raw status
+  const label = t(key as never)
+  return label !== undefined && label !== key ? label : status
+}
+
 export function ProjectDetail({ id }: { id: number }) {
   const t = useTranslations("Platform")
-  const { activeProjectId, loadProjectDetail } = usePlatform()
+  const { activeProjectId, loadProjectDetail, loadProjects } = usePlatform()
   const { setRoute } = useWorkbenchRoute()
   const [detail, setDetail] = useState<ProjectDetail | null>(null)
   const [loading, setLoading] = useState(true)
@@ -58,6 +69,10 @@ export function ProjectDetail({ id }: { id: number }) {
   const [editDescription, setEditDescription] = useState("")
   const [editClientName, setEditClientName] = useState("")
   const [editDefaultAgentType, setEditDefaultAgentType] = useState("")
+  const [editStatus, setEditStatus] = useState("")
+
+  // Project status values (matches backend default + common statuses)
+  const PROJECT_STATUSES = ["planning", "active", "completed", "archived"]
 
   // Scan state for add-repo
   const [scanning, setScanning] = useState(false)
@@ -78,6 +93,7 @@ export function ProjectDetail({ id }: { id: number }) {
           setEditDescription(d.project.description ?? "")
           setEditClientName(d.project.clientName ?? "")
           setEditDefaultAgentType(d.project.defaultAgentType ?? "")
+          setEditStatus(d.project.status)
           setLoading(false)
         }
       } catch {
@@ -99,16 +115,28 @@ export function ProjectDetail({ id }: { id: number }) {
         name: editName,
         description: editDescription || undefined,
         clientName: editClientName || undefined,
+        status: editStatus,
         defaultAgentType: editDefaultAgentType || undefined,
       })
       setDetail((prev) => (prev ? { ...prev, project: updated } : null))
+      // Refresh PlatformContext's projects list so ProjectList picks up
+      // the updated status (ProjectList reads from context directly).
+      await loadProjects()
       setEditing(false)
     } catch (e) {
       // Keep editing state on error
       console.error("Failed to save:", e)
     }
     setSaving(false)
-  }, [detail, editName, editDescription, editClientName, editDefaultAgentType])
+  }, [
+    detail,
+    editName,
+    editDescription,
+    editClientName,
+    editStatus,
+    editDefaultAgentType,
+    loadProjects,
+  ])
 
   const handleScan = useCallback(async () => {
     if (!detail) return
@@ -316,6 +344,21 @@ export function ProjectDetail({ id }: { id: number }) {
                       />
                     </div>
                     <div className="flex flex-col gap-1.5">
+                      <Label>{t("project.status")}</Label>
+                      <Select value={editStatus} onValueChange={setEditStatus}>
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {PROJECT_STATUSES.map((s) => (
+                            <SelectItem key={s} value={s}>
+                              {resolveProjectStatusLabel(t, s)}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="flex flex-col gap-1.5">
                       <Label>{t("project.description")}</Label>
                       <Input
                         value={editDescription}
@@ -363,7 +406,9 @@ export function ProjectDetail({ id }: { id: number }) {
                       <span className="text-[0.75rem] text-muted-foreground">
                         {t("project.status")}
                       </span>
-                      <Badge variant="outline">{project.status}</Badge>
+                      <Badge variant="outline">
+                        {resolveProjectStatusLabel(t, project.status)}
+                      </Badge>
                     </div>
                     <div className="flex flex-col gap-1">
                       <span className="text-[0.75rem] text-muted-foreground">

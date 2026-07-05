@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
+import type { AgentType } from "@/lib/types"
 import {
   Loader2,
   Save,
@@ -426,13 +427,14 @@ export function TaskDetail({ taskId }: { taskId: number }) {
   )
 
   const handleCreateConversation = useCallback(
-    async (payload: ContextInjectPayload) => {
+    async (payload: ContextInjectPayload, agentType: AgentType) => {
       if (!detail) return
       setCreatingConversation(true)
       try {
         const result = await createConversationForTask({
           taskId: detail.task.id,
           injectedDocsJson: payload.injectedDocsJson,
+          agentType,
         })
         setConversations((prev) => [result.link, ...prev])
         setContextPanelOpen(false)
@@ -1022,6 +1024,9 @@ export function TaskDetail({ taskId }: { taskId: number }) {
           kbLoading={kbLoading}
           submitting={creatingConversation}
           kbDirPrefix={kbDirPrefix}
+          defaultAgentType={
+            activeProject?.defaultAgentType as AgentType | null | undefined
+          }
           onConfirm={handleCreateConversation}
         />
 

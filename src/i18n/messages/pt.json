@@ -3431,7 +3431,13 @@
       "addRepo": "Adicionar repo",
       "addRepoFailed": "Falha ao adicionar repos: {repos}",
       "rescan": "Reescanear",
-      "noRepos": "Sem repos vinculados"
+      "noRepos": "Sem repos vinculados",
+      "statusValues": {
+        "planning": "Planejamento",
+        "active": "Ativo",
+        "completed": "Concluído",
+        "archived": "Arquivado"
+      }
     },
     "task": {
       "kanban": "Kanban",
@@ -3441,7 +3447,7 @@
       "createFailed": "Falha ao criar tarefa",
       "title": "Título",
       "titlePlaceholder": "Inserir título da tarefa",
-      "taskType": "Tipo de tarefa",
+      "taskType": "Tipo",
       "description": "Descrição",
       "priority": "Prioridade",
       "assignee": "Responsável",
@@ -3514,7 +3520,6 @@
       "createAsSubTasksOf": "Criar como subtarefas de \"{taskName}\"",
       "taskTitle": "Título",
       "taskDescription": "Descrição",
-      "taskType": "Tipo",
       "taskPriority": "Prioridade",
       "decompositionCardTitle": "Decomposição de tarefas",
       "decompositionSubTaskCount": "{count} subtarefas",
@@ -3599,16 +3604,14 @@
       "searchDocs": "Buscar documentos…",
       "noDocs": "Sem documentos KB disponíveis",
       "noAttachments": "Sem anexos para esta tarefa",
-      "injectContext": "Injetar contexto",
-      "injecting": "Injetando…",
+      "addToChat": "Adicionar ao chat",
+      "adding": "Adicionando…",
       "createConversation": "Criar conversa",
+      "agentType": "Tipo de agente",
       "selectContext": "Selecione o contexto para anexar.",
-      "needConversation": "Envie primeiro uma mensagem para criar uma conversa, depois você poderá vincular uma tarefa.",
-      "linkTask": "Vincular tarefa",
-      "willAutoLink": "Vinculará automaticamente quando a conversa for criada",
+      "pendingTasks": "Tarefas pendentes",
       "noTasksFound": "Nenhuma tarefa encontrada",
       "cancel": "Cancelar",
-      "unlink": "Desvincular",
       "searchTasks": "Buscar tarefas…",
       "loading": "Carregando…",
       "optionLabel": {

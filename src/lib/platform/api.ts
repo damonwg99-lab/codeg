@@ -224,10 +224,12 @@ export async function linkConversation(params: {
 export async function createConversationForTask(params: {
   taskId: number
   injectedDocsJson?: string | null
+  agentType?: string | null
 }): Promise<TaskConversationLaunchInfo> {
   return getTransport().call("create_conversation_for_task", {
     taskId: params.taskId,
     injectedDocsJson: params.injectedDocsJson ?? null,
+    agentType: params.agentType ?? null,
   })
 }
 

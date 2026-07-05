@@ -3431,7 +3431,13 @@
       "addRepo": "リポジトリを追加",
       "addRepoFailed": "リポジトリの追加に失敗しました: {repos}",
       "rescan": "再スキャン",
-      "noRepos": "関連リポジトリなし"
+      "noRepos": "関連リポジトリなし",
+      "statusValues": {
+        "planning": "計画中",
+        "active": "進行中",
+        "completed": "完了",
+        "archived": "アーカイブ"
+      }
     },
     "task": {
       "kanban": "カンバン",
@@ -3441,7 +3447,7 @@
       "createFailed": "タスクの作成に失敗しました",
       "title": "タイトル",
       "titlePlaceholder": "タスクのタイトルを入力",
-      "taskType": "タスクタイプ",
+      "taskType": "タイプ",
       "description": "説明",
       "priority": "優先度",
       "assignee": "担当者",
@@ -3514,7 +3520,6 @@
       "createAsSubTasksOf": "「{taskName}」のサブタスクとして作成",
       "taskTitle": "タイトル",
       "taskDescription": "説明",
-      "taskType": "タイプ",
       "taskPriority": "優先度",
       "decompositionCardTitle": "タスク分解",
       "decompositionSubTaskCount": "{count} サブタスク",
@@ -3599,16 +3604,14 @@
       "searchDocs": "ドキュメントを検索…",
       "noDocs": "ナレッジベースのドキュメントなし",
       "noAttachments": "このタスクに添付ファイルなし",
-      "injectContext": "コンテキストを注入",
-      "injecting": "注入中…",
+      "addToChat": "チャットに追加",
+      "adding": "追加中…",
       "createConversation": "会話を作成",
+      "agentType": "エージェントタイプ",
       "selectContext": "添付するコンテキストを選択。",
-      "needConversation": "まずメッセージを送信して会話を作成し、タスクをリンクしてください。",
-      "linkTask": "タスクをリンク",
-      "willAutoLink": "会話作成時に自動リンク",
+      "pendingTasks": "未完了タスク",
       "noTasksFound": "タスクが見つかりません",
       "cancel": "キャンセル",
-      "unlink": "リンク解除",
       "searchTasks": "タスクを検索…",
       "loading": "読み込み中…",
       "optionLabel": {

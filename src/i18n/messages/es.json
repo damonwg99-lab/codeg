@@ -3431,7 +3431,13 @@
       "addRepo": "Agregar repo",
       "addRepoFailed": "Error al agregar repos: {repos}",
       "rescan": "Reescanear",
-      "noRepos": "Sin repos vinculados"
+      "noRepos": "Sin repos vinculados",
+      "statusValues": {
+        "planning": "Planificación",
+        "active": "Activo",
+        "completed": "Completado",
+        "archived": "Archivado"
+      }
     },
     "task": {
       "kanban": "Kanban",
@@ -3441,7 +3447,7 @@
       "createFailed": "Error al crear tarea",
       "title": "Título",
       "titlePlaceholder": "Ingresar título de la tarea",
-      "taskType": "Tipo de tarea",
+      "taskType": "Tipo",
       "description": "Descripción",
       "priority": "Prioridad",
       "assignee": "Responsable",
@@ -3514,7 +3520,6 @@
       "createAsSubTasksOf": "Crear como subtareas de \"{taskName}\"",
       "taskTitle": "Título",
       "taskDescription": "Descripción",
-      "taskType": "Tipo",
       "taskPriority": "Prioridad",
       "decompositionCardTitle": "Descomposición de tareas",
       "decompositionSubTaskCount": "{count} subtareas",
@@ -3599,16 +3604,14 @@
       "searchDocs": "Buscar documentos…",
       "noDocs": "Sin documentos KB disponibles",
       "noAttachments": "Sin adjuntos para esta tarea",
-      "injectContext": "Injectar contexto",
-      "injecting": "Injectando…",
+      "addToChat": "Añadir al chat",
+      "adding": "Añadiendo…",
       "createConversation": "Crear conversación",
+      "agentType": "Tipo de agente",
       "selectContext": "Selecciona el contexto para adjuntar.",
-      "needConversation": "Envía primero un mensaje para crear una conversación, luego podrás vincular una tarea.",
-      "linkTask": "Vincular tarea",
-      "willAutoLink": "Se vinculará automáticamente al crear la conversación",
+      "pendingTasks": "Tareas pendientes",
       "noTasksFound": "No se encontraron tareas",
       "cancel": "Cancelar",
-      "unlink": "Desvincular",
       "searchTasks": "Buscar tareas…",
       "loading": "Cargando…",
       "optionLabel": {

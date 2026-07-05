@@ -3431,7 +3431,13 @@
       "addRepo": "Ajouter un dépôt",
       "addRepoFailed": "Échec de l'ajout des dépôts : {repos}",
       "rescan": "Rescanner",
-      "noRepos": "Aucun dépôt lié"
+      "noRepos": "Aucun dépôt lié",
+      "statusValues": {
+        "planning": "Planification",
+        "active": "Actif",
+        "completed": "Terminé",
+        "archived": "Archivé"
+      }
     },
     "task": {
       "kanban": "Kanban",
@@ -3441,7 +3447,7 @@
       "createFailed": "Échec de la création de la tâche",
       "title": "Titre",
       "titlePlaceholder": "Entrer le titre de la tâche",
-      "taskType": "Type de tâche",
+      "taskType": "Type",
       "description": "Description",
       "priority": "Priorité",
       "assignee": "Responsable",
@@ -3514,7 +3520,6 @@
       "createAsSubTasksOf": "Créer comme sous-tâches de \"{taskName}\"",
       "taskTitle": "Titre",
       "taskDescription": "Description",
-      "taskType": "Type",
       "taskPriority": "Priorité",
       "decompositionCardTitle": "Décomposition des tâches",
       "decompositionSubTaskCount": "{count} sous-tâches",
@@ -3599,16 +3604,14 @@
       "searchDocs": "Rechercher des documents…",
       "noDocs": "Aucun document KB disponible",
       "noAttachments": "Aucun attachement pour cette tâche",
-      "injectContext": "Injecter le contexte",
-      "injecting": "Injection…",
+      "addToChat": "Ajouter au chat",
+      "adding": "Ajout…",
       "createConversation": "Créer une conversation",
+      "agentType": "Type d'agent",
       "selectContext": "Sélectionner le contexte à attacher.",
-      "needConversation": "Envoyez d'abord un message pour créer une conversation, puis vous pourrez lier une tâche.",
-      "linkTask": "Lier une tâche",
-      "willAutoLink": "Sera lié automatiquement quand la conversation est créée",
+      "pendingTasks": "Tâches en attente",
       "noTasksFound": "Aucune tâche trouvée",
       "cancel": "Annuler",
-      "unlink": "Délier",
       "searchTasks": "Rechercher des tâches…",
       "loading": "Chargement…",
       "optionLabel": {

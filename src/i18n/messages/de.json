@@ -3431,7 +3431,13 @@
       "addRepo": "Repo hinzufügen",
       "addRepoFailed": "Repo(s) konnten nicht hinzugefügt werden: {repos}",
       "rescan": "Neu suchen",
-      "noRepos": "Keine verknüpften Repos"
+      "noRepos": "Keine verknüpften Repos",
+      "statusValues": {
+        "planning": "Planung",
+        "active": "Aktiv",
+        "completed": "Abgeschlossen",
+        "archived": "Archiviert"
+      }
     },
     "task": {
       "kanban": "Kanban",
@@ -3441,7 +3447,7 @@
       "createFailed": "Aufgabe konnte nicht erstellt werden",
       "title": "Titel",
       "titlePlaceholder": "Aufgabentitel eingeben",
-      "taskType": "Aufgabentyp",
+      "taskType": "Typ",
       "description": "Beschreibung",
       "priority": "Priorität",
       "assignee": "Zuständig",
@@ -3514,7 +3520,6 @@
       "createAsSubTasksOf": "Als Unteraufgaben von \"{taskName}\" erstellen",
       "taskTitle": "Titel",
       "taskDescription": "Beschreibung",
-      "taskType": "Typ",
       "taskPriority": "Priorität",
       "decompositionCardTitle": "Aufgabenzerlegung",
       "decompositionSubTaskCount": "{count} Teilaufgaben",
@@ -3599,16 +3604,14 @@
       "searchDocs": "Dokumente suchen…",
       "noDocs": "Keine KB-Dokumente verfügbar",
       "noAttachments": "Keine Anhänge für diese Aufgabe",
-      "injectContext": "Kontext einfügen",
-      "injecting": "Einfügen…",
+      "addToChat": "Zum Chat hinzufügen",
+      "adding": "Hinzufügen…",
       "createConversation": "Gespräch erstellen",
+      "agentType": "Agent-Typ",
       "selectContext": "Wählen Sie den Kontext zum Anhängen.",
-      "needConversation": "Senden Sie zuerst eine Nachricht, um ein Gespräch zu erstellen, dann können Sie eine Aufgabe verknüpfen.",
-      "linkTask": "Aufgabe verknüpfen",
-      "willAutoLink": "Wird automatisch verknüpft, wenn Gespräch erstellt wird",
+      "pendingTasks": "Offene Aufgaben",
       "noTasksFound": "Keine Aufgaben gefunden",
       "cancel": "Abbrechen",
-      "unlink": "Verknüpfung aufheben",
       "searchTasks": "Aufgaben suchen…",
       "loading": "Laden…",
       "optionLabel": {

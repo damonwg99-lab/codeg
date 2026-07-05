@@ -1,7 +1,7 @@
 "use client"
 
 import { useMemo, useState } from "react"
-import { ClipboardList, Link, Search, X } from "lucide-react"
+import { ClipboardList, ChevronDown, ChevronRight, Search } from "lucide-react"
 import { useTranslations } from "next-intl"
 import type {
   ContextInjectPayload,
@@ -12,6 +12,7 @@ import type {
 import {
   buildInjectOptions,
   buildProjectOptions,
+  buildTaskOptions,
   buildPayloadFromOptions,
   resolveTaskTypeLabel,
   type InjectI18nFn,
@@ -21,11 +22,10 @@ import type {
   TaskConversationInfo,
   TaskInfo,
 } from "@/lib/platform/types"
-import type { PendingTaskLink } from "@/contexts/tab-context"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
-import { ScrollArea } from "@/components/ui/scroll-area"
 import { cn } from "@/lib/utils"
 import { listTasks } from "@/lib/platform/api"
 import { InjectOptionList } from "@/components/platform/inject-option-list"
@@ -42,7 +42,6 @@ interface ProjectResourcePickerProps {
     role: string,
     taskInfo?: { title: string; taskType: string }
   ) => Promise<void>
-  onUnlink: () => Promise<void>
   /** Active project ID for task search. */
   activeProjectId: number | null
   /** KB data — loaded lazily by the host when popover opens. */
@@ -55,10 +54,6 @@ interface ProjectResourcePickerProps {
   /** KB directory path relative to the project root (e.g., "_knowledge").
    *  Used to prefix doc filePaths so they become project-root-relative. */
   kbDirPrefix?: string
-  /** Pending task link (for new conversations without a DB ID yet). */
-  pendingTask?: PendingTaskLink | null
-  /** Clear the pending task link intent. */
-  onClearPendingLink?: () => void
 }
 
 const TASK_TYPE_ROLE_MAP: Record<string, string> = {
@@ -73,8 +68,7 @@ const TASK_TYPE_ROLE_MAP: Record<string, string> = {
   requirement: "analysis",
 }
 
-/** Visible groups for Mode A (linked task inject). Attachments placed
- *  immediately after task info (basic) rather than after KB docs. */
+/** Visible groups for Mode A (linked task inject). */
 const VISIBLE_GROUPS_A: InjectOptionGroup[] = [
   "basic",
   "attachments",
@@ -82,8 +76,8 @@ const VISIBLE_GROUPS_A: InjectOptionGroup[] = [
   "kb_docs",
 ]
 
-/** Visible groups for Mode B/C (no linked task). Attachments before KB docs. */
-const VISIBLE_GROUPS_BC: InjectOptionGroup[] = ["attachments", "kb_docs"]
+/** Visible groups for Mode B/C (no linked task). KB docs only. */
+const VISIBLE_GROUPS_BC: InjectOptionGroup[] = ["kb_docs"]
 
 function inferRole(taskType: string): string {
   return TASK_TYPE_ROLE_MAP[taskType] ?? "discussion"
@@ -94,15 +88,12 @@ export function ProjectResourcePicker({
   linkedTask,
   onInject,
   onLink,
-  onUnlink,
   activeProjectId,
   kbDocs,
   attachments,
   linkedConversations,
   kbLoading,
   kbDirPrefix,
-  pendingTask,
-  onClearPendingLink,
 }: ProjectResourcePickerProps) {
   const t = useTranslations("Platform.inject")
 
@@ -164,15 +155,8 @@ export function ProjectResourcePicker({
 
   // ─── Mode B/C: Project resources (no linked task) ───
   const projectOptions = useMemo<InjectOption[]>(
-    () =>
-      buildProjectOptions(
-        kbDocs,
-        attachments,
-        [],
-        t as InjectI18nFn,
-        kbDirPrefix
-      ),
-    [kbDocs, attachments, t, kbDirPrefix]
+    () => buildProjectOptions(kbDocs, [], [], t as InjectI18nFn, kbDirPrefix),
+    [kbDocs, t, kbDirPrefix]
   )
 
   const projectDefaultIds = useMemo(
@@ -213,71 +197,97 @@ export function ProjectResourcePicker({
     )
   }, [projectKbDocSearchQuery, projectOptions])
 
-  // ─── Task search (for linking) ───
-  const [searchQuery, setSearchQuery] = useState("")
-  const [searchResults, setSearchResults] = useState<TaskInfo[]>([])
-  const [searchLoading, setSearchLoading] = useState(false)
-  const [linking, setLinking] = useState(false)
-  const [unlinking, setUnlinking] = useState(false)
+  // ─── Task list (accordion) ───
+  const [expandedTaskId, setExpandedTaskId] = useState<number | null>(null)
+  const [taskSearchQuery, setTaskSearchQuery] = useState("")
+  const [allTasks, setAllTasks] = useState<TaskInfo[]>([])
+  const [taskLoading, setTaskLoading] = useState(false)
   const [injecting, setInjecting] = useState(false)
-  const [showTaskSearch, setShowTaskSearch] = useState(false)
 
-  const fetchSearchResults = useMemo(() => {
-    return async () => {
-      if (!activeProjectId) {
-        setSearchResults([])
-        return
-      }
-      setSearchLoading(true)
-      try {
-        const tasks = await listTasks(activeProjectId)
-        setSearchResults(tasks)
-      } catch {
-        setSearchResults([])
-      } finally {
-        setSearchLoading(false)
-      }
+  // Fetch task list when popover opens
+  useMemo(() => {
+    if (!activeProjectId) {
+      setAllTasks([])
+      return
     }
+    setTaskLoading(true)
+    listTasks(activeProjectId)
+      .then((tasks) => {
+        setAllTasks(tasks)
+        setTaskLoading(false)
+      })
+      .catch(() => {
+        setAllTasks([])
+        setTaskLoading(false)
+      })
   }, [activeProjectId])
 
   const filteredTasks = useMemo(() => {
-    if (!searchQuery) return searchResults
-    const q = searchQuery.toLowerCase()
-    return searchResults.filter(
-      (t) =>
-        t.title.toLowerCase().includes(q) ||
-        (t.description ?? "").toLowerCase().includes(q)
+    if (!taskSearchQuery) return allTasks
+    const q = taskSearchQuery.toLowerCase()
+    return allTasks.filter(
+      (task) =>
+        task.title.toLowerCase().includes(q) ||
+        (task.description ?? "").toLowerCase().includes(q)
     )
-  }, [searchResults, searchQuery])
+  }, [allTasks, taskSearchQuery])
+
+  // Generate inject options for the expanded task
+  const expandedTask = useMemo(
+    () => allTasks.find((task) => task.id === expandedTaskId) ?? null,
+    [allTasks, expandedTaskId]
+  )
+
+  const expandedTaskAttachments = useMemo(() => {
+    if (!expandedTask) return []
+    return attachments.filter((d) => d.taskId === expandedTask.id)
+  }, [expandedTask, attachments])
+
+  const expandedTaskOptions = useMemo<InjectOption[]>(() => {
+    if (!expandedTask) return []
+    return [
+      ...buildTaskOptions(expandedTask, t as InjectI18nFn),
+      ...buildProjectOptions(
+        [],
+        expandedTaskAttachments,
+        [],
+        t as InjectI18nFn,
+        kbDirPrefix
+      ),
+    ]
+  }, [expandedTask, expandedTaskAttachments, t, kbDirPrefix])
+
+  // Checked state for expanded task options
+  const expandedTaskDefaultIds = useMemo(
+    () =>
+      new Set<OptionId>(
+        expandedTaskOptions
+          .filter((option) => option.defaultChecked)
+          .map((option) => option.id)
+      ),
+    [expandedTaskOptions]
+  )
+
+  const [expandedTaskChecked, setExpandedTaskChecked] = useState<Set<OptionId>>(
+    expandedTaskDefaultIds
+  )
+
+  useMemo(() => {
+    setExpandedTaskChecked(expandedTaskDefaultIds)
+  }, [expandedTaskDefaultIds])
+
+  function expandedTaskToggle(id: OptionId, value: boolean) {
+    setExpandedTaskChecked((prev) => {
+      const next = new Set(prev)
+      if (value) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }
 
   // ─── Handlers ───
 
-  async function handleLink(taskId: number) {
-    setLinking(true)
-    try {
-      const task = searchResults.find((t) => t.id === taskId)
-      const role = task ? inferRole(task.taskType) : "discussion"
-      await onLink(
-        taskId,
-        role,
-        task ? { title: task.title, taskType: task.taskType } : undefined
-      )
-      setShowTaskSearch(false)
-    } finally {
-      setLinking(false)
-    }
-  }
-
-  async function handleUnlink() {
-    setUnlinking(true)
-    try {
-      await onUnlink()
-    } finally {
-      setUnlinking(false)
-    }
-  }
-
-  async function handleInject() {
+  async function handleModeAInject() {
     if (!linkedTask) return
     setInjecting(true)
     try {
@@ -288,11 +298,28 @@ export function ProjectResourcePicker({
     }
   }
 
-  async function handleProjectInject() {
+  async function handleModeBCInject() {
     setInjecting(true)
     try {
-      const payload = buildPayloadFromOptions(projectOptions, projectChecked)
+      // Combine project KB options + expanded task options
+      const allChecked = new Set<OptionId>([
+        ...projectChecked,
+        ...expandedTaskChecked,
+      ])
+      const allOptions = [...projectOptions, ...expandedTaskOptions]
+      const payload = buildPayloadFromOptions(allOptions, allChecked)
       onInject(payload)
+
+      // Auto-link: set pendingTaskLink for new conversations
+      if (expandedTaskId) {
+        const task = allTasks.find((t) => t.id === expandedTaskId)
+        if (task) {
+          await onLink(expandedTaskId, inferRole(task.taskType), {
+            title: task.title,
+            taskType: task.taskType,
+          })
+        }
+      }
     } finally {
       setInjecting(false)
     }
@@ -303,8 +330,8 @@ export function ProjectResourcePicker({
   if (linkedTask && linkedTaskInfo) {
     // Mode A: Already linked — show task summary + KB files
     return (
-      <ScrollArea className="max-h-[480px]">
-        <div className="flex flex-col gap-2 p-2">
+      <div className="flex flex-col max-h-[min(480px,calc(100dvh-2rem))]">
+        <div className="min-h-0 overflow-y-auto p-2">
           {/* Task summary — only show title, no status/priority */}
           <div className="rounded-md border bg-muted/30 p-2.5">
             <div className="truncate text-sm font-medium">
@@ -333,36 +360,28 @@ export function ProjectResourcePicker({
               onKbDocSearchChange={setKbDocSearchQuery}
             />
           )}
-
-          <div className="flex gap-2">
-            <Button
-              size="sm"
-              onClick={handleInject}
-              disabled={injecting || linkedChecked.size === 0}
-              className="flex-1"
-            >
-              <ClipboardList className="mr-1 h-3.5 w-3.5" />
-              {injecting ? t("injecting") : t("injectContext")}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleUnlink}
-              disabled={unlinking}
-            >
-              <X className="mr-1 h-3.5 w-3.5" />
-              {t("unlink")}
-            </Button>
-          </div>
         </div>
-      </ScrollArea>
+
+        {/* Fixed bottom action bar */}
+        <div className="shrink-0 border-t p-2">
+          <Button
+            size="sm"
+            onClick={handleModeAInject}
+            disabled={injecting || linkedChecked.size === 0}
+            className="w-full h-8"
+          >
+            <ClipboardList className="mr-1 h-3.5 w-3.5" />
+            {injecting ? t("adding") : t("addToChat")}
+          </Button>
+        </div>
+      </div>
     )
   }
 
-  // Mode B/C: No linked task — show KB files + optional task linking
+  // Mode B/C: No linked task — show KB docs + accordion task list
   return (
-    <ScrollArea className="max-h-[480px]">
-      <div className="flex flex-col gap-2 p-2">
+    <div className="flex flex-col max-h-[min(480px,calc(100dvh-2rem))]">
+      <div className="min-h-0 overflow-y-auto p-2">
         {/* KB file selection */}
         {kbLoading ? (
           <div className="flex items-center justify-center py-3 text-xs text-muted-foreground">
@@ -384,95 +403,61 @@ export function ProjectResourcePicker({
           />
         )}
 
-        {/* Inject button */}
-        <Button
-          size="sm"
-          onClick={handleProjectInject}
-          disabled={injecting || projectChecked.size === 0 || kbLoading}
-          className="flex-1"
-        >
-          <ClipboardList className="mr-1 h-3.5 w-3.5" />
-          {injecting ? t("injecting") : t("injectContext")}
-        </Button>
+        {/* Pending tasks section (accordion) */}
+        {activeProjectId && (
+          <section className="mt-2">
+            <h3 className="text-[0.6875rem] font-medium uppercase text-muted-foreground mb-1.5">
+              {t("pendingTasks")}
+            </h3>
 
-        {/* Pending task link indicator */}
-        {pendingTask && (
-          <div className="flex items-center gap-2 rounded-md border bg-muted/30 p-2">
-            <span className="text-xs font-medium">📌 {pendingTask.title}</span>
-            <span className="text-[0.625rem] text-muted-foreground">
-              {t("willAutoLink")}
-            </span>
-            {onClearPendingLink && (
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                onClick={onClearPendingLink}
-                className="shrink-0"
-              >
-                <X className="h-3 w-3" />
-              </Button>
-            )}
-          </div>
-        )}
+            {/* Task search input */}
+            <div className="relative mb-1.5">
+              <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                className="h-7 pl-7 text-xs"
+                placeholder={t("searchTasks")}
+                value={taskSearchQuery}
+                onChange={(e) => setTaskSearchQuery(e.target.value)}
+              />
+            </div>
 
-        {/* Link task — always available, collapsible search */}
-        {!pendingTask && (
-          <>
-            {!showTaskSearch ? (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  setShowTaskSearch(true)
-                  void fetchSearchResults()
-                }}
-                className="w-full"
-              >
-                <Link className="mr-1 h-3.5 w-3.5" />
-                {t("linkTask")}
-              </Button>
-            ) : (
-              <div className="flex flex-col gap-1.5 rounded-md border p-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-medium">{t("linkTask")}</span>
-                  <Button
-                    variant="ghost"
-                    size="icon-xs"
-                    onClick={() => setShowTaskSearch(false)}
-                  >
-                    <X className="h-3 w-3" />
-                  </Button>
+            {/* Task list with max height */}
+            <div className="max-h-[200px] overflow-y-auto">
+              {taskLoading ? (
+                <div className="flex items-center justify-center py-3 text-xs text-muted-foreground">
+                  {t("loading")}
                 </div>
-                <div className="relative">
-                  <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    className="h-7 pl-7 text-xs"
-                    placeholder={t("searchTasks")}
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                  />
+              ) : filteredTasks.length === 0 ? (
+                <div className="flex items-center justify-center py-3 text-xs text-muted-foreground">
+                  {t("noTasksFound")}
                 </div>
-                <ScrollArea className="max-h-[160px]">
-                  {searchLoading ? (
-                    <div className="flex items-center justify-center py-3 text-xs text-muted-foreground">
-                      {t("loading")}
-                    </div>
-                  ) : filteredTasks.length === 0 ? (
-                    <div className="flex items-center justify-center py-3 text-xs text-muted-foreground">
-                      {t("noTasksFound")}
-                    </div>
-                  ) : (
-                    <div className="flex flex-col gap-1">
-                      {filteredTasks.map((task) => (
+              ) : (
+                <div className="flex flex-col gap-1">
+                  {filteredTasks.map((task) => {
+                    const isExpanded = expandedTaskId === task.id
+                    return (
+                      <div
+                        key={task.id}
+                        className={cn(
+                          "rounded-md border",
+                          isExpanded && "bg-muted/20"
+                        )}
+                      >
+                        {/* Task row header */}
                         <button
-                          key={task.id}
                           className={cn(
-                            "flex items-center gap-2 rounded-md border p-1.5 text-left",
+                            "flex items-center gap-2 p-1.5 text-left w-full",
                             "hover:bg-accent/50 cursor-pointer"
                           )}
-                          onClick={() => handleLink(task.id)}
-                          disabled={linking}
+                          onClick={() =>
+                            setExpandedTaskId(isExpanded ? null : task.id)
+                          }
                         >
+                          {isExpanded ? (
+                            <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                          ) : (
+                            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                          )}
                           <Badge
                             variant="outline"
                             className="shrink-0 text-[0.625rem]"
@@ -486,16 +471,67 @@ export function ProjectResourcePicker({
                             {task.title}
                           </span>
                         </button>
-                      ))}
-                    </div>
-                  )}
-                </ScrollArea>
-              </div>
-            )}
-          </>
+
+                        {/* Expanded content: description + attachments */}
+                        {isExpanded && expandedTaskOptions.length > 0 && (
+                          <div className="px-1.5 pb-1.5 space-y-0.5">
+                            {expandedTaskOptions.map((option) => (
+                              <label
+                                key={option.id}
+                                className={cn(
+                                  "flex cursor-pointer items-start rounded-md border",
+                                  "hover:bg-accent/50 gap-2 p-1.5"
+                                )}
+                              >
+                                <Checkbox
+                                  checked={expandedTaskChecked.has(option.id)}
+                                  onCheckedChange={(value) =>
+                                    expandedTaskToggle(
+                                      option.id,
+                                      value === true
+                                    )
+                                  }
+                                  className="mt-0.5 h-3.5 w-3.5"
+                                />
+                                <span className="min-w-0">
+                                  <span className="block truncate font-medium text-[0.8125rem]">
+                                    {option.label}
+                                  </span>
+                                  <span className="mt-0.5 block text-muted-foreground text-[0.6875rem]">
+                                    {option.description}
+                                  </span>
+                                </span>
+                              </label>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          </section>
         )}
       </div>
-    </ScrollArea>
+
+      {/* Fixed bottom action bar */}
+      <div className="shrink-0 border-t p-2">
+        <Button
+          size="sm"
+          onClick={handleModeBCInject}
+          disabled={
+            injecting ||
+            (projectChecked.size === 0 && expandedTaskChecked.size === 0) ||
+            kbLoading
+          }
+          className="w-full h-8"
+        >
+          <ClipboardList className="mr-1 h-3.5 w-3.5" />
+          {injecting ? t("adding") : t("addToChat")}
+        </Button>
+      </div>
+    </div>
   )
 }
 

@@ -220,6 +220,9 @@ pub async fn create_conversation_for_task_core(
     emitter: &crate::web::event_bridge::EventEmitter,
     task_id: i32,
     injected_docs_json: Option<String>,
+    // Optional override for the agent type. When provided, use this instead
+    // of the project's `default_agent_type`.
+    agent_type_override: Option<String>,
 ) -> Result<TaskConversationLaunchInfo, AppCommandError> {
     let conn = &db.conn;
     let task = platform_task_service::get_by_id(conn, task_id)
@@ -233,7 +236,13 @@ pub async fn create_conversation_for_task_core(
     let folder_id = project
         .folder_id
         .ok_or_else(|| AppCommandError::invalid_input("Project has no root folder"))?;
-    let agent_type = resolve_agent_type(project.default_agent_type.as_deref());
+    // When the caller provides an explicit agent type, use it; otherwise fall
+    // back to the project's `default_agent_type`.
+    let agent_type = resolve_agent_type(
+        agent_type_override
+            .as_deref()
+            .or(project.default_agent_type.as_deref()),
+    );
     let title = task.title.clone();
 
     let conversation_id =
@@ -470,8 +479,9 @@ pub async fn create_conversation_for_task(
     emitter: tauri::State<'_, crate::web::event_bridge::EventEmitter>,
     task_id: i32,
     injected_docs_json: Option<String>,
+    agent_type: Option<String>,
 ) -> Result<TaskConversationLaunchInfo, AppCommandError> {
-    create_conversation_for_task_core(&db, &emitter, task_id, injected_docs_json).await
+    create_conversation_for_task_core(&db, &emitter, task_id, injected_docs_json, agent_type).await
 }
 
 #[cfg(feature = "tauri-runtime")]

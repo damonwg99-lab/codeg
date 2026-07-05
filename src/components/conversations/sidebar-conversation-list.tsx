@@ -18,6 +18,7 @@ import { Virtualizer, type VirtualizerHandle } from "virtua"
 import {
   FolderClosed,
   Bot,
+  Briefcase,
   Check,
   ChevronRight,
   Download,
@@ -104,6 +105,7 @@ import {
   type SidebarRow,
 } from "./sidebar-conversation-grouping"
 import { useSubsessionSync } from "@/hooks/use-subsession-sync"
+import { useAutoCreateProject } from "@/hooks/use-auto-create-project"
 import { SidebarSectionHeader } from "./sidebar-section-header"
 import { ConversationManageDialog } from "./conversation-manage-dialog"
 import { CloneDialog } from "@/components/layout/clone-dialog"
@@ -572,6 +574,7 @@ export function SidebarConversationList({
   const tCommon = useTranslations("Folder.common")
   const tFolderDropdown = useTranslations("Folder.folderNameDropdown")
   const tFileTree = useTranslations("Folder.fileTreeTab")
+  const tPlatformNav = useTranslations("Platform.nav")
   const { resolvedTheme } = useTheme()
   const { themeColor: appThemeColor } = useThemeColor()
   const { createTerminalInDirectory } = useTerminalContext()
@@ -591,6 +594,7 @@ export function SidebarConversationList({
   } = useAppWorkspace()
   const refreshing = loading
   const { activeFolder } = useActiveFolder()
+  const { autoCreateProject } = useAutoCreateProject()
 
   const {
     openTab,
@@ -601,7 +605,7 @@ export function SidebarConversationList({
     activeTabId,
     tabs,
   } = useTabContext()
-  const { openConversations } = useWorkbenchRoute()
+  const { openConversations, setRoute } = useWorkbenchRoute()
   const { addTask, updateTask } = useTaskContext()
 
   const folderIndex = useMemo(() => {
@@ -1780,14 +1784,15 @@ export function SidebarConversationList({
         })
         if (!result) return
         const selected = Array.isArray(result) ? result[0] : result
-        await openFolder(selected)
+        const detail = await openFolder(selected)
+        void autoCreateProject(detail)
       } catch (err) {
         console.error("[SidebarConversationList] failed to open folder:", err)
       }
     } else {
       setBrowserOpen(true)
     }
-  }, [openFolder])
+  }, [openFolder, autoCreateProject])
 
   // Stable trigger for the Clone Repository dialog, passed to the memoized
   // Folders section header. Empty deps (setCloneOpen is a stable setter) so the
@@ -1796,11 +1801,13 @@ export function SidebarConversationList({
 
   const handleBrowserSelect = useCallback(
     (path: string) => {
-      openFolder(path).catch((err) => {
-        console.error("[SidebarConversationList] failed to open folder:", err)
-      })
+      openFolder(path)
+        .then((detail) => void autoCreateProject(detail))
+        .catch((err) => {
+          console.error("[SidebarConversationList] failed to open folder:", err)
+        })
     },
-    [openFolder]
+    [openFolder, autoCreateProject]
   )
 
   const handleProjectBoot = useCallback(() => {
@@ -2028,6 +2035,15 @@ export function SidebarConversationList({
       ) : showEmptyWorkspaceActions ? (
         <div className="flex-1 flex flex-col items-center justify-center px-3 gap-2">
           <Button
+            variant="default"
+            size="sm"
+            className="w-full max-w-[14rem] justify-start"
+            onClick={() => setRoute("create-project")}
+          >
+            <Briefcase className="h-3.5 w-3.5 mr-1.5" />
+            {tPlatformNav("createProject")}
+          </Button>
+          <Button
             variant="outline"
             size="sm"
             className="w-full max-w-[14rem] justify-start"
@@ -2045,10 +2061,11 @@ export function SidebarConversationList({
             <FolderGit2 className="h-3.5 w-3.5 mr-1.5" />
             {tFolderDropdown("cloneRepository")}
           </Button>
+          {/* Project Boot launcher — temporarily hidden */}
           <Button
             variant="outline"
             size="sm"
-            className="w-full max-w-[14rem] justify-start"
+            className="w-full max-w-[14rem] justify-start hidden"
             onClick={handleProjectBoot}
           >
             <Rocket className="h-3.5 w-3.5 mr-1.5" />
@@ -2161,7 +2178,8 @@ export function SidebarConversationList({
               <FolderGit2 className="h-4 w-4" />
               {tFolderDropdown("cloneRepository")}
             </ContextMenuItem>
-            <ContextMenuItem onSelect={handleProjectBoot}>
+            {/* Project Boot launcher — temporarily hidden */}
+            <ContextMenuItem onSelect={handleProjectBoot} className="hidden">
               <Rocket className="h-4 w-4" />
               {tFolderDropdown("projectBoot")}
             </ContextMenuItem>

@@ -14,12 +14,14 @@ import { openProjectBootWindow } from "@/lib/api"
 import { isDesktop, openFileDialog } from "@/lib/platform"
 import { getActiveRemoteConnectionId } from "@/lib/transport"
 import { useAppWorkspace } from "@/contexts/app-workspace-context"
+import { useAutoCreateProject } from "@/hooks/use-auto-create-project"
 import { CloneDialog } from "@/components/layout/clone-dialog"
 import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-dialog"
 
 export function NewFolderDropdown() {
   const t = useTranslations("Folder.folderNameDropdown")
   const { openFolder } = useAppWorkspace()
+  const { autoCreateProject } = useAutoCreateProject()
   const [cloneOpen, setCloneOpen] = useState(false)
   const [browserOpen, setBrowserOpen] = useState(false)
 
@@ -35,7 +37,10 @@ export function NewFolderDropdown() {
         multiple: false,
       })
       if (selected) {
-        await openFolder(Array.isArray(selected) ? selected[0] : selected)
+        const detail = await openFolder(
+          Array.isArray(selected) ? selected[0] : selected
+        )
+        void autoCreateProject(detail)
       }
     } else {
       setBrowserOpen(true)
@@ -64,7 +69,11 @@ export function NewFolderDropdown() {
             <FolderGit2 className="h-3.5 w-3.5 shrink-0" />
             {t("cloneRepository")}
           </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => openProjectBootWindow()}>
+          {/* Project Boot launcher — temporarily hidden */}
+          <DropdownMenuItem
+            onSelect={() => openProjectBootWindow()}
+            className="hidden"
+          >
             <Rocket className="h-3.5 w-3.5 shrink-0" />
             {t("projectBoot")}
           </DropdownMenuItem>
@@ -75,9 +84,11 @@ export function NewFolderDropdown() {
         open={browserOpen}
         onOpenChange={setBrowserOpen}
         onSelect={(path) => {
-          openFolder(path).catch((err) => {
-            console.error("[NewFolderDropdown] failed to open folder:", err)
-          })
+          openFolder(path)
+            .then((detail) => void autoCreateProject(detail))
+            .catch((err) => {
+              console.error("[NewFolderDropdown] failed to open folder:", err)
+            })
         }}
       />
     </>
