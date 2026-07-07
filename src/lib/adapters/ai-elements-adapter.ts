@@ -27,6 +27,7 @@ import {
 import { stripFeedbackReminder } from "@/lib/feedback-reminder"
 import {
   extractDecompositionSegments,
+  parseDecompositionToolInput,
   type ProposedSubTask,
 } from "@/lib/platform/decomposition-parser"
 
@@ -507,6 +508,13 @@ function expandInlineToolText(
  *
  * Returns `null` when no decomposition fences (complete or incomplete) are
  * found.
+ */
+/**
+ * HISTORICAL-PATH fallback for rendering decomposition cards from persisted
+ * text blocks (which lack the synthetic decomposition ContentBlock).
+ * Live streaming turns use the turn-builder's Phase 3 synthetic block
+ * instead. This function remains active only for DB-loaded turns where the
+ * raw ```task_decomposition_json text is still embedded in text blocks.
  */
 function expandDecompositionText(text: string): AdaptedContentPart[] | null {
   // First try complete fences
@@ -1075,6 +1083,15 @@ function adaptContentBlock(
         isStreaming,
       }
 
+    case "decomposition":
+      return {
+        type: "decomposition",
+        tasks: block.tasks,
+        // Use the block's own isStreaming flag (the turn builder sets it
+        // based on whether the fence is complete), not the parameter.
+        isStreaming: block.isStreaming,
+      }
+
     default:
       return null
   }
@@ -1636,8 +1653,22 @@ export function adaptMessageTurn(
     const block = turn.blocks[index]
 
     if (turn.role === "assistant" && block.type === "text") {
+      // Merge consecutive text blocks so content spanning multiple blocks
+      // (e.g. a ```task_decomposition_json code fence split across ACP
+      // streaming chunks) can be detected as a single unit.
+      let mergedText = block.text
+      let mergeEnd = index
+      while (
+        mergeEnd + 1 < turn.blocks.length &&
+        turn.blocks[mergeEnd + 1].type === "text"
+      ) {
+        mergeEnd++
+        mergedText +=
+          "\n" + (turn.blocks[mergeEnd] as { type: "text"; text: string }).text
+      }
+
       const goalExpandedParts = expandGoalUpdateText(
-        block.text,
+        mergedText,
         turn.id,
         index,
         text.toolCallFailed,
@@ -1645,26 +1676,32 @@ export function adaptMessageTurn(
       )
       if (goalExpandedParts) {
         adaptedContent.push(...goalExpandedParts)
+        index = mergeEnd
         continue
       }
 
       const expandedParts = expandInlineToolText(
-        block.text,
+        mergedText,
         turn.id,
         index,
         text.toolCallFailed
       )
       if (expandedParts) {
         adaptedContent.push(...expandedParts)
+        index = mergeEnd
         continue
       }
 
       // 3rd: extract task_decomposition_json code blocks → structured cards
-      const decompExpanded = expandDecompositionText(block.text)
+      const decompExpanded = expandDecompositionText(mergedText)
       if (decompExpanded) {
         adaptedContent.push(...decompExpanded)
+        index = mergeEnd
         continue
       }
+
+      // No expansion matched — fall through to adaptContentBlock for each
+      // individual block (default text rendering).
     }
 
     if (block.type === "tool_use") {
@@ -1701,6 +1738,36 @@ export function adaptMessageTurn(
           isStreaming: false,
         })
         continue
+      }
+
+      // Historical path: detect create_task_decomposition tool_use →
+      // decomposition block. Same pattern as plan block detection above.
+      if (!isStreaming && block.tool_name === "create_task_decomposition") {
+        const decompTasks = parseDecompositionToolInput(
+          block.input_preview ?? ""
+        )
+        if (decompTasks && decompTasks.length > 0) {
+          // Consume paired tool_result so its acknowledgment text
+          // doesn't render as an orphan tool-result part.
+          if (block.tool_use_id && resultMap.get(block.tool_use_id)) {
+            matchedResultIds.add(block.tool_use_id)
+          } else {
+            const nextBlock = turn.blocks[index + 1]
+            if (
+              !block.tool_use_id &&
+              nextBlock?.type === "tool_result" &&
+              !nextBlock.tool_use_id
+            ) {
+              positionMatchedIndices.add(index + 1)
+            }
+          }
+          adaptedContent.push({
+            type: "decomposition",
+            tasks: decompTasks,
+            isStreaming: false,
+          })
+          continue
+        }
       }
 
       const toolCallId = block.tool_use_id || generateToolCallId(turn.id, index)

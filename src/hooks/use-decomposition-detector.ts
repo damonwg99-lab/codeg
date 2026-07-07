@@ -171,7 +171,19 @@ export function useDecompositionDetector(
 
     if (!lastAssistant) return null
 
-    // Collect all text blocks from the assistant message
+    // Path 1: synthetic decomposition block (live streaming path)
+    // The turn builder may have already extracted the tasks into a dedicated
+    // ContentBlock — use them directly instead of re-parsing text.
+    const decompBlock = (lastAssistant.blocks ?? []).find(
+      (b) => b.type === "decomposition"
+    ) as { type: "decomposition"; tasks: ProposedSubTask[] } | undefined
+    if (decompBlock && decompBlock.tasks.length > 0) {
+      return decompBlock.tasks
+    }
+
+    // Path 2: text-based regex parsing (historical/path fallback)
+    // For persisted turns (no synthetic block) the decomposition is still
+    // embedded in text blocks as a ```task_decomposition_json fence.
     const textContent = (lastAssistant.blocks ?? [])
       .filter((b) => b.type === "text")
       .map((b) => b.text)

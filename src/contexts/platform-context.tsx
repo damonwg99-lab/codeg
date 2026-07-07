@@ -112,6 +112,14 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  // Auto-select first project when none is selected and projects are loaded.
+  // Handles first-time visit (no localStorage) and ensures desktop/web parity.
+  useEffect(() => {
+    if (activeProjectId === null && projects.length > 0) {
+      setActiveProjectId(projects[0].id)
+    }
+  }, [activeProjectId, projects])
+
   // When activeProjectId changes, load the full project info + folder IDs
   useEffect(() => {
     if (activeProjectId === null) {

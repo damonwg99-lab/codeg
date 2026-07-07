@@ -138,6 +138,7 @@ pub struct CompanionFeatures {
     pub feedback: bool,
     pub ask: bool,
     pub sessions: bool,
+    pub decomposition: bool,
 }
 
 impl CompanionFeatures {
@@ -153,6 +154,7 @@ impl CompanionFeatures {
                 feedback: false,
                 ask: false,
                 sessions: false,
+                decomposition: false,
             };
         };
         let mut f = Self {
@@ -160,6 +162,7 @@ impl CompanionFeatures {
             feedback: false,
             ask: false,
             sessions: false,
+            decomposition: false,
         };
         for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             match tok {
@@ -167,6 +170,7 @@ impl CompanionFeatures {
                 "feedback" => f.feedback = true,
                 "ask" => f.ask = true,
                 "sessions" => f.sessions = true,
+                "decomposition" => f.decomposition = true,
                 _ => {}
             }
         }
@@ -179,6 +183,7 @@ impl CompanionFeatures {
             "check_user_feedback" => self.feedback,
             "ask_user_question" => self.ask,
             "get_session_info" => self.sessions,
+            "create_task_decomposition" => self.decomposition,
             "delegate_to_agent" | "get_delegation_status" | "cancel_delegation" => self.delegation,
             _ => false,
         }
@@ -538,6 +543,45 @@ async fn build_tools_call_spawn(
             let round_trip =
                 Box::pin(async move { client_session_round_trip(&socket, &req).await });
             register_and_spawn(inflight, id, None, round_trip, render_session_result).await
+        }
+        "create_task_decomposition" => {
+            // Local-only: no broker round-trip. Parse & validate the input,
+            // then return a confirmation the LLM sees as the tool result.
+            // The front-end detects the tool_call block on the ACP stream
+            // and synthesises a DecompositionCard directly.
+            let input_str = match arguments.get("subTasks") {
+                Some(v) => serde_json::to_string(v).unwrap_or_default(),
+                None => {
+                    return LineAction::Respond(err(
+                        id,
+                        -32602,
+                        "create_task_decomposition requires a non-empty subTasks array",
+                    ));
+                }
+            };
+            let sub_tasks: Vec<serde_json::Value> = match serde_json::from_str::<Vec<serde_json::Value>>(&input_str) {
+                Ok(arr) if !arr.is_empty() => arr,
+                Ok(_) => {
+                    return LineAction::Respond(err(
+                        id,
+                        -32602,
+                        "create_task_decomposition requires a non-empty subTasks array",
+                    ));
+                }
+                Err(_) => {
+                    return LineAction::Respond(err(
+                        id,
+                        -32602,
+                        "create_task_decomposition subTasks must be a valid JSON array",
+                    ));
+                }
+            };
+            let count = sub_tasks.len();
+            let msg = format!(
+                "Decomposition proposal received ({count} sub-tasks). \
+                 The user can review and confirm them in the CodeG interface."
+            );
+            LineAction::Respond(ok(id, Value::String(msg)))
         }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
     }
@@ -1164,6 +1208,7 @@ mod tests {
             feedback: false,
             ask: false,
             sessions: false,
+            decomposition: false,
         })
     }
 
@@ -1634,24 +1679,28 @@ mod tests {
         feedback: true,
         ask: false,
         sessions: false,
+        decomposition: false,
     };
     const BOTH: CompanionFeatures = CompanionFeatures {
         delegation: true,
         feedback: true,
         ask: false,
         sessions: false,
+        decomposition: false,
     };
     const ASK_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
         feedback: false,
         ask: true,
         sessions: false,
+        decomposition: false,
     };
     const SESSIONS_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
         feedback: false,
         ask: false,
         sessions: true,
+        decomposition: false,
     };
 
     fn list_tool_names(action: LineAction) -> Vec<String> {
@@ -1671,9 +1720,10 @@ mod tests {
         assert!(def.delegation && !def.feedback);
         assert!(!def.ask);
         assert!(!def.sessions);
+        assert!(!def.decomposition);
         // Explicit list, whitespace + unknown tokens tolerated.
-        let all = CompanionFeatures::parse(Some(" delegation , feedback , ask , sessions ,bogus"));
-        assert!(all.delegation && all.feedback && all.ask && all.sessions);
+        let all = CompanionFeatures::parse(Some(" delegation , feedback , ask , sessions , decomposition ,bogus"));
+        assert!(all.delegation && all.feedback && all.ask && all.sessions && all.decomposition);
         let fb = CompanionFeatures::parse(Some("feedback"));
         assert!(!fb.delegation && fb.feedback && !fb.ask);
         let ask = CompanionFeatures::parse(Some("ask"));
@@ -1682,7 +1732,7 @@ mod tests {
         assert!(!sessions.delegation && !sessions.feedback && !sessions.ask && sessions.sessions);
         // Empty string → nothing enabled.
         let none = CompanionFeatures::parse(Some(""));
-        assert!(!none.delegation && !none.feedback && !none.ask && !none.sessions);
+        assert!(!none.delegation && !none.feedback && !none.ask && !none.sessions && !none.decomposition);
     }
 
     #[tokio::test]

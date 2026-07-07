@@ -172,6 +172,7 @@ pub fn build_delegation_stack(
         feedback: feedback.clone(),
         ask: ask.clone(),
         sessions: sessions.clone(),
+        decomposition: crate::acp::decomposition::DecompositionRuntimeConfig::new(),
         // Same backing manager as the listener's question lookup; used only by
         // the run_connection teardown guard to reclaim a parked ask.
         questions: Arc::new(crate::acp::manager::ConnectionManagerQuestionLookup {

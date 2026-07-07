@@ -1,3 +1,5 @@
+import type { ProposedSubTask } from "@/lib/platform/decomposition-parser"
+
 export type AgentType =
   | "claude_code"
   | "codex"
@@ -177,6 +179,15 @@ export type ContentBlock =
    * persistence/export switches over `ContentBlock` never receive it.
    */
   | { type: "plan"; entries: PlanEntryInfo[] }
+  /**
+   * Frontend-only, LIVE-stream synthetic block (mirrors the plan pattern).
+   * NEVER persisted — the persisted decomposition path is the raw
+   * ```task_decomposition_json text inside a text block. It exists so a
+   * streaming decomposition can survive `buildStreamingTurnsFromLiveMessage`
+   * → `adaptContentBlock` even when non-text blocks interrupt the fence.
+   * Historical replay uses the adapter's `expandDecompositionText` fallback.
+   */
+  | { type: "decomposition"; tasks: ProposedSubTask[]; isStreaming: boolean }
 
 export type TurnRole = "user" | "assistant" | "system"
 

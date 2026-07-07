@@ -89,11 +89,18 @@ function normalizeEntry(
 // ─── Instruction ───
 
 /**
- * Lightweight instruction appended to the prompt when the user expresses
- * decomposition intent. Instructs the AI to output a structured JSON block
- * at the end of its response.
+ * Instruction appended to the prompt when the user expresses decomposition intent.
+ *
+ * Provides BOTH paths so the AI can choose based on its capabilities:
+ * - Primary: call the `create_task_decomposition` MCP tool (reliable, JSON guaranteed)
+ * - Fallback: output a ```task_decomposition_json code fence (for agents that
+ *   can't or won't call MCP tools)
+ *
+ * The frontend detects both paths:
+ *   tool_call block → parseDecompositionToolInput (primary)
+ *   text fence      → extractDecompositionSegments (fallback)
  */
-export const DECOMPOSITION_INSTRUCTION = `[系统指令：当提出任务分解时，请在回复末尾的 \`\`\`task_decomposition_json 代码块中输出 JSON，格式为 {"subTasks":[{"title":"任务标题（中文）","description":"任务描述（中文）","taskType":"bug|feature|task|improvement","priority":"low|medium|high|urgent"}]}。title 和 description 必须用中文填写。]`
+export const DECOMPOSITION_INSTRUCTION = `[系统指令：当提出任务分解时，请优先调用 create_task_decomposition 工具传入子任务列表。如果无法调用该工具（如不在可用工具列表中），请在回复末尾的 \`\`\`task_decomposition_json 代码块中输出 JSON。格式为 {"subTasks":[{"title":"任务标题（中文）","description":"任务描述（中文）","taskType":"bug|feature|task|improvement","priority":"low|medium|high|urgent"}]}。title 和 description 必须用中文填写。]`
 
 // ─── JSON Extraction ───
 
@@ -249,4 +256,56 @@ export function tryParseSubTasksJson(
   } catch {
     return null
   }
+}
+
+// ─── MCP Tool Call Parsing (primary path) ───
+
+/** Cast unknown to Record<string, unknown> if it's a plain object. */
+function asRecord(v: unknown): Record<string, unknown> | null {
+  if (typeof v === "object" && v !== null && !Array.isArray(v)) {
+    return v as Record<string, unknown>
+  }
+  return null
+}
+
+/**
+ * Parse the raw_input of a `create_task_decomposition` tool call.
+ * Returns `ProposedSubTask[]` if the input matches the expected schema,
+ * or `null` if it doesn't (meaning this is NOT a decomposition tool call).
+ *
+ * This is the **primary** path: the MCP tool framework guarantees valid
+ * JSON, so no regex is needed. Returns `null` (not an empty array) as an
+ * identity signal — "this tool call is not a decomposition" vs "it is but
+ * the content was invalid".
+ */
+export function parseDecompositionToolInput(
+  rawInput: string | null | undefined
+): ProposedSubTask[] | null {
+  if (!rawInput) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(rawInput)
+  } catch {
+    return null
+  }
+
+  const obj = asRecord(parsed)
+  if (!obj || !Array.isArray(obj.subTasks) || obj.subTasks.length === 0)
+    return null
+
+  // Validate each entry has a non-empty title (minimum requirement)
+  const everyItemHasTitle = obj.subTasks.every((item: unknown) => {
+    const record = asRecord(item)
+    return (
+      !!record &&
+      typeof record.title === "string" &&
+      record.title.trim().length > 0
+    )
+  })
+  if (!everyItemHasTitle) return null
+
+  // Normalize each entry using the existing normalizeEntry function
+  return obj.subTasks
+    .map((item: unknown) => normalizeEntry(asRecord(item) ?? {}))
+    .filter((e: ProposedSubTask | null): e is ProposedSubTask => e !== null)
 }

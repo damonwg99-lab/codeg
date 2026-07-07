@@ -16,6 +16,7 @@ import type {
 import { getFolderConversation } from "@/lib/api"
 import type {
   AgentExecutionStats,
+  ContentBlock,
   DbConversationDetail,
   MessageTurn,
   PlanEntryInfo,
@@ -30,6 +31,10 @@ import {
 import { COLLAB_AGENT_TOOL_NAME, mergeCollabOp } from "@/lib/collab-tool"
 import { collapseLiveCollabBlocks } from "@/lib/collab-collapse"
 import { kimiTodoWriteEntries } from "@/lib/plan-parse"
+import {
+  extractDecompositionSegments,
+  parseDecompositionToolInput,
+} from "@/lib/platform/decomposition-parser"
 import { toErrorMessage } from "@/lib/app-error"
 
 export type ConversationSyncState = "idle" | "awaiting_persist"
@@ -508,6 +513,8 @@ export function buildStreamingTurnsFromLiveMessage(
     if (block.type === "tool_call") {
       const entries = kimiTodoWriteEntries(block.info.raw_input)
       if (entries) latestKimiTodoEntries = entries
+      // Primary path: detect create_task_decomposition MCP tool call
+      // (handled in the tool_call case branch below)
     }
   }
 
@@ -735,6 +742,21 @@ export function buildStreamingTurnsFromLiveMessage(
           break
         }
 
+        // Primary path: create_task_decomposition MCP tool call → synthetic
+        // decomposition block. The tool_call's raw_input is guaranteed valid
+        // JSON by the MCP framework, so we parse it directly — no regex
+        // needed. Break suppresses the generic tool card (identical to the
+        // plan/KimiTodoWrite pattern).
+        const decompTasks = parseDecompositionToolInput(block.info.raw_input)
+        if (decompTasks) {
+          currentBlocks.push({
+            type: "decomposition",
+            tasks: decompTasks,
+            isStreaming: false, // tool call arrives with input already complete
+          })
+          break
+        }
+
         const toolName = getToolName(block.info)
         currentBlocks.push({
           type: "tool_use",
@@ -819,6 +841,99 @@ export function buildStreamingTurnsFromLiveMessage(
         }
         break
       }
+    }
+  }
+
+  // ── Phase 3: Decomposition detection ──
+  // Scan each group's text blocks for ```task_decomposition_json fences.
+  // Complete fences → synthetic decomposition block + text-only segments.
+  // Incomplete fences (streaming) → placeholder decomposition block.
+  // This mirrors the plan-block pattern (synthetic ContentBlock produced in the
+  // turn builder, then routed by the adapter's adaptContentBlock switch).
+  for (const group of groups) {
+    const textBlocks = group.filter(
+      (b): b is ContentBlock & { type: "text" } => b.type === "text"
+    )
+    if (textBlocks.length === 0) continue
+
+    const allText = textBlocks.map((b) => b.text).join("\n")
+
+    // A) Complete fence: extractDecompositionSegments
+    const segments = extractDecompositionSegments(allText)
+    if (segments) {
+      const hasDecomp = segments.some(
+        (s) => s.kind === "decomposition" && s.tasks && s.tasks.length > 0
+      )
+      if (hasDecomp) {
+        // Build synthetic blocks from segments (text + decomposition)
+        const syntheticBlocks: ContentBlock[] = []
+        for (const seg of segments) {
+          if (seg.kind === "text" && seg.value.trim()) {
+            syntheticBlocks.push({ type: "text", text: seg.value })
+          } else if (
+            seg.kind === "decomposition" &&
+            seg.tasks &&
+            seg.tasks.length > 0
+          ) {
+            syntheticBlocks.push({
+              type: "decomposition",
+              tasks: seg.tasks,
+              isStreaming: false,
+            })
+          }
+          // Parse-failed decomposition segments become text
+          // (extractDecompositionSegments already converts them).
+        }
+
+        // Reconstruct group: replace all text blocks with syntheticBlocks,
+        // keep non-text blocks in their original positions.
+        const reconstructed: ContentBlock[] = []
+        let replacedTextBlocks = false
+        for (const block of group) {
+          if (block.type !== "text") {
+            reconstructed.push(block)
+          } else if (!replacedTextBlocks) {
+            // First text-block position: insert all syntheticBlocks
+            reconstructed.push(...syntheticBlocks)
+            replacedTextBlocks = true
+          }
+          // Remaining text blocks: skip (content now in syntheticBlocks)
+        }
+        group.length = 0
+        group.push(...reconstructed)
+        continue
+      }
+    }
+
+    // B) Incomplete fence (streaming): add placeholder
+    const incompletePattern = /```task_decomposition_json(?:\s*\n|\s*$)/
+    const incompleteMatch = incompletePattern.exec(allText)
+    if (incompleteMatch) {
+      // Suppress text after fence opening — show only text before it
+      const beforeFence = allText.slice(0, incompleteMatch.index)
+      const placeholderBlocks: ContentBlock[] = []
+      if (beforeFence.trim()) {
+        placeholderBlocks.push({ type: "text", text: beforeFence })
+      }
+      placeholderBlocks.push({
+        type: "decomposition",
+        tasks: [],
+        isStreaming: true,
+      })
+
+      // Reconstruct group: same approach as complete case
+      const reconstructed: ContentBlock[] = []
+      let replacedTextBlocks = false
+      for (const block of group) {
+        if (block.type !== "text") {
+          reconstructed.push(block)
+        } else if (!replacedTextBlocks) {
+          reconstructed.push(...placeholderBlocks)
+          replacedTextBlocks = true
+        }
+      }
+      group.length = 0
+      group.push(...reconstructed)
     }
   }
 
