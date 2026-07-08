@@ -268,6 +268,21 @@ export const KB_DOC_TYPE_LABELS: Record<KbDocType, string> = {
   task_attachment: "Task Attachment",
 }
 
+/**
+ * Whether a folder kind should be hidden from the user-facing sidebar list.
+ * `chat` folders are backend-hidden (kept only in `allFolders` for by-id cwd
+ * lookups); `platform_repo` folders back project repos and follow the same
+ * rule — available for git / file-tree switching via RepoSelector but never
+ * rendered as a sidebar header row.
+ *
+ * Centralized here so the three call sites (app-workspace-store upsertFolder,
+ * tab-store makeReplacementDraftTab ×2) stay in sync and don't drift during
+ * upstream merges.
+ */
+export function isHiddenFolderKind(kind: string | undefined | null): boolean {
+  return kind === "chat" || kind === "platform_repo"
+}
+
 /** KB doc type → i18n key for localized label resolution */
 export const KB_DOC_TYPE_I18N_KEYS: Record<KbDocType, string> = {
   tech_doc: "kb.typeTechDoc",

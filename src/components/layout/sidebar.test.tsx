@@ -49,7 +49,7 @@ vi.mock("@/contexts/active-folder-context", () => ({
   useActiveFolder: () => ({ activeFolder: mockState.activeFolder }),
 }))
 vi.mock("@/contexts/tab-context", () => ({
-  useTabContext: () => ({
+  useTabActions: () => ({
     openNewConversationTab: spies.openNewConversationTab,
     openChatModeTab: spies.openChatModeTab,
   }),

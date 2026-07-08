@@ -21,8 +21,8 @@ import {
   MessageSquare,
 } from "lucide-react"
 import type { OverlayScrollbarsComponentRef } from "overlayscrollbars-react"
-import { useAppWorkspace } from "@/contexts/app-workspace-context"
-import { useTabContext } from "@/contexts/tab-context"
+import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
+import { useTabActions, useTabStore } from "@/contexts/tab-context"
 import { usePlatform } from "@/contexts/platform-context"
 import { useProjectSwitchCoordinator } from "@/hooks/use-project-switch-coordinator"
 import { gitListAllBranches } from "@/lib/api"
@@ -139,9 +139,12 @@ export const ConversationFolderBranchPicker = memo(
     tabId,
   }: ConversationFolderBranchPickerProps) {
     const t = useTranslations("Folder.conversationContextBar")
-    const { tabs, activeTabId, openNewConversationTab, openChatModeTab } =
-      useTabContext()
-    const { folders, allFolders, branches } = useAppWorkspace()
+    const tabs = useTabStore((s) => s.tabs)
+    const activeTabId = useTabStore((s) => s.activeTabId)
+    const { openNewConversationTab, openChatModeTab } = useTabActions()
+    const folders = useAppWorkspaceStore((s) => s.folders)
+    const allFolders = useAppWorkspaceStore((s) => s.allFolders)
+    const branches = useAppWorkspaceStore((s) => s.branches)
     const switchToBranch = useSwitchToBranch()
     const { projects } = usePlatform()
     const { switchProject } = useProjectSwitchCoordinator()
@@ -300,8 +303,9 @@ ConversationFolderBranchPicker.displayName = "ConversationFolderBranchPicker"
 export function useConversationFolderBranchPickerVisible(
   tabId?: string | null
 ): boolean {
-  const { tabs, activeTabId } = useTabContext()
-  const { allFolders } = useAppWorkspace()
+  const tabs = useTabStore((s) => s.tabs)
+  const activeTabId = useTabStore((s) => s.activeTabId)
+  const allFolders = useAppWorkspaceStore((s) => s.allFolders)
   const lookupId = tabId ?? activeTabId
   const ownTab = tabs.find((x) => x.id === lookupId) ?? null
   const ownFolder = ownTab
