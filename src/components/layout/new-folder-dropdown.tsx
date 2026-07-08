@@ -13,14 +13,14 @@ import { Button } from "@/components/ui/button"
 import { openProjectBootWindow } from "@/lib/api"
 import { isDesktop, openFileDialog } from "@/lib/platform"
 import { getActiveRemoteConnectionId } from "@/lib/transport"
-import { useAppWorkspace } from "@/contexts/app-workspace-context"
+import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useAutoCreateProject } from "@/hooks/use-auto-create-project"
 import { CloneDialog } from "@/components/layout/clone-dialog"
 import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-dialog"
 
 export function NewFolderDropdown() {
   const t = useTranslations("Folder.folderNameDropdown")
-  const { openFolder } = useAppWorkspace()
+  const openFolder = useAppWorkspaceStore((s) => s.openFolder)
   const { autoCreateProject } = useAutoCreateProject()
   const [cloneOpen, setCloneOpen] = useState(false)
   const [browserOpen, setBrowserOpen] = useState(false)

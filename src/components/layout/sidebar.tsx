@@ -18,7 +18,7 @@ import { useActiveFolder } from "@/contexts/active-folder-context"
 import { usePlatform } from "@/contexts/platform-context"
 import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { useSidebarContext } from "@/contexts/sidebar-context"
-import { useTabContext } from "@/contexts/tab-context"
+import { useTabActions } from "@/contexts/tab-context"
 import { useSearchDialog } from "@/contexts/search-dialog-context"
 import { useAutomationsView } from "@/contexts/automations-view-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
@@ -126,7 +126,7 @@ export function Sidebar({ headerContent }: SidebarProps) {
   const { activeFolder } = useActiveFolder()
   const { activeProjectId, activeFolderIds, activeProject } = usePlatform()
   const { allFolders } = useAppWorkspace()
-  const { openNewConversationTab, openChatModeTab } = useTabContext()
+  const { openNewConversationTab, openChatModeTab } = useTabActions()
   const { setOpen: setSearchOpen } = useSearchDialog()
   const { unseenFailures } = useAutomationsView()
   const { routeId, setRoute, openConversations } = useWorkbenchRoute()

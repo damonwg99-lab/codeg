@@ -13,7 +13,7 @@ import {
 import { useTranslations } from "next-intl"
 import { openSettingsWindow } from "@/lib/api"
 import { getPetSettings, openPetWindow } from "@/lib/pet/api"
-import { useAppWorkspace } from "@/contexts/app-workspace-context"
+import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { usePlatform } from "@/contexts/platform-context"
 import { useIsActiveChatMode } from "@/hooks/use-is-active-chat-mode"
@@ -24,7 +24,7 @@ import { Button } from "@/components/ui/button"
 import { useSidebarContext } from "@/contexts/sidebar-context"
 import { useAuxPanelContext } from "@/contexts/aux-panel-context"
 import { useTerminalContext } from "@/contexts/terminal-context"
-import { useTabContext } from "@/contexts/tab-context"
+import { useTabActions, useTabStore } from "@/contexts/tab-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { useLinkedTask } from "@/hooks/use-linked-task"
 import { Badge } from "@/components/ui/badge"
@@ -56,7 +56,8 @@ import {
 export function FolderTitleBar() {
   const tTitleBar = useTranslations("Folder.folderTitleBar")
   const tPet = useTranslations("Pet")
-  const { openFolder, allFolders } = useAppWorkspace()
+  const openFolder = useAppWorkspaceStore((s) => s.openFolder)
+  const allFolders = useAppWorkspaceStore((s) => s.allFolders)
   const { activeProjectId, activeProject } = usePlatform()
   const { autoCreateProject } = useAutoCreateProject()
   const { activeFolder } = useActiveFolder()
@@ -64,8 +65,9 @@ export function FolderTitleBar() {
   const { isOpen, toggle } = useSidebarContext()
   const { isOpen: auxPanelOpen, toggle: toggleAuxPanel } = useAuxPanelContext()
   const { isOpen: terminalOpen, toggle: toggleTerminal } = useTerminalContext()
-  const { openNewConversationTab } = useTabContext()
-  const { tabs, activeTabId } = useTabContext()
+  const { openNewConversationTab } = useTabActions()
+  const tabs = useTabStore((s) => s.tabs)
+  const activeTabId = useTabStore((s) => s.activeTabId)
   const { switchProject } = useProjectSwitchCoordinator()
   const activeConversationId = useMemo(() => {
     const activeTab = tabs.find((tab) => tab.id === activeTabId)
