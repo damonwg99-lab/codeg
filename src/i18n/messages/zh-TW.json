@@ -1308,7 +1308,9 @@
       "typeToSearch": "輸入關鍵字搜尋會話",
       "typeToSearchFiles": "輸入關鍵字搜尋檔案或目錄",
       "noResults": "找不到結果。",
-      "untitledConversation": "未命名會話"
+      "untitledConversation": "未命名會話",
+      "fileNameMatches": "檔案名稱匹配",
+      "contentMatches": "內容匹配"
     },
     "folderTitleBar": {
       "showSidebar": "顯示側邊欄",

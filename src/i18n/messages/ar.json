@@ -1308,7 +1308,9 @@
       "typeToSearch": "اكتب للبحث في المحادثات",
       "typeToSearchFiles": "اكتب للبحث في الملفات أو المجلدات",
       "noResults": "لم يتم العثور على نتائج.",
-      "untitledConversation": "محادثة بدون عنوان"
+      "untitledConversation": "محادثة بدون عنوان",
+      "fileNameMatches": "تطابقات اسم الملف",
+      "contentMatches": "تطابقات المحتوى"
     },
     "folderTitleBar": {
       "showSidebar": "إظهار الشريط الجانبي",

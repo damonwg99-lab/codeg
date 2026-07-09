@@ -10,6 +10,7 @@ pub mod experts;
 pub mod feedback;
 #[cfg(feature = "tauri-runtime")]
 pub mod file_io;
+pub mod file_search;
 pub mod folder_commands;
 pub mod folders;
 pub mod logging;

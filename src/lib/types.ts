@@ -2041,6 +2041,18 @@ export interface DirectoryItem {
   size: number | null
 }
 
+export interface FileContentMatch {
+  relativePath: string
+  lineNumber: number
+  lineContent: string
+}
+
+export interface ContentSearchBatch {
+  searchId: string
+  matches: FileContentMatch[]
+  done: boolean
+}
+
 export interface UploadAttachmentResult {
   path: string
   name: string

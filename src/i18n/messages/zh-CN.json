@@ -1302,13 +1302,15 @@
       "tabConversations": "会话",
       "tabFiles": "文件",
       "placeholder": "搜索会话...",
-      "filePlaceholder": "搜索文件或目录...",
+      "filePlaceholder": "搜索文件、目录或内容...",
       "allAgents": "全部",
       "searching": "搜索中...",
       "typeToSearch": "输入关键词搜索会话",
       "typeToSearchFiles": "输入关键词搜索文件或目录",
       "noResults": "未找到结果。",
-      "untitledConversation": "未命名会话"
+      "untitledConversation": "未命名会话",
+      "fileNameMatches": "文件名匹配",
+      "contentMatches": "内容匹配"
     },
     "folderTitleBar": {
       "showSidebar": "显示侧边栏",

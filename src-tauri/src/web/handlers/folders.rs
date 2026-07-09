@@ -265,6 +265,26 @@ pub async fn get_file_tree(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SearchFilesContentParams {
+    pub base_path: String,
+    pub keyword: String,
+    pub max_results: Option<usize>,
+}
+
+pub async fn search_files_content(
+    Json(params): Json<SearchFilesContentParams>,
+) -> Result<Json<Vec<crate::commands::file_search::FileContentMatch>>, AppCommandError> {
+    let result = crate::commands::file_search::search_files_content(
+        params.base_path,
+        params.keyword,
+        params.max_results,
+    )
+    .await?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OpenSettingsWindowParams {
     pub section: Option<String>,
     pub agent_type: Option<String>,

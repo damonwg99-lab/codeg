@@ -68,6 +68,7 @@ import type {
   TerminalInfo,
   PromptInputBlock,
   FileTreeNode,
+  FileContentMatch,
   DirectoryEntry,
   DirectoryItem,
   UploadAttachmentResult,
@@ -2673,6 +2674,18 @@ export async function getFileTree(
   return getTransport().call("get_file_tree", {
     path,
     maxDepth: maxDepth ?? null,
+  })
+}
+
+export async function searchFilesContent(
+  basePath: string,
+  keyword: string,
+  maxResults?: number
+): Promise<FileContentMatch[]> {
+  return getTransport().call("search_files_content", {
+    basePath,
+    keyword,
+    maxResults: maxResults ?? null,
   })
 }
 

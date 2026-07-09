@@ -12,10 +12,13 @@ import { useTabActions } from "@/contexts/tab-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { useWorkspaceActions } from "@/contexts/workspace-context"
 import { listAllConversations } from "@/lib/api"
+import { isDesktop } from "@/lib/transport"
 import type {
   AgentType,
+  ContentSearchBatch,
   ConversationStatus,
   DbConversationSummary,
+  FileContentMatch,
 } from "@/lib/types"
 import { useFileTree, type FlatFileEntry } from "@/hooks/use-file-tree"
 import { AGENT_LABELS, compareAgentType } from "@/lib/types"
@@ -29,7 +32,7 @@ import {
   CommandGroup,
   CommandItem,
 } from "@/components/ui/command"
-import { cn } from "@/lib/utils"
+import { cn, randomUUID } from "@/lib/utils"
 import { formatConversationTitle } from "@/lib/conversation-title"
 
 type SearchTab = "conversations" | "files"
@@ -69,6 +72,12 @@ export function SearchCommandDialog({
   const [searching, setSearching] = useState(false)
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined)
 
+  const [contentResults, setContentResults] = useState<FileContentMatch[]>([])
+  const [contentSearching, setContentSearching] = useState(false)
+  const contentDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined)
+  const contentAbortRef = useRef<AbortController | null>(null)
+  const contentUnsubRef = useRef<(() => void) | null>(null)
+
   const folderPath = folder?.path ?? ""
 
   // File search via shared hook (lazy-loaded when files tab is active)
@@ -89,7 +98,13 @@ export function SearchCommandDialog({
   // Filter files by query using pre-computed lowercase fields
   const filteredFiles = useMemo(() => {
     const trimmed = query.trim()
-    if (!trimmed) return allFiles.slice(0, 100)
+    if (!trimmed) {
+      return allFiles
+        .filter((f) => !f.name.startsWith(".") && !f.relativePath.startsWith("."))
+        .filter((f) => !f.name.endsWith(".json"))
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .slice(0, 100)
+    }
     const lower = trimmed.toLowerCase()
     const matched: FlatFileEntry[] = []
     for (const f of allFiles) {
@@ -137,6 +152,103 @@ export function SearchCommandDialog({
     }
   }, [query, agentFilter, doSearch, activeTab])
 
+  const doContentSearch = useCallback(
+    async (q: string) => {
+      const trimmed = q.trim()
+      if (!trimmed || trimmed.length < 2 || !folderPath) {
+        setContentResults([])
+        setContentSearching(false)
+        return
+      }
+
+      contentAbortRef.current?.abort()
+      const controller = new AbortController()
+      contentAbortRef.current = controller
+
+      setContentSearching(true)
+      setContentResults([])
+
+      if (isDesktop()) {
+        const searchId = randomUUID()
+        contentUnsubRef.current?.()
+        contentUnsubRef.current = null
+        try {
+          const { invoke } = await import("@tauri-apps/api/core")
+          const transport = (await import("@/lib/transport")).getTransport()
+          const unsub = await transport.subscribe<ContentSearchBatch>(
+            "search_files_content:results",
+            (payload) => {
+              if (controller.signal.aborted) return
+              if (payload.searchId !== searchId) return
+              setContentResults((prev) => [...prev, ...payload.matches])
+              if (payload.done) {
+                setContentSearching(false)
+                contentUnsubRef.current?.()
+                contentUnsubRef.current = null
+              }
+            }
+          )
+          contentUnsubRef.current = unsub
+          await invoke("search_files_content_streaming", {
+            searchId,
+            basePath: folderPath,
+            keyword: trimmed,
+            maxResults: 100,
+          })
+        } catch (err) {
+          if (!controller.signal.aborted) {
+            console.warn("[ContentSearch] search failed:", err)
+            setContentResults([])
+            setContentSearching(false)
+            contentUnsubRef.current?.()
+            contentUnsubRef.current = null
+          }
+        }
+      } else {
+        try {
+          const transport = (await import("@/lib/transport")).getTransport()
+          const data: FileContentMatch[] = await transport.call(
+            "search_files_content",
+            { basePath: folderPath, keyword: trimmed, maxResults: 100 }
+          )
+          if (!controller.signal.aborted) {
+            setContentResults(data)
+          }
+        } catch (err) {
+          if (!controller.signal.aborted) {
+            console.warn("[ContentSearch] search failed:", err)
+            setContentResults([])
+          }
+        } finally {
+          if (!controller.signal.aborted) {
+            setContentSearching(false)
+          }
+        }
+      }
+    },
+    [folderPath]
+  )
+
+  // Debounced content search on query change (files tab only)
+  useEffect(() => {
+    if (activeTab !== "files") return
+    if (contentDebounceRef.current)
+      clearTimeout(contentDebounceRef.current)
+
+    const trimmed = query.trim()
+    if (trimmed.length >= 2) {
+      setContentSearching(true)
+    }
+
+    contentDebounceRef.current = setTimeout(() => {
+      doContentSearch(query)
+    }, 400)
+    return () => {
+      if (contentDebounceRef.current)
+        clearTimeout(contentDebounceRef.current)
+    }
+  }, [query, doContentSearch, activeTab])
+
   // Reset state when dialog closes
   useEffect(() => {
     if (!open) {
@@ -145,6 +257,11 @@ export function SearchCommandDialog({
       setResults([])
       setActiveTab("conversations")
       resetFileTree()
+      setContentResults([])
+      setContentSearching(false)
+      contentAbortRef.current?.abort()
+      contentUnsubRef.current?.()
+      contentUnsubRef.current = null
     }
   }, [open, resetFileTree])
 
@@ -172,6 +289,18 @@ export function SearchCommandDialog({
         }
         openFilePreview(entry.relativePath)
       }
+      onOpenChange(false)
+    },
+    [revealInFileTree, openFilePreview, onOpenChange]
+  )
+
+  const handleSelectContentMatch = useCallback(
+    (match: FileContentMatch) => {
+      const lastSlash = match.relativePath.lastIndexOf("/")
+      if (lastSlash > 0) {
+        revealInFileTree(match.relativePath.slice(0, lastSlash))
+      }
+      openFilePreview(match.relativePath, { line: match.lineNumber })
       onOpenChange(false)
     },
     [revealInFileTree, openFilePreview, onOpenChange]
@@ -321,13 +450,18 @@ export function SearchCommandDialog({
                 ? t("searching")
                 : !query.trim()
                   ? t("typeToSearchFiles")
-                  : t("noResults")}
+                  : filteredFiles.length === 0 &&
+                      contentResults.length === 0
+                    ? t("noResults")
+                    : contentSearching
+                      ? t("searching")
+                      : t("noResults")}
             </CommandEmpty>
             {filteredFiles.length > 0 && (
-              <CommandGroup>
+              <CommandGroup heading={t("fileNameMatches")}>
                 {filteredFiles.map((entry) => (
                   <CommandItem
-                    key={entry.relativePath}
+                    key={`file-${entry.relativePath}`}
                     value={entry.relativePath}
                     onSelect={() => handleSelectFile(entry)}
                   >
@@ -344,6 +478,40 @@ export function SearchCommandDialog({
                 ))}
               </CommandGroup>
             )}
+            {contentSearching || contentResults.length > 0 ? (
+              <CommandGroup heading={t("contentMatches")}>
+                {contentSearching ? (
+                  <div className="flex items-center gap-2 px-2 py-3 text-sm text-muted-foreground">
+                    <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                    </svg>
+                    {t("searching")}
+                  </div>
+                ) : (
+                  contentResults.map((match, i) => (
+                    <CommandItem
+                      key={`content-${match.relativePath}-${match.lineNumber}-${i}`}
+                      value={`content-${match.relativePath}-${match.lineNumber}`}
+                      onSelect={() => handleSelectContentMatch(match)}
+                    >
+                      <File className="w-4 h-4 shrink-0 text-muted-foreground" />
+                      <div className="flex-1 min-w-0">
+                        <div className="truncate text-sm">
+                          {match.relativePath}
+                        </div>
+                        <div className="truncate text-xs text-muted-foreground">
+                          {match.lineContent.trimStart()}
+                        </div>
+                      </div>
+                      <span className="text-xs text-muted-foreground shrink-0">
+                        :{match.lineNumber}
+                      </span>
+                    </CommandItem>
+                  ))
+                )}
+              </CommandGroup>
+            ) : null}
           </>
         )}
       </CommandList>

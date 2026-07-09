@@ -219,6 +219,10 @@ pub fn build_router(
         )
         .route("/get_file_tree", post(handlers::folders::get_file_tree))
         .route(
+            "/search_files_content",
+            post(handlers::folders::search_files_content),
+        )
+        .route(
             "/start_workspace_state_stream",
             post(handlers::workspace_state::start_workspace_state_stream),
         )

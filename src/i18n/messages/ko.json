@@ -1308,7 +1308,9 @@
       "typeToSearch": "입력하여 대화를 검색하세요",
       "typeToSearchFiles": "입력하여 파일 또는 디렉토리를 검색하세요",
       "noResults": "검색 결과가 없습니다.",
-      "untitledConversation": "제목 없는 대화"
+      "untitledConversation": "제목 없는 대화",
+      "fileNameMatches": "파일 이름 일치",
+      "contentMatches": "내용 일치"
     },
     "folderTitleBar": {
       "showSidebar": "사이드바 표시",

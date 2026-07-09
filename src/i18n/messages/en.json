@@ -1302,13 +1302,15 @@
       "tabConversations": "Conversations",
       "tabFiles": "Files",
       "placeholder": "Search conversations...",
-      "filePlaceholder": "Search files or directories...",
+      "filePlaceholder": "Search files, directories or content...",
       "allAgents": "All",
       "searching": "Searching...",
       "typeToSearch": "Type to search conversations",
       "typeToSearchFiles": "Type to search files or directories",
       "noResults": "No results found.",
-      "untitledConversation": "Untitled conversation"
+      "untitledConversation": "Untitled conversation",
+      "fileNameMatches": "File name matches",
+      "contentMatches": "Content matches"
     },
     "folderTitleBar": {
       "showSidebar": "Show Sidebar",

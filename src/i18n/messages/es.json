@@ -1308,7 +1308,9 @@
       "typeToSearch": "Escribe para buscar conversaciones",
       "typeToSearchFiles": "Escribe para buscar archivos o directorios",
       "noResults": "No se encontraron resultados.",
-      "untitledConversation": "Conversación sin título"
+      "untitledConversation": "Conversación sin título",
+      "fileNameMatches": "Coincidencias de nombre",
+      "contentMatches": "Coincidencias de contenido"
     },
     "folderTitleBar": {
       "showSidebar": "Mostrar barra lateral",

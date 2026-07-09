@@ -1308,7 +1308,9 @@
       "typeToSearch": "Tippen, um Konversationen zu suchen",
       "typeToSearchFiles": "Tippen, um Dateien oder Verzeichnisse zu suchen",
       "noResults": "Keine Ergebnisse gefunden.",
-      "untitledConversation": "Unbenannte Konversation"
+      "untitledConversation": "Unbenannte Konversation",
+      "fileNameMatches": "Dateinamen-Treffer",
+      "contentMatches": "Inhaltstreffer"
     },
     "folderTitleBar": {
       "showSidebar": "Seitenleiste anzeigen",
