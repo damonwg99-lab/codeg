@@ -1298,6 +1298,24 @@ pub async fn git_push_info(path: String) -> Result<GitPushInfo, AppCommandError>
     })
 }
 
+async fn ensure_tracking_ref(path: &str, remote: &str, branch: &str) {
+    let tracking_ref = format!("refs/remotes/{}/{}", remote, branch);
+    let exists = crate::process::tokio_command("git")
+        .args(["rev-parse", "--verify", "--quiet", &tracking_ref])
+        .current_dir(path)
+        .output()
+        .await
+        .is_ok_and(|o| o.status.success());
+    if exists {
+        return;
+    }
+    let _ = crate::process::tokio_command("git")
+        .args(["update-ref", &tracking_ref, branch])
+        .current_dir(path)
+        .output()
+        .await;
+}
+
 pub(crate) async fn git_push_core(
     data_dir: &std::path::Path,
     emitter: &EventEmitter,
@@ -1375,6 +1393,8 @@ pub(crate) async fn git_push_core(
     if !output.status.success() {
         return Err(classify_remote_git_error("push", &output.stderr));
     }
+
+    ensure_tracking_ref(path, target_remote, &branch).await;
 
     let upstream_set = needs_set_upstream;
 
@@ -4217,7 +4237,7 @@ async fn get_unpushed_hashes(
         .await
         .map_err(AppCommandError::io)?;
 
-    let has_upstream = upstream_output.status.success()
+    let mut has_upstream = upstream_output.status.success()
         && !String::from_utf8_lossy(&upstream_output.stdout)
             .trim()
             .is_empty();
@@ -4288,6 +4308,7 @@ async fn get_unpushed_hashes(
         let remote_branch_exists = verify_output.is_ok_and(|o| o.status.success());
 
         if remote_branch_exists {
+            has_upstream = true;
             let range = format!("{}/{}..{}", remote, branch_name, local_ref);
             crate::process::tokio_command("git")
                 .args(["rev-list", &limit_arg, &range])
