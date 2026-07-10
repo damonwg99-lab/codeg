@@ -3473,6 +3473,7 @@
       "priority": "Priorität",
       "assignee": "Zuständig",
       "deadline": "Fälligkeitsdatum",
+      "searchPlaceholder": "Aufgaben suchen…",
       "detail": "Aufgabendetails",
       "basicInfo": "Basisinformationen",
       "conversations": "Verknüpfte Gespräche",

@@ -3473,6 +3473,7 @@
       "priority": "優先順序",
       "assignee": "負責人",
       "deadline": "截止日期",
+      "searchPlaceholder": "搜尋任務…",
       "detail": "任務詳情",
       "basicInfo": "基本資訊",
       "conversations": "關聯對話",

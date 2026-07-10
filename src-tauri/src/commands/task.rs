@@ -45,11 +45,20 @@ fn resolve_agent_type(value: Option<&str>) -> AgentType {
 pub async fn list_tasks_core(
     db: &AppDatabase,
     project_id: i32,
+    keyword: Option<String>,
+    task_type: Option<String>,
+    priority: Option<String>,
 ) -> Result<Vec<TaskInfo>, AppCommandError> {
     let conn = &db.conn;
-    platform_task_service::list_by_project(conn, project_id)
-        .await
-        .map_err(AppCommandError::from)
+    platform_task_service::list_by_project(
+        conn,
+        project_id,
+        keyword.as_deref(),
+        task_type.as_deref(),
+        priority.as_deref(),
+    )
+    .await
+    .map_err(AppCommandError::from)
 }
 
 pub async fn get_task_core(
@@ -376,8 +385,11 @@ pub async fn create_decomposition_core(
 pub async fn list_tasks(
     db: tauri::State<'_, AppDatabase>,
     project_id: i32,
+    keyword: Option<String>,
+    task_type: Option<String>,
+    priority: Option<String>,
 ) -> Result<Vec<TaskInfo>, AppCommandError> {
-    list_tasks_core(&db, project_id).await
+    list_tasks_core(&db, project_id, keyword, task_type, priority).await
 }
 
 #[cfg(feature = "tauri-runtime")]

@@ -3473,6 +3473,7 @@
       "priority": "Prioridad",
       "assignee": "Responsable",
       "deadline": "Fecha límite",
+      "searchPlaceholder": "Buscar tareas…",
       "detail": "Detalles de la tarea",
       "basicInfo": "Información básica",
       "conversations": "Conversaciones vinculadas",

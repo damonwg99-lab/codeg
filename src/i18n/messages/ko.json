@@ -3473,6 +3473,7 @@
       "priority": "우선순위",
       "assignee": "담당자",
       "deadline": "마감일",
+      "searchPlaceholder": "작업 검색…",
       "detail": "작업 상세",
       "basicInfo": "기본 정보",
       "conversations": "연결된 대화",

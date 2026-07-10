@@ -1,9 +1,9 @@
 "use client"
 
-import { useEffect, useState, useCallback, useMemo } from "react"
+import { useEffect, useState, useCallback, useMemo, useRef } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
-import { Plus, GripVertical, Trash2 } from "lucide-react"
+import { Plus, GripVertical, Trash2, Search } from "lucide-react"
 import {
   DndContext,
   closestCorners,
@@ -24,6 +24,14 @@ import {
   TASK_PRIORITY_COLORS,
 } from "@/lib/platform/types"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -294,11 +302,23 @@ export function TaskKanban({ projectId }: { projectId: number }) {
   const [tasks, setTasks] = useState<TaskInfo[]>([])
   const [loading, setLoading] = useState(true)
 
+  const [searchInput, setSearchInput] = useState("")
+  const [searchKeyword, setSearchKeyword] = useState("")
+  const [filterType, setFilterType] = useState<string>("all")
+  const [filterPriority, setFilterPriority] = useState<string>("all")
+
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
   useEffect(() => {
     let cancelled = false
     async function load() {
       try {
-        const list = await listTasks(projectId)
+        const list = await listTasks(
+          projectId,
+          searchKeyword || undefined,
+          filterType !== "all" ? filterType : undefined,
+          filterPriority !== "all" ? filterPriority : undefined
+        )
         if (!cancelled) {
           setTasks(list)
           setLoading(false)
@@ -311,7 +331,7 @@ export function TaskKanban({ projectId }: { projectId: number }) {
     return () => {
       cancelled = true
     }
-  }, [projectId])
+  }, [projectId, searchKeyword, filterType, filterPriority])
 
   const handleDeleteTask = useCallback(
     async (taskId: number) => {
@@ -355,11 +375,16 @@ export function TaskKanban({ projectId }: { projectId: number }) {
       try {
         await updateTaskStatus(taskId, newStatus)
       } catch {
-        const list = await listTasks(projectId)
+        const list = await listTasks(
+          projectId,
+          searchKeyword || undefined,
+          filterType !== "all" ? filterType : undefined,
+          filterPriority !== "all" ? filterPriority : undefined
+        )
         setTasks(list)
       }
     },
-    [tasks, projectId]
+    [tasks, projectId, searchKeyword, filterType, filterPriority]
   )
 
   if (loading) {
@@ -373,9 +398,49 @@ export function TaskKanban({ projectId }: { projectId: number }) {
   return (
     <div className="flex flex-col h-full">
       {/* Toolbar header */}
-      <div className="flex items-center justify-between px-4 py-3 shrink-0 border-b">
-        <h2 className="text-lg font-semibold">{t("task.kanban")}</h2>
+      <div className="flex items-center justify-between px-4 py-3 shrink-0 border-b gap-3">
+        <h2 className="text-lg font-semibold shrink-0">{t("task.kanban")}</h2>
         <div className="flex items-center gap-2">
+          <div className="relative">
+            <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+            <Input
+              placeholder={t("task.searchPlaceholder" as never)}
+              value={searchInput}
+              onChange={(e) => {
+                const val = e.target.value
+                setSearchInput(val)
+                if (debounceRef.current) clearTimeout(debounceRef.current)
+                debounceRef.current = setTimeout(() => {
+                  setSearchKeyword(val)
+                }, 300)
+              }}
+              className="h-8 w-[180px] pl-7 text-[0.8125rem]"
+            />
+          </div>
+          <Select value={filterType} onValueChange={setFilterType}>
+            <SelectTrigger size="sm" className="w-[110px] text-[0.8125rem]">
+              <SelectValue placeholder={t("task.taskType" as never)} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">{t("task.taskType" as never)}</SelectItem>
+              <SelectItem value="bug">{t("task.taskTypeOptions.bug" as never)}</SelectItem>
+              <SelectItem value="feature">{t("task.taskTypeOptions.feature" as never)}</SelectItem>
+              <SelectItem value="task">{t("task.taskTypeOptions.task" as never)}</SelectItem>
+              <SelectItem value="improvement">{t("task.taskTypeOptions.improvement" as never)}</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select value={filterPriority} onValueChange={setFilterPriority}>
+            <SelectTrigger size="sm" className="w-[110px] text-[0.8125rem]">
+              <SelectValue placeholder={t("task.priority" as never)} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">{t("task.priority" as never)}</SelectItem>
+              <SelectItem value="low">{t("task.priorityOptions.low" as never)}</SelectItem>
+              <SelectItem value="medium">{t("task.priorityOptions.medium" as never)}</SelectItem>
+              <SelectItem value="high">{t("task.priorityOptions.high" as never)}</SelectItem>
+              <SelectItem value="urgent">{t("task.priorityOptions.urgent" as never)}</SelectItem>
+            </SelectContent>
+          </Select>
           <Button
             variant="outline"
             size="sm"

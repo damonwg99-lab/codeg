@@ -1,7 +1,7 @@
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait,
-    QueryFilter, QueryOrder, Set, IntoActiveModel,
+    ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, Condition, DatabaseConnection,
+    EntityTrait, QueryFilter, QueryOrder, Set, IntoActiveModel,
 };
 use sea_orm::entity::prelude::DateTimeUtc;
 
@@ -38,10 +38,36 @@ fn to_info(m: platform_task::Model) -> TaskInfo {
 pub async fn list_by_project(
     conn: &DatabaseConnection,
     project_id: i32,
+    keyword: Option<&str>,
+    task_type: Option<&str>,
+    priority: Option<&str>,
 ) -> Result<Vec<TaskInfo>, DbError> {
-    let rows = platform_task::Entity::find()
+    let mut query = platform_task::Entity::find()
         .filter(platform_task::Column::ProjectId.eq(project_id))
-        .filter(platform_task::Column::DeletedAt.is_null())
+        .filter(platform_task::Column::DeletedAt.is_null());
+
+    if let Some(kw) = keyword {
+        if !kw.is_empty() {
+            let kw_cond = Condition::any()
+                .add(platform_task::Column::Title.contains(kw))
+                .add(platform_task::Column::Description.contains(kw));
+            query = query.filter(kw_cond);
+        }
+    }
+
+    if let Some(tt) = task_type {
+        if !tt.is_empty() && tt != "all" {
+            query = query.filter(platform_task::Column::TaskType.eq(tt));
+        }
+    }
+
+    if let Some(pr) = priority {
+        if !pr.is_empty() && pr != "all" {
+            query = query.filter(platform_task::Column::Priority.eq(pr));
+        }
+    }
+
+    let rows = query
         .order_by_asc(platform_task::Column::Status)
         .order_by_desc(platform_task::Column::Priority)
         .all(conn)

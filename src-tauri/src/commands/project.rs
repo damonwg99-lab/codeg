@@ -39,7 +39,7 @@ pub async fn get_project_core(
         .map_err(AppCommandError::from)?;
 
     // Count tasks by status
-    let tasks = crate::db::service::platform_task_service::list_by_project(conn, id)
+    let tasks = crate::db::service::platform_task_service::list_by_project(conn, id, None, None, None)
         .await
         .map_err(AppCommandError::from)?;
 

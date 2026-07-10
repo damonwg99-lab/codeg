@@ -3473,6 +3473,7 @@
       "priority": "Priority",
       "assignee": "Assignee",
       "deadline": "Deadline",
+      "searchPlaceholder": "Search tasks…",
       "detail": "Task detail",
       "basicInfo": "Basic info",
       "conversations": "Linked conversations",

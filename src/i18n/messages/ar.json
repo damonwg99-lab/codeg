@@ -3473,6 +3473,7 @@
       "priority": "الأولوية",
       "assignee": "المسؤول",
       "deadline": "الموعد النهائي",
+      "searchPlaceholder": "البحث عن المهام…",
       "detail": "تفاصيل المهمة",
       "basicInfo": "المعلومات الأساسية",
       "conversations": "المحادثات المرتبطة",

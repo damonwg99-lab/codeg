@@ -126,8 +126,18 @@ export async function scanGitRepos(
 
 // ─── Task ───
 
-export async function listTasks(projectId: number): Promise<TaskInfo[]> {
-  return getTransport().call("list_tasks", { projectId })
+export async function listTasks(
+  projectId: number,
+  keyword?: string,
+  taskType?: string,
+  priority?: string
+): Promise<TaskInfo[]> {
+  return getTransport().call("list_tasks", {
+    projectId,
+    keyword: keyword || null,
+    taskType: taskType || null,
+    priority: priority || null,
+  })
 }
 
 export async function getTask(id: number): Promise<TaskDetail> {

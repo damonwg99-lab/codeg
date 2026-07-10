@@ -20,6 +20,10 @@ use crate::models::{
 #[serde(rename_all = "camelCase")]
 pub struct ListTasksParams {
     pub project_id: i32,
+    pub keyword: Option<String>,
+    #[serde(rename = "taskType")]
+    pub task_type: Option<String>,
+    pub priority: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -156,7 +160,16 @@ pub async fn list_tasks(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<ListTasksParams>,
 ) -> Result<Json<Vec<TaskInfo>>, AppCommandError> {
-    Ok(Json(task_commands::list_tasks_core(&state.db, params.project_id).await?))
+    Ok(Json(
+        task_commands::list_tasks_core(
+            &state.db,
+            params.project_id,
+            params.keyword,
+            params.task_type,
+            params.priority,
+        )
+        .await?,
+    ))
 }
 
 pub async fn get_task(

@@ -3473,6 +3473,7 @@
       "priority": "优先级",
       "assignee": "负责人",
       "deadline": "截止日期",
+      "searchPlaceholder": "搜索任务…",
       "detail": "任务详情",
       "basicInfo": "基本信息",
       "conversations": "关联对话",
