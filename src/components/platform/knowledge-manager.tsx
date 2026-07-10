@@ -329,7 +329,7 @@ export function KnowledgeManager({
               <div className="relative flex-1 max-w-[200px]">
                 <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
                 <Input
-                  className="h-7 pl-7 text-[0.8125rem]"
+                  className="pl-7 text-[0.8125rem] py-2"
                   placeholder={t("kb.search")}
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
@@ -371,7 +371,7 @@ export function KnowledgeManager({
               {t("kb.noDocs")}
             </p>
           ) : (
-            <div className="flex flex-col gap-2">
+            <div className="flex flex-col gap-2 max-h-[50vh] overflow-y-auto">
               {filteredDocs.map((doc) => (
                 <div
                   key={doc.id}

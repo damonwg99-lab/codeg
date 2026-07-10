@@ -488,7 +488,7 @@ export function ProjectDetail({ id }: { id: number }) {
                     {t("project.noRepos")}
                   </p>
                 ) : (
-                  <div className="flex flex-col gap-2">
+                  <div className="flex flex-col gap-2 max-h-[50vh] overflow-y-auto">
                     {repos.map((repo) => (
                       <div
                         key={repo.id}

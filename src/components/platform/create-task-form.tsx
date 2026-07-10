@@ -220,7 +220,7 @@ export function CreateTaskForm({ projectId }: { projectId: number }) {
           <div className="flex items-center gap-2">
             <Input
               type="file"
-              className="h-8"
+              className="file:h-9 file:leading-9 py-0"
               onChange={(e) => {
                 const f = e.target.files?.[0]
                 if (f) {

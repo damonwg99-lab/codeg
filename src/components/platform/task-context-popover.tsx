@@ -330,8 +330,8 @@ export function ProjectResourcePicker({
   if (linkedTask && linkedTaskInfo) {
     // Mode A: Already linked — show task summary + KB files
     return (
-      <div className="flex flex-col max-h-[min(480px,calc(100dvh-2rem))]">
-        <div className="min-h-0 overflow-y-auto p-2">
+      <div className="flex flex-col">
+        <div className="flex flex-col gap-2 p-2">
           {/* Task summary — only show title, no status/priority */}
           <div className="rounded-md border bg-muted/30 p-2.5">
             <div className="truncate text-sm font-medium">
@@ -380,8 +380,8 @@ export function ProjectResourcePicker({
 
   // Mode B/C: No linked task — show KB docs + accordion task list
   return (
-    <div className="flex flex-col max-h-[min(480px,calc(100dvh-2rem))]">
-      <div className="min-h-0 overflow-y-auto p-2">
+    <div className="flex flex-col">
+      <div className="flex flex-col gap-2 p-2">
         {/* KB file selection */}
         {kbLoading ? (
           <div className="flex items-center justify-center py-3 text-xs text-muted-foreground">

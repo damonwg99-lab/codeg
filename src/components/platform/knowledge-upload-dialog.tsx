@@ -108,7 +108,7 @@ export function KnowledgeUploadDialog({
               value={docType}
               onValueChange={(v) => setDocType(v as KbDocType)}
             >
-              <SelectTrigger className="h-7 text-[0.8125rem]">
+              <SelectTrigger className="text-[0.8125rem]">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -133,7 +133,7 @@ export function KnowledgeUploadDialog({
           <div className="flex flex-col gap-1.5">
             <Label>{t("kb.subDir")}</Label>
             <Input
-              className="h-7 text-[0.8125rem]"
+              className="text-[0.8125rem]"
               placeholder={t("kb.subDirPlaceholder")}
               value={subDir}
               onChange={(e) => setSubDir(e.target.value)}
@@ -144,7 +144,7 @@ export function KnowledgeUploadDialog({
           <div className="flex flex-col gap-1.5">
             <Label>{t("kb.selectFile")}</Label>
             <Input
-              className="h-7 text-[0.8125rem]"
+              className="text-[0.8125rem] file:h-9 file:leading-9 py-0"
               type="file"
               onChange={(e) => {
                 const f = e.target.files?.[0]

@@ -88,7 +88,14 @@ export function InjectOptionList({
         // Groups that should always render a bordered card area
         if (isCardGroup) {
           return (
-            <section key={group} className="space-y-1.5">
+            <section
+              key={group}
+              className={cn(
+                "space-y-1.5",
+                group === "kb_docs" &&
+                  "flex flex-col min-h-0 max-h-[320px]"
+              )}
+            >
               <h3
                 className={cn(
                   "font-medium uppercase text-muted-foreground",
@@ -120,7 +127,10 @@ export function InjectOptionList({
               <div
                 className={cn(
                   "rounded-md border",
-                  isEmpty ? "bg-muted/30 p-3" : ""
+                  isEmpty ? "bg-muted/30 p-3" : "",
+                  !isEmpty &&
+                    group === "kb_docs" &&
+                    "overflow-y-auto min-h-0 flex-1"
                 )}
               >
                 {isEmpty ? (
