@@ -1300,15 +1300,6 @@ pub async fn git_push_info(path: String) -> Result<GitPushInfo, AppCommandError>
 
 async fn ensure_tracking_ref(path: &str, remote: &str, branch: &str) {
     let tracking_ref = format!("refs/remotes/{}/{}", remote, branch);
-    let exists = crate::process::tokio_command("git")
-        .args(["rev-parse", "--verify", "--quiet", &tracking_ref])
-        .current_dir(path)
-        .output()
-        .await
-        .is_ok_and(|o| o.status.success());
-    if exists {
-        return;
-    }
     let _ = crate::process::tokio_command("git")
         .args(["update-ref", &tracking_ref, branch])
         .current_dir(path)
