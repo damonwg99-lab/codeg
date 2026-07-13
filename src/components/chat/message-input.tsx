@@ -706,6 +706,7 @@ export function MessageInput({
   }, [taskPopoverOpen, activeProject, linkedTask])
 
   // ─── Quick messages ───
+  const [quickMessages, setQuickMessages] = useState<QuickMessage[]>([])
   const [quickMessagesLoading, setQuickMessagesLoading] = useState(false)
   // Whether the async Clipboard read API is usable here. It's absent in
   // non-secure web deployments served over HTTP/LAN (see installClipboardFallback
