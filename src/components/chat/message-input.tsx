@@ -1087,7 +1087,7 @@ export function MessageInput({
         return
       }
       if (isLegacyMarkdown) {
-        editorRef.current?.insertMarkdownAtCursor(pending)
+        editorRef.current?.insertTextAtCursor(pending)
       } else {
         for (const ref of refs) {
           editor.chain().insertReference(ref).insertContent(" ").run()
