@@ -178,6 +178,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
   const [editing, setEditing] = useState(false)
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [contextPanelOpen, setContextPanelOpen] = useState(false)
+  const [contextPanelKey, setContextPanelKey] = useState(0)
   const [creatingConversation, setCreatingConversation] = useState(false)
 
   // Attachments state
@@ -864,7 +865,10 @@ export function TaskDetail({ taskId }: { taskId: number }) {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => setContextPanelOpen(true)}
+              onClick={() => {
+                setContextPanelKey((k) => k + 1)
+                setContextPanelOpen(true)
+              }}
               disabled={creatingConversation}
             >
               {creatingConversation ? (
@@ -1015,6 +1019,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
         )}
 
         <ContextInjectPanel
+          key={contextPanelKey}
           open={contextPanelOpen}
           onOpenChange={setContextPanelOpen}
           task={detail.task}

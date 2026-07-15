@@ -92,8 +92,7 @@ export function InjectOptionList({
               key={group}
               className={cn(
                 "space-y-1.5",
-                group === "kb_docs" &&
-                  "flex flex-col min-h-0 max-h-[320px]"
+                group === "kb_docs" && "flex flex-col min-h-0 max-h-[320px]"
               )}
             >
               <h3
@@ -107,7 +106,6 @@ export function InjectOptionList({
 
               {/* KB doc search input — above the card container */}
               {group === "kb_docs" &&
-                !isEmpty &&
                 kbDocSearchQuery !== undefined &&
                 onKbDocSearchChange && (
                   <div className="relative">
