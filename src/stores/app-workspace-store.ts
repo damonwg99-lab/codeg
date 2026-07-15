@@ -408,13 +408,10 @@ export const useAppWorkspaceStore = create<AppWorkspaceStoreState>()(
           updated[idx] = detail
           return updated
         }
-        const { folders, allFolders, branches } = get()
-        const nextBranches = new Map(branches)
-        nextBranches.set(id, detail.git_branch ?? null)
+        const { folders, allFolders } = get()
         set({
           folders: patchList(folders),
           allFolders: patchList(allFolders),
-          branches: nextBranches,
         })
       } catch (err) {
         console.error("[AppWorkspace] refreshFolder failed:", err)
