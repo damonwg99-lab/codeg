@@ -24,6 +24,7 @@ import {
   listTaskConversations,
   createConversationForTask,
   uploadTaskAttachment,
+  uploadTaskAiIntermediateDoc,
   listKnowledgeDocs,
   deleteKnowledgeDoc,
   unlinkConversation,
@@ -188,6 +189,15 @@ export function TaskDetail({ taskId }: { taskId: number }) {
   const [deletingAttachment, setDeletingAttachment] = useState(false)
   const [uploadingAttachment, setUploadingAttachment] = useState(false)
 
+  // AI intermediate docs state
+  const [aiIntermediateDocs, setAiIntermediateDocs] = useState<
+    KnowledgeDocInfo[]
+  >([])
+  const [deleteAiDocTarget, setDeleteAiDocTarget] =
+    useState<KnowledgeDocInfo | null>(null)
+  const [deletingAiDoc, setDeletingAiDoc] = useState(false)
+  const [uploadingAiDoc, setUploadingAiDoc] = useState(false)
+
   // Delete conversation dialog state
   const [deleteConvTarget, setDeleteConvTarget] =
     useState<TaskConversationInfo | null>(null)
@@ -246,6 +256,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
         if (!cancelled) {
           setDetail(d)
           setAttachments(d.attachments)
+          setAiIntermediateDocs(d.aiIntermediateDocs ?? [])
           setEditTitle(d.task.title)
           setEditDescription(d.task.description ?? "")
           setEditTaskType(d.task.taskType)
@@ -275,6 +286,17 @@ export function TaskDetail({ taskId }: { taskId: number }) {
       console.error("Failed to reload attachments:", e)
     }
   }, [taskId])
+
+  // ─── Reload AI intermediate docs (used after upload/delete) ───
+  const loadAiIntermediateDocs = useCallback(async () => {
+    if (!activeProject) return
+    try {
+      const d = await getTask(taskId)
+      setAiIntermediateDocs(d.aiIntermediateDocs ?? [])
+    } catch (e) {
+      console.error("Failed to reload AI intermediate docs:", e)
+    }
+  }, [activeProject, taskId])
 
   // Attachments are now loaded via getTask detail (find_by_task_id),
   // so we no longer need the separate listKnowledgeDocs call here.
@@ -323,6 +345,26 @@ export function TaskDetail({ taskId }: { taskId: number }) {
     [activeProject, taskId, loadAttachments]
   )
 
+  // ─── Upload AI intermediate doc ───
+  const handleUploadAiIntermediateDoc = useCallback(
+    async (file: File) => {
+      if (!activeProject) return
+      setUploadingAiDoc(true)
+      try {
+        await uploadTaskAiIntermediateDoc({
+          projectId: activeProject.id,
+          taskId,
+          file,
+        })
+        await loadAiIntermediateDocs()
+      } catch (e) {
+        console.error("AI doc upload failed:", e)
+      }
+      setUploadingAiDoc(false)
+    },
+    [activeProject, taskId, loadAiIntermediateDocs]
+  )
+
   // ─── Delete attachment ───
   const handleDeleteAttachment = useCallback(async () => {
     if (!deleteAttachmentTarget) return
@@ -336,6 +378,20 @@ export function TaskDetail({ taskId }: { taskId: number }) {
     }
     setDeletingAttachment(false)
   }, [deleteAttachmentTarget, loadAttachments])
+
+  // ─── Delete AI intermediate doc ───
+  const handleDeleteAiDoc = useCallback(async () => {
+    if (!deleteAiDocTarget) return
+    setDeletingAiDoc(true)
+    try {
+      await deleteKnowledgeDoc(deleteAiDocTarget.id)
+      setDeleteAiDocTarget(null)
+      await loadAiIntermediateDocs()
+    } catch (e) {
+      console.error("Delete AI doc failed:", e)
+    }
+    setDeletingAiDoc(false)
+  }, [deleteAiDocTarget, loadAiIntermediateDocs])
 
   // ─── Delete linked conversation ───
   // If the conversation still exists (not soft-deleted), delete it entirely
@@ -856,6 +912,91 @@ export function TaskDetail({ taskId }: { taskId: number }) {
           </CardContent>
         </Card>
 
+        {/* ─── AI Intermediate Docs ─── */}
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between gap-3 pb-2">
+            <CardTitle className="text-[0.9375rem]">
+              {t("kb.aiIntermediateDocs")}
+            </CardTitle>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={uploadingAiDoc}
+              onClick={() => {
+                const input = document.createElement("input")
+                input.type = "file"
+                input.onchange = (e) => {
+                  const f = (e.target as HTMLInputElement).files?.[0]
+                  if (f) void handleUploadAiIntermediateDoc(f)
+                }
+                input.click()
+              }}
+            >
+              {uploadingAiDoc ? (
+                <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Upload className="mr-1 h-3.5 w-3.5" />
+              )}
+              {uploadingAiDoc ? t("kb.uploadingAiDoc") : t("kb.addAiDoc")}
+            </Button>
+          </CardHeader>
+          <CardContent
+            className={aiIntermediateDocs.length === 0 ? "pb-3" : ""}
+          >
+            {aiIntermediateDocs.length === 0 ? (
+              <p className="text-[0.75rem] text-muted-foreground">
+                {t("kb.noAiIntermediateDocs")}
+              </p>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {aiIntermediateDocs.map((doc) => (
+                  <div
+                    key={doc.id}
+                    className="flex items-center gap-2 rounded-md border p-2"
+                  >
+                    <FileText className="h-4 w-4 text-muted-foreground shrink-0" />
+                    <div className="flex flex-col gap-0.5 min-w-0">
+                      <span className="text-[0.875rem] font-medium truncate">
+                        {doc.title}
+                      </span>
+                      <span className="text-[0.75rem] text-muted-foreground truncate">
+                        {doc.filePath}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0 ml-auto">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-6 w-6"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          const relPath = kbDocRelPath(
+                            activeProject?.kbLocalDir ?? null,
+                            activeProject?.rootDir ?? "",
+                            activeFolder?.path ?? null,
+                            doc.filePath
+                          )
+                          if (relPath) void openFilePreview(relPath)
+                        }}
+                      >
+                        <Eye className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-6 w-6 text-muted-foreground hover:text-destructive"
+                        onClick={() => setDeleteAiDocTarget(doc)}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
         {/* ─── Linked Conversations ─── */}
         <Card>
           <CardHeader className="flex flex-row items-center justify-between gap-3 pb-2">
@@ -1056,6 +1197,35 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                 disabled={deletingAttachment}
               >
                 {deletingAttachment ? (
+                  <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                ) : null}
+                {t("kb.deleteDoc")}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        {/* ─── Delete AI Doc Confirm ─── */}
+        <AlertDialog
+          open={deleteAiDocTarget !== null}
+          onOpenChange={(open) => {
+            if (!open) setDeleteAiDocTarget(null)
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{t("kb.deleteDoc")}</AlertDialogTitle>
+              <AlertDialogDescription>
+                {t("kb.deleteConfirm")}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>{t("project.cancel")}</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={() => void handleDeleteAiDoc()}
+                disabled={deletingAiDoc}
+              >
+                {deletingAiDoc ? (
                   <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
                 ) : null}
                 {t("kb.deleteDoc")}
