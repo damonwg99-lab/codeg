@@ -532,6 +532,51 @@ export async function uploadTaskAttachment(params: {
   return res.json()
 }
 
+/**
+ * Upload an AI intermediate document for a task via multipart form-data.
+ * In desktop mode, uses Tauri invoke with bytes.
+ */
+export async function uploadTaskAiIntermediateDoc(params: {
+  projectId: number
+  taskId: number
+  file: File
+}): Promise<KnowledgeDocInfo> {
+  const transport = getTransport()
+
+  if (transport.isDesktop()) {
+    const contentBytes = Array.from(
+      new Uint8Array(await params.file.arrayBuffer())
+    )
+    return transport.call("upload_task_ai_intermediate_doc", {
+      projectId: params.projectId,
+      taskId: params.taskId,
+      filename: params.file.name,
+      contentBytes,
+    })
+  }
+
+  // Web/server: multipart upload
+  const formData = new FormData()
+  formData.append("project_id", String(params.projectId))
+  formData.append("task_id", String(params.taskId))
+  formData.append("file", params.file)
+
+  const token = getUploadToken()
+  const baseUrl = getUploadBaseUrl()
+  const res = await fetch(`${baseUrl}/api/upload_task_ai_intermediate_doc`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  })
+  if (!res.ok) {
+    const error = await res
+      .json()
+      .catch(() => ({ message: `HTTP ${res.status}` }))
+    throw error
+  }
+  return res.json()
+}
+
 // ─── Upload helpers (web mode multipart) ───
 
 /** Get the auth token for multipart uploads (shared with main api.ts). */
