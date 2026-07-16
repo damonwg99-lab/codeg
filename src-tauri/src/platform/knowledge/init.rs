@@ -20,6 +20,23 @@ const PRIVATE_SUB_DIRS: &[&str] = &[
 /// Default `.gitignore` content for `_knowledge/`.
 const GITIGNORE_CONTENT: &str = "# 私有区域 — 不纳入 Git 版本管理\n.private/\n";
 
+/// Default `RULES.md` content for `_knowledge/`.
+const RULES_CONTENT: &str = "\
+# Project Rules
+
+## File Storage Convention
+- AI generated task-related documents → `.private/tasks/{task_id}/ai_intermediate/`
+- AI generated non-task-related documents → `.private/ai-intermediate/`
+- Architecture/design docs → `docs/`
+- All task-related files must be saved under `.private/tasks/{task_id}/`
+
+## Code Style
+(Add your project code style rules here)
+
+## Architecture Decisions
+(Add your architectural decisions here)
+";
+
 /// Default `README.md` content for `_knowledge/`.
 const README_CONTENT: &str = "\
 # 📚 项目知识库
@@ -131,12 +148,32 @@ pub fn init_kb_dir(kb_dir: &str) -> Result<KbInitResult, AppCommandError> {
         std::fs::write(&readme_path, README_CONTENT).map_err(AppCommandError::io)?;
     }
 
+    // Create RULES.md if it doesn't exist
+    let rules_path = root.join("RULES.md");
+    let _rules_created = !rules_path.is_file();
+    if !rules_path.is_file() {
+        std::fs::write(&rules_path, RULES_CONTENT).map_err(AppCommandError::io)?;
+    }
+
     Ok(KbInitResult {
         kb_dir: canon_root.to_string_lossy().to_string(),
         sub_dirs: created_sub_dirs,
         gitignore_created,
         readme_created,
     })
+}
+
+/// Ensure `.private/tasks/{task_id}/ai_intermediate/` exists in the KB directory.
+pub fn create_task_ai_intermediate_dir(kb_dir: &str, task_id: i32) -> Result<(), AppCommandError> {
+    let dir = Path::new(kb_dir)
+        .join(".private")
+        .join("tasks")
+        .join(task_id.to_string())
+        .join("ai_intermediate");
+    if !dir.is_dir() {
+        std::fs::create_dir_all(&dir).map_err(AppCommandError::io)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
