@@ -26,9 +26,6 @@ use crate::acp::types::{
 };
 use crate::db::entities::conversation::{self, ConversationKind, ConversationStatus};
 use crate::db::service::conversation_service;
-use crate::db::service::platform_project_service;
-use crate::db::service::platform_task_conversation_service;
-use crate::db::service::platform_task_service;
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
 use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmitter};
@@ -1019,6 +1016,9 @@ impl ConnectionManager {
         }
 
         // ─── First-prompt injection: KB Rules + Task Context ───
+        // Context is built in `acp::context_injection` and wrapped in markers
+        // so the frontend can hide it from the user while the agent's LLM
+        // still sees it.
         let blocks = if !already_linked {
             let (cid, fid) = {
                 let s = state_arc.read().await;
@@ -1026,67 +1026,14 @@ impl ConnectionManager {
             };
             if let (Some(cid), Some(fid)) = (cid, fid) {
                 let mut injected_blocks = Vec::new();
-
-                // 1. Project KB Rules (from RULES.md)
-                if let Ok(Some(project)) =
-                    platform_project_service::get_by_folder_id(&db.conn, fid).await
+                if let Some(block) =
+                    crate::acp::context_injection::build_first_prompt_injection(
+                        &db.conn, cid, fid,
+                    )
+                    .await
                 {
-                    let kb_dir = project.kb_local_dir.unwrap_or_else(|| {
-                        format!("{}/_knowledge", project.root_dir)
-                    });
-                    let rules_path = std::path::Path::new(&kb_dir).join("RULES.md");
-                    if rules_path.is_file() {
-                        match std::fs::read_to_string(&rules_path) {
-                            Ok(content) => {
-                                injected_blocks.push(PromptInputBlock::Text {
-                                    text: format!(
-                                        "=== Project Knowledge Base Rules ===\n{}\n=== End of Rules ===",
-                                        content,
-                                    ),
-                                });
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "[manager] failed to read RULES.md at {}: {e}",
-                                    rules_path.display()
-                                );
-                            }
-                        }
-                    }
+                    injected_blocks.push(block);
                 }
-
-                // 2. Task Context (from platform_task_conversation link)
-                if let Ok(Some(link)) =
-                    platform_task_conversation_service::get_by_conversation(&db.conn, cid)
-                        .await
-                {
-                    if let Ok(Some(task)) =
-                        platform_task_service::get_by_id(&db.conn, link.task_id).await
-                    {
-                        if let Ok(Some(project)) =
-                            platform_project_service::get_by_id(&db.conn, task.project_id).await
-                        {
-                            let kb_dir = project.kb_local_dir.unwrap_or_else(|| {
-                                format!("{}/_knowledge", project.root_dir)
-                            });
-                            injected_blocks.push(PromptInputBlock::Text {
-                                text: format!(
-                                    "=== Task Context ===\n\
-                                     Task ID: {}\n\
-                                     Task Title: {}\n\
-                                     Task Type: {}\n\
-                                     Task Directory: {}/.private/tasks/{}/\n\
-                                     \x20 \x20├── attachments/       # User attachments, do not modify\n\
-                                     \x20 \x20└── ai_intermediate/   # Your generated documents go here\n\
-                                     === End Task Context ===",
-                                    task.id, task.title, task.task_type, kb_dir, task.id,
-                                ),
-                            });
-                        }
-                    }
-                }
-
-                // Prepend injected blocks before user's prompt
                 if !injected_blocks.is_empty() {
                     injected_blocks.extend(blocks);
                     injected_blocks
