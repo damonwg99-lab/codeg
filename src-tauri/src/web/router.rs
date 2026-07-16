@@ -1188,6 +1188,11 @@ pub fn build_router(
             post(handlers::knowledge::upload_task_attachment)
                 .layer(DefaultBodyLimit::disable()),
         )
+        .route(
+            "/upload_task_ai_intermediate_doc",
+            post(handlers::knowledge::upload_task_ai_intermediate_doc)
+                .layer(DefaultBodyLimit::disable()),
+        )
         // Catch-all
         .fallback(api_not_found)
         .layer(middleware::from_fn(move |req, next| {
