@@ -373,6 +373,50 @@ pub async fn upload_task_attachment_core(
         .map_err(AppCommandError::from)
 }
 
+pub async fn upload_task_ai_intermediate_doc_core(
+    db: &AppDatabase,
+    project_id: i32,
+    task_id: i32,
+    filename: String,
+    content_bytes: Vec<u8>,
+) -> Result<KnowledgeDocInfo, AppCommandError> {
+    let conn = &db.conn;
+    let kb_dir = ensure_kb_dir(db, project_id).await?;
+
+    let target_dir = format!(".private/tasks/{task_id}/ai_intermediate");
+    let full_dir = Path::new(&kb_dir).join(&target_dir);
+    tokio::task::block_in_place(|| {
+        std::fs::create_dir_all(&full_dir).map_err(AppCommandError::io)
+    })?;
+
+    let full_path = full_dir.join(&filename);
+    tokio::task::block_in_place(|| {
+        std::fs::write(&full_path, &content_bytes).map_err(AppCommandError::io)
+    })?;
+
+    let file_path = format!("{target_dir}/{filename}");
+    let title = Path::new(&filename)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| filename.clone());
+
+    let draft = UpsertKnowledgeDocDraft {
+        project_id,
+        doc_type: "ai_intermediate".to_string(),
+        title,
+        file_path,
+        is_shared: false,
+        tags_json: None,
+        description: None,
+        skill_name: None,
+        task_id: Some(task_id),
+    };
+
+    platform_knowledge_doc_service::upsert_by_path(conn, draft)
+        .await
+        .map_err(AppCommandError::from)
+}
+
 // ─── KB Init ───
 
 pub async fn init_knowledge_repo_core(
@@ -532,6 +576,18 @@ pub async fn upload_task_attachment(
     content_bytes: Vec<u8>,
 ) -> Result<KnowledgeDocInfo, AppCommandError> {
     upload_task_attachment_core(&db, project_id, task_id, filename, content_bytes).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn upload_task_ai_intermediate_doc(
+    db: State<'_, AppDatabase>,
+    project_id: i32,
+    task_id: i32,
+    filename: String,
+    content_bytes: Vec<u8>,
+) -> Result<KnowledgeDocInfo, AppCommandError> {
+    upload_task_ai_intermediate_doc_core(&db, project_id, task_id, filename, content_bytes).await
 }
 
 #[cfg(feature = "tauri-runtime")]

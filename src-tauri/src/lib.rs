@@ -1068,6 +1068,7 @@ mod tauri_app {
                 knowledge_commands::list_skills,
                 knowledge_commands::upload_kb_doc,
                 knowledge_commands::upload_task_attachment,
+                knowledge_commands::upload_task_ai_intermediate_doc,
                 knowledge_commands::init_knowledge_repo,
                 knowledge_commands::read_kb_doc_content,
                 system_settings::get_system_proxy_settings,
