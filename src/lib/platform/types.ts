@@ -141,6 +141,7 @@ export interface TaskDetail {
   conversations: TaskConversationInfo[]
   subTasks: TaskInfo[]
   attachments: KnowledgeDocInfo[]
+  aiIntermediateDocs: KnowledgeDocInfo[]
 }
 
 export interface TaskConversationInfo {
