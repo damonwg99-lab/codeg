@@ -1071,6 +1071,8 @@ mod tauri_app {
                 knowledge_commands::upload_task_ai_intermediate_doc,
                 knowledge_commands::init_knowledge_repo,
                 knowledge_commands::read_kb_doc_content,
+                knowledge_commands::start_kb_watch,
+                knowledge_commands::stop_kb_watch,
                 system_settings::get_system_proxy_settings,
                 system_settings::update_system_proxy_settings,
                 system_settings::get_system_language_settings,

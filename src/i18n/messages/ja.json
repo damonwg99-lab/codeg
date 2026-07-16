@@ -3731,7 +3731,7 @@
       "uploadingAttachment": "アップロード中…",
       "attachmentUploadFailed": "添付ファイルのアップロードに失敗しました",
       "noAttachments": "添付ファイルなし",
-      "aiIntermediateDocs": "AI Intermediate Docs",
+      "aiIntermediateDocs": "AI Generated Docs",
       "addAiDoc": "アップロード",
       "uploadingAiDoc": "アップロード中…",
       "noAiIntermediateDocs": "AI中間ドキュメントなし",

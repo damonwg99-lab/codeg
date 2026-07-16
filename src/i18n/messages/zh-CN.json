@@ -3731,10 +3731,10 @@
       "uploadingAttachment": "上传中…",
       "attachmentUploadFailed": "附件上传失败",
       "noAttachments": "暂无附件",
-      "aiIntermediateDocs": "AI 中间文档",
+      "aiIntermediateDocs": "AI 生成文档",
       "addAiDoc": "上传",
       "uploadingAiDoc": "上传中…",
-      "noAiIntermediateDocs": "暂无AI中间文档",
+      "noAiIntermediateDocs": "暂无AI生成文档",
       "stagedFiles": "暂存文件",
       "removeFile": "移除",
       "viewAttachment": "查看",
@@ -3742,7 +3742,7 @@
       "typeTemplate": "模板文档",
       "typeSkill": "技能",
       "typeRequirement": "需求文档",
-      "typeAiIntermediate": "AI 中间产物",
+      "typeAiIntermediate": "AI 生成文档",
       "typeTaskAttachment": "任务附件"
     },
     "inject": {

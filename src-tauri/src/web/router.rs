@@ -1178,6 +1178,8 @@ pub fn build_router(
         .route("/list_skills", post(handlers::knowledge::list_skills))
         .route("/init_knowledge_repo", post(handlers::knowledge::init_knowledge_repo))
         .route("/read_kb_doc_content", post(handlers::knowledge::read_kb_doc_content))
+        .route("/start_kb_watch", post(handlers::knowledge::start_kb_watch))
+        .route("/stop_kb_watch", post(handlers::knowledge::stop_kb_watch))
         .route(
             "/upload_kb_doc",
             post(handlers::knowledge::upload_kb_doc)

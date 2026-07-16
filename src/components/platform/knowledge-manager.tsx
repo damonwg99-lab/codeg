@@ -142,8 +142,11 @@ export function KnowledgeManager({
 
   useEffect(() => {
     let cancelled = false
-    async function load() {
+    let unsub: (() => void) | null = null
+
+    async function init() {
       setLoading(true)
+
       try {
         const docList = await listKnowledgeDocs({ projectId })
         if (!cancelled) {
@@ -153,12 +156,39 @@ export function KnowledgeManager({
       } catch {
         if (!cancelled) setLoading(false)
       }
+
+      try {
+        const { getTransport, isDesktop } = await import("@/lib/transport")
+        if (isDesktop()) {
+          const { listen } = await import("@tauri-apps/api/event")
+          unsub = await listen<ScanResultInfo>(
+            "knowledge://index-changed",
+            (event) => {
+              setScanResult(event.payload)
+              void loadDocs()
+            }
+          )
+        } else {
+          unsub = await getTransport().subscribe<ScanResultInfo>(
+            "knowledge://index-changed",
+            (payload) => {
+              setScanResult(payload)
+              void loadDocs()
+            }
+          )
+        }
+      } catch (e) {
+        console.error("[kb-watch] subscribe failed:", e)
+      }
     }
-    void load()
+
+    void init()
+
     return () => {
       cancelled = true
+      unsub?.()
     }
-  }, [projectId])
+  }, [projectId, loadDocs])
 
   // ─── Scan ───
   const handleScan = useCallback(async () => {

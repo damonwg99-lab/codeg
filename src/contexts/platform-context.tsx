@@ -9,7 +9,12 @@ import {
   useState,
   type ReactNode,
 } from "react"
-import { listProjects, getProject } from "@/lib/platform/api"
+import {
+  listProjects,
+  getProject,
+  startKbWatch,
+  stopKbWatch,
+} from "@/lib/platform/api"
 import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import type {
   ProjectInfo,
@@ -116,6 +121,7 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
   // Handles first-time visit (no localStorage) and ensures desktop/web parity.
   useEffect(() => {
     if (activeProjectId === null && projects.length > 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setActiveProjectId(projects[0].id)
     }
   }, [activeProjectId, projects])
@@ -165,6 +171,24 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
       cancelled = true
     }
   }, [activeProjectId, addFolderToWorkspaceById, setWorkspaceActiveFolderId])
+
+  // When activeProjectId changes, start KB watcher for the new project
+  // and stop for the old one (via cleanup). The watcher keeps the KB index
+  // up to date regardless of which page/tab the user is viewing.
+  useEffect(() => {
+    if (activeProjectId === null) return
+    const projectId = activeProjectId
+
+    startKbWatch(projectId).catch((e) =>
+      console.error("[platform-context] start kb watch failed:", e)
+    )
+
+    return () => {
+      stopKbWatch(projectId).catch((e) =>
+        console.error("[platform-context] stop kb watch failed:", e)
+      )
+    }
+  }, [activeProjectId])
 
   const loadProjects = useCallback(async () => {
     setLoadingProjects(true)

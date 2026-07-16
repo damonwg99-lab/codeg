@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Extension, Multipart},
+    http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use serde::Deserialize;
@@ -79,6 +81,18 @@ pub struct InitKnowledgeRepoParams {
 #[serde(rename_all = "camelCase")]
 pub struct ReadKbDocContentParams {
     pub id: i32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartKbWatchParams {
+    pub project_id: i32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopKbWatchParams {
+    pub project_id: i32,
 }
 
 // ─── Handlers ───
@@ -420,4 +434,24 @@ pub async fn upload_task_ai_intermediate_doc(
         )
         .await?,
     ))
+}
+
+pub async fn start_kb_watch(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<StartKbWatchParams>,
+) -> Result<Json<ScanResultInfo>, AppCommandError> {
+    let result = knowledge_commands::start_kb_watch_core(
+        &state.db,
+        &state.emitter,
+        params.project_id,
+    )
+    .await?;
+    Ok(Json(result))
+}
+
+pub async fn stop_kb_watch(
+    Json(params): Json<StopKbWatchParams>,
+) -> impl IntoResponse {
+    knowledge_commands::stop_kb_watch_core(params.project_id);
+    StatusCode::OK
 }

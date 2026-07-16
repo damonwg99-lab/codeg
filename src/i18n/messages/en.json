@@ -3731,10 +3731,10 @@
       "uploadingAttachment": "Uploading…",
       "attachmentUploadFailed": "Attachment upload failed",
       "noAttachments": "No attachments",
-      "aiIntermediateDocs": "AI Intermediate Docs",
+      "aiIntermediateDocs": "AI Generated Docs",
       "addAiDoc": "Add document",
       "uploadingAiDoc": "Uploading…",
-      "noAiIntermediateDocs": "No AI intermediate docs",
+      "noAiIntermediateDocs": "No AI generated docs",
       "stagedFiles": "Staged files",
       "removeFile": "Remove",
       "viewAttachment": "View",
@@ -3742,7 +3742,7 @@
       "typeTemplate": "Template",
       "typeSkill": "Skill",
       "typeRequirement": "Requirement",
-      "typeAiIntermediate": "AI Intermediate",
+      "typeAiIntermediate": "AI Generated",
       "typeTaskAttachment": "Task Attachment"
     },
     "inject": {

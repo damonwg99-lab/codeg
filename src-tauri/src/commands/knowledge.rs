@@ -10,7 +10,8 @@ use crate::models::{
     KnowledgeDocInfo, KbInitResult, ScanResultInfo, SkillInfo,
     UpdateKnowledgeDocDraft, UpsertKnowledgeDocDraft,
 };
-use crate::platform::knowledge::{init, scanner, skill_discovery};
+use crate::platform::knowledge::{init, scanner, skill_discovery, watcher};
+use crate::web::event_bridge::EventEmitter;
 
 const KNOWLEDGE_DIR_NAME: &str = "_knowledge";
 
@@ -228,6 +229,26 @@ pub async fn delete_knowledge_doc_core(
     id: i32,
 ) -> Result<(), AppCommandError> {
     let conn = &db.conn;
+
+    let doc = platform_knowledge_doc_service::get_by_id(conn, id)
+        .await
+        .map_err(AppCommandError::from)?
+        .ok_or_else(|| AppCommandError::not_found(format!("Knowledge doc not found: {id}")))?;
+
+    let kb_dir = ensure_kb_dir(db, doc.project_id).await?;
+    let abs_path = Path::new(&kb_dir).join(&doc.file_path);
+
+    // Delete the actual file if it exists; ignore errors (file may already be
+    // gone e.g. manually removed from disk).
+    if abs_path.exists() {
+        if let Err(e) = tokio::fs::remove_file(&abs_path).await {
+            tracing::warn!(
+                "[kb-delete] failed to remove file {}: {e}",
+                abs_path.display()
+            );
+        }
+    }
+
     platform_knowledge_doc_service::delete(conn, id)
         .await
         .map_err(AppCommandError::from)
@@ -467,6 +488,23 @@ pub async fn read_kb_doc_content_core(
     })
 }
 
+// ─── KB auto-watch ───
+
+pub async fn start_kb_watch_core(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    project_id: i32,
+) -> Result<ScanResultInfo, AppCommandError> {
+    let result = scan_knowledge_repo_core(db, project_id).await?;
+    let kb_dir = ensure_kb_dir(db, project_id).await?;
+    watcher::start_kb_watcher(project_id, &kb_dir, db.clone(), emitter.clone())?;
+    Ok(result)
+}
+
+pub fn stop_kb_watch_core(project_id: i32) {
+    watcher::stop_kb_watcher(project_id);
+}
+
 // ─── Tauri command wrappers (desktop mode only) ───
 
 #[cfg(feature = "tauri-runtime")]
@@ -606,4 +644,21 @@ pub async fn read_kb_doc_content(
     id: i32,
 ) -> Result<String, AppCommandError> {
     read_kb_doc_content_core(&db, id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn start_kb_watch(
+    app: tauri::AppHandle,
+    db: State<'_, AppDatabase>,
+    project_id: i32,
+) -> Result<ScanResultInfo, AppCommandError> {
+    let emitter = EventEmitter::Tauri(app);
+    start_kb_watch_core(&db, &emitter, project_id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub fn stop_kb_watch(project_id: i32) {
+    stop_kb_watch_core(project_id);
 }

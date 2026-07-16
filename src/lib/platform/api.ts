@@ -375,6 +375,14 @@ export async function scanKnowledgeRepo(
   return getTransport().call("scan_knowledge_repo", { projectId })
 }
 
+export async function startKbWatch(projectId: number): Promise<ScanResultInfo> {
+  return getTransport().call("start_kb_watch", { projectId })
+}
+
+export async function stopKbWatch(projectId: number): Promise<void> {
+  return getTransport().call("stop_kb_watch", { projectId })
+}
+
 export async function listKnowledgeDocs(params: {
   projectId: number
   docTypeFilter?: KbDocType | string
