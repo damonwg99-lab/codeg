@@ -35,7 +35,8 @@ pub struct TaskDetail {
     pub task: TaskInfo,
     pub conversations: Vec<TaskConversationInfo>,
     pub sub_tasks: Vec<TaskInfo>,
-    pub attachments: Vec<KnowledgeDocInfo>,
+    pub attachments: Vec<KnowledgeDocInfo>,              // doc_type = "task_attachment"
+    pub ai_intermediate_docs: Vec<KnowledgeDocInfo>,     // doc_type = "ai_intermediate"
 }
 
 #[derive(Debug, Clone, Serialize)]

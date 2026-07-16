@@ -79,15 +79,28 @@ pub async fn get_task_core(
         .await
         .map_err(AppCommandError::from)?;
 
-    let attachments = platform_knowledge_doc_service::find_by_task_id(conn, id)
+    let all_docs = platform_knowledge_doc_service::find_by_task_id(conn, id)
         .await
         .map_err(AppCommandError::from)?;
+
+    let attachments: Vec<_> = all_docs
+        .iter()
+        .filter(|d| d.doc_type == "task_attachment")
+        .cloned()
+        .collect();
+
+    let ai_intermediate_docs: Vec<_> = all_docs
+        .iter()
+        .filter(|d| d.doc_type == "ai_intermediate")
+        .cloned()
+        .collect();
 
     Ok(TaskDetail {
         task,
         conversations,
         sub_tasks,
         attachments,
+        ai_intermediate_docs,
     })
 }
 
