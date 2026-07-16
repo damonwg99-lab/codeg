@@ -29,12 +29,6 @@ const RULES_CONTENT: &str = "\
 - AI generated non-task-related documents → `_knowledge/.private/ai-intermediate/`
 - Architecture/design docs → `_knowledge/docs/`
 - All task-related files must be saved under `_knowledge/.private/tasks/{task_id}/`
-
-## Code Style
-(Add your project code style rules here)
-
-## Architecture Decisions
-(Add your architectural decisions here)
 ";
 
 /// Default `README.md` content for `_knowledge/`.
