@@ -25,7 +25,7 @@ const RULES_CONTENT: &str = "\
 # Project Rules
 
 ## File Storage Convention
-- AI generated task-related documents → `_knowledge/.private/tasks/{task_id}/ai_intermediate/`
+- AI generated task-related documents → `_knowledge/.private/tasks/{task_id}/ai-intermediate/`
 - AI generated non-task-related documents → `_knowledge/.private/ai-intermediate/`
 - Architecture/design docs → `_knowledge/docs/`
 - All task-related files must be saved under `_knowledge/.private/tasks/{task_id}/`
@@ -163,7 +163,7 @@ pub fn create_task_ai_intermediate_dir(kb_dir: &str, task_id: i32) -> Result<(),
         .join(".private")
         .join("tasks")
         .join(task_id.to_string())
-        .join("ai_intermediate");
+        .join("ai-intermediate");
     if !dir.is_dir() {
         std::fs::create_dir_all(&dir).map_err(AppCommandError::io)?;
     }

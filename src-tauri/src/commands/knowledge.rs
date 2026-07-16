@@ -383,7 +383,7 @@ pub async fn upload_task_ai_intermediate_doc_core(
     let conn = &db.conn;
     let kb_dir = ensure_kb_dir(db, project_id).await?;
 
-    let target_dir = format!(".private/tasks/{task_id}/ai_intermediate");
+    let target_dir = format!(".private/tasks/{task_id}/ai-intermediate");
     let full_dir = Path::new(&kb_dir).join(&target_dir);
     tokio::task::block_in_place(|| {
         std::fs::create_dir_all(&full_dir).map_err(AppCommandError::io)

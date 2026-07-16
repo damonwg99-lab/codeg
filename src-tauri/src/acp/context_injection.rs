@@ -75,7 +75,7 @@ pub async fn build_first_prompt_injection(
                      Task Type: {}\n\
                      Task Directory: {}/.private/tasks/{}/\n\
                      \x20 \x20├── attachments/       # User attachments, do not modify\n\
-                     \x20 \x20└── ai_intermediate/   # Your generated documents go here\n\
+                     \x20 \x20└── ai-intermediate/   # Your generated documents go here\n\
                      === End Task Context ===",
                     task.id, task.title, task.task_type, kb_dir, task.id,
                 ));
