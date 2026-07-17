@@ -12,6 +12,7 @@ pub mod quick_message_service;
 pub mod remote_workspace_connection_service;
 pub mod sender_context_service;
 pub mod tab_service;
+pub mod thread_binding_service;
 // ─── Platform services ───
 pub mod platform_project_service;
 pub mod platform_project_repo_service;

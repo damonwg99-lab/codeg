@@ -29,6 +29,7 @@ mod m20260622_platform_000003_create_activity_log;
 mod m20260627_platform_000004_create_knowledge_doc;
 mod m20260630_000001_conversation_parent_id_index;
 mod m20260703_platform_000005_normalize_knowledge_doc_path;
+mod m20260703_000001_chat_channel_thread_binding;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -64,6 +65,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260627_platform_000004_create_knowledge_doc::Migration),
             Box::new(m20260630_000001_conversation_parent_id_index::Migration),
             Box::new(m20260703_platform_000005_normalize_knowledge_doc_path::Migration),
+            Box::new(m20260703_000001_chat_channel_thread_binding::Migration),
         ]
     }
 }
