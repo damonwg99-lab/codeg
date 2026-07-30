@@ -24,6 +24,7 @@ pub struct ListTasksParams {
     #[serde(rename = "taskType")]
     pub task_type: Option<String>,
     pub priority: Option<String>,
+    pub status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +168,7 @@ pub async fn list_tasks(
             params.keyword,
             params.task_type,
             params.priority,
+            params.status,
         )
         .await?,
     ))
@@ -341,4 +343,49 @@ pub async fn create_decomposition(
     Ok(Json(
         task_commands::create_decomposition_core(&state.db, params.source_task_id, params.ai_generated, params.decomposition_json).await?,
     ))
+}
+
+pub async fn link_task_branch(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<serde_json::Value>,
+) -> Result<Json<crate::models::TaskBranchInfo>, AppCommandError> {
+    let task_id = params.get("taskId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let project_id = params.get("projectId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let repo_name = params.get("repoName").and_then(|v| v.as_str()).unwrap_or("");
+    let branch = params.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+    Ok(Json(
+        task_commands::link_task_branch_core(&state.db, task_id, project_id, repo_name, branch)
+            .await?,
+    ))
+}
+
+pub async fn update_task_branch(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<serde_json::Value>,
+) -> Result<Json<crate::models::TaskBranchInfo>, AppCommandError> {
+    let branch_id = params.get("branchId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let status = params.get("status").and_then(|v| v.as_str()).unwrap_or("open");
+    Ok(Json(
+        task_commands::update_task_branch_status_core(&state.db, branch_id, status).await?,
+    ))
+}
+
+pub async fn update_task_db_scripts(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppCommandError> {
+    let task_id = params.get("taskId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let scripts_json = params.get("scriptsJson").and_then(|v| v.as_str()).unwrap_or("[]");
+    task_commands::update_task_db_scripts_core(&state.db, task_id, scripts_json).await?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+pub async fn unlink_task_branch(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppCommandError> {
+    let task_id = params.get("taskId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let branch_id = params.get("branchId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    task_commands::unlink_task_branch_core(&state.db, task_id, branch_id).await?;
+    Ok(Json(serde_json::json!({"ok": true})))
 }

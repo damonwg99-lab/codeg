@@ -49,7 +49,7 @@ pub use platform_project::{
 };
 pub use platform_task::{
     TaskConversationInfo, TaskConversationLaunchInfo, TaskDecompositionInfo, TaskDetail, TaskInfo,
-    TaskTypeMappingInfo,
+    TaskBranchInfo, TaskTypeMappingInfo,
 };
 pub use platform_config::{CredentialInfo, GlobalConfigInfo};
 pub use platform_knowledge_doc::{
@@ -57,3 +57,8 @@ pub use platform_knowledge_doc::{
 };
 pub mod platform_knowledge;
 pub use platform_knowledge::{KbInitResult, ScanResultInfo, ScannedDoc, SkillInfo};
+// ─── Release/Branch models ───
+pub mod platform_release;
+pub use platform_release::{
+    BranchInfo, CreateReleaseParams, ReleaseDetail, ReleaseInfo, ReleaseItemInfo,
+};

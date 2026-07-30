@@ -25,3 +25,7 @@ pub mod platform_global_config;
 pub mod platform_credential;
 pub mod platform_activity_log;
 pub mod platform_knowledge_doc;
+pub mod platform_branch;
+pub mod platform_task_branch;
+pub mod platform_release;
+pub mod platform_release_item;

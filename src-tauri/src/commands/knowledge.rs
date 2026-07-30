@@ -4,7 +4,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::app_error::AppCommandError;
-use crate::db::service::{platform_knowledge_doc_service, platform_project_service};
+use crate::db::service::{
+    platform_branch_service, platform_knowledge_doc_service, platform_project_service,
+    platform_task_service,
+};
 use crate::db::AppDatabase;
 use crate::models::{
     KnowledgeDocInfo, KbInitResult, ScanResultInfo, SkillInfo,
@@ -25,6 +28,27 @@ fn infer_task_id_from_path(file_path: &str) -> Option<i32> {
     } else {
         None
     }
+}
+
+struct BranchLogEntry {
+    repo: String,
+    branch: String,
+}
+
+fn parse_branch_log_line(line: &str) -> Option<BranchLogEntry> {
+    let line = line.trim_start_matches('-').trim();
+    let parts: Vec<&str> = line.splitn(2, ':').collect();
+    if parts.len() == 2 {
+        let repo = parts[0].trim();
+        let branch = parts[1].trim();
+        if !repo.is_empty() && !branch.is_empty() {
+            return Some(BranchLogEntry {
+                repo: repo.to_string(),
+                branch: branch.to_string(),
+            });
+        }
+    }
+    None
 }
 
 // ─── Helper: resolve kb_local_dir for a project, init if missing ───
@@ -140,6 +164,64 @@ pub async fn scan_knowledge_repo_core(
             updated_count += 1;
         } else {
             new_count += 1;
+        }
+    }
+
+    // ─── Post-scan: auto-track branches and DB scripts ───
+    // Process .branch-log.md files to auto-create branch ↔ task associations
+    // Process .sql files to auto-populate related_db_scripts_json on tasks
+    for doc in &scanned_docs {
+        if doc.file_path.ends_with(".branch-log.md")
+            && doc.file_path.contains(".private/tasks/")
+        {
+            if let Some(task_id) = infer_task_id_from_path(&doc.file_path) {
+                let full_path = Path::new(&kb_dir).join(&doc.file_path);
+                if let Ok(content) = std::fs::read_to_string(&full_path) {
+                    for line in content.lines() {
+                        let trimmed = line.trim();
+                        if let Some(entry) = parse_branch_log_line(trimmed) {
+                            let branch = platform_branch_service::upsert(
+                                conn, project_id, &entry.repo, &entry.branch,
+                            )
+                            .await?;
+                            let _ = platform_branch_service::link_to_task(
+                                conn, task_id, branch.id,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+
+        if doc.file_path.ends_with(".sql")
+            && doc.file_path.contains(".private/tasks/")
+            && doc.file_path.contains("ai-intermediate")
+        {
+            if let Some(task_id) = infer_task_id_from_path(&doc.file_path) {
+                let _scripts_json = doc.file_path.clone();
+                // Update task's related_db_scripts_json
+                if let Ok(Some(task)) = platform_task_service::get_by_id(conn, task_id).await {
+                    let mut scripts: Vec<serde_json::Value> = task
+                        .related_db_scripts_json
+                        .as_deref()
+                        .and_then(|j| serde_json::from_str(j).ok())
+                        .unwrap_or_default();
+                    let entry = serde_json::json!({
+                        "path": doc.file_path,
+                        "db": "main",
+                    });
+                    if !scripts.iter().any(|s| s["path"] == doc.file_path) {
+                        scripts.push(entry);
+                        let new_json =
+                            serde_json::to_string(&scripts).unwrap_or_else(|_| "[]".to_string());
+                        let _ = platform_task_service::update_related_db_scripts(
+                            conn, task_id, &new_json,
+                        )
+                        .await;
+                    }
+                }
+            }
         }
     }
 

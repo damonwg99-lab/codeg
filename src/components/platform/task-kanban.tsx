@@ -5,6 +5,12 @@ import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import { Plus, GripVertical, Trash2, Search } from "lucide-react"
 import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/tabs"
+import {
   DndContext,
   closestCorners,
   useDroppable,
@@ -19,7 +25,7 @@ import { listTasks, updateTaskStatus, deleteTask } from "@/lib/platform/api"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import type { TaskInfo, TaskPriority, TaskStatus } from "@/lib/platform/types"
 import {
-  TASK_STATUS_LIST,
+  KANBAN_STATUS_LIST,
   TASK_STATUS_COLORS,
   TASK_PRIORITY_COLORS,
 } from "@/lib/platform/types"
@@ -45,15 +51,17 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { cn } from "@/lib/utils"
+import { ReleaseList } from "@/components/platform/release-list"
+import { ArchiveView } from "@/components/platform/archive-view"
 
-// ── Relative date helper ──
+// 鈹€鈹€ Relative date helper 鈹€鈹€
 
 function formatRelativeDate(iso: string): string {
   const date = new Date(iso)
   return `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")}`
 }
 
-// ── Label resolvers ──
+// 鈹€鈹€ Label resolvers 鈹€鈹€
 
 function resolveStatusLabel(t: (key: never) => string, status: string): string {
   const keyMap: Record<string, string> = {
@@ -61,7 +69,8 @@ function resolveStatusLabel(t: (key: never) => string, status: string): string {
     confirmed: "task.status.confirmed",
     in_progress: "task.status.in_progress",
     done: "task.status.done",
-    released: "task.status.released",
+    pending: "task.status.pending",
+    archived: "task.status.archived",
   }
   const key = keyMap[status]
   return key ? (t(key as never) ?? status) : status
@@ -92,7 +101,7 @@ function resolvePriorityLabel(
   return key ? (t(key as never) ?? priority) : priority
 }
 
-// ── TaskCard ──
+// 鈹€鈹€ TaskCard 鈹€鈹€
 
 function TaskCard({
   task,
@@ -159,7 +168,7 @@ function TaskCard({
         }
       >
         <CardContent className="flex items-stretch p-0">
-          {/* Drag handle — separate from click target */}
+          {/* Drag handle 鈥?separate from click target */}
           <div
             {...attributes}
             {...listeners}
@@ -202,6 +211,33 @@ function TaskCard({
               )}
               <span className="ml-auto">{relativeDate}</span>
             </div>
+            {(task.branchCount > 0 || task.dbScriptCount > 0) && (
+              <div className="flex items-center gap-1 text-[0.625rem] text-muted-foreground">
+                {task.branchCount > 0 && (
+                  <Badge variant="outline" className="text-[0.625rem]">
+                    {t("task.branchesCount")}: {task.branchCount}
+                  </Badge>
+                )}
+                {task.dbScriptCount > 0 && (
+                  <Badge variant="outline" className="text-[0.625rem]">
+                    {t("task.scriptsCount")}: {task.dbScriptCount}
+                  </Badge>
+                )}
+              </div>
+            )}
+            {task.branchStatuses && task.branchStatuses.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1 text-[0.625rem]">
+                {task.branchStatuses.map((bs, i) => (
+                  <Badge
+                    key={i}
+                    variant="secondary"
+                    className="text-[0.625rem]"
+                  >
+                    {bs}
+                  </Badge>
+                ))}
+              </div>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -218,7 +254,7 @@ function TaskCard({
             </AlertDialogCancel>
             <AlertDialogAction disabled={deleting} onClick={handleDelete}>
               {deleting
-                ? t("task.deleteTask" as never) + "…"
+                ? t("task.deleteTask" as never) + "..."
                 : t("task.deleteTask" as never)}
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -228,7 +264,7 @@ function TaskCard({
   )
 }
 
-// ── KanbanColumn ──
+// 鈹€鈹€ KanbanColumn 鈹€鈹€
 
 function KanbanColumn({
   status,
@@ -255,7 +291,7 @@ function KanbanColumn({
         isOver && "bg-accent/30"
       )}
     >
-      {/* Column header — centered */}
+      {/* Column header 鈥?centered */}
       <div className="flex items-center justify-center gap-2 px-2 py-1.5 shrink-0">
         <Badge
           variant="outline"
@@ -294,13 +330,14 @@ function KanbanColumn({
   )
 }
 
-// ── Main kanban board ──
+// 鈹€鈹€ Main kanban board 鈹€鈹€
 
 export function TaskKanban({ projectId }: { projectId: number }) {
   const t = useTranslations("Platform")
   const { setRoute } = useWorkbenchRoute()
   const [tasks, setTasks] = useState<TaskInfo[]>([])
   const [loading, setLoading] = useState(true)
+  const [activeTab, setActiveTab] = useState("kanban")
 
   const [searchInput, setSearchInput] = useState("")
   const [searchKeyword, setSearchKeyword] = useState("")
@@ -390,79 +427,168 @@ export function TaskKanban({ projectId }: { projectId: number }) {
   if (loading) {
     return (
       <div className="flex items-center justify-center py-16 text-muted-foreground">
-        Loading…
-      </div>
+        {t("task.loading")}</div>
     )
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <Tabs value={activeTab} onValueChange={setActiveTab} className="flex h-full flex-col min-h-0 gap-0">
       {/* Toolbar header */}
       <div className="flex items-center justify-between px-4 py-3 shrink-0 border-b gap-3">
-        <h2 className="text-lg font-semibold shrink-0">{t("task.kanban")}</h2>
+        <TabsList className="shrink-0">
+          <TabsTrigger value="kanban">{t("task.kanban")}</TabsTrigger>
+          <TabsTrigger value="release">{t("task.releaseManagement")}</TabsTrigger>
+          <TabsTrigger value="archive">{t("task.archivedTasks")}</TabsTrigger>
+        </TabsList>
         <div className="flex items-center gap-2">
-          <div className="relative">
-            <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
-            <Input
-              placeholder={t("task.searchPlaceholder" as never)}
-              value={searchInput}
-              onChange={(e) => {
-                const val = e.target.value
-                setSearchInput(val)
-                if (debounceRef.current) clearTimeout(debounceRef.current)
-                debounceRef.current = setTimeout(() => {
-                  setSearchKeyword(val)
-                }, 300)
-              }}
-              className="h-8 w-[180px] pl-7 text-[0.8125rem]"
-            />
-          </div>
-          <Select value={filterType} onValueChange={setFilterType}>
-            <SelectTrigger size="sm" className="w-[110px] text-[0.8125rem]">
-              <SelectValue placeholder={t("task.taskType" as never)} />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">{t("task.taskType" as never)}</SelectItem>
-              <SelectItem value="bug">{t("task.taskTypeOptions.bug" as never)}</SelectItem>
-              <SelectItem value="feature">{t("task.taskTypeOptions.feature" as never)}</SelectItem>
-              <SelectItem value="task">{t("task.taskTypeOptions.task" as never)}</SelectItem>
-              <SelectItem value="improvement">{t("task.taskTypeOptions.improvement" as never)}</SelectItem>
-            </SelectContent>
-          </Select>
-          <Select value={filterPriority} onValueChange={setFilterPriority}>
-            <SelectTrigger size="sm" className="w-[110px] text-[0.8125rem]">
-              <SelectValue placeholder={t("task.priority" as never)} />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">{t("task.priority" as never)}</SelectItem>
-              <SelectItem value="low">{t("task.priorityOptions.low" as never)}</SelectItem>
-              <SelectItem value="medium">{t("task.priorityOptions.medium" as never)}</SelectItem>
-              <SelectItem value="high">{t("task.priorityOptions.high" as never)}</SelectItem>
-              <SelectItem value="urgent">{t("task.priorityOptions.urgent" as never)}</SelectItem>
-            </SelectContent>
-          </Select>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setRoute("create-task", { projectId })}
-          >
-            <Plus className="mr-1 h-3.5 w-3.5" />
-            {t("task.create")}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setRoute("task-kanban", { projectId })}
-          >
-            {t("task.list")}
-          </Button>
+          {activeTab === "kanban" && (
+            <>
+              <div className="relative">
+                <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+                <Input
+                  placeholder={t("task.searchPlaceholder" as never)}
+                  value={searchInput}
+                  onChange={(e) => {
+                    const val = e.target.value
+                    setSearchInput(val)
+                    if (debounceRef.current) clearTimeout(debounceRef.current)
+                    debounceRef.current = setTimeout(() => {
+                      setSearchKeyword(val)
+                    }, 300)
+                  }}
+                  className="h-8 w-[180px] pl-7 text-[0.8125rem]"
+                />
+              </div>
+              <Select value={filterType} onValueChange={setFilterType}>
+                <SelectTrigger size="sm" className="w-[110px] text-[0.8125rem]">
+                  <SelectValue placeholder={t("task.taskType" as never)} />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">{t("task.taskType" as never)}</SelectItem>
+                  <SelectItem value="bug">
+                    {t("task.taskTypeOptions.bug" as never)}
+                  </SelectItem>
+                  <SelectItem value="feature">
+                    {t("task.taskTypeOptions.feature" as never)}
+                  </SelectItem>
+                  <SelectItem value="task">
+                    {t("task.taskTypeOptions.task" as never)}
+                  </SelectItem>
+                  <SelectItem value="improvement">
+                    {t("task.taskTypeOptions.improvement" as never)}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              <Select value={filterPriority} onValueChange={setFilterPriority}>
+                <SelectTrigger size="sm" className="w-[110px] text-[0.8125rem]">
+                  <SelectValue placeholder={t("task.priority" as never)} />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">{t("task.priority" as never)}</SelectItem>
+                  <SelectItem value="low">
+                    {t("task.priorityOptions.low" as never)}
+                  </SelectItem>
+                  <SelectItem value="medium">
+                    {t("task.priorityOptions.medium" as never)}
+                  </SelectItem>
+                  <SelectItem value="high">
+                    {t("task.priorityOptions.high" as never)}
+                  </SelectItem>
+                  <SelectItem value="urgent">
+                    {t("task.priorityOptions.urgent" as never)}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setRoute("create-task", { projectId })}
+              >
+                <Plus className="mr-1 h-3.5 w-3.5" />
+                {t("task.create")}
+              </Button>
+            </>
+          )}
+          {activeTab === "release" && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() =>
+                setRoute("create-release", { projectId }, { routeId: "release-list", params: { projectId } })
+              }
+            >
+              <Plus className="mr-1 h-3.5 w-3.5" />
+              {t("task.createRelease")}
+            </Button>
+          )}
+          {activeTab === "archive" && (
+            <>
+              <div className="relative">
+                <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+                <Input
+                  placeholder={t("task.searchPlaceholder" as never)}
+                  value={searchInput}
+                  onChange={(e) => {
+                    const val = e.target.value
+                    setSearchInput(val)
+                    if (debounceRef.current) clearTimeout(debounceRef.current)
+                    debounceRef.current = setTimeout(() => {
+                      setSearchKeyword(val)
+                    }, 300)
+                  }}
+                  className="h-8 w-[180px] pl-7 text-[0.8125rem]"
+                />
+              </div>
+              <Select value={filterType} onValueChange={setFilterType}>
+                <SelectTrigger size="sm" className="w-[110px] text-[0.8125rem]">
+                  <SelectValue placeholder={t("task.taskType" as never)} />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">{t("task.taskType" as never)}</SelectItem>
+                  <SelectItem value="bug">
+                    {t("task.taskTypeOptions.bug" as never)}
+                  </SelectItem>
+                  <SelectItem value="feature">
+                    {t("task.taskTypeOptions.feature" as never)}
+                  </SelectItem>
+                  <SelectItem value="task">
+                    {t("task.taskTypeOptions.task" as never)}
+                  </SelectItem>
+                  <SelectItem value="improvement">
+                    {t("task.taskTypeOptions.improvement" as never)}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              <Select value={filterPriority} onValueChange={setFilterPriority}>
+                <SelectTrigger size="sm" className="w-[110px] text-[0.8125rem]">
+                  <SelectValue placeholder={t("task.priority" as never)} />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">{t("task.priority" as never)}</SelectItem>
+                  <SelectItem value="low">
+                    {t("task.priorityOptions.low" as never)}
+                  </SelectItem>
+                  <SelectItem value="medium">
+                    {t("task.priorityOptions.medium" as never)}
+                  </SelectItem>
+                  <SelectItem value="high">
+                    {t("task.priorityOptions.high" as never)}
+                  </SelectItem>
+                  <SelectItem value="urgent">
+                    {t("task.priorityOptions.urgent" as never)}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </>
+          )}
         </div>
       </div>
 
-      {/* Kanban board — columns fill width equally, each scrolls vertically */}
+      {/* Kanban board */}
+      <TabsContent value="kanban" className="flex-1 min-h-0">
       <DndContext collisionDetection={closestCorners} onDragEnd={handleDragEnd}>
-        <div className="flex flex-1 min-h-0 gap-0 divide-x">
-          {TASK_STATUS_LIST.map((status) => (
+        <div className="hidden md:flex flex-1 min-h-0 gap-0 divide-x">
+          {KANBAN_STATUS_LIST.map((status) => (
             <KanbanColumn
               key={status}
               status={status}
@@ -472,7 +598,60 @@ export function TaskKanban({ projectId }: { projectId: number }) {
             />
           ))}
         </div>
+        <div className="md:hidden h-full overflow-auto p-2 space-y-2">
+          {tasks.length === 0 ? (
+            <p className="text-sm text-muted-foreground p-4 text-center">
+              {t("task.noTasks" as never)}
+            </p>
+          ) : (
+            tasks.map((task) => (
+              <div key={task.id} className="rounded border p-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-muted-foreground">
+                    {resolveStatusLabel(t, task.status)}
+                  </span>
+                  <span
+                    className="flex-1 truncate text-sm font-medium cursor-pointer hover:underline"
+                    onClick={() =>
+                      setRoute("task-detail", {
+                        taskId: task.id,
+                        projectId,
+                      })
+                    }
+                  >
+                    {task.title}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center gap-1 text-[0.625rem] text-muted-foreground">
+                  <Badge variant="outline" className="text-[0.625rem]">
+                    {resolveTypeLabel(t, task.taskType)}
+                  </Badge>
+                  {task.priority && (
+                    <Badge variant="outline" className="text-[0.625rem]">
+                      {resolvePriorityLabel(t, task.priority)}
+                    </Badge>
+                  )}
+                  {task.branchCount > 0 && (
+                    <span>{t("task.branchesCount")}: {task.branchCount}</span>
+                  )}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
       </DndContext>
-    </div>
+      </TabsContent>
+      <TabsContent value="release" className="flex flex-1 min-h-0 overflow-auto">
+        <ReleaseList projectId={projectId} setRoute={setRoute as (id: string) => void} />
+      </TabsContent>
+      <TabsContent value="archive" className="flex flex-1 min-h-0 overflow-auto">
+        <ArchiveView
+          projectId={projectId}
+          searchKeyword={searchKeyword}
+          filterType={filterType}
+          filterPriority={filterPriority}
+        />
+      </TabsContent>
+    </Tabs>
   )
 }

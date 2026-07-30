@@ -27,6 +27,10 @@ export type WorkbenchRouteId =
   | "task-kanban"
   | "task-detail"
   | "create-task"
+  | "release-list"
+  | "release-detail"
+  | "create-release"
+  | "archive-view"
 
 interface WorkbenchRouteContextValue {
   routeId: WorkbenchRouteId

@@ -1210,6 +1210,17 @@ pub fn build_router(
         .route("/update_task_type_mapping", post(handlers::task::update_task_type_mapping))
         .route("/delete_task_type_mapping", post(handlers::task::delete_task_type_mapping))
         .route("/create_decomposition", post(handlers::task::create_decomposition))
+        .route("/link_task_branch", post(handlers::task::link_task_branch))
+        .route("/update_task_branch", post(handlers::task::update_task_branch))
+        .route("/update_task_db_scripts", post(handlers::task::update_task_db_scripts))
+        .route("/unlink_task_branch", post(handlers::task::unlink_task_branch))
+        // ─── Release ───
+        .route("/create_release", post(handlers::release::create_release))
+        .route("/list_releases", post(handlers::release::list_releases))
+        .route("/releases/for_task", get(handlers::release::list_releases_for_task))
+        .route("/get_release", post(handlers::release::get_release))
+        .route("/update_release", post(handlers::release::update_release))
+        .route("/delete_release", post(handlers::release::delete_release))
         // ─── Knowledge Base ───
         .route("/scan_knowledge_repo", post(handlers::knowledge::scan_knowledge_repo))
         .route("/list_knowledge_docs", post(handlers::knowledge::list_knowledge_docs))

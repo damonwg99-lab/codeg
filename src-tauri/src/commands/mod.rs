@@ -40,3 +40,4 @@ pub mod workspace_state;
 pub mod project;
 pub mod task;
 pub mod knowledge;
+pub mod release;

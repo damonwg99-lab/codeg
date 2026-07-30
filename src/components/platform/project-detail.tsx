@@ -38,7 +38,8 @@ function resolveStatusLabel(t: (key: never) => string, status: string): string {
     confirmed: "task.status.confirmed",
     in_progress: "task.status.in_progress",
     done: "task.status.done",
-    released: "task.status.released",
+    pending: "task.status.pending",
+    archived: "task.status.archived",
   }
   const key = keyMap[status]
   return key ? (t(key as never) ?? status) : status
@@ -311,7 +312,7 @@ export function ProjectDetail({ id }: { id: number }) {
             variant="outline"
             className="text-[0.625rem] bg-purple-50 text-purple-700 dark:bg-purple-950 dark:text-purple-300"
           >
-            {taskCountByStatus.released} {resolveStatusLabel(t, "released")}
+            {taskCountByStatus.archived} {resolveStatusLabel(t, "archived")}
           </Badge>
         </div>
 

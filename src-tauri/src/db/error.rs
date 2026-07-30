@@ -12,6 +12,8 @@ pub enum DbError {
     Validation(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("invalid state transition: {0}")]
+    InvalidStateTransition(String),
 }
 
 impl Serialize for DbError {

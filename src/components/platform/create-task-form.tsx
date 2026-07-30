@@ -197,8 +197,11 @@ export function CreateTaskForm({ projectId }: { projectId: number }) {
               <SelectItem value="done">
                 {t("task.statusOptions.done")}
               </SelectItem>
-              <SelectItem value="released">
-                {t("task.statusOptions.released")}
+              <SelectItem value="pending">
+                {t("task.statusOptions.pending")}
+              </SelectItem>
+              <SelectItem value="archived">
+                {t("task.statusOptions.archived")}
               </SelectItem>
             </SelectContent>
           </Select>

@@ -1,7 +1,7 @@
 use crate::app_error::AppCommandError;
 use crate::commands::conversations::create_conversation_core;
 use crate::db::service::{
-    platform_knowledge_doc_service,
+    platform_branch_service, platform_knowledge_doc_service,
     platform_project_service, platform_task_conversation_service,
     platform_task_decomposition_service, platform_task_service, platform_task_type_mapping_service,
 };
@@ -48,17 +48,49 @@ pub async fn list_tasks_core(
     keyword: Option<String>,
     task_type: Option<String>,
     priority: Option<String>,
+    status: Option<String>,
 ) -> Result<Vec<TaskInfo>, AppCommandError> {
     let conn = &db.conn;
-    platform_task_service::list_by_project(
+    let mut tasks = platform_task_service::list_by_project(
         conn,
         project_id,
         keyword.as_deref(),
         task_type.as_deref(),
         priority.as_deref(),
+        status.as_deref(),
     )
     .await
-    .map_err(AppCommandError::from)
+    .map_err(AppCommandError::from)?;
+
+    let branch_counts = platform_branch_service::count_branches_for_tasks(
+        conn,
+        &tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
+    )
+    .await
+    .map_err(AppCommandError::from)?;
+
+    let branch_statuses = platform_branch_service::get_branch_statuses_for_tasks(
+        conn,
+        &tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
+    )
+    .await
+    .map_err(AppCommandError::from)?;
+
+    for task in &mut tasks {
+        task.branch_count = branch_counts.get(&task.id).copied().unwrap_or(0) as i32;
+        task.branch_statuses = branch_statuses
+            .get(&task.id)
+            .cloned()
+            .unwrap_or_default();
+        task.db_script_count = task
+            .related_db_scripts_json
+            .as_ref()
+            .and_then(|j| serde_json::from_str::<Vec<serde_json::Value>>(j).ok())
+            .map(|v| v.len() as i32)
+            .unwrap_or(0);
+    }
+
+    Ok(tasks)
 }
 
 pub async fn get_task_core(
@@ -95,12 +127,39 @@ pub async fn get_task_core(
         .cloned()
         .collect();
 
+    let branch_models =
+        crate::db::service::platform_branch_service::list_task_branches(conn, id)
+            .await
+            .map_err(AppCommandError::from)?;
+    let branch_links =
+        crate::db::service::platform_branch_service::list_task_branch_links(conn, id)
+            .await
+            .map_err(AppCommandError::from)?;
+    let branches: Vec<crate::models::TaskBranchInfo> = branch_models
+        .into_iter()
+        .map(|b| {
+            let created_at = branch_links
+                .iter()
+                .find(|l| l.branch_id == b.id)
+                .map(|l| l.created_at.to_rfc3339())
+                .unwrap_or_default();
+            crate::models::TaskBranchInfo {
+                branch_id: b.id,
+                repo_name: b.repo_name,
+                branch: b.branch,
+                status: b.status,
+                created_at,
+            }
+        })
+        .collect();
+
     Ok(TaskDetail {
         task,
         conversations,
         sub_tasks,
         attachments,
         ai_intermediate_docs,
+        branches,
     })
 }
 
@@ -401,8 +460,9 @@ pub async fn list_tasks(
     keyword: Option<String>,
     task_type: Option<String>,
     priority: Option<String>,
+    status: Option<String>,
 ) -> Result<Vec<TaskInfo>, AppCommandError> {
-    list_tasks_core(&db, project_id, keyword, task_type, priority).await
+    list_tasks_core(&db, project_id, keyword, task_type, priority, status).await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -589,4 +649,135 @@ pub async fn create_decomposition(
     decomposition_json: Option<String>,
 ) -> Result<TaskDecompositionInfo, AppCommandError> {
     create_decomposition_core(&db, source_task_id, ai_generated, decomposition_json).await
+}
+
+// ─── Branch & DB Script management ───
+
+pub async fn link_task_branch_core(
+    db: &AppDatabase,
+    task_id: i32,
+    project_id: i32,
+    repo_name: &str,
+    branch: &str,
+) -> Result<crate::models::TaskBranchInfo, AppCommandError> {
+    let conn = &db.conn;
+    let branch_model =
+        crate::db::service::platform_branch_service::upsert(conn, project_id, repo_name, branch)
+            .await
+            .map_err(AppCommandError::from)?;
+    let link = crate::db::service::platform_branch_service::link_to_task(
+        conn, task_id, branch_model.id,
+    )
+    .await
+    .map_err(AppCommandError::from)?;
+    let branch_model =
+        crate::db::service::platform_branch_service::update_status(
+            conn, branch_model.id, "open",
+        )
+        .await
+        .map_err(AppCommandError::from)?;
+    Ok(crate::models::TaskBranchInfo {
+        branch_id: branch_model.id,
+        repo_name: branch_model.repo_name,
+        branch: branch_model.branch,
+        status: branch_model.status,
+        created_at: link.created_at.to_rfc3339(),
+    })
+}
+
+pub async fn update_task_branch_status_core(
+    db: &AppDatabase,
+    branch_id: i32,
+    status: &str,
+) -> Result<crate::models::TaskBranchInfo, AppCommandError> {
+    let conn = &db.conn;
+    let branch_model =
+        crate::db::service::platform_branch_service::update_status(conn, branch_id, status)
+            .await
+            .map_err(AppCommandError::from)?;
+    Ok(crate::models::TaskBranchInfo {
+        branch_id: branch_model.id,
+        repo_name: branch_model.repo_name,
+        branch: branch_model.branch,
+        status: branch_model.status,
+        created_at: String::new(),
+    })
+}
+
+pub async fn update_task_db_scripts_core(
+    db: &AppDatabase,
+    task_id: i32,
+    scripts_json: &str,
+) -> Result<(), AppCommandError> {
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+    use crate::db::entities::platform_task;
+    use crate::db::error::DbError;
+
+    let conn = &db.conn;
+    let task = platform_task::Entity::find_by_id(task_id)
+        .filter(platform_task::Column::DeletedAt.is_null())
+        .one(conn)
+        .await
+        .map_err(DbError::from)?
+        .ok_or_else(|| AppCommandError::not_found("Task not found"))?;
+
+    let mut active: platform_task::ActiveModel = task.into();
+    active.related_db_scripts_json = Set(Some(scripts_json.to_string()));
+    active.updated_at = Set(chrono::Utc::now());
+    active.update(conn).await.map_err(DbError::from)?;
+
+    Ok(())
+}
+
+pub async fn unlink_task_branch_core(
+    db: &AppDatabase,
+    task_id: i32,
+    branch_id: i32,
+) -> Result<(), AppCommandError> {
+    platform_branch_service::unlink_task_branch(&db.conn, task_id, branch_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    Ok(())
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn link_task_branch(
+    db: tauri::State<'_, AppDatabase>,
+    task_id: i32,
+    project_id: i32,
+    repo_name: String,
+    branch: String,
+) -> Result<crate::models::TaskBranchInfo, AppCommandError> {
+    link_task_branch_core(&db, task_id, project_id, &repo_name, &branch).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn update_task_branch(
+    db: tauri::State<'_, AppDatabase>,
+    branch_id: i32,
+    status: String,
+) -> Result<crate::models::TaskBranchInfo, AppCommandError> {
+    update_task_branch_status_core(&db, branch_id, &status).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn update_task_db_scripts(
+    db: tauri::State<'_, AppDatabase>,
+    task_id: i32,
+    scripts_json: String,
+) -> Result<(), AppCommandError> {
+    update_task_db_scripts_core(&db, task_id, &scripts_json).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn unlink_task_branch(
+    db: tauri::State<'_, AppDatabase>,
+    task_id: i32,
+    branch_id: i32,
+) -> Result<(), AppCommandError> {
+    unlink_task_branch_core(&db, task_id, branch_id).await
 }

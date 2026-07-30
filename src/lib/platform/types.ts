@@ -36,7 +36,8 @@ export interface TaskCountByStatus {
   confirmed: number
   inProgress: number
   done: number
-  released: number
+  pending: number
+  archived: number
 }
 
 export interface ProjectRepoInfo {
@@ -65,8 +66,9 @@ export type TaskStatus =
   | "backlog"
   | "confirmed"
   | "in_progress"
+  | "pending"
   | "done"
-  | "released"
+  | "archived"
 
 export type TaskPriority = "low" | "medium" | "high" | "urgent"
 
@@ -74,16 +76,26 @@ export const TASK_STATUS_LIST: TaskStatus[] = [
   "backlog",
   "confirmed",
   "in_progress",
+  "pending",
   "done",
-  "released",
+  "archived",
+]
+
+export const KANBAN_STATUS_LIST: TaskStatus[] = [
+  "backlog",
+  "confirmed",
+  "in_progress",
+  "done",
+  "pending",
 ]
 
 export const TASK_STATUS_LABELS: Record<TaskStatus, string> = {
   backlog: "Backlog",
   confirmed: "Confirmed",
   in_progress: "In Progress",
+  pending: "\u6682\u7F13",
   done: "Done",
-  released: "Released",
+  archived: "\u5DF2\u5F52\u6863",
 }
 
 export const TASK_STATUS_COLORS: Record<TaskStatus, string> = {
@@ -91,9 +103,9 @@ export const TASK_STATUS_COLORS: Record<TaskStatus, string> = {
   confirmed: "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300",
   in_progress:
     "bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300",
+  pending: "text-orange-500",
   done: "bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300",
-  released:
-    "bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300",
+  archived: "text-gray-400",
 }
 
 export const TASK_PRIORITY_COLORS: Record<TaskPriority, string> = {
@@ -132,6 +144,11 @@ export interface TaskInfo {
   kbRefsJson: string | null
   affectedReposJson: string | null
   delegationConfig: string | null
+  relatedDbScriptsJson: string | null
+  branchCount: number
+  dbScriptCount: number
+  branchStatuses: string[]
+  archivedReleaseCode: string | null
   createdAt: string
   updatedAt: string
 }
@@ -142,6 +159,58 @@ export interface TaskDetail {
   subTasks: TaskInfo[]
   attachments: KnowledgeDocInfo[]
   aiIntermediateDocs: KnowledgeDocInfo[]
+  branches: TaskBranchInfo[]
+}
+
+export interface TaskBranchInfo {
+  branchId: number
+  repoName: string
+  branch: string
+  status: "open" | "uat" | "prd"
+  createdAt: string
+}
+
+export interface ReleaseInfo {
+  id: number
+  projectId: number
+  releaseCode: string
+  title: string | null
+  notes: string | null
+  status: "draft" | "prd_deployed" | "closed"
+  deployer: string | null
+  branchCount: number
+  prdDeployedAt: string | null
+  closedAt: string | null
+  ciJobId: string | null
+  ciWebhookUrl: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ReleaseItemInfo {
+  id: number
+  releaseId: number
+  branchId: number
+  repoName: string
+  branch: string
+  branchStatus: string
+  taskId: number | null
+  taskTitle: string | null
+  externalRefJson: string | null
+}
+
+export interface ReleaseDetail {
+  release: ReleaseInfo
+  items: ReleaseItemInfo[]
+}
+
+export interface CreateReleaseParams {
+  projectId: number
+  title?: string
+  notes?: string
+  deployer?: string
+  branchIds: number[]
+  externalRefsJson?: string
 }
 
 export interface TaskConversationInfo {

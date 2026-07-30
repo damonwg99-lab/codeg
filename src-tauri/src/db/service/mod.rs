@@ -23,3 +23,5 @@ pub mod platform_task_decomposition_service;
 pub mod platform_global_config_service;
 pub mod platform_credential_service;
 pub mod platform_knowledge_doc_service;
+pub mod platform_branch_service;
+pub mod platform_release_service;

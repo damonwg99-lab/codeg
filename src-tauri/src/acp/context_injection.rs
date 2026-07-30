@@ -96,3 +96,40 @@ pub async fn build_first_prompt_injection(
 
     Some(PromptInputBlock::Text { text })
 }
+
+/// Build a compact re-injection preamble for long-running conversations.
+/// Only contains the critical file-storage and branch-tracking rules to
+/// prevent exceeding token budgets.
+pub fn build_reinjection_preamble(kb_dir: &str, task_id: i32) -> String {
+    let task_dir = format!("{kb_dir}/.private/tasks/{task_id}/ai-intermediate/");
+    let branch_log = format!("{kb_dir}/.private/tasks/{task_id}/.branch-log.md");
+
+    format!(
+        "{}\n=== Task Reminder ===\n\
+         Task ID: {task_id}\n\
+         - Save generated documents to: `{task_dir}`\n\
+         - Record new git branches in: `{branch_log}`\n\
+         Format per branch: `- {{repo_name}}: {{branch_name}}`\n\
+         === End Reminder ===\n{}",
+        INJECTION_MARKER_START,
+        INJECTION_MARKER_END,
+    )
+}
+
+/// Whether the current session should receive a re-injection.
+///
+/// Triggers when:
+/// - `message_count` reaches a multiple of `re_injection_interval`
+/// - OR `current_tokens` exceeds 50% of `max_tokens`
+pub fn should_reinject(
+    message_count: usize,
+    current_tokens: usize,
+    max_tokens: usize,
+    re_injection_interval: usize,
+) -> bool {
+    if message_count == 0 {
+        return false;
+    }
+    message_count.is_multiple_of(re_injection_interval)
+        || (current_tokens as f64 / max_tokens as f64) > 0.5
+}
