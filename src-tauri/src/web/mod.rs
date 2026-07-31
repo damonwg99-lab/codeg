@@ -3,6 +3,7 @@ pub mod event_bridge;
 pub mod handlers;
 pub mod port_probe;
 pub mod router;
+pub mod router_platform;
 pub mod shutdown;
 pub mod socket_inherit;
 pub mod ws;
@@ -837,6 +838,10 @@ pub(crate) async fn do_start_web_server_tauri(
             .state::<crate::update::AppUpdateStateHandle>()
             .inner()
             .clone(),
+        // Platform manager — Cluster A: project / zentao / credential state.
+        // Tauri-side initializes this in `tauri_app::run`; HTTP mirrors the
+        // SAME handle so the two surfaces agree on project state.
+        platform_manager: crate::app_state::default_platform_manager(),
     });
 
     // See do_start_web_server_with_state for rationale on the reset.

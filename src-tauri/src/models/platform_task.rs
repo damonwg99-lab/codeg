@@ -1,0 +1,101 @@
+use chrono::{DateTime, Utc};
+use super::AgentType;
+use super::platform_knowledge_doc::KnowledgeDocInfo;
+use serde::Serialize;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskInfo {
+    pub id: i32,
+    pub project_id: i32,
+    pub parent_task_id: Option<i32>,
+    pub title: String,
+    pub description: Option<String>,
+    pub task_type: String,
+    pub status: String,
+    pub priority: Option<String>,
+    pub assignee: Option<String>,
+    pub zentao_id: Option<i32>,
+    pub zentao_type: Option<String>,
+    pub zentao_sync_status: Option<String>,
+    pub deadline: Option<DateTime<Utc>>,
+    pub estimated_hours: Option<f64>,
+    pub consumed_hours: Option<f64>,
+    pub zentao_module: Option<String>,
+    pub kb_refs_json: Option<String>,
+    pub affected_repos_json: Option<String>,
+    pub related_db_scripts_json: Option<String>,
+    pub branch_count: i32,
+    pub db_script_count: i32,
+    pub branch_statuses: Vec<String>,
+    pub archived_release_code: Option<String>,
+    pub delegation_config: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDetail {
+    pub task: TaskInfo,
+    pub conversations: Vec<TaskConversationInfo>,
+    pub sub_tasks: Vec<TaskInfo>,
+    pub attachments: Vec<KnowledgeDocInfo>,              // doc_type = "task_attachment"
+    pub ai_intermediate_docs: Vec<KnowledgeDocInfo>,     // doc_type = "ai_intermediate"
+    pub branches: Vec<TaskBranchInfo>,                   // 任务关联的分支
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskBranchInfo {
+    pub branch_id: i32,
+    pub repo_name: String,
+    pub branch: String,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskConversationInfo {
+    pub id: i32,
+    pub task_id: i32,
+    pub conversation_id: i32,
+    pub conversation_role: String,
+    pub summary: Option<String>,
+    pub injected_docs_json: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskConversationLaunchInfo {
+    pub conversation_id: i32,
+    pub folder_id: i32,
+    pub agent_type: AgentType,
+    pub title: String,
+    pub link: TaskConversationInfo,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskTypeMappingInfo {
+    pub id: i32,
+    pub local_type: String,
+    pub zentao_type: String,
+    pub zentao_module: Option<String>,
+    pub project_id: Option<i32>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDecompositionInfo {
+    pub id: i32,
+    pub source_task_id: i32,
+    pub ai_generated: bool,
+    pub decomposition_json: Option<String>,
+    pub created_at: DateTime<Utc>,
+}

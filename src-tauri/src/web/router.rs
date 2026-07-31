@@ -1266,6 +1266,13 @@ pub fn build_router(
         )
         .route("/terminal_kill", post(handlers::terminal::terminal_kill))
         .route("/terminal_list", post(handlers::terminal::terminal_list))
+        // ─── Platform (Cluster A/B/C/D/E) ──────────────────────────────
+        // Pulled out into `router_platform::platform_routes()` (a standalone
+        // module) so the giant handler list here doesn't carry every platform
+        // endpoint inline; auth/CORS layers below still gate these routes
+        // exactly like the rest of `api` because `.merge(...)` runs BEFORE
+        // `.layer(require_token)`.
+        .merge(crate::web::router_platform::platform_routes())
         // Catch-all
         .fallback(api_not_found)
         .layer(middleware::from_fn(move |req, next| {
