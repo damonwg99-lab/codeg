@@ -12,6 +12,7 @@ use crate::terminal::manager::TerminalManager;
 use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
 use crate::web::WebServerState;
 use crate::workspace_transfer::WorkspaceTransferManager;
+use crate::platform::project::manager::PlatformManager;
 
 pub struct AppState {
     pub db: AppDatabase,
@@ -69,6 +70,11 @@ pub struct AppState {
     /// The upgrade UI subscribes to it and re-syncs from a snapshot on mount,
     /// so download progress survives settings-page navigation and reloads.
     pub update_state: crate::update::AppUpdateStateHandle,
+    /// Platform module state manager (Cluster A/B/C). Phase 1a stub holds no
+    /// runtime state; Phase 1b may add active_project_id and related UI state.
+    /// Backed by `PlatformManager::inner: Arc<Inner>` so cheap clone-ref sharing
+    /// matches main's `Arc<DelegationBroker>` idiom (D8).
+    pub platform_manager: PlatformManager,
 }
 
 pub fn default_system_op_lock() -> Arc<tokio::sync::Mutex<()>> {
@@ -89,6 +95,13 @@ pub fn default_terminal_manager() -> TerminalManager {
 
 pub fn default_chat_channel_manager() -> ChatChannelManager {
     ChatChannelManager::new()
+}
+
+/// Construct a default `PlatformManager` (Cluster A). Cheap to clone via the
+/// internal `Arc<Inner>` so handlers may take an owned `PlatformManager`
+/// snapshot without bumping `AppState` borrow counts.
+pub fn default_platform_manager() -> PlatformManager {
+    PlatformManager::new()
 }
 
 /// Build the delegation broker + token registry + per-process UDS socket
@@ -159,6 +172,11 @@ pub fn build_delegation_stack(
     let feedback = crate::acp::feedback::FeedbackRuntimeConfig::new();
     let ask = crate::acp::question::QuestionRuntimeConfig::new();
     let sessions = crate::acp::session_info::SessionInfoRuntimeConfig::new();
+    // Cluster D: decomposition runtime config starts default-off. Kept local
+    // since the二开 had no settings surface or AppState handle for it — the
+    // toggle is reserved for a future Cluster D settings command. The handle
+    // is cloned into the injection so MCP injection reads the same Arc<RwLock>.
+    let decomposition = crate::acp::decomposition::DecompositionRuntimeConfig::new();
 
     // Install the injection on the manager so spawn_agent picks it up
     // without an extra parameter at every call site.
@@ -170,6 +188,7 @@ pub fn build_delegation_stack(
         feedback: feedback.clone(),
         ask: ask.clone(),
         sessions: sessions.clone(),
+        decomposition: decomposition.clone(),
         // Same backing manager as the listener's question lookup; used only by
         // the run_connection teardown guard to reclaim a parked ask.
         questions: Arc::new(crate::acp::manager::ConnectionManagerQuestionLookup {
@@ -182,6 +201,7 @@ pub fn build_delegation_stack(
         }) as Arc<dyn crate::acp::plan_approval::SessionPlanApprovalAccess>,
     });
 
+    let _ = decomposition; // keep the local alive until after install_delegation
     (broker, tokens, socket_path, feedback, ask, sessions)
 }
 
@@ -236,6 +256,7 @@ impl AppState {
             session_info_config,
             system_op_lock: default_system_op_lock(),
             update_state: default_update_state(),
+            platform_manager: default_platform_manager(),
         }
     }
 }

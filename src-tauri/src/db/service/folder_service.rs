@@ -61,7 +61,7 @@ pub async fn get_folder_by_id(
 /// How [`add_folder_inner`] writes the `parent_id` column. The two callers want
 /// different semantics on reopen of an existing path, which a bare `Option<i32>`
 /// could not express (it conflates "no parent" with "don't touch the parent").
-enum ParentWrite {
+pub(crate) enum ParentWrite {
     /// Plain open: leave an existing row's `parent_id` untouched (insert NULL).
     /// A plain reopen must never clear a worktree's recorded root.
     Preserve,
@@ -75,7 +75,7 @@ pub async fn add_folder(
     conn: &DatabaseConnection,
     path: &str,
 ) -> Result<FolderHistoryEntry, DbError> {
-    add_folder_inner(conn, path, ParentWrite::Preserve).await
+    add_folder_inner(conn, path, ParentWrite::Preserve, FolderKind::Regular).await
 }
 
 /// Like [`add_folder`] but authoritatively sets `parent_id` — the *root* folder
@@ -88,13 +88,20 @@ pub async fn add_folder_with_parent(
     path: &str,
     parent_id: Option<i32>,
 ) -> Result<FolderHistoryEntry, DbError> {
-    add_folder_inner(conn, path, ParentWrite::Set(parent_id)).await
+    add_folder_inner(
+        conn,
+        path,
+        ParentWrite::Set(parent_id),
+        FolderKind::Regular,
+    )
+    .await
 }
 
-async fn add_folder_inner(
+pub(crate) async fn add_folder_inner(
     conn: &DatabaseConnection,
     path: &str,
     parent: ParentWrite,
+    kind: FolderKind,
 ) -> Result<FolderHistoryEntry, DbError> {
     let now = Utc::now();
     let name = std::path::Path::new(path)
@@ -144,7 +151,7 @@ async fn add_folder_inner(
                 ParentWrite::Preserve => None,
                 ParentWrite::Set(parent_id) => parent_id,
             }),
-            kind: Set(FolderKind::Regular),
+            kind: Set(kind),
             alias: Set(None),
         };
         active.insert(conn).await?

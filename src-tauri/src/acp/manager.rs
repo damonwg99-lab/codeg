@@ -1066,6 +1066,38 @@ impl ConnectionManager {
             .await;
         }
 
+        // ─── First-prompt context injection (Platform KB Rules + Task Context) ───
+        // Only on the genuine first-prompt path (`!already_linked`): prepends an
+        // injected block (built in `acp::context_injection`) wrapped in markers
+        // so the frontend can hide it from the user while the agent's LLM still
+        // sees it. On follow-up turns (`already_linked == true`) or when no
+        // project/task is linked, no block is injected and `blocks` is unchanged.
+        let blocks = if !already_linked {
+            let (cid, fid) = {
+                let s = state_arc.read().await;
+                (s.conversation_id, s.folder_id)
+            };
+            if let (Some(cid), Some(fid)) = (cid, fid) {
+                if let Some(block) =
+                    crate::acp::context_injection::build_first_prompt_injection(
+                        &db.conn, cid, fid,
+                    )
+                    .await
+                {
+                    let mut injected = Vec::with_capacity(blocks.len() + 1);
+                    injected.push(block);
+                    injected.extend(blocks);
+                    injected
+                } else {
+                    blocks
+                }
+            } else {
+                blocks
+            }
+        } else {
+            blocks
+        };
+
         // Capture a bounded preview of the user's message BEFORE `blocks` is
         // moved into `send_prompt_inner`. Only on the genuine UI path
         // (`delegation.is_none()`): delegation / sub-agent prompts are not user

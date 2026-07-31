@@ -2512,6 +2512,13 @@ pub struct DelegationInjection {
     /// is on, and the companion's `--features` lists `sessions` to expose the
     /// `get_session_info` tool. No teardown handle (the lookup is stateless).
     pub sessions: crate::acp::session_info::SessionInfoRuntimeConfig,
+    /// Hot-swappable "is create_task_decomposition enabled?" flag. Read at
+    /// injection time alongside the other four so `codeg-mcp` is injected
+    /// when ANY of the five is on, and the companion's `--features` lists
+    /// `decomposition` to expose the `create_task_decomposition` tool. No
+    /// teardown handle (the tool is local-only — handled in-process by the
+    /// companion without a broker round-trip).
+    pub decomposition: crate::acp::decomposition::DecompositionRuntimeConfig,
     /// Question registry handle for the teardown cascade. The `run_connection`
     /// cleanup guard calls `cancel_questions_by_parent` through this so a pending
     /// `ask_user_question` is reclaimed synchronously on disconnect, mirroring
@@ -2617,8 +2624,14 @@ fn companion_features_arg(
     feedback_enabled: bool,
     ask_enabled: bool,
     sessions_enabled: bool,
+    decomposition_enabled: bool,
 ) -> Option<String> {
-    if !delegation_enabled && !feedback_enabled && !ask_enabled && !sessions_enabled {
+    if !delegation_enabled
+        && !feedback_enabled
+        && !ask_enabled
+        && !sessions_enabled
+        && !decomposition_enabled
+    {
         return None;
     }
     let mut features: Vec<&str> = Vec::new();
@@ -2633,6 +2646,9 @@ fn companion_features_arg(
     }
     if sessions_enabled {
         features.push("sessions");
+    }
+    if decomposition_enabled {
+        features.push("decomposition");
     }
     Some(features.join(","))
 }
@@ -2659,12 +2675,14 @@ async fn inject_codeg_mcp(
     let feedback_enabled = injection.feedback.is_enabled().await;
     let ask_enabled = injection.ask.is_enabled().await;
     let sessions_enabled = injection.sessions.is_enabled().await;
+    let decomposition_enabled = injection.decomposition.is_enabled().await;
     // `None` (no feature enabled) short-circuits the whole injection.
     let features_arg = companion_features_arg(
         delegation_enabled,
         feedback_enabled,
         ask_enabled,
         sessions_enabled,
+        decomposition_enabled,
     )?;
     let Some(binary_path) = locate_codeg_mcp_binary() else {
         tracing::warn!(
@@ -10655,6 +10673,7 @@ mod tests {
             feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
             ask: crate::acp::question::QuestionRuntimeConfig::new(),
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
+            decomposition: crate::acp::decomposition::DecompositionRuntimeConfig::new(),
             questions: Arc::new(NoQuestions)
                 as Arc<dyn crate::acp::question::SessionQuestionAccess>,
             plan_approvals: Arc::new(NoPlanApprovals)
@@ -10754,32 +10773,40 @@ mod tests {
     #[test]
     fn companion_features_arg_inject_skip_decision() {
         // All off → no companion at all.
-        assert_eq!(companion_features_arg(false, false, false, false), None);
+        assert_eq!(
+            companion_features_arg(false, false, false, false, false),
+            None
+        );
         // Delegation only.
         assert_eq!(
-            companion_features_arg(true, false, false, false),
+            companion_features_arg(true, false, false, false, false),
             Some("delegation".to_string())
         );
         // Feedback only — the decoupling: companion injected for feedback even
         // when delegation is off.
         assert_eq!(
-            companion_features_arg(false, true, false, false),
+            companion_features_arg(false, true, false, false, false),
             Some("feedback".to_string())
         );
         // Ask only — likewise injects the companion on its own.
         assert_eq!(
-            companion_features_arg(false, false, true, false),
+            companion_features_arg(false, false, true, false, false),
             Some("ask".to_string())
         );
         // Sessions only — likewise injects the companion on its own.
         assert_eq!(
-            companion_features_arg(false, false, false, true),
+            companion_features_arg(false, false, false, true, false),
             Some("sessions".to_string())
+        );
+        // Decomposition only — likewise injects the companion on its own.
+        assert_eq!(
+            companion_features_arg(false, false, false, false, true),
+            Some("decomposition".to_string())
         );
         // All on → comma-joined, in declaration order.
         assert_eq!(
-            companion_features_arg(true, true, true, true),
-            Some("delegation,feedback,ask,sessions".to_string())
+            companion_features_arg(true, true, true, true, true),
+            Some("delegation,feedback,ask,sessions,decomposition".to_string())
         );
     }
 }

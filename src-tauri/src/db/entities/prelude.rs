@@ -15,3 +15,19 @@ pub use super::folder_command::Entity as FolderCommand;
 pub use super::model_provider::Entity as ModelProvider;
 pub use super::opened_tab::Entity as OpenedTab;
 pub use super::quick_message::Entity as QuickMessage;
+
+// ─── Platform entities (Cluster A/B/C) ───
+pub use super::platform_activity_log::Entity as PlatformActivityLog;
+pub use super::platform_branch::Entity as PlatformBranch;
+pub use super::platform_credential::Entity as PlatformCredential;
+pub use super::platform_global_config::Entity as PlatformGlobalConfig;
+pub use super::platform_knowledge_doc::Entity as PlatformKnowledgeDoc;
+pub use super::platform_project::Entity as PlatformProject;
+pub use super::platform_project_repo::Entity as PlatformProjectRepo;
+pub use super::platform_release::Entity as PlatformRelease;
+pub use super::platform_release_item::Entity as PlatformReleaseItem;
+pub use super::platform_task::Entity as PlatformTask;
+pub use super::platform_task_branch::Entity as PlatformTaskBranch;
+pub use super::platform_task_conversation::Entity as PlatformTaskConversation;
+pub use super::platform_task_decomposition::Entity as PlatformTaskDecomposition;
+pub use super::platform_task_type_mapping::Entity as PlatformTaskTypeMapping;

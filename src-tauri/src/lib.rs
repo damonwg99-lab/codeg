@@ -33,6 +33,7 @@ pub mod paths;
 pub mod pet_sessions;
 pub mod pet_state_mapper;
 pub mod pets;
+pub mod platform;
 #[cfg(feature = "tauri-runtime")]
 pub mod preferences;
 pub mod process;
@@ -63,15 +64,20 @@ mod tauri_app {
         automation as automation_commands, background as background_commands, backup,
         chat_channel as chat_channel_commands, conversations,
         custom_skills as custom_skills_commands, delegation as delegation_commands,
-        experts as experts_commands, feedback as feedback_commands, file_io, folder_commands,
+        experts as experts_commands, feedback as feedback_commands, file_io, file_search,
+        folder_commands,
+        knowledge as knowledge_commands,
         office_tools as office_tools_commands,
         folders, logging as logging_commands, mcp as mcp_commands,
         model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
+        project as project_commands,
         question as question_commands, quick_messages as quick_messages_commands,
+        release as release_commands,
         remote_proxy as remote_proxy_commands,
         remote_workspace as remote_workspace_commands, science as science_commands,
         session_info as session_info_commands,
-        system_settings, terminal as terminal_commands,
+        system_settings, task as task_commands,
+        terminal as terminal_commands,
         version_control, windows, workspace_state as workspace_state_commands,
     };
     use crate::terminal::manager::TerminalManager;
@@ -236,6 +242,11 @@ mod tauri_app {
             // embedded web server's AppState so HTTP and webview clients see the
             // same download progress; lets the upgrade UI survive navigation.
             .manage(crate::update::new_update_state_handle())
+            // Cluster A: PlatformManager shared state for the project/task/release
+            // surface. Cheap to clone via inner Arc; tauri commands reach it via
+            // `app.state::<PlatformManager>()`. Mirrors main's idiom for the
+            // other long-lived manage()'d singletons.
+            .manage(crate::app_state::default_platform_manager())
             .setup(|app| {
                 let app_data_dir = app.path().app_data_dir()?;
 
@@ -1268,6 +1279,70 @@ mod tauri_app {
                 web::get_web_service_config,
                 web::update_web_service_config,
                 web::probe_web_service_port,
+
+                // ─── Platform (Cluster A/B/C/D/E) ───────────────────────────
+                // File content search (Cluster E).
+                file_search::search_files_content_streaming,
+
+                // Project + zentao integration + credentials (Cluster A).
+                project_commands::list_projects,
+                project_commands::get_project,
+                project_commands::create_project,
+                project_commands::update_project,
+                project_commands::delete_project,
+                project_commands::list_project_repos,
+                project_commands::add_project_repo,
+                project_commands::remove_project_repo,
+                project_commands::scan_git_repos,
+                project_commands::get_global_config,
+                project_commands::set_global_config,
+                project_commands::save_credential,
+                project_commands::delete_credential,
+
+                // Tasks + task-type mapping + decomposition + branch links (Clusters A/B/D).
+                task_commands::list_tasks,
+                task_commands::get_task,
+                task_commands::create_task,
+                task_commands::update_task,
+                task_commands::update_task_status,
+                task_commands::delete_task,
+                task_commands::link_conversation,
+                task_commands::create_conversation_for_task,
+                task_commands::unlink_conversation,
+                task_commands::list_task_conversations,
+                task_commands::get_task_by_conversation,
+                task_commands::list_task_type_mappings,
+                task_commands::create_task_type_mapping,
+                task_commands::update_task_type_mapping,
+                task_commands::delete_task_type_mapping,
+                task_commands::create_decomposition,
+                task_commands::link_task_branch,
+                task_commands::update_task_branch,
+                task_commands::update_task_db_scripts,
+                task_commands::unlink_task_branch,
+
+                // Releases (Cluster B).
+                release_commands::create_release,
+                release_commands::list_releases,
+                release_commands::get_release,
+                release_commands::update_release,
+                release_commands::delete_release,
+
+                // Knowledge Base: scan / docs / skills / upload / watcher (Cluster C).
+                knowledge_commands::scan_knowledge_repo,
+                knowledge_commands::list_knowledge_docs,
+                knowledge_commands::search_knowledge_docs,
+                knowledge_commands::get_knowledge_doc,
+                knowledge_commands::update_knowledge_doc,
+                knowledge_commands::delete_knowledge_doc,
+                knowledge_commands::list_skills,
+                knowledge_commands::upload_kb_doc,
+                knowledge_commands::upload_task_attachment,
+                knowledge_commands::upload_task_ai_intermediate_doc,
+                knowledge_commands::init_knowledge_repo,
+                knowledge_commands::read_kb_doc_content,
+                knowledge_commands::start_kb_watch,
+                knowledge_commands::stop_kb_watch,
             ])
             .build(tauri::generate_context!())
             .expect("error while building tauri application")

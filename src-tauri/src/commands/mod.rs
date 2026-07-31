@@ -23,6 +23,12 @@ pub mod office_tools;
 pub mod notification;
 pub mod pet;
 pub mod project_boot;
+// ─── Platform commands (Cluster A/B/C) ───
+pub mod file_search;
+pub mod knowledge;
+pub mod project;
+pub mod release;
+pub mod task;
 pub mod question;
 pub mod quick_messages;
 #[cfg(feature = "tauri-runtime")]

@@ -1,6 +1,6 @@
 [package]
 name = "codeg"
-version = "0.22.2"
+version = "1.0.8"
 description = "Agent Code Generation App"
 authors = ["feitao"]
 edition = "2021"
@@ -69,6 +69,11 @@ dirs = "6"
 if-addrs = "0.13"
 walkdir = "2"
 ignore = "0.4"
+# Parallel directory traversal for `search_files_content_streaming` (Cluster E).
+rayon = "1"
+# Skill manifest parsing for the project knowledge-base skill discovery
+# (Cluster C). Vendored libyaml bindings; pinned to the 0.9 line.
+yaml-rust2 = "0.9"
 sacp = "11.0.0"
 sacp-tokio = "11.0.0"
 tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt", "net", "rt-multi-thread"] }

@@ -291,6 +291,7 @@ async fn async_main() -> ExitCode {
         session_info_config: session_info_config.clone(),
         system_op_lock: codeg_lib::app_state::default_system_op_lock(),
         update_state: codeg_lib::app_state::default_update_state(),
+        platform_manager: codeg_lib::app_state::default_platform_manager(),
     });
 
     // Logging phase 3: wire the emitter so the Logs viewer's live tail

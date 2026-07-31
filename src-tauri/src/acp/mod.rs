@@ -43,3 +43,7 @@ pub use session_state::{
 pub use types::{
     user_blocks_from_prompt, AcpEvent, ConversationConnectionInfo, EventEnvelope, UserMessageBlock,
 };
+
+// ─── Platform ACP modules (Cluster C/D) ───
+pub mod context_injection;
+pub mod decomposition;

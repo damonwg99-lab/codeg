@@ -151,5 +151,43 @@
         }
       }
     }
+  },
+  {
+    "name": "create_task_decomposition",
+    "description": "Propose a breakdown of a parent task into a list of sub-tasks, so the user can review and confirm them in the CodeG interface before any sub-task is created. This tool is LOCAL-ONLY: it never blocks, makes no broker round-trip, and returns immediately with a confirmation that just echoes the count of proposed sub-tasks. The user reviews the proposal as a card surfaced in the conversation — they can edit, add, or remove sub-tasks, choose a parent task and target project, and confirm (or dismiss) the batch. Do NOT call this tool if the user's request is already clear and atomic; reserve it for non-trivial tasks the user would benefit from reviewing a split for. The proposal itself is the deliverable here — actually creating the sub-tasks is the user's confirmation step, not yours.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["subTasks"],
+      "properties": {
+        "subTasks": {
+          "type": "array",
+          "minItems": 1,
+          "description": "One or more proposed sub-tasks. The user reviews, edits, and confirms this list; each confirmed item becomes a real task under the chosen parent.",
+          "items": {
+            "type": "object",
+            "required": ["title", "description"],
+            "properties": {
+              "title": {
+                "type": "string",
+                "description": "A concise, action-oriented sub-task title."
+              },
+              "description": {
+                "type": "string",
+                "description": "What this sub-task entails: the goal, the acceptance criteria, and any constraints a downstream agent should know."
+              },
+              "priority": {
+                "type": "string",
+                "enum": ["low", "medium", "high"],
+                "description": "Suggested priority (default medium if omitted)."
+              },
+              "task_type": {
+                "type": "string",
+                "description": "Optional task-type slug from the platform's configured task-type mapping; omitted means the platform default."
+              }
+            }
+          }
+        }
+      }
+    }
   }
 ]

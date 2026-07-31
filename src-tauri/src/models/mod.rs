@@ -41,3 +41,27 @@ pub use system::{
     GitHubTokenValidation, GitSettings, SystemLanguageSettings, SystemProxySettings,
     SystemTerminalSettings, TerminalShellOption,
 };
+
+// ─── Platform models (Cluster A/B/C) ───
+pub mod platform_project;
+pub mod platform_task;
+pub mod platform_config;
+pub mod platform_knowledge_doc;
+pub use platform_project::{
+    GitRepoScanResult, ProjectDetail, ProjectInfo, ProjectRepoInfo, TaskCountByStatus,
+};
+pub use platform_task::{
+    TaskBranchInfo, TaskConversationInfo, TaskConversationLaunchInfo, TaskDecompositionInfo,
+    TaskDetail, TaskInfo, TaskTypeMappingInfo,
+};
+pub use platform_config::{CredentialInfo, GlobalConfigInfo};
+pub use platform_knowledge_doc::{
+    CreateKnowledgeDocDraft, KnowledgeDocInfo, UpdateKnowledgeDocDraft, UpsertKnowledgeDocDraft,
+};
+pub mod platform_knowledge;
+pub use platform_knowledge::{KbInitResult, ScanResultInfo, ScannedDoc, SkillInfo};
+// ─── Release/Branch models (Cluster B) ───
+pub mod platform_release;
+pub use platform_release::{
+    BranchInfo, CreateReleaseParams, ReleaseDetail, ReleaseInfo, ReleaseItemInfo,
+};

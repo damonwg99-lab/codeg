@@ -14,3 +14,17 @@ pub mod remote_workspace_connection_service;
 pub mod sender_context_service;
 pub mod tab_service;
 pub mod thread_binding_service;
+
+// ─── Platform services (Cluster A/B/C) ───
+pub mod platform_branch_service;
+pub mod platform_credential_service;
+pub mod platform_folder_kind;
+pub mod platform_global_config_service;
+pub mod platform_knowledge_doc_service;
+pub mod platform_project_repo_service;
+pub mod platform_project_service;
+pub mod platform_release_service;
+pub mod platform_task_conversation_service;
+pub mod platform_task_decomposition_service;
+pub mod platform_task_service;
+pub mod platform_task_type_mapping_service;

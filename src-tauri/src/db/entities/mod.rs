@@ -15,3 +15,19 @@ pub mod opened_tab;
 pub mod prelude;
 pub mod quick_message;
 pub mod remote_workspace_connection;
+
+// ─── Platform entities (Cluster A/B/C) ───
+pub mod platform_activity_log;
+pub mod platform_branch;
+pub mod platform_credential;
+pub mod platform_global_config;
+pub mod platform_knowledge_doc;
+pub mod platform_project;
+pub mod platform_project_repo;
+pub mod platform_release;
+pub mod platform_release_item;
+pub mod platform_task;
+pub mod platform_task_branch;
+pub mod platform_task_conversation;
+pub mod platform_task_decomposition;
+pub mod platform_task_type_mapping;
