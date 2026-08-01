@@ -51,6 +51,7 @@ import {
 } from "@/contexts/workspace-context"
 import { RemoteConnectionGate } from "@/contexts/remote-connection-context"
 import { UpdateProvider } from "@/components/providers/update-provider"
+import { PlatformProvider } from "@/contexts/platform-context"
 import { useWorkspaceBackground, useZoomLevel } from "@/hooks/use-appearance"
 import { FILL_MODE_STYLE } from "@/lib/workspace-background"
 import { TabBar } from "@/components/tabs/tab-bar"
@@ -1151,7 +1152,14 @@ function WorkbenchRouteConversationSync() {
 function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
   return (
     <AppWorkspaceProvider>
-      <AlertProvider>
+      {/* Platform (Cluster A) — scoped project context. Mounted OUTSIDE
+          ConversationRuntimeProvider per D31 so platform pages (project/task
+          releases) can read active project + repos without spawning an ACP
+          session. Sits inside AppWorkspaceProvider because platform-context
+          needs the workspace folder/activeFolder APIs to auto-open the
+          project's root folder. */}
+      <PlatformProvider>
+        <AlertProvider>
         <GitCredentialProvider>
           <TaskProvider>
             <AcpConnectionsProvider>
@@ -1196,6 +1204,7 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
           </TaskProvider>
         </GitCredentialProvider>
       </AlertProvider>
+      </PlatformProvider>
     </AppWorkspaceProvider>
   )
 }

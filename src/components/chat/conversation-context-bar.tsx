@@ -33,6 +33,8 @@ import {
 } from "@/lib/folder-display"
 import { FolderAliasLabel } from "@/components/conversations/folder-alias-label"
 import { BranchDropdown } from "@/components/layout/branch-dropdown"
+import { usePlatform } from "@/contexts/platform-context"
+import { isHiddenFolderKind } from "@/lib/platform/types"
 
 interface ConversationContextBarProps {
   extraContent?: React.ReactNode
@@ -247,6 +249,14 @@ export const ConversationFolderBranchPicker = memo(
     const folders = useAppWorkspaceStore((s) => s.folders)
     const allFolders = useAppWorkspaceStore((s) => s.allFolders)
 
+    // Platform (Cluster A) — when an active project exists, the picker is
+    // SCOPED to that project's repos (root folder + sub-repos) and folds down
+    // to just the branch picker when the project has <=1 repo. With no active
+    // project, falls back to main's default (top-level non-chat repos), with
+    // platform_repo sub-repo folders additionally excluded so they don't leak
+    // a project's hidden repos into the unscoped list (D3).
+    const { activeProject, activeProjectRepos } = usePlatform()
+
     const ownTab = useMemo(() => {
       const lookupId = tabId ?? activeTabId
       return tabs.find((x) => x.id === lookupId) ?? null
@@ -260,15 +270,39 @@ export const ConversationFolderBranchPicker = memo(
       [ownTab, allFolders]
     )
 
-    // The folder picker lists only top-level repos — worktree folders
-    // (`parent_id != null`) are reached through the branch picker, not here, so
-    // they're hidden to keep this picker a clean repo switcher. Hidden chat
-    // folders are excluded too (they're a per-conversation implementation
-    // detail, not a switchable repo).
-    const topLevelFolders = useMemo(
-      () => excludeChatFolders(filterTopLevelFolders(folders)),
+    // Unscoped list: main's default minus platform_repo sub-repos so the
+    // picker never lists a project's hidden sub-repo folders.
+    const unscopedTopLevelFolders = useMemo(
+      () =>
+        excludeChatFolders(filterTopLevelFolders(folders)).filter(
+          (f) => !isHiddenFolderKind(f.kind)
+        ),
       [folders]
     )
+
+    // Scoped list: the active project's root folder plus its sub-repos.
+    // Sub-repos have `kind === "platform_repo"` and live in `allFolders` (not
+    // the sidebar `folders` list, since they're hidden there too).
+    const scopedTopLevelFolders = useMemo(() => {
+      if (!activeProject) return null
+      const list: typeof folders = []
+      const rootFolder = allFolders.find((f) => f.id === activeProject.folderId)
+      if (rootFolder) list.push(rootFolder)
+      for (const repo of activeProjectRepos) {
+        if (repo.folderId == null) continue
+        const repoFolder = allFolders.find((f) => f.id === repo.folderId)
+        if (repoFolder && !list.some((f) => f.id === repoFolder.id)) {
+          list.push(repoFolder)
+        }
+      }
+      return list
+    }, [activeProject, activeProjectRepos, allFolders])
+
+    const pickerFolders =
+      scopedTopLevelFolders ?? unscopedTopLevelFolders
+    // Fold picker when scoped to <=1 repo (D3 sub-rule) so only the branch
+    // picker remains.
+    const showFolderPicker = pickerFolders.length > 1
 
     if (!ownTab) return null
     // Chat mode: either a draft flagged `isChat` (no folder yet) or a bound
@@ -294,52 +328,54 @@ export const ConversationFolderBranchPicker = memo(
 
     return (
       <>
-        <FolderPicker
-          folders={topLevelFolders}
-          currentFolderId={pickerSelectedId}
-          currentFolderName={displayFolderName}
-          title={`${t("folderTitle")}: ${displayFolderName}`}
-          editable={isNewConversation}
-          onSelect={async (folderId) => {
-            const target = folders.find((f) => f.id === folderId)
-            if (!target) return
-            try {
-              // Route through openNewConversationTab so the target folder's
-              // saved default agent is applied. The function's existing-
-              // draft branch reuses ownTab via the singleton invariant and
-              // runs the disconnect-then-patch dance for folder+agent
-              // changes. `inheritFromActive: true` preserves the user's
-              // current agent when the target folder has no pinned default
-              // — "I'm switching folders, keep my workflow".
-              openNewConversationTab(target.id, target.path, {
-                inheritFromActive: true,
-              })
-              toast.success(t("toasts.folderChanged", { name: target.name }))
-            } catch (err) {
-              console.error(
-                "[ConversationFolderBranchPicker] switch folder failed:",
-                err
-              )
-              toast.error(t("toasts.openFolderFailed"))
-            }
-          }}
-          labelEmpty={t("noFolders")}
-          labelSearch={t("searchFolder")}
-          labelChatMode={t("chatModeLabel")}
-          isChatMode={isChatMode}
-          onSelectChatMode={() => {
-            try {
-              openChatModeTab()
-              toast.success(t("toasts.switchedToChatMode"))
-            } catch (err) {
-              console.error(
-                "[ConversationFolderBranchPicker] switch to chat mode failed:",
-                err
-              )
-              toast.error(t("toasts.openFolderFailed"))
-            }
-          }}
-        />
+        {showFolderPicker && (
+          <FolderPicker
+            folders={pickerFolders}
+            currentFolderId={pickerSelectedId}
+            currentFolderName={displayFolderName}
+            title={`${t("folderTitle")}: ${displayFolderName}`}
+            editable={isNewConversation}
+            onSelect={async (folderId) => {
+              const target = allFolders.find((f) => f.id === folderId)
+              if (!target) return
+              try {
+                // Route through openNewConversationTab so the target folder's
+                // saved default agent is applied. The function's existing-
+                // draft branch reuses ownTab via the singleton invariant and
+                // runs the disconnect-then-patch dance for folder+agent
+                // changes. `inheritFromActive: true` preserves the user's
+                // current agent when the target folder has no pinned default
+                // — "I'm switching folders, keep my workflow".
+                openNewConversationTab(target.id, target.path, {
+                  inheritFromActive: true,
+                })
+                toast.success(t("toasts.folderChanged", { name: target.name }))
+              } catch (err) {
+                console.error(
+                  "[ConversationFolderBranchPicker] switch folder failed:",
+                  err
+                )
+                toast.error(t("toasts.openFolderFailed"))
+              }
+            }}
+            labelEmpty={t("noFolders")}
+            labelSearch={t("searchFolder")}
+            labelChatMode={t("chatModeLabel")}
+            isChatMode={isChatMode}
+            onSelectChatMode={() => {
+              try {
+                openChatModeTab()
+                toast.success(t("toasts.switchedToChatMode"))
+              } catch (err) {
+                console.error(
+                  "[ConversationFolderBranchPicker] switch to chat mode failed:",
+                  err
+                )
+                toast.error(t("toasts.openFolderFailed"))
+              }
+            }}
+          />
+        )}
 
         {/* Branch selector — the rich BranchDropdown (pull / commit / push /
             new branch / worktree / stash / merge / rebase / … + branch tree).

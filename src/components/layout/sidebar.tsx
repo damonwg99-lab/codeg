@@ -42,6 +42,7 @@ import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
 import { formatShortcutLabel } from "@/lib/keyboard-shortcuts"
 import { isDesktop } from "@/lib/platform"
 import { leftChromeReserve } from "@/lib/window-chrome"
+import { PlatformSidebarSection } from "@/components/layout/platform-sidebar-section"
 import {
   loadShowCompleted,
   loadShowWorktrees,
@@ -78,7 +79,7 @@ const SHORTCUT_BADGE_CLASS = cn(
  * route — on one geometry instead of copy-pasting the className. Each row is a
  * `group` so a `group-hover`-revealed trailing element works.
  */
-function SidebarNavButton({
+export function SidebarNavButton({
   icon: Icon,
   label,
   onClick,
@@ -383,6 +384,7 @@ export function Sidebar() {
           the list below. Each row is a `group` so its shortcut hint reveals on
           hover / keyboard focus. */}
       <div className="flex shrink-0 flex-col gap-0.5 px-1.5 pt-1.5">
+        <PlatformSidebarSection />
         <SidebarNavButton
           icon={SquarePen}
           label={t("newChat")}

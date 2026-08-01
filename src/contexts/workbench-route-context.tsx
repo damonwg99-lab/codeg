@@ -18,13 +18,39 @@ import {
  * component in WORKBENCH_ROUTES, and add a SidebarNavButton that calls
  * `setRoute("<id>")`. Nothing else needs to change.
  */
-export type WorkbenchRouteId = "conversations" | "automations"
+export type WorkbenchRouteId =
+  | "conversations"
+  | "automations"
+  | "project-list"
+  | "project-detail"
+  | "create-project"
+  | "task-kanban"
+  | "task-detail"
+  | "create-task"
+  | "release-list"
+  | "release-detail"
+  | "create-release"
+  | "archive-view"
 
 interface WorkbenchRouteContextValue {
   routeId: WorkbenchRouteId
+  /** Route params (id, projectId, taskId, etc.) for the active route. */
+  routeParams: Record<string, string | number>
+  /** The route the user navigated FROM (for back-button logic).
+   *  Null means no recorded origin — fall back to default. */
+  fromRoute: WorkbenchRouteId | null
+  /** Params of the origin route (e.g. { projectId } for task-kanban). */
+  fromParams: Record<string, string | number>
   /** Convenience for the common branch — `routeId === "conversations"`. */
   isConversations: boolean
-  setRoute: (id: WorkbenchRouteId) => void
+  setRoute: (
+    id: WorkbenchRouteId,
+    params?: Record<string, string | number>,
+    from?: {
+      routeId: WorkbenchRouteId
+      params?: Record<string, string | number>
+    }
+  ) => void
   /** Sugar for returning to the conversation workspace. */
   openConversations: () => void
 }
@@ -55,18 +81,54 @@ export function useWorkbenchRoute() {
 
 export function WorkbenchRouteProvider({ children }: { children: ReactNode }) {
   const [routeId, setRouteId] = useState<WorkbenchRouteId>("conversations")
+  const [routeParams, setRouteParams] = useState<
+    Record<string, string | number>
+  >({})
+  const [fromRoute, setFromRoute] = useState<WorkbenchRouteId | null>(null)
+  const [fromParams, setFromParams] = useState<Record<string, string | number>>(
+    {}
+  )
 
-  const setRoute = useCallback((id: WorkbenchRouteId) => setRouteId(id), [])
-  const openConversations = useCallback(() => setRouteId("conversations"), [])
+  const setRoute = useCallback(
+    (
+      id: WorkbenchRouteId,
+      params?: Record<string, string | number>,
+      from?: {
+        routeId: WorkbenchRouteId
+        params?: Record<string, string | number>
+      }
+    ) => {
+      setRouteId(id)
+      setRouteParams(params ?? {})
+      if (from) {
+        setFromRoute(from.routeId)
+        setFromParams(from.params ?? {})
+      } else {
+        setFromRoute(null)
+        setFromParams({})
+      }
+    },
+    []
+  )
+
+  const openConversations = useCallback(() => {
+    setRouteId("conversations")
+    setRouteParams({})
+    setFromRoute(null)
+    setFromParams({})
+  }, [])
 
   const value = useMemo<WorkbenchRouteContextValue>(
     () => ({
       routeId,
+      routeParams,
+      fromRoute,
+      fromParams,
       isConversations: routeId === "conversations",
       setRoute,
       openConversations,
     }),
-    [routeId, setRoute, openConversations]
+    [routeId, routeParams, fromRoute, fromParams, setRoute, openConversations]
   )
 
   return (
