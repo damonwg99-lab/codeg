@@ -28,6 +28,11 @@ import {
   unescapeReferenceLabel,
   unwrapReferenceDestination,
 } from "@/lib/reference-link"
+import {
+  extractDecompositionSegments,
+  parseDecompositionToolInput,
+  type ProposedSubTask,
+} from "@/lib/platform/decomposition-parser"
 
 /**
  * Adapted content part types for AI SDK Elements components
@@ -131,6 +136,20 @@ export type AdaptedProposedPlanPart = {
   isStreaming: boolean
 }
 
+/**
+ * A task-decomposition proposal lifted out of an assistant text block
+ * (```task_decomposition_json fences) or reconstructed from a persisted
+ * `create_task_decomposition` tool_use. The card renders an editable list of
+ * proposed sub-tasks; while the fence is still open, `isStreaming` is true and
+ * `tasks` is empty so the card renders as a lightweight "generating…"
+ * placeholder instead of a full task list.
+ */
+export type AdaptedDecompositionPart = {
+  type: "decomposition"
+  tasks: ProposedSubTask[]
+  isStreaming: boolean
+}
+
 export type AdaptedContentPart =
   | { type: "text"; text: string }
   | AdaptedToolCallPart
@@ -174,6 +193,7 @@ export type AdaptedContentPart =
   | AdaptedGeneratedImagePart
   | AdaptedPlanPart
   | AdaptedProposedPlanPart
+  | AdaptedDecompositionPart
 
 export interface UserResourceDisplay {
   name: string
@@ -477,6 +497,74 @@ function expandProposedPlanText(
   if (trail.trim().length > 0) parts.push({ type: "text", text: trail })
 
   return sawPlan ? parts : null
+}
+
+/**
+ * Extract ```task_decomposition_json code fences from assistant text and
+ * replace them with structured `AdaptedDecompositionPart` cards. Any prose
+ * before/after the fences is preserved as `text` parts.
+ *
+ * Also handles incomplete (streaming) fences: when the opening marker
+ * ```task_decomposition_json is present but the closing ``` hasn't arrived
+ * yet, the text from the opening marker onward is suppressed so the raw JSON
+ * doesn't flash in the UI while streaming. Once the fence closes, the next
+ * adapt cycle will replace it with a proper card.
+ *
+ * HISTORICAL-PATH fallback for rendering decomposition cards from persisted
+ * text blocks (which lack the synthetic decomposition ContentBlock). Live
+ * streaming turns use the turn-builder's synthetic block instead. This
+ * function remains active only for DB-loaded turns where the raw
+ * ```task_decomposition_json text is still embedded in text blocks.
+ *
+ * Returns `null` when no decomposition fences (complete or incomplete) are
+ * found.
+ */
+function expandDecompositionText(text: string): AdaptedContentPart[] | null {
+  // First try complete fences
+  const segments = extractDecompositionSegments(text)
+  if (segments) {
+    const parts: AdaptedContentPart[] = []
+    for (const segment of segments) {
+      if (segment.kind === "text") {
+        if (segment.value.trim()) {
+          parts.push({ type: "text", text: segment.value })
+        }
+      } else {
+        parts.push({
+          type: "decomposition",
+          tasks: segment.tasks ?? [],
+          isStreaming: false,
+        })
+      }
+    }
+    return parts.length > 0 ? parts : null
+  }
+
+  // No complete fence found — check for an incomplete (streaming) fence.
+  // The opening marker ```task_decomposition_json may be present without
+  // its closing ```. In that case, render a lightweight streaming
+  // placeholder card instead of showing raw JSON or suppressing entirely.
+  // Match two scenarios:
+  //   1. Marker followed by newline + partial JSON content (normal streaming)
+  //   2. Marker at end of text with no trailing newline (marker just arrived)
+  const incompletePattern = /```task_decomposition_json(?:\s*\n|\s*$)/
+  const incompleteMatch = incompletePattern.exec(text)
+  if (incompleteMatch) {
+    const before = text.slice(0, incompleteMatch.index)
+    const parts: AdaptedContentPart[] = []
+    if (before.trim()) {
+      parts.push({ type: "text", text: before })
+    }
+    // Streaming placeholder — empty tasks, isStreaming = true
+    parts.push({
+      type: "decomposition",
+      tasks: [],
+      isStreaming: true,
+    })
+    return parts
+  }
+
+  return null
 }
 
 function expandInlineToolText(
@@ -1763,6 +1851,17 @@ export function adaptMessageTurn(
         adaptedContent.push(...proposedPlanParts)
         continue
       }
+
+      // Decomposition: lift ```task_decomposition_json code fences out of the
+      // assistant text and render them as structured `decomposition` cards.
+      // Ordering (D15): runs AFTER proposed-plan extraction (so a plan body
+      // containing an embedded decomp fence is not mis-parsed here) and BEFORE
+      // the default text fallback below.
+      const decompParts = expandDecompositionText(block.text)
+      if (decompParts) {
+        adaptedContent.push(...decompParts)
+        continue
+      }
     }
 
     if (block.type === "tool_use") {
@@ -1799,6 +1898,39 @@ export function adaptMessageTurn(
           isStreaming: false,
         })
         continue
+      }
+
+      // Historical path: detect a persisted `create_task_decomposition`
+      // tool_use and render it as a `decomposition` card (same pattern as
+      // the plan-block detection above). Only fires for DB-loaded turns;
+      // live turns use the synthetic decomposition ContentBlock from the
+      // turn-builder, so the historical path stays consistent.
+      if (!isStreaming && block.tool_name === "create_task_decomposition") {
+        const decompTasks = parseDecompositionToolInput(
+          block.input_preview ?? ""
+        )
+        if (decompTasks && decompTasks.length > 0) {
+          // Consume paired tool_result so its acknowledgment text doesn't
+          // render as an orphan tool-result part.
+          if (block.tool_use_id && resultMap.get(block.tool_use_id)) {
+            matchedResultIds.add(block.tool_use_id)
+          } else {
+            const nextBlock = turn.blocks[index + 1]
+            if (
+              !block.tool_use_id &&
+              nextBlock?.type === "tool_result" &&
+              !nextBlock.tool_use_id
+            ) {
+              positionMatchedIndices.add(index + 1)
+            }
+          }
+          adaptedContent.push({
+            type: "decomposition",
+            tasks: decompTasks,
+            isStreaming: false,
+          })
+          continue
+        }
       }
 
       const toolCallId = block.tool_use_id || generateToolCallId(turn.id, index)

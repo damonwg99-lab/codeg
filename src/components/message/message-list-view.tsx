@@ -28,6 +28,7 @@ import { UserResourceLinks } from "./user-resource-links"
 import { UserImageAttachments } from "./user-image-attachments"
 import { AgentPlanOverlay } from "@/components/chat/agent-plan-overlay"
 import { SubAgentOverlay } from "@/components/chat/sub-agent-overlay"
+import { PlatformDecompositionBridge } from "@/components/chat/platform-decomposition-bridge"
 import { normalizeToolName } from "@/lib/tool-call-normalization"
 import { isDelegateToAgentToolName } from "@/lib/delegation-card"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
@@ -651,6 +652,14 @@ export function MessageListView({
   const timelineTurns = useConversationRuntimeStore((s) =>
     selectTimelineTurns(s, conversationId)
   )
+  // Project the timeline turns to plain MessageTurn[] so the platform
+  // decomposition bridge can scan them for proposal fences without touching
+  // the runtime store contract. Memoized so the bridge's detector hook sees
+  // a stable reference across renders.
+  const localTurns = useMemo(
+    () => timelineTurns.map((item) => item.turn),
+    [timelineTurns]
+  )
 
   const shouldUseSmoothResize = !(
     isActive &&
@@ -1038,7 +1047,11 @@ export function MessageListView({
   }
 
   return (
-    <div className="relative flex h-full min-h-0 flex-col">
+    <PlatformDecompositionBridge
+      conversationId={conversationId}
+      localTurns={localTurns}
+    >
+      <div className="relative flex h-full min-h-0 flex-col">
       <MessageThread
         className="flex-1 min-h-0"
         resize={shouldUseSmoothResize ? "smooth" : undefined}
@@ -1094,5 +1107,6 @@ export function MessageListView({
         />
       </div>
     </div>
+    </PlatformDecompositionBridge>
   )
 }

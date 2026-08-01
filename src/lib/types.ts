@@ -237,6 +237,19 @@ export type ContentBlock =
    * persistence/export switches over `ContentBlock` never receive it.
    */
   | { type: "plan"; entries: PlanEntryInfo[] }
+  /**
+   * Frontend-only, LIVE-stream synthetic block (same doctrine as `plan`):
+   * never persisted, never emitted by the Rust JSONL parsers. Created by the
+   * ACP turn-builder when a `create_task_decomposition` tool_call streams in,
+   * so the live render shows a `decomposition` card before the tool_result
+   * arrives. The persisted path reconstructs the card from the paired
+   * `create_task_decomposition` tool_use block inside `adaptMessageTurn`.
+   */
+  | {
+      type: "decomposition"
+      tasks: import("@/lib/platform/decomposition-parser").ProposedSubTask[]
+      isStreaming: boolean
+    }
 
 export type TurnRole = "user" | "assistant" | "system"
 

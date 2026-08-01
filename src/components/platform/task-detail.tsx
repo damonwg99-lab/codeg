@@ -62,6 +62,11 @@ import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { usePlatform } from "@/contexts/platform-context"
 import { useTabContext } from "@/contexts/tab-context"
 import { useAppWorkspace } from "@/contexts/app-workspace-shim"
+import {
+  buildNewConversationDraftStorageKey,
+  saveMessageInputDraftV2,
+} from "@/lib/message-input-draft"
+import type { JSONContent } from "@tiptap/core"
 import { useWorkspaceContext } from "@/contexts/workspace-context"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { ContextInjectPanel } from "@/components/platform/context-inject-panel"
@@ -503,12 +508,28 @@ export function TaskDetail({ taskId }: { taskId: number }) {
           false,
           result.title
         )
-        // Pre-fill the new conversation's composer with context badges.
-        // TODO(Phase 4): convert refs → PromptInputBlock[] via from-prompt-blocks
-        // and persist via saveMessageInputDraftV2(buildNewConversationDraftStorageKey(tabId), doc)
-        // — main's composer will hydrate badges through from-prompt-blocks on mount.
-        // (D4: pending draft migration from二开's platform-tab-slice to main's
-        // message-input-draft v2 system.)
+        // Pre-fill the new conversation's composer with context text (D4 b+i):
+        // Each selected InjectOption's `prefixLine` becomes a ProseMirror paragraph,
+        // persisted via main's per-tab draft v2 storage. The composer auto-hydrates
+        // from `loadMessageInputDraftV2(buildNewConversationDraftStorageKey(tabId))`
+        // on mount — no composer code change needed.
+        const tabId = `conv-${result.folderId}-${result.agentType}-${result.conversationId}`
+        const draftKey = buildNewConversationDraftStorageKey(tabId)
+        const paragraphs: JSONContent[] = []
+        for (const option of payload.options) {
+          const text = option.prefixLine?.trim()
+          if (!text) continue
+          paragraphs.push({
+            type: "paragraph",
+            content: [{ type: "text", text }],
+          })
+        }
+        if (paragraphs.length > 0) {
+          saveMessageInputDraftV2(draftKey, {
+            type: "doc",
+            content: paragraphs,
+          })
+        }
       } catch (e) {
         console.error("Create task conversation failed:", e)
       } finally {

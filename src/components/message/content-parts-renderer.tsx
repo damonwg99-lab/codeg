@@ -62,6 +62,7 @@ import { GoalRunPart, GoalToolCallPart } from "./goal-tool-call"
 import { PlanCard, PlanEntriesList } from "./plan-card"
 import { PlanModeCard } from "./plan-mode-card"
 import { PlainTextWithBadges } from "./plain-text-with-badges"
+import { DecompositionCard } from "./decomposition-card"
 import {
   FileTextIcon,
   FilePenLineIcon,
@@ -2832,6 +2833,16 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
 
     if (part.type === "proposed-plan") {
       return <ProposedPlanPart key={`proposed-plan-${keyId}`} part={part} />
+    }
+
+    if (part.type === "decomposition") {
+      return (
+        <DecompositionCard
+          key={`decomposition-${keyId}`}
+          tasks={part.tasks}
+          isStreaming={part.isStreaming}
+        />
+      )
     }
 
     if (part.type === "generated-image") {
