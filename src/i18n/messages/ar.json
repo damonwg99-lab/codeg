@@ -1603,6 +1603,8 @@
       "searching": "جارٍ البحث...",
       "typeToSearch": "اكتب للبحث في المحادثات",
       "typeToSearchFiles": "اكتب للبحث في الملفات أو المجلدات",
+      "fileNameMatches": "تطابقات اسم الملف",
+      "contentMatches": "تطابقات المحتوى",
       "noResults": "لم يتم العثور على نتائج.",
       "untitledConversation": "محادثة بدون عنوان"
     },

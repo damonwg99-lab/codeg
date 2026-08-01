@@ -1603,6 +1603,8 @@
       "searching": "Suche...",
       "typeToSearch": "Tippen, um Konversationen zu suchen",
       "typeToSearchFiles": "Tippen, um Dateien oder Verzeichnisse zu suchen",
+      "fileNameMatches": "Dateinamen-Treffer",
+      "contentMatches": "Inhaltstreffer",
       "noResults": "Keine Ergebnisse gefunden.",
       "untitledConversation": "Unbenannte Konversation"
     },

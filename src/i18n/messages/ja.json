@@ -1603,6 +1603,8 @@
       "searching": "検索中...",
       "typeToSearch": "入力して会話を検索",
       "typeToSearchFiles": "入力してファイルまたはディレクトリを検索",
+      "fileNameMatches": "ファイル名の一致",
+      "contentMatches": "コンテンツの一致",
       "noResults": "結果が見つかりません。",
       "untitledConversation": "無題の会話"
     },

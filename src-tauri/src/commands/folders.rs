@@ -1341,6 +1341,24 @@ pub async fn git_push_info(path: String) -> Result<GitPushInfo, AppCommandError>
     })
 }
 
+/// Re-arm the local remote-tracking ref after a push on a single-branch clone.
+///
+/// On a clone made without `--no-single-branch` clones a single branch by
+/// default, `refs/remotes/<remote>/<branch>` exists only for the originally
+/// cloned branch. After pushing a *different* branch the local
+/// remote-tracking ref is still missing, so the next `get_unpushed_hashes`
+/// probe would wrongly report every commit as unpushed. Run
+/// `git update-ref refs/remotes/<remote>/<branch> <branch>` here so the
+/// tracking ref exists regardless of how the clone was made.
+async fn ensure_tracking_ref(path: &str, remote: &str, branch: &str) {
+    let tracking_ref = format!("refs/remotes/{}/{}", remote, branch);
+    let _ = crate::process::tokio_command("git")
+        .args(["update-ref", &tracking_ref, branch])
+        .current_dir(path)
+        .output()
+        .await;
+}
+
 pub(crate) async fn git_push_core(
     data_dir: &std::path::Path,
     emitter: &EventEmitter,
@@ -1418,6 +1436,8 @@ pub(crate) async fn git_push_core(
     if !output.status.success() {
         return Err(classify_remote_git_error("push", &output.stderr));
     }
+
+    ensure_tracking_ref(path, target_remote, &branch).await;
 
     let upstream_set = needs_set_upstream;
 

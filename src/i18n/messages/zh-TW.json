@@ -1603,6 +1603,8 @@
       "searching": "搜尋中...",
       "typeToSearch": "輸入關鍵字搜尋會話",
       "typeToSearchFiles": "輸入關鍵字搜尋檔案或目錄",
+      "fileNameMatches": "檔案名稱匹配",
+      "contentMatches": "內容匹配",
       "noResults": "找不到結果。",
       "untitledConversation": "未命名會話"
     },

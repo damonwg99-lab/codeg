@@ -35,7 +35,7 @@ function CommandDialog({
   return (
     <Dialog {...props}>
       <DialogContent
-        className="overflow-hidden p-0 rounded-2xl max-w-lg md:max-w-xl lg:max-w-2xl"
+        className="overflow-hidden p-0 rounded-2xl max-w-2xl md:max-w-3xl lg:max-w-4xl"
         closeButtonClassName="top-1.5 z-10"
       >
         <VisuallyHidden.Root>
@@ -79,7 +79,7 @@ function CommandList({
     <CommandPrimitive.List
       data-slot="command-list"
       className={cn(
-        "max-h-[300px] overflow-y-auto overflow-x-hidden",
+        "max-h-[50vh] overflow-y-auto overflow-x-hidden",
         className
       )}
       {...props}

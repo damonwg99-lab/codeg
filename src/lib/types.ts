@@ -3033,6 +3033,22 @@ export interface CodexModelConfig {
   default?: string
 }
 
+/** A single line of a file whose contents match a content-search query. */
+export interface FileContentMatch {
+  relativePath: string
+  lineNumber: number
+  lineContent: string
+}
+
+/** A streamed chunk of content-search results emitted via the
+ *  `search_files_content:results` event (Tauri desktop path) — the web path
+ *  returns `FileContentMatch[]` directly. */
+export interface ContentSearchBatch {
+  searchId: string
+  matches: FileContentMatch[]
+  done: boolean
+}
+
 /** Recursively sort object keys so serialized `overrides` are byte-stable (the
  *  edit dialog diffs `provider.model !== serialize(state)`). */
 function sortJsonValue(v: unknown): unknown {

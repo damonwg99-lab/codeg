@@ -10,6 +10,7 @@ import { isDesktop, openFileDialog } from "@/lib/platform"
 import { getActiveRemoteConnectionId } from "@/lib/transport"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useGitCredential } from "@/contexts/git-credential-context"
+import { useAutoCreateProject } from "@/hooks/use-auto-create-project"
 import {
   Dialog,
   DialogContent,
@@ -31,6 +32,7 @@ export function CloneDialog({ open, onOpenChange }: CloneDialogProps) {
   const t = useTranslations("Folder.cloneDialog")
   const tToasts = useTranslations("Folder.toasts")
   const openFolder = useAppWorkspaceStore((s) => s.openFolder)
+  const { autoCreateProject } = useAutoCreateProject()
   const { withCredentialRetry } = useGitCredential()
   const [url, setUrl] = useState("")
   const [targetDir, setTargetDir] = useState("")
@@ -80,7 +82,11 @@ export function CloneDialog({ open, onOpenChange }: CloneDialogProps) {
         (creds) => cloneRepository(url, fullPath, creds),
         { remoteUrl: url }
       )
-      await openFolder(fullPath)
+      const detail = await openFolder(fullPath)
+      // Opportunistic auto-create a project mapping to this clone so the
+      // platform surface (Project list / Switcher / KB watcher) lights up
+      // automatically. Failures are swallowed by the hook itself.
+      void autoCreateProject(detail)
       onOpenChange(false)
       resetForm()
     } catch (err) {

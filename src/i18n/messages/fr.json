@@ -1603,6 +1603,8 @@
       "searching": "Recherche...",
       "typeToSearch": "Tapez pour rechercher des conversations",
       "typeToSearchFiles": "Tapez pour rechercher des fichiers ou répertoires",
+      "fileNameMatches": "Correspondances de nom",
+      "contentMatches": "Correspondances de contenu",
       "noResults": "Aucun résultat trouvé.",
       "untitledConversation": "Conversation sans titre"
     },

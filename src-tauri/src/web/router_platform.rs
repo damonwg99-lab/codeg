@@ -14,8 +14,39 @@
 use axum::{
     extract::DefaultBodyLimit,
     routing::{get, post},
-    Router,
+    Json, Router,
 };
+use serde::Deserialize;
+
+/// Web params for `/search_files_content` (Cluster E). The desktop path streams
+/// results via the `search_files_content:results` event; the web/server path
+/// returns the full `Vec<FileContentMatch>` synchronously via this endpoint.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchFilesContentParams {
+    base_path: String,
+    keyword: String,
+    max_results: Option<usize>,
+}
+
+/// Inline handler for `/search_files_content` — delegates to the shared
+/// `commands::file_search::search_files_content` core. Lives here instead of
+/// in `handlers/folders.rs` to keep the Cluster E surface grouped with the
+/// rest of the platform routes (D32 decoupling).
+async fn search_files_content(
+    Json(params): Json<SearchFilesContentParams>,
+) -> Result<
+    Json<Vec<crate::commands::file_search::FileContentMatch>>,
+    crate::app_error::AppCommandError,
+> {
+    let result = crate::commands::file_search::search_files_content(
+        params.base_path,
+        params.keyword,
+        params.max_results,
+    )
+    .await?;
+    Ok(Json(result))
+}
 
 /// Build the platform route router. The routes match the command names used by
 /// the web transport (`call("list_projects") -> POST /api/list_projects`), so
@@ -141,6 +172,16 @@ pub fn platform_routes() -> Router {
             "/upload_task_ai_intermediate_doc",
             post(handlers::knowledge::upload_task_ai_intermediate_doc)
                 .layer(DefaultBodyLimit::disable()),
+        )
+        // ─── File content search (Cluster E) ────────────────────────────────
+        .route(
+            "/search_files_content",
+            post(search_files_content),
+        )
+        // ─── Releases for a task (Cluster B, GET path) ──────────────────────
+        .route(
+            "/releases/for_task",
+            get(handlers::release::list_releases_for_task),
         )
 }
 
