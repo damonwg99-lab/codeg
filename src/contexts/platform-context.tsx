@@ -60,6 +60,15 @@ export function usePlatformContext() {
 /** Alias for convenience — shorter name used in sidebar and nav buttons. */
 export const usePlatform = usePlatformContext
 
+/**
+ * Optional variant: returns null when no PlatformProvider is mounted, instead
+ * of throwing. Used by sidebar mounts that must render in test harnesses
+ * without platform wiring (the platform section then hides itself).
+ */
+export function usePlatformOptional(): PlatformContextValue | null {
+  return useContext(PlatformContext)
+}
+
 export function PlatformProvider({ children }: { children: ReactNode }) {
   const {
     addFolderToWorkspaceById,

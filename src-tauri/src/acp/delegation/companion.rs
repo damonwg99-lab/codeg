@@ -2168,6 +2168,49 @@ mod tests {
         assert!(e.message.contains("unknown tool"));
     }
 
+    #[tokio::test]
+    async fn create_task_decomposition_surfaces_and_dispatches_locally() {
+        // decomposition-only ctx → only create_task_decomposition is listed.
+        let names = list_tool_names(
+            dispatch_with_features(
+                DECOMPOSITION_ONLY,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        assert_eq!(names, vec!["create_task_decomposition".to_string()]);
+
+        // tools/call with a valid subTasks array is answered locally with a
+        // confirmation message (no broker round-trip).
+        let line = json!({
+            "jsonrpc": "2.0", "id": 34, "method": "tools/call",
+            "params": {
+                "name": "create_task_decomposition",
+                "arguments": {
+                    "subTasks": [
+                        { "title": "Step 1", "description": " Wire scaffold" },
+                        { "title": "Step 2", "description": " Wire tests" }
+                    ]
+                }
+            }
+        })
+        .to_string();
+        let resp = unwrap_respond(dispatch_with_features(DECOMPOSITION_ONLY, &line).await);
+        let msg = resp.result.unwrap();
+        assert!(msg.as_str().unwrap().contains("Decomposition proposal received (2 sub-tasks)"));
+
+        // Missing subTasks → synchronous -32602.
+        let bad = json!({
+            "jsonrpc": "2.0", "id": 35, "method": "tools/call",
+            "params": { "name": "create_task_decomposition", "arguments": {} }
+        })
+        .to_string();
+        let resp = unwrap_respond(dispatch_with_features(DECOMPOSITION_ONLY, &bad).await);
+        let e = resp.error.unwrap();
+        assert_eq!(e.code, -32602);
+        assert!(e.message.contains("subTasks"));
+    }
+
     #[test]
     fn parse_session_id_tolerates_number_string_and_whole_float() {
         assert_eq!(parse_session_id(&json!({ "session_id": 7 })), Some(7));
