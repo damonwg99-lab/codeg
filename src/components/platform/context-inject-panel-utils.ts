@@ -10,6 +10,7 @@ import type {
   TaskInfo,
 } from "@/lib/platform/types"
 import { KB_SKIP_FILENAMES } from "@/lib/platform/types"
+import type { ReferenceAttrs } from "@/components/chat/composer/types"
 /** Check whether a KB doc's filePath ends with a filename that should be skipped
  *  (e.g. README.md, .gitignore). These files are project-level metadata, not
  *  meaningful knowledge docs. */
@@ -291,5 +292,32 @@ export function buildPayloadFromOptions(
   return {
     options: selected,
     injectedDocsJson: JSON.stringify(docs),
+  }
+}
+
+/**
+ * Convert an InjectOption to a ProseMirror ReferenceAttrs for badge rendering.
+ * KB docs and attachments with a file path get `refType: "file"` with a `file://`
+ * URI; task description and conversation summary options (no file path) get a
+ * `refType: "file"` marker with `uri: null` so the badge renders without a link.
+ */
+export function optionToReferenceAttrs(
+  option: InjectOption
+): ReferenceAttrs {
+  if (option.docPath) {
+    return {
+      refType: "file",
+      id: option.docPath,
+      label: option.label,
+      uri: `file://${option.docPath}`,
+      meta: { fileKind: "file" },
+    }
+  }
+  return {
+    refType: "file",
+    id: String(option.id),
+    label: option.label,
+    uri: null,
+    meta: null,
   }
 }

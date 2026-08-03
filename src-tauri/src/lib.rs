@@ -321,6 +321,13 @@ mod tauri_app {
                 ))
                 .map_err(|e| e.to_string())?;
                 app.manage(database);
+                // Cluster A: Platform commands (commands/project.rs, task.rs,
+                // knowledge.rs, release.rs) take `tauri::State<'_, EventEmitter>`
+                // in their #[tauri::command] wrappers. Provide a managed
+                // `EventEmitter::Tauri(handle)` so those commands resolve state.
+                app.manage(crate::web::event_bridge::EventEmitter::Tauri(
+                    app.handle().clone(),
+                ));
 
                 // Restore and apply saved system proxy settings before any network operation.
                 let db = app.state::<db::AppDatabase>();

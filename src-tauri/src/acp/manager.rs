@@ -1067,16 +1067,29 @@ impl ConnectionManager {
         }
 
         // ─── First-prompt context injection (Platform KB Rules + Task Context) ───
-        // Only on the genuine first-prompt path (`!already_linked`): prepends an
-        // injected block (built in `acp::context_injection`) wrapped in markers
-        // so the frontend can hide it from the user while the agent's LLM still
-        // sees it. On follow-up turns (`already_linked == true`) or when no
-        // project/task is linked, no block is injected and `blocks` is unchanged.
-        let blocks = if !already_linked {
-            let (cid, fid) = {
-                let s = state_arc.read().await;
-                (s.conversation_id, s.folder_id)
-            };
+        // Inject only on the very first user prompt where the conversation row
+        // has never seen a turn (`message_count == 0`). The original
+        // `!already_linked` gate checked whether a conversation row already
+        // existed, which ALWAYS skipped injection for task-created conversations
+        // (create_conversation_for_task creates the row BEFORE the first prompt).
+        // Checking `message_count` fixes this: a brand-new row has message_count
+        // 0 regardless of how it was created (UI or task page).
+        let (cid, fid) = {
+            let s = state_arc.read().await;
+            (s.conversation_id, s.folder_id)
+        };
+        let is_first_prompt = if let Some(cid) = cid {
+            conversation::Entity::find_by_id(cid)
+                .one(&db.conn)
+                .await
+                .ok()
+                .flatten()
+                .map(|c| c.message_count == 0)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        let blocks = if is_first_prompt {
             if let (Some(cid), Some(fid)) = (cid, fid) {
                 if let Some(block) =
                     crate::acp::context_injection::build_first_prompt_injection(

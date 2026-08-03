@@ -1104,6 +1104,7 @@ function adaptContentBlock(
 ): AdaptedContentPart | null {
   switch (block.type) {
     case "text":
+      if (block.text.startsWith("<!-- codeg:inject:start -->")) return null
       return {
         type: "text",
         text: block.text,

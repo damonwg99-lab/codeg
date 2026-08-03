@@ -181,6 +181,8 @@ import {
   skillToReference,
 } from "@/components/chat/composer/invocation-reference"
 import { cutSelectionToClipboard } from "@/components/chat/composer/clipboard-actions"
+import { PlatformComposerToolbar } from "./platform-composer-toolbar"
+import { usePlatformTabSlice } from "@/stores/platform-tab-slice"
 import type { ReferenceAttrs } from "@/components/chat/composer/types"
 import type { Editor, JSONContent } from "@tiptap/core"
 import {
@@ -2417,6 +2419,25 @@ export function MessageInput({
     }
   }, [attachmentTabId])
 
+  // Consume pending initial drafts (Cluster A — task-detail.tsx writer).
+  // On first mount of a task-created conversation tab, insert reference
+  // badges for the selected inject options, then clear the draft.
+  useEffect(() => {
+    if (!composerReady || !attachmentTabId) return
+    const refsJson =
+      usePlatformTabSlice.getState().pendingInitialDrafts.get(attachmentTabId)
+    if (!refsJson) return
+    const refs = JSON.parse(refsJson) as ReferenceAttrs[]
+    if (!Array.isArray(refs) || refs.length === 0) return
+    const ed = editorRef.current?.getEditor()
+    if (!ed) return
+    ed.chain().focus("end")
+    for (const ref of refs) {
+      ed.chain().insertReference(ref).insertContent(" ").run()
+    }
+    usePlatformTabSlice.getState().clearPendingInitialDraft(attachmentTabId)
+  }, [composerReady, attachmentTabId])
+
   useEffect(() => {
     let cancelled = false
     const unlisteners: Array<() => void | Promise<void>> = []
@@ -3000,6 +3021,18 @@ export function MessageInput({
     handleModeSelect,
     t,
   ])
+
+  // Platform composer toolbar callback — converts InjectOption[] selections
+  // from ProjectResourcePicker into inline reference badges in the composer.
+  const handlePlatformInject = useCallback((refs: ReferenceAttrs[]) => {
+    const editor = editorRef.current?.getEditor()
+    if (!editor) return
+    let chain = editor.chain().focus("end")
+    for (const ref of refs) {
+      chain = chain.insertReference(ref).insertContent(" ")
+    }
+    chain.run()
+  }, [])
 
   const actionButtons = isEditingQueueItem ? (
     <div className="flex items-center gap-1">
@@ -3605,6 +3638,9 @@ export function MessageInput({
                       )}
                     </DropdownMenuContent>
                   </DropdownMenu>
+                  <PlatformComposerToolbar
+                    onInjectReferences={handlePlatformInject}
+                  />
                   {hasInlineSelectors && (
                     <div className="hidden min-w-0 items-end gap-1 @[30rem]:flex">
                       {inlineSelectorItems}

@@ -62,16 +62,13 @@ import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { usePlatform } from "@/contexts/platform-context"
 import { useTabContext } from "@/contexts/tab-context"
 import { useAppWorkspace } from "@/contexts/app-workspace-shim"
-import {
-  buildNewConversationDraftStorageKey,
-  saveMessageInputDraftV2,
-} from "@/lib/message-input-draft"
-import type { JSONContent } from "@tiptap/core"
+import { usePlatformTabSlice } from "@/stores/platform-tab-slice"
 import { useWorkspaceContext } from "@/contexts/workspace-context"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { ContextInjectPanel } from "@/components/platform/context-inject-panel"
 import { TaskChangeTracking } from "@/components/platform/task-change-tracking"
 import {
+  optionToReferenceAttrs,
   type ContextInjectPayload,
 } from "@/components/platform/context-inject-panel-utils"
 import {
@@ -508,27 +505,17 @@ export function TaskDetail({ taskId }: { taskId: number }) {
           false,
           result.title
         )
-        // Pre-fill the new conversation's composer with context text (D4 b+i):
-        // Each selected InjectOption's `prefixLine` becomes a ProseMirror paragraph,
-        // persisted via main's per-tab draft v2 storage. The composer auto-hydrates
-        // from `loadMessageInputDraftV2(buildNewConversationDraftStorageKey(tabId))`
-        // on mount — no composer code change needed.
-        const tabId = `conv-${result.folderId}-${result.agentType}-${result.conversationId}`
-        const draftKey = buildNewConversationDraftStorageKey(tabId)
-        const paragraphs: JSONContent[] = []
-        for (const option of payload.options) {
-          const text = option.prefixLine?.trim()
-          if (!text) continue
-          paragraphs.push({
-            type: "paragraph",
-            content: [{ type: "text", text }],
-          })
-        }
-        if (paragraphs.length > 0) {
-          saveMessageInputDraftV2(draftKey, {
-            type: "doc",
-            content: paragraphs,
-          })
+        // Pre-fill the composer with inline reference badges.
+        // Uses the pendingInitialDrafts mechanism in platform-tab-slice:
+        // the writer deposits JSON-serialised ReferenceAttrs[] keyed by
+        // tabId; message-input.tsx mounts and inserts them via
+        // editorRef -> insertReference(ref).insertContent(" ").run().
+        const refs = payload.options.map(optionToReferenceAttrs)
+        if (refs.length > 0) {
+          const tabId = `conv-${result.folderId}-${result.agentType}-${result.conversationId}`
+          usePlatformTabSlice
+            .getState()
+            .setPendingInitialDraft(tabId, JSON.stringify(refs))
         }
       } catch (e) {
         console.error("Create task conversation failed:", e)

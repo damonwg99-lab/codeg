@@ -72,13 +72,41 @@ pub async fn build_first_prompt_injection(
                     "=== Task Context ===\n\
                      Task ID: {}\n\
                      Task Title: {}\n\
+                     Task Description: {}\n\
                      Task Type: {}\n\
                      Task Directory: {}/.private/tasks/{}/\n\
-                     \x20 \x20├── attachments/       # User attachments, do not modify\n\
-                     \x20 \x20└── ai-intermediate/   # Your generated documents go here\n\
+                     \x20 \x20\u{251c}\u{2500}\u{2500} attachments/       # User attachments, do not modify\n\
+                     \x20 \x20\u{2514}\u{2500}\u{2500} ai-intermediate/   # Your generated documents go here\n\
                      === End Task Context ===",
-                    task.id, task.title, task.task_type, kb_dir, task.id,
+                    task.id,
+                    task.title,
+                    task.description.as_deref().unwrap_or("(no description)"),
+                    task.task_type,
+                    kb_dir,
+                    task.id,
                 ));
+                // 3. Injected docs (KB docs, attachments, conversation summaries)
+                //    passed from the frontend as JSON in the task-conversation link.
+                if let Some(ref docs_json) = link.injected_docs_json {
+                    if let Ok(docs) =
+                        serde_json::from_str::<serde_json::Value>(docs_json)
+                    {
+                        if let Some(arr) = docs.as_array() {
+                            let mut doc_lines = Vec::new();
+                            for doc in arr {
+                                if let Some(prefix) = doc.get("prefixLine").and_then(|v| v.as_str()) {
+                                    doc_lines.push(prefix.to_string());
+                                }
+                            }
+                            if !doc_lines.is_empty() {
+                                parts.push(format!(
+                                    "=== Injected Context Documents ===\n{}\n=== End Injected Documents ===",
+                                    doc_lines.join("\n---\n"),
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
