@@ -30,12 +30,12 @@ mod m20260726_000001_custom_agent;
 mod m20260727_000001_custom_agent_skills;
 mod m20260728_000001_custom_agent_skills_dir;
 mod m20260728_000002_custom_agent_source;
-mod m20260729_platform_000001_create_core_tables;
-mod m20260729_platform_000002_create_config_tables;
-mod m20260729_platform_000003_create_activity_log;
-mod m20260729_platform_000004_create_knowledge_doc;
-mod m20260729_platform_000005_normalize_knowledge_doc_path;
-mod m20260729_platform_000006_create_branch_and_release;
+mod m20260622_platform_000001_create_core_tables;
+mod m20260622_platform_000002_create_config_tables;
+mod m20260622_platform_000003_create_activity_log;
+mod m20260627_platform_000004_create_knowledge_doc;
+mod m20260703_platform_000005_normalize_knowledge_doc_path;
+mod m20260718_platform_000006_create_branch_and_release;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -72,12 +72,12 @@ impl MigratorTrait for Migrator {
             Box::new(m20260727_000001_custom_agent_skills::Migration),
             Box::new(m20260728_000001_custom_agent_skills_dir::Migration),
             Box::new(m20260728_000002_custom_agent_source::Migration),
-            Box::new(m20260729_platform_000001_create_core_tables::Migration),
-            Box::new(m20260729_platform_000002_create_config_tables::Migration),
-            Box::new(m20260729_platform_000003_create_activity_log::Migration),
-            Box::new(m20260729_platform_000004_create_knowledge_doc::Migration),
-            Box::new(m20260729_platform_000005_normalize_knowledge_doc_path::Migration),
-            Box::new(m20260729_platform_000006_create_branch_and_release::Migration),
+            Box::new(m20260622_platform_000001_create_core_tables::Migration),
+            Box::new(m20260622_platform_000002_create_config_tables::Migration),
+            Box::new(m20260622_platform_000003_create_activity_log::Migration),
+            Box::new(m20260627_platform_000004_create_knowledge_doc::Migration),
+            Box::new(m20260703_platform_000005_normalize_knowledge_doc_path::Migration),
+            Box::new(m20260718_platform_000006_create_branch_and_release::Migration),
         ]
     }
 }
