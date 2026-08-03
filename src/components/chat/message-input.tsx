@@ -2422,6 +2422,8 @@ export function MessageInput({
   // Consume pending initial drafts (Cluster A — task-detail.tsx writer).
   // On first mount of a task-created conversation tab, insert reference
   // badges for the selected inject options, then clear the draft.
+  // Deferred via setTimeout(0) to avoid ProseMirror chain().run() calling
+  // flushSync during React's render/bootstrap lifecycle.
   useEffect(() => {
     if (!composerReady || !attachmentTabId) return
     const refsJson =
@@ -2429,13 +2431,17 @@ export function MessageInput({
     if (!refsJson) return
     const refs = JSON.parse(refsJson) as ReferenceAttrs[]
     if (!Array.isArray(refs) || refs.length === 0) return
-    const ed = editorRef.current?.getEditor()
-    if (!ed) return
-    ed.chain().focus("end")
-    for (const ref of refs) {
-      ed.chain().insertReference(ref).insertContent(" ").run()
-    }
-    usePlatformTabSlice.getState().clearPendingInitialDraft(attachmentTabId)
+    const id = setTimeout(() => {
+      const editor = editorRef.current?.getEditor()
+      if (!editor) return
+      let chain = editor.chain().focus("end")
+      for (const ref of refs) {
+        chain = chain.insertReference(ref).insertContent(" ")
+      }
+      chain.run()
+      usePlatformTabSlice.getState().clearPendingInitialDraft(attachmentTabId)
+    }, 0)
+    return () => clearTimeout(id)
   }, [composerReady, attachmentTabId])
 
   useEffect(() => {
