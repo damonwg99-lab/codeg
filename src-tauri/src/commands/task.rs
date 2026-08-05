@@ -115,16 +115,21 @@ pub async fn get_task_core(
         .await
         .map_err(AppCommandError::from)?;
 
-    let attachments: Vec<_> = all_docs
-        .iter()
-        .filter(|d| d.doc_type == "task_attachment")
-        .cloned()
-        .collect();
-
+    // Task attachments are all docs linked to this task that are NOT
+    // ai-intermediate. We intentionally do NOT filter by
+    // `doc_type == "task_attachment"`: the KB scanner can overwrite a task
+    // attachment's doc_type to "tech_doc" (it has no `.private/tasks/`
+    // branch), while still preserving task_id. Filtering strictly by
+    // doc_type would make those attachments disappear from the detail page.
     let ai_intermediate_docs: Vec<_> = all_docs
         .iter()
         .filter(|d| d.doc_type == "ai_intermediate")
         .cloned()
+        .collect();
+
+    let attachments: Vec<_> = all_docs
+        .into_iter()
+        .filter(|d| d.doc_type != "ai_intermediate")
         .collect();
 
     let branch_models =

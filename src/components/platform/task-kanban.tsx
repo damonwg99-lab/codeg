@@ -502,7 +502,13 @@ export function TaskKanban({ projectId }: { projectId: number }) {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => setRoute("create-task", { projectId })}
+                onClick={() =>
+                  setRoute(
+                    "create-task",
+                    { projectId },
+                    { routeId: "task-kanban", params: { projectId } }
+                  )
+                }
               >
                 <Plus className="mr-1 h-3.5 w-3.5" />
                 {t("task.create")}
@@ -513,9 +519,7 @@ export function TaskKanban({ projectId }: { projectId: number }) {
             <Button
               variant="outline"
               size="sm"
-              onClick={() =>
-                setRoute("create-release", { projectId }, { routeId: "release-list", params: { projectId } })
-              }
+              onClick={() => setRoute("create-release", { projectId })}
             >
               <Plus className="mr-1 h-3.5 w-3.5" />
               {t("task.createRelease")}
@@ -613,10 +617,14 @@ export function TaskKanban({ projectId }: { projectId: number }) {
                   <span
                     className="flex-1 truncate text-sm font-medium cursor-pointer hover:underline"
                     onClick={() =>
-                      setRoute("task-detail", {
-                        taskId: task.id,
-                        projectId,
-                      })
+                      setRoute(
+                        "task-detail",
+                        {
+                          taskId: task.id,
+                          projectId,
+                        },
+                        { routeId: "task-kanban", params: { projectId } }
+                      )
                     }
                   >
                     {task.title}

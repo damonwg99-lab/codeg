@@ -59,7 +59,7 @@ function resolveProjectStatusLabel(
 export function ProjectDetail({ id }: { id: number }) {
   const t = useTranslations("Platform")
   const { activeProjectId, loadProjectDetail, loadProjects } = usePlatform()
-  const { setRoute } = useWorkbenchRoute()
+  const { setRoute, fromRoute, back } = useWorkbenchRoute()
   const [detail, setDetail] = useState<ProjectDetail | null>(null)
   const [loading, setLoading] = useState(true)
   const [editing, setEditing] = useState(false)
@@ -245,7 +245,7 @@ export function ProjectDetail({ id }: { id: number }) {
               variant="ghost"
               size="icon"
               className="h-7 w-7"
-              onClick={() => setRoute("project-list")}
+              onClick={() => (fromRoute ? back() : setRoute("project-list"))}
             >
               <ArrowLeft className="h-4 w-4" />
             </Button>

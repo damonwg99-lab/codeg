@@ -297,27 +297,22 @@ export function buildPayloadFromOptions(
 
 /**
  * Convert an InjectOption to a ProseMirror ReferenceAttrs for badge rendering.
- * KB docs and attachments with a file path get `refType: "file"` with a `file://`
- * URI; task description and conversation summary options (no file path) get a
- * `refType: "file"` marker with `uri: null` so the badge renders without a link.
+ * All inject options use `refType: "context"` so they render as platform badges;
+ * docPath/kbDocId/prefixLine are carried in `meta` for serialization.
  */
 export function optionToReferenceAttrs(
   option: InjectOption
 ): ReferenceAttrs {
-  if (option.docPath) {
-    return {
-      refType: "file",
-      id: option.docPath,
-      label: option.label,
-      uri: `file://${option.docPath}`,
-      meta: { fileKind: "file" },
-    }
-  }
   return {
-    refType: "file",
+    refType: "context",
     id: String(option.id),
     label: option.label,
     uri: null,
-    meta: null,
+    meta: {
+      injectGroup: option.group,
+      injectPrefix: option.prefixLine ?? undefined,
+      injectDocPath: option.docPath ?? undefined,
+      injectDocId: option.kbDocId ?? undefined,
+    },
   }
 }

@@ -64,6 +64,7 @@ import { useTabContext } from "@/contexts/tab-context"
 import { useAppWorkspace } from "@/contexts/app-workspace-shim"
 import { usePlatformTabSlice } from "@/stores/platform-tab-slice"
 import { useWorkspaceContext } from "@/contexts/workspace-context"
+import { kbDocAbsPath } from "@/lib/kb-doc-path"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { ContextInjectPanel } from "@/components/platform/context-inject-panel"
 import { TaskChangeTracking } from "@/components/platform/task-change-tracking"
@@ -132,40 +133,9 @@ function resolvePriorityLabel(
   return key ? (t(key as never) ?? priority) : priority
 }
 
-/** Compute a path relative to the folder root from a KB doc's filePath.
- *  KB docs store filePath relative to the _knowledge/ directory (e.g. "docs/arch.md").
- *  To open in the file panel via openFilePreview (which uses folderPath as root),
- *  we need the path relative to the folder root: "_knowledge/docs/arch.md".
- *  For custom kbLocalDir outside the folder root, we can't use openFilePreview
- *  (it requires a relative path) — return null to signal this case. */
-function kbDocRelPath(
-  kbLocalDir: string | null,
-  rootDir: string,
-  folderPath: string | null,
-  filePath: string
-): string | null {
-  // Normalize everything to forward slashes for consistent comparison.
-  // On Windows, kbLocalDir and rootDir may contain backslashes from
-  // PathBuf::to_string_lossy(); filePath may also have backslashes
-  // from the scanner's strip_prefix + to_string_lossy.
-  const kbDir = (
-    kbLocalDir ?? `${rootDir.replace(/\\/g, "/")}/_knowledge`
-  ).replace(/\\/g, "/")
-  const fp = folderPath?.replace(/\\/g, "/") ?? ""
-  const normalizedFilePath = filePath.replace(/\\/g, "/")
-  if (!fp) return null // No folder context → can't compute relative path
-  if (kbDir.startsWith(fp + "/") || kbDir === fp + "/_knowledge") {
-    const kbRel = kbDir.slice(fp.length + 1) // "_knowledge"
-    return `${kbRel}/${normalizedFilePath}`
-  }
-  // KB dir is outside folder root — can't open via openFilePreview
-  // (it requires path relative to folderPath, rejects absolute paths)
-  return null
-}
-
 export function TaskDetail({ taskId }: { taskId: number }) {
   const t = useTranslations("Platform")
-  const { setRoute, routeParams, fromRoute, fromParams, openConversations } =
+  const { setRoute, routeParams, fromRoute, back, openConversations } =
     useWorkbenchRoute()
   const { activeProject } = usePlatform()
   const { openTab, closeConversationTab } =
@@ -590,7 +560,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
               className="h-7 w-7"
               onClick={() => {
                 if (fromRoute) {
-                  setRoute(fromRoute, fromParams)
+                  back()
                 } else {
                   setRoute("task-kanban", { projectId })
                 }
@@ -906,13 +876,13 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                               className="h-6 w-6"
                               onClick={(e) => {
                                 e.stopPropagation()
-                                const relPath = kbDocRelPath(
-                                  activeProject?.kbLocalDir ?? null,
-                                  activeProject?.rootDir ?? "",
-                                  activeFolder?.path ?? null,
-                                  att.filePath
+                                void openFilePreview(
+                                  kbDocAbsPath(
+                                    activeProject?.kbLocalDir ?? null,
+                                    activeProject?.rootDir ?? "",
+                                    att.filePath
+                                  )
                                 )
-                                if (relPath) void openFilePreview(relPath)
                               }}
                             >
                               <Eye className="h-3.5 w-3.5" />
@@ -989,16 +959,16 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                               variant="ghost"
                               size="icon"
                               className="h-6 w-6"
-                              onClick={(e) => {
-                                e.stopPropagation()
-                                const relPath = kbDocRelPath(
-                                  activeProject?.kbLocalDir ?? null,
-                                  activeProject?.rootDir ?? "",
-                                  activeFolder?.path ?? null,
-                                  doc.filePath
-                                )
-                                if (relPath) void openFilePreview(relPath)
-                              }}
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  void openFilePreview(
+                                    kbDocAbsPath(
+                                      activeProject?.kbLocalDir ?? null,
+                                      activeProject?.rootDir ?? "",
+                                      doc.filePath
+                                    )
+                                  )
+                                }}
                             >
                               <Eye className="h-3.5 w-3.5" />
                             </Button>
@@ -1402,13 +1372,13 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                             className="h-6 w-6"
                             onClick={(e) => {
                               e.stopPropagation()
-                              const relPath = kbDocRelPath(
-                                activeProject?.kbLocalDir ?? null,
-                                activeProject?.rootDir ?? "",
-                                activeFolder?.path ?? null,
-                                att.filePath
+                              void openFilePreview(
+                                kbDocAbsPath(
+                                  activeProject?.kbLocalDir ?? null,
+                                  activeProject?.rootDir ?? "",
+                                  att.filePath
+                                )
                               )
-                              if (relPath) void openFilePreview(relPath)
                             }}
                           >
                             <Eye className="h-3.5 w-3.5" />
@@ -1487,13 +1457,13 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                             className="h-6 w-6"
                             onClick={(e) => {
                               e.stopPropagation()
-                              const relPath = kbDocRelPath(
-                                activeProject?.kbLocalDir ?? null,
-                                activeProject?.rootDir ?? "",
-                                activeFolder?.path ?? null,
-                                doc.filePath
+                              void openFilePreview(
+                                kbDocAbsPath(
+                                  activeProject?.kbLocalDir ?? null,
+                                  activeProject?.rootDir ?? "",
+                                  doc.filePath
+                                )
                               )
-                              if (relPath) void openFilePreview(relPath)
                             }}
                           >
                             <Eye className="h-3.5 w-3.5" />

@@ -24,7 +24,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 
 export function CreateTaskForm({ projectId }: { projectId: number }) {
   const t = useTranslations("Platform")
-  const { setRoute } = useWorkbenchRoute()
+  const { setRoute, fromRoute, back } = useWorkbenchRoute()
 
   // Form state
   const [title, setTitle] = useState("")
@@ -71,10 +71,12 @@ export function CreateTaskForm({ projectId }: { projectId: number }) {
         }
         setAttachmentUploading(false)
       }
+      // In-tab: opening created task replaces this form in place; the kanban is
+      // recorded as the back target (also recorded when this form opened).
       setRoute(
         "task-detail",
         { taskId: task.id },
-        { routeId: "create-task", params: { projectId } }
+        { routeId: "task-kanban", params: { projectId } }
       )
     } catch (e) {
       setCreateError(String(e))
@@ -100,7 +102,9 @@ export function CreateTaskForm({ projectId }: { projectId: number }) {
             variant="ghost"
             size="icon"
             className="h-7 w-7"
-            onClick={() => setRoute("task-kanban", { projectId })}
+            onClick={() =>
+              fromRoute ? back() : setRoute("task-kanban", { projectId })
+            }
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>

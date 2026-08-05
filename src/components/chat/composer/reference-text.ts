@@ -132,6 +132,10 @@ export function referenceToMarkdown(attrs: ReferenceAttrs): string {
         ? `[${escapeMarkdownText(text)}](${escapeLinkDestination(attrs.uri)})`
         : inlineText(text)
     }
+    case "context": {
+      const prefix = attrs.meta?.injectPrefix?.trim()
+      return prefix || `[${inlineText(attrs.label || attrs.id)}]`
+    }
     default:
       return inlineText(attrs.label || attrs.id)
   }

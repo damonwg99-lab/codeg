@@ -24,7 +24,7 @@ import { Separator } from "@/components/ui/separator"
 
 export function CreateProjectForm() {
   const t = useTranslations("Platform")
-  const { setRoute } = useWorkbenchRoute()
+  const { setRoute, fromRoute, fromParams, back } = useWorkbenchRoute()
   const { loadProjects } = usePlatform()
 
   // Form state
@@ -126,8 +126,14 @@ export function CreateProjectForm() {
       // Refresh project list (no implicit project switching)
       await loadProjects()
 
-      // Navigate to detail even if some repos failed — user can see errors there
-      setRoute("project-detail", { id: project.id })
+      // Navigate to detail even if some repos failed — user can see errors there.
+      // In-tab: the origin list stays the back target (recorded when this form
+      // opened), so this replaces the form in place instead of stacking tabs.
+      setRoute(
+        "project-detail",
+        { id: project.id },
+        { routeId: fromRoute ?? "project-list", params: fromParams }
+      )
     } catch (e) {
       setCreateError(String(e))
     }
@@ -141,6 +147,8 @@ export function CreateProjectForm() {
     scanResults,
     selectedRepos,
     setRoute,
+    fromRoute,
+    fromParams,
     loadProjects,
   ])
 
@@ -152,7 +160,7 @@ export function CreateProjectForm() {
             variant="ghost"
             size="icon"
             className="h-7 w-7"
-            onClick={() => setRoute("project-list")}
+            onClick={() => (fromRoute ? back() : setRoute("project-list"))}
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>

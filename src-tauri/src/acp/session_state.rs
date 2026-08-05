@@ -421,6 +421,16 @@ pub struct SessionState {
     /// not part of the client-visible snapshot.
     pub turn_in_flight: bool,
 
+    /// Number of user prompts sent on THIS connection (incremented by the
+    /// manager under the prompt lock, once per send). Used as a robust
+    /// per-connection signal for context injection: the very first prompt
+    /// (count == 0) gets the full KB-rules/task-context injection; subsequent
+    /// prompts get the compact re-injection preamble every
+    /// `CODEG_REINJECTION_INTERVAL` turns. Deliberately NOT derived from the
+    /// conversation row's `message_count`, which stays 0 for the whole
+    /// lifetime of a live session. Not serialized in the client snapshot.
+    pub prompt_turn_count: usize,
+
     /// Whether the most recently completed turn ended via a stop reason other
     /// than `"end_turn"` (cancelled, refusal, max_tokens, max_turn_requests,
     /// empty, unknown — the same "abnormal ending" bucket `connection.rs`
@@ -498,6 +508,15 @@ impl SessionState {
             pending_user_message_started_at: None,
             turn_in_flight: false,
             last_turn_ended_abnormally: false,
+            // Number of user prompts sent on THIS connection (incremented by
+            // the manager under the prompt lock, once per send). Used as a
+            // robust per-connection signal for context injection: the very
+            // first prompt (count == 0) gets the full KB-rules/task-context
+            // injection; subsequent prompts get the compact re-injection
+            // preamble every `CODEG_REINJECTION_INTERVAL` turns. Deliberately
+            // NOT derived from the conversation row's `message_count`, which
+            // stays 0 for the whole lifetime of a live session.
+            prompt_turn_count: 0,
             config_stale: false,
             config_stale_kind: None,
         }

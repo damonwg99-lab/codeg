@@ -133,7 +133,11 @@ export function ReleaseList({ projectId, setRoute }: Props) {
                   variant="outline"
                   size="sm"
                   onClick={() =>
-                    setRoute("release-detail", { releaseId: r.id, projectId })
+                    setRoute(
+                      "release-detail",
+                      { releaseId: r.id, projectId },
+                      { routeId: "release-list", params: { projectId } }
+                    )
                   }
                 >
                   {t("task.view")}

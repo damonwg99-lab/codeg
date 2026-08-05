@@ -19,7 +19,8 @@ import {
 } from "@/components/ui/alert-dialog"
 
 export function ReleaseDetail() {
-  const { routeParams, setRoute, fromRoute, fromParams } = useWorkbenchRoute()
+  const { routeParams, setRoute, fromRoute, fromParams, back } =
+    useWorkbenchRoute()
   const releaseId = routeParams.releaseId as number
   const projectId =
     (routeParams.projectId as number) ?? (fromParams?.projectId as number)
@@ -56,7 +57,7 @@ export function ReleaseDetail() {
 
   const handleBack = () => {
     if (fromRoute && fromParams) {
-      setRoute(fromRoute, fromParams)
+      back()
     } else {
       setRoute("release-list", { projectId })
     }

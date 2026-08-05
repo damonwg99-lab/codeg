@@ -153,6 +153,7 @@ export function AutomationEditor({
       session: tComposer("mentionGroupSession"),
       commit: tComposer("mentionGroupCommit"),
       skill: tComposer("mentionGroupSkill"),
+      context: "Context",
     }),
     [tComposer]
   )

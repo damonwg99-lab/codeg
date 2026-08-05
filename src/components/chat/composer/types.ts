@@ -1,7 +1,7 @@
 import type { AgentType } from "@/lib/types"
 
 /** The five kinds of inline reference the composer can embed. */
-export type ReferenceKind = "file" | "agent" | "session" | "commit" | "skill"
+export type ReferenceKind = "file" | "agent" | "session" | "commit" | "skill" | "context"
 
 export const REFERENCE_KINDS: readonly ReferenceKind[] = [
   "file",
@@ -9,6 +9,7 @@ export const REFERENCE_KINDS: readonly ReferenceKind[] = [
   "session",
   "commit",
   "skill",
+  "context",
 ]
 
 /**
@@ -56,6 +57,14 @@ export interface ReferenceMeta {
    * `/` when absent.
    */
   invocationPrefix?: "/" | "$"
+  /** context: platform inject group (taskDescription / kb_doc / task_attachment / conversation). */
+  injectGroup?: string
+  /** context: the prefix line text serialized for the AI prompt. */
+  injectPrefix?: string
+  /** context: file path of the injected doc, relative to the project root. */
+  injectDocPath?: string
+  /** context: KB doc id in the platform_knowledge_doc table. */
+  injectDocId?: number
 }
 
 /**

@@ -75,6 +75,8 @@ import {
   createConversation,
   openSettingsWindow,
 } from "@/lib/api"
+import { linkConversation } from "@/lib/platform/api"
+import { usePlatformTabSlice } from "@/stores/platform-tab-slice"
 import {
   flushRetryDelayMs,
   forkSendBlockedByQueue,
@@ -1105,6 +1107,33 @@ const ConversationTabView = memo(function ConversationTabView({
           }
           clearMessageInputDraft(buildNewConversationDraftStorageKey(tabId))
           refreshConversations()
+
+          // Persist a task link chosen in the 📋 popover BEFORE the first
+          // prompt goes out. For a brand-new conversation the popover's
+          // handleTaskLink can only stash the intent (setPendingTaskLink —
+          // there is no conversationId yet to bind against). Consuming it here,
+          // right after the DB row is created, binds the platform_task_conversation
+          // record so the backend's first-prompt context injection (which
+          // resolves the task link) can fire on message 1. On failure the intent
+          // is kept so a later send can retry; the send itself is not blocked.
+          const pendingLink = usePlatformTabSlice
+            .getState()
+            .pendingTaskLink.get(tabId)
+          if (pendingLink) {
+            try {
+              await linkConversation({
+                taskId: pendingLink.taskId,
+                conversationId: newConversationId,
+                role: pendingLink.role,
+              })
+              usePlatformTabSlice.getState().clearPendingTaskLink(tabId)
+            } catch (e) {
+              console.error(
+                "[ConversationTabView] persist pending task link:",
+                e
+              )
+            }
+          }
 
           // Now that the row exists, kick off the actual prompt with the
           // conversation_id pinned so the backend adopts our row instead of

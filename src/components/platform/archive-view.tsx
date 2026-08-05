@@ -144,10 +144,11 @@ export function ArchiveView({
                     <button
                       className="text-left hover:underline text-[0.875rem]"
                       onClick={() =>
-                        setRoute("task-detail", {
-                          taskId: task.id,
-                          projectId,
-                        })
+                        setRoute(
+                          "task-detail",
+                          { taskId: task.id, projectId },
+                          { routeId: "archive-view" }
+                        )
                       }
                     >
                       {task.title}

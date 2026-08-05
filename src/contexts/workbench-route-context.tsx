@@ -5,9 +5,10 @@ import {
   useCallback,
   useContext,
   useMemo,
-  useState,
   type ReactNode,
 } from "react"
+import { useWorkbenchTabStore } from "@/stores/workbench-tab-store"
+import { useIsMobile } from "@/hooks/use-mobile"
 
 /**
  * The view occupying the main content region. `"conversations"` is the default
@@ -43,6 +44,13 @@ interface WorkbenchRouteContextValue {
   fromParams: Record<string, string | number>
   /** Convenience for the common branch — `routeId === "conversations"`. */
   isConversations: boolean
+  /**
+   * Navigate to a workbench route.
+   *  - Passing `from` navigates the ACTIVE tab in place (list → detail drill
+   *    replaces the list; the back button returns to `from`).
+   *  - Without `from`, opens (or focuses) a top-level tab — a fresh, separate
+   *    page tab like the sidebar entries.
+   */
   setRoute: (
     id: WorkbenchRouteId,
     params?: Record<string, string | number>,
@@ -53,6 +61,8 @@ interface WorkbenchRouteContextValue {
   ) => void
   /** Sugar for returning to the conversation workspace. */
   openConversations: () => void
+  /** Pop the active tab back to its recorded origin (no-op if none). */
+  back: () => void
 }
 
 const WorkbenchRouteContext = createContext<WorkbenchRouteContextValue | null>(
@@ -80,14 +90,28 @@ export function useWorkbenchRoute() {
 }
 
 export function WorkbenchRouteProvider({ children }: { children: ReactNode }) {
-  const [routeId, setRouteId] = useState<WorkbenchRouteId>("conversations")
-  const [routeParams, setRouteParams] = useState<
-    Record<string, string | number>
-  >({})
-  const [fromRoute, setFromRoute] = useState<WorkbenchRouteId | null>(null)
-  const [fromParams, setFromParams] = useState<Record<string, string | number>>(
-    {}
+  // Thin facade over the workbench tab store: the active workbench tab (if any)
+  // drives which route fills the main region; when none is active the
+  // conversation workspace shows. Public API (routeId/routeParams/setRoute/
+  // openConversations/isConversations) is unchanged so all platform call sites
+  // keep working untouched. `fromRoute`/`fromParams`/`back` are backed by the
+  // active tab's in-tab navigation record.
+  const activeTab = useWorkbenchTabStore((s) =>
+    s.tabs.find((tab) => tab.id === s.activeTabId)
   )
+  const openTab = useWorkbenchTabStore((s) => s.openTab)
+  const switchTab = useWorkbenchTabStore((s) => s.switchTab)
+  const navigateTab = useWorkbenchTabStore((s) => s.navigateTab)
+
+  const isMobile = useIsMobile()
+
+  const openConversations = useCallback(() => {
+    // Desktop: the conversation column and the workbench right zone coexist —
+    // focusing a conversation must NOT clear the focused workbench tab (that
+    // would fall the right zone back to the empty "open a file or diff" hint).
+    // Mobile is single-pane: a conversation focus hides the workbench overlay.
+    if (isMobile) switchTab(null)
+  }, [isMobile, switchTab])
 
   const setRoute = useCallback(
     (
@@ -98,37 +122,41 @@ export function WorkbenchRouteProvider({ children }: { children: ReactNode }) {
         params?: Record<string, string | number>
       }
     ) => {
-      setRouteId(id)
-      setRouteParams(params ?? {})
-      if (from) {
-        setFromRoute(from.routeId)
-        setFromParams(from.params ?? {})
-      } else {
-        setFromRoute(null)
-        setFromParams({})
+      if (id === "conversations") {
+        openConversations()
+        return
       }
+      if (from && activeTab) {
+        navigateTab(activeTab.id, id, params, from)
+        return
+      }
+      openTab(id, params)
     },
-    []
+    [openTab, navigateTab, openConversations, activeTab]
   )
 
-  const openConversations = useCallback(() => {
-    setRouteId("conversations")
-    setRouteParams({})
-    setFromRoute(null)
-    setFromParams({})
-  }, [])
+  const back = useCallback(() => {
+    if (!activeTab?.backRoute) return
+    navigateTab(
+      activeTab.id,
+      activeTab.backRoute,
+      activeTab.backParams ?? {},
+      null
+    )
+  }, [activeTab, navigateTab])
 
   const value = useMemo<WorkbenchRouteContextValue>(
     () => ({
-      routeId,
-      routeParams,
-      fromRoute,
-      fromParams,
-      isConversations: routeId === "conversations",
+      routeId: activeTab?.routeId ?? "conversations",
+      routeParams: activeTab?.params ?? {},
+      fromRoute: activeTab?.backRoute ?? null,
+      fromParams: activeTab?.backParams ?? {},
+      isConversations: !activeTab,
       setRoute,
       openConversations,
+      back,
     }),
-    [routeId, routeParams, fromRoute, fromParams, setRoute, openConversations]
+    [activeTab, setRoute, openConversations, back]
   )
 
   return (
