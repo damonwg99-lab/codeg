@@ -106,6 +106,7 @@ function WorkspaceDocumentTitle() {
 
 const TOAST_DURATION_MS = 15000
 const WORKSPACE_PANEL_GROUP_ID = "workspace-panel-group"
+const WORKSPACE_OVERLAY_PANEL_GROUP_ID = "workspace-overlay-panel-group"
 const WORKSPACE_CONVERSATION_PANEL_ID = "workspace-conversation-panel"
 const WORKSPACE_FILES_PANEL_ID = "workspace-files-panel"
 const FOLDER_SHELL_GROUP_ID = "folder-shell-group"
@@ -218,6 +219,28 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
     if (mode !== "fusion") return
     setActivePane("files")
   }, [mode, setActivePane])
+
+  // The file column reused both in the conversation+files split and inside the
+  // full-screen workbench overlay's split (tab strip + header + panel).
+  const fileColumnSection = (
+    <section className="flex h-full min-h-0 flex-col overflow-hidden">
+      <div className="flex h-10 shrink-0 items-stretch bg-muted ws-transparent-bg">
+        <div className="flex min-w-0 flex-1 items-stretch">
+          <FileWorkspaceTabBar />
+        </div>
+      </div>
+      <div
+        className="flex min-h-0 flex-1 flex-col overflow-hidden"
+        onPointerDownCapture={markFileActive}
+        onFocusCapture={markFileActive}
+      >
+        <FileWorkspaceHeader />
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <FileWorkspacePanel />
+        </div>
+      </div>
+    </section>
+  )
 
   const applyLayout = useCallback((layout: [number, number]) => {
     desiredLayoutRef.current = layout
@@ -525,33 +548,46 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
               visible while the file is inspected. No files: route fills the
               whole overlay, identical to main. */}
           {fileTabs.length > 0 ? (
-            <ResizablePanelGroup
-              direction="horizontal"
-              className="min-h-0 flex-1"
-              id={WORKSPACE_PANEL_GROUP_ID}
-            >
-              <ResizablePanel defaultSize={60} minSize={30}>
-                <WorkbenchRoutePage />
-              </ResizablePanel>
-              <ResizableHandle withHandle />
-              <ResizablePanel defaultSize={40} minSize={20}>
-                <section className="flex h-full min-h-0 flex-col overflow-hidden">
-                  <div className="flex min-w-0 flex-1 items-stretch bg-muted">
-                    <FileWorkspaceTabBar />
-                  </div>
+            /* Kept mounted and switched with CSS (like the conversation+files
+               split below): maximize overlays the file column across the whole
+               split area instead of tearing down / remounting the panel group
+               and the detail route — unmounting the route (e.g. a heavy task
+               detail) on every toggle is what made the button feel laggy. The
+               `relative` wrapper anchors the file column's `absolute inset-0`. */
+            <div className="relative min-h-0 flex-1">
+              <ResizablePanelGroup
+                direction="horizontal"
+                className="min-h-0 flex-1"
+                id={WORKSPACE_OVERLAY_PANEL_GROUP_ID}
+              >
+                <ResizablePanel
+                  defaultSize={60}
+                  minSize={30}
+                  className={cn(filesMaximized && "invisible")}
+                >
+                  <WorkbenchRoutePage />
+                </ResizablePanel>
+                <ResizableHandle
+                  withHandle
+                  className={cn(filesMaximized && "invisible")}
+                />
+                <ResizablePanel defaultSize={40} minSize={20}>
+                  {/* When maximized the file column overlays the whole split
+                      area (anchored by the `relative` wrapper) — visibility
+                      instead of unmount keeps both panes mounted so toggling
+                      never tears down the detail route. */}
                   <div
-                    className="flex min-h-0 flex-1 flex-col overflow-hidden"
-                    onPointerDownCapture={markFileActive}
-                    onFocusCapture={markFileActive}
+                    className={cn(
+                      "h-full min-h-0",
+                      filesMaximized &&
+                        "absolute inset-0 z-30 bg-background ws-transparent-bg"
+                    )}
                   >
-                    <FileWorkspaceHeader />
-                    <div className="flex-1 min-h-0 overflow-hidden">
-                      <FileWorkspacePanel />
-                    </div>
+                    {fileColumnSection}
                   </div>
-                </section>
-              </ResizablePanel>
-            </ResizablePanelGroup>
+                </ResizablePanel>
+              </ResizablePanelGroup>
+            </div>
           ) : (
             <div className="min-h-0 flex-1">
               <WorkbenchRoutePage />
