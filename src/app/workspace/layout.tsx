@@ -53,6 +53,7 @@ import { PlatformProvider } from "@/contexts/platform-context"
 import {
   WorkspaceProvider,
   useWorkspaceActions,
+  useWorkspaceFileTabs,
   useWorkspaceView,
 } from "@/contexts/workspace-context"
 import { RemoteConnectionGate } from "@/contexts/remote-connection-context"
@@ -202,6 +203,7 @@ function usePanelSlideOnToggle(open: boolean, ready: boolean): boolean {
 function WorkspaceContent({ children }: { children: React.ReactNode }) {
   const { mode, filesMaximized } = useWorkspaceView()
   const { setActivePane } = useWorkspaceActions()
+  const { fileTabs } = useWorkspaceFileTabs()
   const panelGroupRef = useRef<ImperativePanelGroupHandle | null>(null)
   const fusionLayoutRef = useRef<[number, number]>(DEFAULT_FUSION_LAYOUT)
   const desiredLayoutRef = useRef<[number, number]>(DEFAULT_FUSION_LAYOUT)
@@ -516,9 +518,45 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
             <WorkbenchRouteStrip />
             <div data-tauri-drag-region className="h-full min-w-0 flex-1" />
           </div>
-          <div className="min-h-0 flex-1">
-            <WorkbenchRoutePage />
-          </div>
+          {/* Body: the active route full-width, or — when files are open on a
+              full-screen route (e.g. a task detail with previewed docs) — a
+              split that keeps the route on the left and reuses the file
+              column (tab strip + panel) on the right, so the detail stays
+              visible while the file is inspected. No files: route fills the
+              whole overlay, identical to main. */}
+          {fileTabs.length > 0 ? (
+            <ResizablePanelGroup
+              direction="horizontal"
+              className="min-h-0 flex-1"
+              id={WORKSPACE_PANEL_GROUP_ID}
+            >
+              <ResizablePanel defaultSize={60} minSize={30}>
+                <WorkbenchRoutePage />
+              </ResizablePanel>
+              <ResizableHandle withHandle />
+              <ResizablePanel defaultSize={40} minSize={20}>
+                <section className="flex h-full min-h-0 flex-col overflow-hidden">
+                  <div className="flex min-w-0 flex-1 items-stretch bg-muted">
+                    <FileWorkspaceTabBar />
+                  </div>
+                  <div
+                    className="flex min-h-0 flex-1 flex-col overflow-hidden"
+                    onPointerDownCapture={markFileActive}
+                    onFocusCapture={markFileActive}
+                  >
+                    <FileWorkspaceHeader />
+                    <div className="flex-1 min-h-0 overflow-hidden">
+                      <FileWorkspacePanel />
+                    </div>
+                  </div>
+                </section>
+              </ResizablePanel>
+            </ResizablePanelGroup>
+          ) : (
+            <div className="min-h-0 flex-1">
+              <WorkbenchRoutePage />
+            </div>
+          )}
         </div>
       ) : null}
     </div>
