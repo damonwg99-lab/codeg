@@ -66,12 +66,12 @@ export function ReleaseDetail() {
   if (loading)
     return <p className="p-4 text-sm text-muted-foreground">{t("task.loading")}</p>
   if (!detail)
-    return <p className="p-4 text-sm text-destructive">{t("task.releaseNotFound")}</p>
+    return <p className="px-4 pb-4 pt-4 text-sm text-destructive">{t("task.releaseNotFound")}</p>
 
   const { release, items } = detail
 
   return (
-    <div className="h-full overflow-auto p-4 sm:p-6">
+    <div className="h-full overflow-auto px-4 pb-4 pt-4">
       <Button variant="ghost" size="sm" className="mb-4" onClick={handleBack}>
         &larr; {t("task.releaseBackToList")}
       </Button>

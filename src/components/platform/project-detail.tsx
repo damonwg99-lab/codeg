@@ -238,7 +238,7 @@ export function ProjectDetail({ id }: { id: number }) {
 
   return (
     <ScrollArea className="h-full">
-      <div className="flex flex-col gap-6 p-4 sm:p-6">
+      <div className="flex flex-col gap-6 px-4 pb-4 pt-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Button
@@ -249,7 +249,6 @@ export function ProjectDetail({ id }: { id: number }) {
             >
               <ArrowLeft className="h-4 w-4" />
             </Button>
-            <h2 className="text-lg font-semibold">{project.name}</h2>
           </div>
           <div className="flex items-center gap-1">
             {editing ? (

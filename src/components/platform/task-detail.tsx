@@ -507,7 +507,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
   if (loading) {
     return (
       <ScrollArea className="h-full">
-        <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 p-4 sm:p-6">
+        <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-4 pb-4 pt-4">
           <div className="flex items-center justify-center py-16 text-muted-foreground">
             Loading…
           </div>
@@ -519,7 +519,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
   if (!detail) {
     return (
       <ScrollArea className="h-full">
-        <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 p-4 sm:p-6">
+        <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-4 pb-4 pt-4">
           <div className="flex items-center justify-center py-16 text-destructive">
             Task not found
           </div>
@@ -551,7 +551,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
 
   return (
     <ScrollArea className="h-full">
-      <div className="flex flex-col gap-6 p-4 sm:p-6">
+      <div className="flex flex-col gap-6 px-4 pb-4 pt-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Button
@@ -568,7 +568,6 @@ export function TaskDetail({ taskId }: { taskId: number }) {
             >
               <ArrowLeft className="h-4 w-4" />
             </Button>
-            <h2 className="text-lg font-semibold">{task.title}</h2>
           </div>
           <div className="flex items-center gap-1">
             {editing ? (

@@ -1,6 +1,18 @@
 "use client"
 
 import type { ComponentType } from "react"
+import { useTranslations } from "next-intl"
+import {
+  Archive,
+  FilePlus,
+  FolderOpen,
+  FolderPlus,
+  KanbanSquare,
+  ListTodo,
+  PackagePlus,
+  Rocket,
+  type LucideIcon,
+} from "lucide-react"
 import {
   useWorkbenchRoute,
   type WorkbenchRouteId,
@@ -29,6 +41,36 @@ import { ArchiveView } from "@/components/platform/archive-view"
  * route: extend WorkbenchRouteId, add an entry below, and add a SidebarNavButton
  * that calls `setRoute("<id>")`.
  */
+
+// ─── Platform page titles (window-chrome strip) ──────────────────────────────
+// Same chrome-strip idiom as TasksPageTitle: a h-10 band with an icon + title.
+// Each platform route gets one so the full-screen overlay reads consistently.
+
+function makePlatformTitle(icon: LucideIcon, labelKey: string) {
+  return function PlatformPageTitle() {
+    const t = useTranslations("Platform")
+    const Icon = icon
+    return (
+      <div className="flex h-10 shrink-0 items-center gap-2 pl-4">
+        <h1 className="flex items-center gap-1.5 text-[0.8125rem] font-semibold leading-none">
+          <Icon className="size-4 text-muted-foreground" aria-hidden="true" />
+          {t(labelKey as never)}
+        </h1>
+      </div>
+    )
+  }
+}
+
+const ProjectListTitle = makePlatformTitle(FolderOpen, "nav.projectList")
+const ProjectDetailTitle = makePlatformTitle(FolderOpen, "project.detail")
+const CreateProjectTitle = makePlatformTitle(FolderPlus, "nav.createProject")
+const TaskKanbanTitle = makePlatformTitle(KanbanSquare, "nav.taskKanban")
+const TaskDetailTitle = makePlatformTitle(ListTodo, "task.detail")
+const CreateTaskTitle = makePlatformTitle(FilePlus, "task.create")
+const ReleaseListTitle = makePlatformTitle(Rocket, "task.releaseManagement")
+const ReleaseDetailTitle = makePlatformTitle(Rocket, "task.releaseManagement")
+const CreateReleaseTitle = makePlatformTitle(PackagePlus, "task.createRelease")
+const ArchiveViewTitle = makePlatformTitle(Archive, "task.archivedTasks")
 const WORKBENCH_ROUTES: Partial<Record<WorkbenchRouteId, ComponentType>> = {
   automations: AutomationsPage,
   "project-list": ProjectList,
@@ -52,6 +94,16 @@ const WORKBENCH_ROUTE_STRIPS: Partial<Record<WorkbenchRouteId, ComponentType>> =
     automations: AutomationsPageTitle,
     tasks: TasksPageTitle,
     tokenUsage: TokenUsagePageTitle,
+    "project-list": ProjectListTitle,
+    "project-detail": ProjectDetailTitle,
+    "create-project": CreateProjectTitle,
+    "task-kanban": TaskKanbanTitle,
+    "task-detail": TaskDetailTitle,
+    "create-task": CreateTaskTitle,
+    "release-list": ReleaseListTitle,
+    "release-detail": ReleaseDetailTitle,
+    "create-release": CreateReleaseTitle,
+    "archive-view": ArchiveViewTitle,
   }
 
 /**

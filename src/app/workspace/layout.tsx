@@ -35,8 +35,11 @@ import {
   WorkbenchRouteProvider,
   useWorkbenchRoute,
 } from "@/contexts/workbench-route-context"
-import { WorkbenchRoutePage } from "@/components/workbench/workbench-content"
-import { WorkbenchTabBar } from "@/components/workbench/workbench-tab-bar"
+import {
+  WorkbenchRoutePage,
+  WorkbenchRouteStrip,
+  useHasWorkbenchRouteStrip,
+} from "@/components/workbench/workbench-content"
 import {
   AuxPanelProvider,
   useAuxPanelContext,
@@ -46,6 +49,7 @@ import {
   useTerminalContext,
 } from "@/contexts/terminal-context"
 import { GitCredentialProvider } from "@/contexts/git-credential-context"
+import { PlatformProvider } from "@/contexts/platform-context"
 import {
   WorkspaceProvider,
   useWorkspaceActions,
@@ -53,7 +57,6 @@ import {
 } from "@/contexts/workspace-context"
 import { RemoteConnectionGate } from "@/contexts/remote-connection-context"
 import { UpdateProvider } from "@/components/providers/update-provider"
-import { PlatformProvider } from "@/contexts/platform-context"
 import { useWorkspaceBackground, useZoomLevel } from "@/hooks/use-appearance"
 import { FILL_MODE_STYLE } from "@/lib/workspace-background"
 import { TabBar } from "@/components/tabs/tab-bar"
@@ -63,14 +66,9 @@ import { LeftEdgeChrome } from "@/components/layout/left-edge-chrome"
 import { RightEdgeChrome } from "@/components/layout/right-edge-chrome"
 import { WorkspaceChromeController } from "@/components/layout/workspace-chrome-controller"
 import { WindowControls } from "@/components/layout/window-controls"
+import { FileWorkspaceTabBar } from "@/components/files/file-workspace-tab-bar"
 import { FileWorkspaceHeader } from "@/components/files/file-workspace-header"
 import { FileWorkspacePanel } from "@/components/files/file-workspace-panel"
-import {
-  WorkbenchRightZoneContent,
-  WorkbenchRightZoneTabBars,
-  WorkbenchLayerSync,
-  useEffectiveLayer,
-} from "@/components/workbench/workbench-right-zone"
 import { ExternalConflictDialog } from "@/components/files/external-conflict-dialog"
 import { AppToaster } from "@/components/ui/app-toaster"
 import {
@@ -93,7 +91,6 @@ import {
 } from "@/lib/window-chrome"
 import { useIsMobile } from "@/hooks/use-mobile"
 import { usePlatform } from "@/hooks/use-platform"
-import { useWorkbenchTabStore } from "@/stores/workbench-tab-store"
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet"
 
 function WorkspaceDocumentTitle() {
@@ -210,22 +207,10 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
   const desiredLayoutRef = useRef<[number, number]>(DEFAULT_FUSION_LAYOUT)
   const appliedLayoutRef = useRef<[number, number] | null>(null)
 
-  // The right zone has two mutually exclusive layers (file / workbench); each
-  // remembers its own maximized state. The overlay/disabled conditions below
-  // key off whichever layer is currently effective.
-  const effectiveLayer = useEffectiveLayer()
-  const workbenchMaximized = useWorkbenchTabStore((s) => s.maximized)
-  const rightZoneMaximized =
-    effectiveLayer === "workbench"
-      ? workbenchMaximized
-      : effectiveLayer === "file"
-        ? filesMaximized
-        : false
-
   const markConversationActive = useCallback(() => {
-    if (mode !== "fusion" || rightZoneMaximized) return
+    if (mode !== "fusion" || filesMaximized) return
     setActivePane("conversation")
-  }, [mode, rightZoneMaximized, setActivePane])
+  }, [mode, filesMaximized, setActivePane])
 
   const markFileActive = useCallback(() => {
     if (mode !== "fusion") return
@@ -280,6 +265,8 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
     [applyLayout, mode]
   )
 
+  const { isConversations } = useWorkbenchRoute()
+  const hasRouteStrip = useHasWorkbenchRouteStrip()
   const { isOpen: sidebarOpen } = useSidebarContext()
   const { isOpen: auxOpen } = useAuxPanelContext()
   const { isMac, isWindows, isLinux } = usePlatform()
@@ -298,17 +285,27 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
   // is the window's right edge: the file column in fusion, else conversation.
   const convReservesRight = !auxOpen && mode === "conversation"
   const fileReservesRight = !auxOpen && mode === "fusion"
-  // Maximizing the right zone (file column or workbench pages) overlays the
-  // whole middle area, so the right zone then also owns the window's LEFT edge
-  // when the sidebar is collapsed — reserve the left overlay too (normally
-  // that's the conversation column's job).
-  const fileReservesLeft = rightZoneMaximized && !sidebarOpen
+  // Maximizing files overlays the whole middle area, so the file column then
+  // also owns the window's LEFT edge when the sidebar is collapsed — reserve the
+  // left overlay too (normally that's the conversation column's job).
+  const fileReservesLeft = filesMaximized && !sidebarOpen
 
   return (
     <div className="relative h-full min-h-0 overflow-hidden">
-      {/* Kept mounted even when a workbench route or the file column fills the
-          right zone, so background conversations keep streaming. */}
-      <div className="h-full min-h-0">
+      {/* Kept mounted (and only hidden) when a workbench route takes over, so
+          background conversations keep streaming. `inert` drops it from the tab
+          order; `invisible` (visibility, not display — keeps mount/layout/
+          scroll) stops it painting, because with a workspace background image
+          the route overlay's ws-surface is translucent and the conversation
+          would ghost through it. conversation-tab-hidden kills the subtree's
+          transitions so visibility flips instantly (transition-all ghosts). */}
+      <div
+        className={cn(
+          "h-full min-h-0",
+          !isConversations && "conversation-tab-hidden invisible"
+        )}
+        inert={!isConversations || undefined}
+      >
         <ResizablePanelGroup
           id={WORKSPACE_PANEL_GROUP_ID}
           ref={panelGroupRef}
@@ -326,13 +323,13 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
                 "flex h-full min-h-0 flex-col overflow-hidden",
                 mode === "conversation" &&
                   "absolute inset-0 z-30 bg-background ws-transparent-bg",
-                // Covered by the right-zone-maximized overlay: stop painting so
-                // it can't show through the now-translucent overlay. `invisible`
+                // Covered by the files-maximized overlay: stop painting so it
+                // can't show through the now-translucent overlay. `invisible`
                 // (visibility:hidden), not display:none, keeps mount + box size
                 // intact so the stick-to-bottom scroll doesn't reset.
-                rightZoneMaximized && "invisible"
+                filesMaximized && "invisible"
               )}
-              inert={rightZoneMaximized || undefined}
+              inert={filesMaximized || undefined}
             >
               {/* Conversation column top bar (UNSPLIT only): the tab strip,
                   plus a left reserve (only when the sidebar is collapsed, so
@@ -407,12 +404,12 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
               thing the overlay approach avoids. */}
           <ResizableHandle
             withHandle
-            disabled={mode !== "fusion" || rightZoneMaximized}
+            disabled={mode !== "fusion" || filesMaximized}
             className={cn(
               mode !== "fusion" &&
                 "pointer-events-none w-0 opacity-0 after:w-0",
               mode === "fusion" &&
-                rightZoneMaximized &&
+                filesMaximized &&
                 "pointer-events-none invisible"
             )}
           />
@@ -437,7 +434,7 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
             <section
               className={cn(
                 "flex h-full min-h-0 flex-col overflow-hidden",
-                rightZoneMaximized &&
+                filesMaximized &&
                   "absolute inset-0 z-30 bg-background ws-transparent-bg",
                 // Covered by the conversation overlay in conversation mode: hide
                 // from paint (keep mount + layout) so it can't show through the
@@ -466,7 +463,7 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
                   />
                 )}
                 <div className="flex min-w-0 flex-1 items-stretch">
-                  <WorkbenchRightZoneTabBars />
+                  <FileWorkspaceTabBar />
                 </div>
                 {fileReservesRight && (
                   <div
@@ -483,12 +480,47 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
                 onPointerDownCapture={markFileActive}
                 onFocusCapture={markFileActive}
               >
-                <WorkbenchRightZoneContent />
+                <FileWorkspaceHeader />
+                <div className="flex-1 min-h-0 overflow-hidden">
+                  <FileWorkspacePanel />
+                </div>
               </div>
             </section>
           </ResizablePanel>
         </ResizablePanelGroup>
       </div>
+      {!isConversations ? (
+        // `bg-background ws-transparent-bg` matches the conversation surface
+        // exactly: opaque background normally, fully transparent (image shows
+        // through, no frost) with a workspace background image on — the
+        // conversation beneath is `invisible` so nothing else paints through.
+        <div className="absolute inset-0 z-40 flex flex-col bg-background ws-transparent-bg">
+          {/* Window-chrome strip: reserves the fixed corner overlays' h-10
+              band, hosts the active route's title on the left, and keeps the
+              empty middle as a window-drag region. With a title present it
+              closes with the sidebar-header hairline (ws-chrome-border keeps
+              it legible over a background image). */}
+          <div
+            className={cn(
+              "flex h-10 shrink-0 items-stretch",
+              hasRouteStrip && "border-b border-border/50 ws-chrome-border"
+            )}
+          >
+            {!sidebarOpen && (
+              <div
+                data-tauri-drag-region
+                className="h-full shrink-0"
+                style={{ width: leftReserve }}
+              />
+            )}
+            <WorkbenchRouteStrip />
+            <div data-tauri-drag-region className="h-full min-w-0 flex-1" />
+          </div>
+          <div className="min-h-0 flex-1">
+            <WorkbenchRoutePage />
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -496,6 +528,7 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
 function MobileWorkspaceContent({ children }: { children: React.ReactNode }) {
   const { mode, activePane } = useWorkspaceView()
   const { isConversations } = useWorkbenchRoute()
+  const hasRouteStrip = useHasWorkbenchRouteStrip()
 
   const showConversation =
     mode === "conversation" || activePane === "conversation"
@@ -532,10 +565,15 @@ function MobileWorkspaceContent({ children }: { children: React.ReactNode }) {
         )}
       </div>
       {!isConversations ? (
+        // Same canvas as the desktop overlay: conversation-identical background
+        // (opaque normally, transparent under a workspace background image).
         <div className="absolute inset-0 z-40 flex flex-col bg-background ws-transparent-bg">
-          <div className="flex h-10 shrink-0 items-stretch bg-muted ws-transparent-bg">
-            <WorkbenchTabBar />
-          </div>
+          {hasRouteStrip ? (
+            <div className="flex h-10 shrink-0 items-stretch border-b border-border/50 ws-chrome-border">
+              <WorkbenchRouteStrip />
+              <div className="min-w-0 flex-1" />
+            </div>
+          ) : null}
           <div className="min-h-0 flex-1">
             <WorkbenchRoutePage />
           </div>
@@ -1162,13 +1200,8 @@ function WorkbenchRouteConversationSync() {
   const activeTabId = useTabStore((s) => s.activeTabId)
   const { consumeRemoteActivation } = useTabActions()
   const { openConversations } = useWorkbenchRoute()
-  const isMobile = useIsMobile()
   const prevRef = useRef(activeTabId)
   useEffect(() => {
-    // Desktop: conversations and the workbench are independent now (a
-    // conversation tab lives in its own left column), so a conversation
-    // activation must NOT yank the right zone back to the conversations route.
-    if (!isMobile) return
     if (prevRef.current === activeTabId) return
     prevRef.current = activeTabId
     // A remote tab snapshot that mirrors another client's focus also changes
@@ -1178,7 +1211,7 @@ function WorkbenchRouteConversationSync() {
     // edits). Local activations leave the flag false and switch as before.
     if (consumeRemoteActivation()) return
     openConversations()
-  }, [isMobile, activeTabId, openConversations, consumeRemoteActivation])
+  }, [activeTabId, openConversations, consumeRemoteActivation])
   return null
 }
 
@@ -1193,56 +1226,52 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
           project's root folder. */}
       <PlatformProvider>
         <AlertProvider>
-        <GitCredentialProvider>
-          <TaskProvider>
-            <AcpConnectionsProvider>
-              <DelegationProvider>
-                <ConversationStatusEventBridge />
-                <ConversationRuntimeProvider>
-                  <WorkspaceProvider>
-                    <TabProvider>
-                      <WorkspaceDocumentTitle />
-                      <TabKeysSync />
-                      <HeavyPluginsWarmup />
-                      <DeepLinkBootstrap />
-                      <PetFocusBridge />
-                      {/* Always mounted: external-change conflicts must be
-                            resolvable even with the aux file tree closed. */}
-                      <ExternalConflictDialog />
-                      <SidebarProvider>
-                        <AuxPanelProvider>
-                          <TerminalProvider>
-                            <SearchDialogProvider>
-                              <AutomationsViewProvider>
-                                <TasksViewProvider>
-                                  <WorkbenchRouteProvider>
-                                    <WorkbenchRouteConversationSync />
-                                    {/* Flips the right zone to the file layer when
-                                        a file tab activates. Workbench activation
-                                        is set inside the store actions themselves. */}
-                                    <WorkbenchLayerSync />
-                                    {/* Inside WorkbenchRouteProvider: the
-                                        listener calls openConversations() to
-                                        surface a launcher-opened folder. */}
-                                    <WorkspaceOpenFolderListener />
-                                    <FolderLayoutShell>
-                                      {children}
-                                    </FolderLayoutShell>
-                                  </WorkbenchRouteProvider>
-                                </TasksViewProvider>
-                              </AutomationsViewProvider>
-                            </SearchDialogProvider>
-                          </TerminalProvider>
-                        </AuxPanelProvider>
-                      </SidebarProvider>
-                    </TabProvider>
-                  </WorkspaceProvider>
-                </ConversationRuntimeProvider>
-              </DelegationProvider>
-            </AcpConnectionsProvider>
-          </TaskProvider>
-        </GitCredentialProvider>
-      </AlertProvider>
+          <GitCredentialProvider>
+            <TaskProvider>
+              <AcpConnectionsProvider>
+                <DelegationProvider>
+                  <ConversationStatusEventBridge />
+                  <ConversationRuntimeProvider>
+                    <WorkspaceProvider>
+                      <TabProvider>
+                        <WorkspaceDocumentTitle />
+                        <TabKeysSync />
+                        <HeavyPluginsWarmup />
+                        <DeepLinkBootstrap />
+                        <PetFocusBridge />
+                        {/* Always mounted: external-change conflicts must be
+                              resolvable even with the aux file tree closed. */}
+                        <ExternalConflictDialog />
+                        <SidebarProvider>
+                          <AuxPanelProvider>
+                            <TerminalProvider>
+                              <SearchDialogProvider>
+                                <AutomationsViewProvider>
+                                  <TasksViewProvider>
+                                    <WorkbenchRouteProvider>
+                                      <WorkbenchRouteConversationSync />
+                                      {/* Inside WorkbenchRouteProvider: the
+                                            listener calls openConversations() to
+                                            surface a launcher-opened folder. */}
+                                      <WorkspaceOpenFolderListener />
+                                      <FolderLayoutShell>
+                                        {children}
+                                      </FolderLayoutShell>
+                                    </WorkbenchRouteProvider>
+                                  </TasksViewProvider>
+                                </AutomationsViewProvider>
+                              </SearchDialogProvider>
+                            </TerminalProvider>
+                          </AuxPanelProvider>
+                        </SidebarProvider>
+                      </TabProvider>
+                    </WorkspaceProvider>
+                  </ConversationRuntimeProvider>
+                </DelegationProvider>
+              </AcpConnectionsProvider>
+            </TaskProvider>
+          </GitCredentialProvider>
+        </AlertProvider>
       </PlatformProvider>
     </AppWorkspaceProvider>
   )

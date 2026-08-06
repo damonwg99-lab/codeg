@@ -96,7 +96,7 @@ export function CreateTaskForm({ projectId }: { projectId: number }) {
 
   return (
     <ScrollArea className="h-full">
-      <div className="flex flex-col gap-6 p-4 sm:p-6">
+      <div className="flex flex-col gap-6 px-4 pb-4 pt-4">
         <div className="flex items-center gap-2">
           <Button
             variant="ghost"
@@ -108,7 +108,6 @@ export function CreateTaskForm({ projectId }: { projectId: number }) {
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
-          <h1 className="text-lg font-semibold">{t("task.create")}</h1>
         </div>
 
         {/* Title */}

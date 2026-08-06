@@ -96,7 +96,7 @@ export function ArchiveView({
   }
 
   return (
-    <div className="h-full overflow-auto p-4">
+    <div className="h-full overflow-auto px-4 pb-4 pt-4">
       <div className="mb-3">
         <Input
           placeholder={t("task.archiveRelease")}

@@ -48,7 +48,6 @@ import {
   selectTabsToUnload,
 } from "@/lib/file-tab-memory"
 import { useWorkspaceStateStore } from "@/hooks/use-workspace-state-store"
-import { useWorkbenchTabStore } from "@/stores/workbench-tab-store"
 import {
   useOpenFileTabsWatch,
   type WorkspaceExternalConflict,
@@ -517,12 +516,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     []
   )
 
-  // The right zone also hosts the workbench (project/task pages): when any
-  // workbench tab is open the layout must split conversation | right zone just
-  // like it does for file tabs.
-  const hasWorkbenchTabs = useWorkbenchTabStore((s) => s.tabs.length > 0)
-  const mode: WorkspaceMode =
-    fileTabs.length > 0 || hasWorkbenchTabs ? "fusion" : "conversation"
+  const mode: WorkspaceMode = fileTabs.length > 0 ? "fusion" : "conversation"
   const effectiveFilesMaximized = mode === "fusion" && filesMaximized
 
   // Reset maximize state once the file workspace is empty so reopening a file
@@ -555,12 +549,6 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
 
   const activateFilePane = useCallback(() => {
     setActivePaneState((prev) => (prev === "files" ? prev : "files"))
-    // Right-zone layer coupling: every file-pane activation means the file
-    // workspace is the user's latest intent, so the right zone must show the
-    // file layer. This runs even when RE-opening the already-active file tab —
-    // the one case where neither `activePane` nor `activeFileTabId` changes, so
-    // a reactive watcher alone would miss it (idempotent no-op otherwise).
-    useWorkbenchTabStore.getState().setLayer("file")
   }, [])
 
   // NOTE: there is deliberately NO folder-removal cleanup for file tabs.

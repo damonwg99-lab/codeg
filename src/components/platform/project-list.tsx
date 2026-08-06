@@ -29,7 +29,7 @@ export function ProjectList() {
   if (loadingProjects) {
     return (
       <ScrollArea className="h-full">
-        <div className="flex flex-col gap-6 p-4 sm:p-6">
+        <div className="flex flex-col px-4 pb-4 pt-4">
           <div className="text-muted-foreground">Loading…</div>
         </div>
       </ScrollArea>
@@ -39,7 +39,7 @@ export function ProjectList() {
   if (projects.length === 0) {
     return (
       <ScrollArea className="h-full">
-        <div className="flex flex-col items-center justify-center gap-4 p-4 sm:p-6 py-16">
+        <div className="flex flex-col items-center justify-center gap-4 px-4 py-16">
           <FolderOpen className="h-12 w-12 text-muted-foreground" />
           <p className="text-muted-foreground">{t("switcher.noProject")}</p>
           <Button
@@ -57,9 +57,8 @@ export function ProjectList() {
 
   return (
     <ScrollArea className="h-full">
-      <div className="flex flex-col gap-6 p-4 sm:p-6">
-        <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold">{t("nav.projectList")}</h2>
+      <div className="flex flex-col gap-6 px-4 pb-4 pt-4">
+        <div className="flex items-center justify-end">
           <Button
             variant="outline"
             size="sm"

@@ -87,7 +87,7 @@ export function ReleaseList({ projectId, setRoute }: Props) {
 
   return (
     <>
-      <div className="h-full overflow-auto p-4 sm:p-6">
+      <div className="h-full overflow-auto px-4 pb-4 pt-4">
         <div className="space-y-3">
           {releases.map((r) => (
             <div key={r.id} className="space-y-2 rounded-lg border p-4">
