@@ -36,6 +36,11 @@ mod m20260622_platform_000003_create_activity_log;
 mod m20260627_platform_000004_create_knowledge_doc;
 mod m20260703_platform_000005_normalize_knowledge_doc_path;
 mod m20260718_platform_000006_create_branch_and_release;
+mod m20260801_000001_work_task;
+mod m20260801_000002_work_task_p2;
+mod m20260801_000003_work_task_template;
+mod m20260803_000001_folder_link;
+mod m20260803_000001_token_usage;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -71,13 +76,18 @@ impl MigratorTrait for Migrator {
             Box::new(m20260726_000001_custom_agent::Migration),
             Box::new(m20260727_000001_custom_agent_skills::Migration),
             Box::new(m20260728_000001_custom_agent_skills_dir::Migration),
-            Box::new(m20260728_000002_custom_agent_source::Migration),
+             Box::new(m20260728_000002_custom_agent_source::Migration),
             Box::new(m20260622_platform_000001_create_core_tables::Migration),
             Box::new(m20260622_platform_000002_create_config_tables::Migration),
             Box::new(m20260622_platform_000003_create_activity_log::Migration),
             Box::new(m20260627_platform_000004_create_knowledge_doc::Migration),
             Box::new(m20260703_platform_000005_normalize_knowledge_doc_path::Migration),
             Box::new(m20260718_platform_000006_create_branch_and_release::Migration),
+            Box::new(m20260801_000001_work_task::Migration),
+            Box::new(m20260801_000002_work_task_p2::Migration),
+            Box::new(m20260801_000003_work_task_template::Migration),
+            Box::new(m20260803_000001_folder_link::Migration),
+            Box::new(m20260803_000001_token_usage::Migration),
         ]
     }
 }

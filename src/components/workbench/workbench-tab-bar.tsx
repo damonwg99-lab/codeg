@@ -45,6 +45,10 @@ function resolveRouteTitle(
       return t("task.createRelease" as never)
     case "archive-view":
       return t("task.archivedTasks" as never)
+    case "tasks":
+      return "Task Board"
+    case "tokenUsage":
+      return "Token Usage"
     default:
       return "Automations"
   }

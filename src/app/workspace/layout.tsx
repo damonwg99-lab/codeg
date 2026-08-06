@@ -30,6 +30,7 @@ import { selectIsSplit } from "@/stores/tab-store"
 import { SidebarProvider, useSidebarContext } from "@/contexts/sidebar-context"
 import { SearchDialogProvider } from "@/contexts/search-dialog-context"
 import { AutomationsViewProvider } from "@/contexts/automations-view-context"
+import { TasksViewProvider } from "@/contexts/tasks-view-context"
 import {
   WorkbenchRouteProvider,
   useWorkbenchRoute,
@@ -501,7 +502,15 @@ function MobileWorkspaceContent({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="relative h-full min-h-0 overflow-hidden">
-      <div className="h-full min-h-0" inert={!isConversations || undefined}>
+      {/* Same keep-alive hiding as the desktop shell: stop painting under the
+          translucent route overlay without unmounting. */}
+      <div
+        className={cn(
+          "h-full min-h-0",
+          !isConversations && "conversation-tab-hidden invisible"
+        )}
+        inert={!isConversations || undefined}
+      >
         {showConversation ? (
           // Mobile mirrors the desktop chrome: no tab strip — the conversation
           // detail header (folder › title) renders inside {children}, and tabs
@@ -523,7 +532,7 @@ function MobileWorkspaceContent({ children }: { children: React.ReactNode }) {
         )}
       </div>
       {!isConversations ? (
-        <div className="absolute inset-0 z-40 flex flex-col ws-surface">
+        <div className="absolute inset-0 z-40 flex flex-col bg-background ws-transparent-bg">
           <div className="flex h-10 shrink-0 items-stretch bg-muted ws-transparent-bg">
             <WorkbenchTabBar />
           </div>
@@ -607,7 +616,7 @@ function FolderWorkspaceShell({ children }: { children: React.ReactNode }) {
     setWidth: setSidebarWidth,
   } = useSidebarContext()
   const {
-    isOpen: auxOpen,
+    isOpen: auxOpenRequested,
     restored: auxRestored,
     width: auxWidth,
     minWidth: auxMinWidth,
@@ -615,12 +624,22 @@ function FolderWorkspaceShell({ children }: { children: React.ReactNode }) {
     setWidth: setAuxWidth,
   } = useAuxPanelContext()
   const {
-    isOpen: terminalOpen,
+    isOpen: terminalOpenRequested,
     height: terminalHeight,
     minHeight: terminalMinHeight,
     maxHeight: terminalMaxHeight,
     setHeight: setTerminalHeight,
   } = useTerminalContext()
+  // A full-page workbench route (tasks / automations) replaces only the CENTER
+  // panel — the terminal sits below it and the aux panel beside it, both
+  // outside the overlay. Their toggles are hidden on those routes
+  // (RightEdgeChrome), so anything left open would be stranded on screen with
+  // no way to close it. Collapse both for the duration; the contexts keep the
+  // user's real open state (and the terminal keeps running), so switching back
+  // to conversations restores exactly what was there.
+  const { isConversations } = useWorkbenchRoute()
+  const auxOpen = auxOpenRequested && isConversations
+  const terminalOpen = terminalOpenRequested && isConversations
 
   // Animate the shell (horizontal) group while the sidebar/aux toggle and the
   // main (vertical) group while the terminal toggles, so the panes slide open
@@ -1195,20 +1214,22 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
                           <TerminalProvider>
                             <SearchDialogProvider>
                               <AutomationsViewProvider>
-                                <WorkbenchRouteProvider>
-                                  <WorkbenchRouteConversationSync />
-                                  {/* Flips the right zone to the file layer when
-                                      a file tab activates. Workbench activation
-                                      is set inside the store actions themselves. */}
-                                  <WorkbenchLayerSync />
-                                  {/* Inside WorkbenchRouteProvider: the
-                                          listener calls openConversations() to
-                                          surface a launcher-opened folder. */}
-                                  <WorkspaceOpenFolderListener />
-                                  <FolderLayoutShell>
-                                    {children}
-                                  </FolderLayoutShell>
-                                </WorkbenchRouteProvider>
+                                <TasksViewProvider>
+                                  <WorkbenchRouteProvider>
+                                    <WorkbenchRouteConversationSync />
+                                    {/* Flips the right zone to the file layer when
+                                        a file tab activates. Workbench activation
+                                        is set inside the store actions themselves. */}
+                                    <WorkbenchLayerSync />
+                                    {/* Inside WorkbenchRouteProvider: the
+                                        listener calls openConversations() to
+                                        surface a launcher-opened folder. */}
+                                    <WorkspaceOpenFolderListener />
+                                    <FolderLayoutShell>
+                                      {children}
+                                    </FolderLayoutShell>
+                                  </WorkbenchRouteProvider>
+                                </TasksViewProvider>
                               </AutomationsViewProvider>
                             </SearchDialogProvider>
                           </TerminalProvider>

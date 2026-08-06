@@ -32,6 +32,8 @@ export type WorkbenchRouteId =
   | "release-detail"
   | "create-release"
   | "archive-view"
+  | "tasks"
+  | "tokenUsage"
 
 interface WorkbenchRouteContextValue {
   routeId: WorkbenchRouteId

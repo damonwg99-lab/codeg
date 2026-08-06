@@ -5,7 +5,12 @@ import {
   useWorkbenchRoute,
   type WorkbenchRouteId,
 } from "@/contexts/workbench-route-context"
-import { AutomationsPage } from "@/components/automations/automations-page"
+import { AutomationsPage, AutomationsPageTitle } from "@/components/automations/automations-page"
+import { TasksPage, TasksPageTitle } from "@/components/tasks/tasks-page"
+import {
+  TokenUsagePage,
+  TokenUsagePageTitle,
+} from "@/components/token-usage/token-usage-page"
 import { ProjectList } from "@/components/platform/project-list"
 import { ProjectDetail } from "@/components/platform/project-detail"
 import { CreateProjectForm } from "@/components/platform/create-project-form"
@@ -36,7 +41,18 @@ const WORKBENCH_ROUTES: Partial<Record<WorkbenchRouteId, ComponentType>> = {
   "release-detail": ReleaseDetail,
   "create-release": CreateReleaseFormRoute,
   "archive-view": ArchiveViewRoute,
+  tasks: TasksPage,
+  tokenUsage: TokenUsagePage,
 }
+
+/** Optional per-route content for the window-chrome strip above the page
+ *  (the h-10 band the fixed corner overlays sit on) — e.g. the page title. */
+const WORKBENCH_ROUTE_STRIPS: Partial<Record<WorkbenchRouteId, ComponentType>> =
+  {
+    automations: AutomationsPageTitle,
+    tasks: TasksPageTitle,
+    tokenUsage: TokenUsagePageTitle,
+  }
 
 /**
  * Renders the active non-conversation route page, or nothing when the
@@ -47,6 +63,20 @@ export function WorkbenchRoutePage() {
   const { routeId } = useWorkbenchRoute()
   const Page = WORKBENCH_ROUTES[routeId]
   return Page ? <Page /> : null
+}
+
+/** The active route's strip content (page title), or nothing. */
+export function WorkbenchRouteStrip() {
+  const { routeId } = useWorkbenchRoute()
+  const Strip = WORKBENCH_ROUTE_STRIPS[routeId]
+  return Strip ? <Strip /> : null
+}
+
+/** Whether the active route contributes chrome-strip content — lets the host
+ *  style the band (e.g. its bottom border) only when a title renders. */
+export function useHasWorkbenchRouteStrip(): boolean {
+  const { routeId } = useWorkbenchRoute()
+  return WORKBENCH_ROUTE_STRIPS[routeId] != null
 }
 
 // ─── Platform route wrappers (Cluster A/B Release) ───────────────────────────
