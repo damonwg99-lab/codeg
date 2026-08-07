@@ -4,14 +4,12 @@ import { FolderKanban, KanbanSquare } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { usePlatformOptional } from "@/contexts/platform-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
-import { ProjectSwitcher } from "@/components/platform/project-switcher"
 import { SidebarNavButton } from "@/components/layout/sidebar"
 
 /**
- * Platform (Cluster A) sidebar section: a project switcher at the top plus the
- * Projects and Tasks route buttons. Rendered at the top of the sidebar's fixed
- * actions row. `ProjectSwitcher` returns null until at least one project exists,
- * so the switcher only appears when there's something to switch between.
+ * Platform (Cluster A) sidebar section: the Projects and Tasks route buttons.
+ * Rendered at the top of the sidebar's fixed actions row. (The project switcher
+ * itself now lives in the top bar, next to the repo switcher.)
  *
  * Degrades to null when no PlatformProvider is mounted (e.g. in unit tests that
  * render the bare Sidebar without platform wiring).
@@ -26,7 +24,6 @@ export function PlatformSidebarSection() {
 
   return (
     <>
-      <ProjectSwitcher />
       <SidebarNavButton
         icon={FolderKanban}
         label={t("projectList")}

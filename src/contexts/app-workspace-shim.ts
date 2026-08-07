@@ -32,6 +32,7 @@ export function useAppWorkspace() {
       addFolderToWorkspaceById: s.addFolderToWorkspaceById,
       conversations: s.conversations,
       refreshConversations: s.refreshConversations,
+      gitHeads: s.gitHeads,
     }))
   )
 }

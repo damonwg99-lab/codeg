@@ -24,9 +24,13 @@ export const MAC_TRAFFIC_LIGHT_INSET = 76
  */
 export const WINDOW_CAPTION_WIDTH = 138
 
-/** Left cluster: sidebar toggle + remote (two icon buttons + padding). */
-export const LEFT_CHROME_CLUSTER = 80
-
+/**
+ * Left cluster: sidebar toggle + remote + the project/repo top bar (two icon
+ * buttons + project avatar + repo selector + padding). Wider than the old
+ * two-icon-only strip so the project and repo switchers fit without clipping,
+ * but sized to their actual content (~262px) so the left column isn't over-wide.
+ */
+export const LEFT_CHROME_CLUSTER = 260
 /** Right cluster: terminal + aux + settings (three icon buttons + padding). */
 export const RIGHT_CHROME_CLUSTER = 116
 
