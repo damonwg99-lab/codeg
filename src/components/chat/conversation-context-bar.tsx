@@ -34,16 +34,7 @@ import {
 import { FolderAliasLabel } from "@/components/conversations/folder-alias-label"
 import { BranchDropdown } from "@/components/layout/branch-dropdown"
 import { usePlatform } from "@/contexts/platform-context"
-import { isHiddenFolderKind } from "@/lib/platform/types"
-
-/** Normalize a folder path for duplicate detection (case + trailing separators). */
-function normalizeFolderPath(path: string | null | undefined): string {
-  if (!path) return ""
-  return path
-    .trim()
-    .replace(/[\\/]+$/, "")
-    .toLowerCase()
-}
+import { computeScopedTopLevelFolders } from "@/lib/folder-scoping"
 
 interface ConversationContextBarProps {
   extraContent?: React.ReactNode
@@ -279,47 +270,20 @@ export const ConversationFolderBranchPicker = memo(
       [ownTab, allFolders]
     )
 
-    // Unscoped list: main's default minus platform_repo sub-repos so the
-    // picker never lists a project's hidden sub-repo folders.
-    const unscopedTopLevelFolders = useMemo(
+    // Scoped picker list: when a project is active, scope to the project's
+    // repos (root folder + sub-repos) with path-aware dedup; otherwise fall
+    // back to main's default top-level non-chat repos. All logic lives in
+    // `@/lib/folder-scoping` so main's component refactors never touch it.
+    const pickerFolders = useMemo(
       () =>
-        excludeChatFolders(filterTopLevelFolders(folders)).filter(
-          (f) => !isHiddenFolderKind(f.kind)
-        ),
-      [folders]
+        computeScopedTopLevelFolders({
+          folders,
+          allFolders,
+          activeProject,
+          activeProjectRepos,
+        }),
+      [folders, allFolders, activeProject, activeProjectRepos]
     )
-
-    // Scoped list: the active project's root folder plus its sub-repos.
-    // Sub-repos have `kind === "platform_repo"` and live in `allFolders` (not
-    // the sidebar `folders` list, since they're hidden there too).
-    //
-    // Dedup by folder id AND normalized path: a git-rooted project's root can
-    // be re-registered as a sub-repo under a DIFFERENT folder row (its path
-    // string differs enough that `add_folder_inner` inserts a second row), so
-    // the same directory can surface under two ids. Id-only dedup lets that
-    // slip through — collapse on path too (mirrors RepoSelector's options).
-    const scopedTopLevelFolders = useMemo(() => {
-      if (!activeProject) return null
-      const list: typeof folders = []
-      const seenPaths = new Set<string>()
-      const pushFolder = (f: (typeof folders)[number]) => {
-        if (list.some((x) => x.id === f.id)) return
-        const p = normalizeFolderPath(f.path)
-        if (p && seenPaths.has(p)) return
-        if (p) seenPaths.add(p)
-        list.push(f)
-      }
-      const rootFolder = allFolders.find((f) => f.id === activeProject.folderId)
-      if (rootFolder) pushFolder(rootFolder)
-      for (const repo of activeProjectRepos) {
-        if (repo.folderId == null) continue
-        const repoFolder = allFolders.find((f) => f.id === repo.folderId)
-        if (repoFolder) pushFolder(repoFolder)
-      }
-      return list
-    }, [activeProject, activeProjectRepos, allFolders])
-
-    const pickerFolders = scopedTopLevelFolders ?? unscopedTopLevelFolders
     // Show the folder picker whenever there is at least one folder to switch
     // to. (A scoped single-repo project that surfaces two rows for the same
     // directory collapses to one after path-dedup, but the dropdown must stay
