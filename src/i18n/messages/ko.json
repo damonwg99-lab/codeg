@@ -4499,9 +4499,12 @@
       "switchProject": "이 프로젝트로 전환"
     },
     "switcher": {
-      "placeholder": "프로젝트 선택",
+      "createFirst": "첫 프로젝트 생성",
       "noProject": "프로젝트 없음",
-      "createFirst": "첫 프로젝트 생성"
+      "placeholder": "프로젝트 선택",
+      "toasts": {
+        "switchedToProject": "{name}(으)로 전환했습니다"
+      }
     },
     "project": {
       "create": "프로젝트 생성",
@@ -4701,7 +4704,8 @@
     "repoSelector": {
       "root": "프로젝트 루트",
       "placeholder": "리포지토리 선택",
-      "noRepos": "리포지토리 없음"
+      "noRepos": "리포지토리 없음",
+      "initGitRepo": "Git 저장소 초기화"
     },
     "kb": {
       "path": "KB 경로",

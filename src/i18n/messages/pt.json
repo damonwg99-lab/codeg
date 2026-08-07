@@ -4499,9 +4499,12 @@
       "switchProject": "Mudar para este projeto"
     },
     "switcher": {
-      "placeholder": "Selecionar projeto",
+      "createFirst": "Criar seu primeiro projeto",
       "noProject": "Sem projeto",
-      "createFirst": "Criar seu primeiro projeto"
+      "placeholder": "Selecionar projeto",
+      "toasts": {
+        "switchedToProject": "Alterado para {name}"
+      }
     },
     "project": {
       "create": "Criar projeto",
@@ -4701,7 +4704,8 @@
     "repoSelector": {
       "root": "Raiz do projeto",
       "placeholder": "Selecionar repo",
-      "noRepos": "Sem repos"
+      "noRepos": "Sem repos",
+      "initGitRepo": "Inicializar repositório Git"
     },
     "kb": {
       "path": "Caminho KB",

@@ -4499,9 +4499,12 @@
       "switchProject": "التبديل إلى هذا المشروع"
     },
     "switcher": {
-      "placeholder": "اختيار المشروع",
+      "createFirst": "إنشاء مشروعك الأول",
       "noProject": "لا مشروع حاليا",
-      "createFirst": "إنشاء مشروعك الأول"
+      "placeholder": "اختيار المشروع",
+      "toasts": {
+        "switchedToProject": "تم التبديل إلى {name}"
+      }
     },
     "project": {
       "create": "إنشاء مشروع",
@@ -4701,7 +4704,8 @@
     "repoSelector": {
       "root": "جذر المشروع",
       "placeholder": "اختيار المستودع",
-      "noRepos": "لا مستودعات"
+      "noRepos": "لا مستودعات",
+      "initGitRepo": "تهيئة مستودع Git"
     },
     "kb": {
       "path": "مسار KB",

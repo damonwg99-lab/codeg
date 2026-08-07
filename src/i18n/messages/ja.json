@@ -4499,9 +4499,12 @@
       "switchProject": "このプロジェクトに切り替え"
     },
     "switcher": {
-      "placeholder": "プロジェクトを選択",
+      "createFirst": "最初のプロジェクトを作成",
       "noProject": "プロジェクトなし",
-      "createFirst": "最初のプロジェクトを作成"
+      "placeholder": "プロジェクトを選択",
+      "toasts": {
+        "switchedToProject": "{name} に切り替えました"
+      }
     },
     "project": {
       "create": "プロジェクトを作成",
@@ -4701,7 +4704,8 @@
     "repoSelector": {
       "root": "プロジェクトルート",
       "placeholder": "リポジトリを選択",
-      "noRepos": "リポジトリなし"
+      "noRepos": "リポジトリなし",
+      "initGitRepo": "Git リポジトリを初期化"
     },
     "kb": {
       "path": "KBパス",

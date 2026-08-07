@@ -36,6 +36,15 @@ import { BranchDropdown } from "@/components/layout/branch-dropdown"
 import { usePlatform } from "@/contexts/platform-context"
 import { isHiddenFolderKind } from "@/lib/platform/types"
 
+/** Normalize a folder path for duplicate detection (case + trailing separators). */
+function normalizeFolderPath(path: string | null | undefined): string {
+  if (!path) return ""
+  return path
+    .trim()
+    .replace(/[\\/]+$/, "")
+    .toLowerCase()
+}
+
 interface ConversationContextBarProps {
   extraContent?: React.ReactNode
   hasExtraContent?: boolean
@@ -283,26 +292,39 @@ export const ConversationFolderBranchPicker = memo(
     // Scoped list: the active project's root folder plus its sub-repos.
     // Sub-repos have `kind === "platform_repo"` and live in `allFolders` (not
     // the sidebar `folders` list, since they're hidden there too).
+    //
+    // Dedup by folder id AND normalized path: a git-rooted project's root can
+    // be re-registered as a sub-repo under a DIFFERENT folder row (its path
+    // string differs enough that `add_folder_inner` inserts a second row), so
+    // the same directory can surface under two ids. Id-only dedup lets that
+    // slip through — collapse on path too (mirrors RepoSelector's options).
     const scopedTopLevelFolders = useMemo(() => {
       if (!activeProject) return null
       const list: typeof folders = []
+      const seenPaths = new Set<string>()
+      const pushFolder = (f: (typeof folders)[number]) => {
+        if (list.some((x) => x.id === f.id)) return
+        const p = normalizeFolderPath(f.path)
+        if (p && seenPaths.has(p)) return
+        if (p) seenPaths.add(p)
+        list.push(f)
+      }
       const rootFolder = allFolders.find((f) => f.id === activeProject.folderId)
-      if (rootFolder) list.push(rootFolder)
+      if (rootFolder) pushFolder(rootFolder)
       for (const repo of activeProjectRepos) {
         if (repo.folderId == null) continue
         const repoFolder = allFolders.find((f) => f.id === repo.folderId)
-        if (repoFolder && !list.some((f) => f.id === repoFolder.id)) {
-          list.push(repoFolder)
-        }
+        if (repoFolder) pushFolder(repoFolder)
       }
       return list
     }, [activeProject, activeProjectRepos, allFolders])
 
-    const pickerFolders =
-      scopedTopLevelFolders ?? unscopedTopLevelFolders
-    // Fold picker when scoped to <=1 repo (D3 sub-rule) so only the branch
-    // picker remains.
-    const showFolderPicker = pickerFolders.length > 1
+    const pickerFolders = scopedTopLevelFolders ?? unscopedTopLevelFolders
+    // Show the folder picker whenever there is at least one folder to switch
+    // to. (A scoped single-repo project that surfaces two rows for the same
+    // directory collapses to one after path-dedup, but the dropdown must stay
+    // so the folder list AND the pinned "no-folder / chat mode" footer remain
+    // reachable — dedup must never hide the picker.)
 
     if (!ownTab) return null
     // Chat mode: either a draft flagged `isChat` (no folder yet) or a bound
@@ -328,7 +350,7 @@ export const ConversationFolderBranchPicker = memo(
 
     return (
       <>
-        {showFolderPicker && (
+        {pickerFolders.length >= 1 && (
           <FolderPicker
             folders={pickerFolders}
             currentFolderId={pickerSelectedId}

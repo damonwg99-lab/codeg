@@ -4501,7 +4501,10 @@
     "switcher": {
       "placeholder": "Select project",
       "noProject": "No project yet",
-      "createFirst": "Create your first project"
+      "createFirst": "Create your first project",
+      "toasts": {
+        "switchedToProject": "Switched to {name}"
+      }
     },
     "project": {
       "create": "Create project",
@@ -4701,7 +4704,8 @@
     "repoSelector": {
       "root": "Project root",
       "placeholder": "Select repo",
-      "noRepos": "No repos"
+      "noRepos": "No repos",
+      "initGitRepo": "Initialize Git repository"
     },
     "kb": {
       "path": "KB Path",

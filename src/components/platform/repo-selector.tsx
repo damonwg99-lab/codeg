@@ -16,6 +16,8 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
+import { gitInit } from "@/lib/api"
+import { useGitQuickActions } from "@/hooks/use-git-quick-actions"
 import {
   RepoGitOperations,
   RepoGitBranchPanel,
@@ -127,6 +129,23 @@ export function RepoSelector() {
     [options, activeFolderId]
   )
 
+  // The project root backs the "initialize git repository" action shown when
+  // the project has no git repos yet — matching the below-chat-input branch
+  // dropdown's non-repo state. Reuses the shared git-task engine so a success
+  // refreshes the folder + broadcasts branch-changed, flipping the root to a
+  // git repo (and singleGit) right away.
+  const rootOption = options.find((o) => o.isRoot) ?? null
+  const {
+    running: initRunning,
+    runGitTask,
+    dialogs: gitDialogs,
+  } = useGitQuickActions({
+    folderId: rootOption?.folderId ?? null,
+    folderPath: rootOption?.folderPath ?? null,
+  })
+
+  const hasGitRepos = options.some((o) => o.isGit)
+
   const handleSelect = useCallback(
     async (folderId: number) => {
       const isAlreadyOpen = allFolders.some((f) => f.id === folderId)
@@ -180,8 +199,12 @@ export function RepoSelector() {
               const isSelected = opt.folderId === activeFolderId
               const canSwitch = opt.folderId != null
 
-              // Non-git directories just switch — no git-ops fly-out.
+              // A non-git directory is kept as a plain switchable target only
+              // when the project HAS git repos (so the project root stays
+              // selectable beside its sub-repos). With no git repos the root is
+              // redundant — the init entry below covers it.
               if (!opt.isGit) {
+                if (!hasGitRepos) return null
                 return (
                   <DropdownMenuItem
                     key={opt.id}
@@ -212,7 +235,7 @@ export function RepoSelector() {
                     <span className="min-w-0 flex-1 truncate">{opt.name}</span>
                   </DropdownMenuSubTrigger>
                   {/* No overflow-hidden: the branch list's inner shell clips to
-                    the rounding so its right-side action bubble can overflow. */}
+                  the rounding so its right-side action bubble can overflow. */}
                   <DropdownMenuSubContent className="w-[22rem] p-0 overflow-visible">
                     <RepoGitBranchPanel
                       host={() => opRefs.current.get(opt.id) ?? null}
@@ -222,12 +245,30 @@ export function RepoSelector() {
                 </DropdownMenuSub>
               )
             })}
+            {/* No git repos yet: offer to initialize the project root as a git
+                repo, mirroring the below-chat-input branch dropdown's non-repo
+                state so the two stay consistent. */}
+            {!hasGitRepos && rootOption?.folderPath && (
+              <DropdownMenuItem
+                disabled={initRunning}
+                onClick={() => {
+                  void runGitTask(t("repoSelector.initGitRepo"), () =>
+                    gitInit(rootOption.folderPath!)
+                  )
+                }}
+              >
+                <GitBranch className="h-4 w-4" />
+                <span>{t("repoSelector.initGitRepo")}</span>
+              </DropdownMenuItem>
+            )}
           </DropdownMenuContent>
         )}
       </DropdownMenu>
 
-      {/* Dialogs stay mounted here, outside the dropdown, keyed per repo.
-          Only git repos mount a host (non-git dirs have no git-ops fly-out). */}
+      {/* Git-operation hosts + the init task's shared conflict/stash dialogs
+          stay mounted here, outside the dropdown, keyed per repo. Only git
+          repos mount a host (non-git dirs have no git-ops fly-out). */}
+      {gitDialogs}
       {options
         .filter((opt) => opt.isGit)
         .map((opt) => (

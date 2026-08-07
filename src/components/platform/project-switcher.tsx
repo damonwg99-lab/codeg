@@ -2,6 +2,7 @@
 
 import { useTranslations } from "next-intl"
 import { usePlatform } from "@/contexts/platform-context"
+import { useProjectSwitchCoordinator } from "@/hooks/use-project-switch-coordinator"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -19,25 +20,22 @@ function projectInitials(name: string | null | undefined): string {
   return (parts[0][0] + parts[1][0]).toUpperCase()
 }
 
-interface ProjectSwitcherProps {
-  onSwitch?: (newProjectId: number) => void
-}
-
 /**
  * Project switcher rendered in the title bar next to RepoSelector.
  * Uses DropdownMenu style to match RepoSelector.
  * - No projects: hidden (returns null).
  * - Projects exist: shows a dropdown with project names.
+ *
+ * Switching goes through `useProjectSwitchCoordinator`, so the active tab is
+ * retargeted to the new project's root folder (same unified workspace state the
+ * folder picker below the chat input drives) and a bottom-right toast confirms
+ * the switch — keeping top and bottom switching consistent.
  */
-export function ProjectSwitcher({ onSwitch }: ProjectSwitcherProps) {
+export function ProjectSwitcher() {
   const t = useTranslations("Platform.switcher")
-  const {
-    activeProjectId,
-    setActiveProjectId,
-    activeProject,
-    projects,
-    hasProjects,
-  } = usePlatform()
+  const { activeProjectId, activeProject, projects, hasProjects } =
+    usePlatform()
+  const { switchProject } = useProjectSwitchCoordinator()
 
   // Hide when no projects exist — the sidebar empty-state already provides
   // a "Create project" entry point.
@@ -47,14 +45,7 @@ export function ProjectSwitcher({ onSwitch }: ProjectSwitcherProps) {
 
   const handleSelect = (id: number) => {
     if (id === activeProjectId) return
-    // Route navigation is handled by useProjectSwitchCoordinator
-    // (via the onSwitch callback in FolderTitleBar) — it redirects
-    // project-specific pages to their list/kanban views on project switch.
-    if (onSwitch) {
-      onSwitch(id)
-    } else {
-      setActiveProjectId(id)
-    }
+    switchProject(id)
   }
 
   return (

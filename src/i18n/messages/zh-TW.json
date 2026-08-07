@@ -4499,9 +4499,12 @@
       "switchProject": "切換至此專案"
     },
     "switcher": {
-      "placeholder": "選擇專案",
+      "createFirst": "建立第一個專案",
       "noProject": "暫無專案",
-      "createFirst": "建立第一個專案"
+      "placeholder": "選擇專案",
+      "toasts": {
+        "switchedToProject": "已切換到 {name}"
+      }
     },
     "project": {
       "create": "建立專案",
@@ -4701,7 +4704,8 @@
     "repoSelector": {
       "root": "專案根目錄",
       "placeholder": "選擇倉庫",
-      "noRepos": "無倉庫"
+      "noRepos": "無倉庫",
+      "initGitRepo": "初始化 Git 儲存庫"
     },
     "kb": {
       "path": "KB 路徑",

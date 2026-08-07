@@ -1,6 +1,8 @@
 "use client"
 
 import { useCallback, useEffect, useRef } from "react"
+import { toast } from "sonner"
+import { useTranslations } from "next-intl"
 import { useTabContext } from "@/contexts/tab-context"
 import { usePlatform } from "@/contexts/platform-context"
 import { useAppWorkspace } from "@/contexts/app-workspace-shim"
@@ -13,14 +15,17 @@ import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
  * - Draft tab (no conversationId): retargeted to the new project root folder
  * - Existing conversation: closed, then a new draft is created in the new project root
  * - Task kanban page: route params updated to the new projectId so data refreshes
+ * - A bottom-right toast confirms the switch, matching the folder picker below
+ *   the chat input (single source of truth for the "current workspace").
  *
  * The pending-switch ref ensures this only fires on explicit user action
  * (not on initial hydration from localStorage).
  */
 export function useProjectSwitchCoordinator() {
+  const t = useTranslations("Platform.switcher")
   const { tabs, activeTabId, closeTab, openNewConversationTab } =
     useTabContext()
-  const { setActiveProjectId, activeProject } = usePlatform()
+  const { setActiveProjectId, activeProject, projects } = usePlatform()
   const { allFolders } = useAppWorkspace()
   const { routeId, setRoute } = useWorkbenchRoute()
   const pendingSwitchRef = useRef<number | null>(null)
@@ -52,8 +57,23 @@ export function useProjectSwitchCoordinator() {
       // the project detail loads
       pendingSwitchRef.current = newId
       setActiveProjectId(newId)
+
+      // Confirm the switch with the same bottom-right toast the folder picker
+      // below the chat input uses, so top project switching and bottom
+      // folder/workspace switching stay visibly consistent.
+      const target = projects.find((p) => p.id === newId)
+      toast.success(t("toasts.switchedToProject", { name: target?.name ?? "" }))
     },
-    [tabs, activeTabId, closeTab, setActiveProjectId, routeId, setRoute]
+    [
+      tabs,
+      activeTabId,
+      closeTab,
+      setActiveProjectId,
+      routeId,
+      setRoute,
+      projects,
+      t,
+    ]
   )
 
   // After the project detail loads, create or retarget a draft tab in the
