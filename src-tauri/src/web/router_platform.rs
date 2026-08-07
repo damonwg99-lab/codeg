@@ -178,11 +178,6 @@ pub fn platform_routes() -> Router {
             "/search_files_content",
             post(search_files_content),
         )
-        // ─── Releases for a task (Cluster B, GET path) ──────────────────────
-        .route(
-            "/releases/for_task",
-            get(handlers::release::list_releases_for_task),
-        )
 }
 
 use crate::web::handlers;
