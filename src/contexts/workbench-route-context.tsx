@@ -27,6 +27,12 @@ export type WorkbenchRouteId =
   | "task-kanban"
   | "task-detail"
   | "create-task"
+  | "release-list"
+  | "release-detail"
+  | "create-release"
+  | "archive-view"
+  | "tasks"
+  | "tokenUsage"
 
 interface WorkbenchRouteContextValue {
   routeId: WorkbenchRouteId
@@ -39,6 +45,12 @@ interface WorkbenchRouteContextValue {
   fromParams: Record<string, string | number>
   /** Convenience for the common branch — `routeId === "conversations"`. */
   isConversations: boolean
+  /**
+   * Navigate to a workbench route.
+   *  - Passing `from` records the origin so `back()` can return to it (the
+   *    list → detail drill replaces the detail in place).
+   *  - Without `from`, opens a fresh top-level page like the sidebar entries.
+   */
   setRoute: (
     id: WorkbenchRouteId,
     params?: Record<string, string | number>,
@@ -49,6 +61,8 @@ interface WorkbenchRouteContextValue {
   ) => void
   /** Sugar for returning to the conversation workspace. */
   openConversations: () => void
+  /** Pop back to the recorded origin route (no-op if none). */
+  back: () => void
 }
 
 const WorkbenchRouteContext = createContext<WorkbenchRouteContextValue | null>(
@@ -81,9 +95,16 @@ export function WorkbenchRouteProvider({ children }: { children: ReactNode }) {
     Record<string, string | number>
   >({})
   const [fromRoute, setFromRoute] = useState<WorkbenchRouteId | null>(null)
-  const [fromParams, setFromParams] = useState<Record<string, string | number>>(
-    {}
-  )
+  const [fromParams, setFromParams] = useState<
+    Record<string, string | number>
+  >({})
+
+  const openConversations = useCallback(() => {
+    setRouteId("conversations")
+    setRouteParams({})
+    setFromRoute(null)
+    setFromParams({})
+  }, [])
 
   const setRoute = useCallback(
     (
@@ -94,25 +115,25 @@ export function WorkbenchRouteProvider({ children }: { children: ReactNode }) {
         params?: Record<string, string | number>
       }
     ) => {
+      if (id === "conversations") {
+        openConversations()
+        return
+      }
       setRouteId(id)
       setRouteParams(params ?? {})
-      if (from) {
-        setFromRoute(from.routeId)
-        setFromParams(from.params ?? {})
-      } else {
-        setFromRoute(null)
-        setFromParams({})
-      }
+      setFromRoute(from?.routeId ?? null)
+      setFromParams(from?.params ?? {})
     },
-    []
+    [openConversations]
   )
 
-  const openConversations = useCallback(() => {
-    setRouteId("conversations")
-    setRouteParams({})
+  const back = useCallback(() => {
+    if (fromRoute == null) return
+    setRouteId(fromRoute)
+    setRouteParams(fromParams)
     setFromRoute(null)
     setFromParams({})
-  }, [])
+  }, [fromRoute, fromParams])
 
   const value = useMemo<WorkbenchRouteContextValue>(
     () => ({
@@ -123,8 +144,17 @@ export function WorkbenchRouteProvider({ children }: { children: ReactNode }) {
       isConversations: routeId === "conversations",
       setRoute,
       openConversations,
+      back,
     }),
-    [routeId, routeParams, fromRoute, fromParams, setRoute, openConversations]
+    [
+      routeId,
+      routeParams,
+      fromRoute,
+      fromParams,
+      setRoute,
+      openConversations,
+      back,
+    ]
   )
 
   return (

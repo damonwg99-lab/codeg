@@ -1,4 +1,5 @@
 import { COLLAB_AGENT_TOOL_NAME } from "@/lib/collab-tool"
+import { isShellSessionToolName } from "@/lib/shell-session-tool"
 
 export type ToolKindLabel =
   | "search"
@@ -66,6 +67,15 @@ export function isAgentLikeToolName(toolName: string): boolean {
     // forms, since this runs pre-normalize.
     name === "question" ||
     name === "ask_user_question" ||
+    // Kimi Code's native AskUserQuestion (also Claude's SDK tool of the same
+    // name). The history parsers keep this raw camel-case name — without it the
+    // answered capsule folds into a generic tool-group; the live path already
+    // collapses it to "question".
+    name === "askuserquestion" ||
+    // codex Plan-mode `request_user_input` (delivered via elicitation) owns the
+    // same AskQuestionResultCard. The history parser keeps this raw name, so
+    // hoist it here too; the live path already collapses it to "question".
+    name === "request_user_input" ||
     // codeg-mcp check_user_feedback — owns the FeedbackCheckResultCard capsule,
     // so the (visible) ones must break the run and render standalone rather than
     // fold into a tool-group. The no-op polls are dropped upstream by
@@ -117,7 +127,11 @@ export function classifyToolKind(toolName: string): ToolKindLabel {
     name === "exec_command" ||
     name === "shell" ||
     name === "execute_command" ||
-    name === "run_command"
+    name === "run_command" ||
+    // codex's unified-exec session tools continue a background shell started by
+    // an `exec_command`, so they belong with the commands in the tool-group
+    // tally (see `shell-session-tool.ts`).
+    isShellSessionToolName(name)
   ) {
     return "command"
   }

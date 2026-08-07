@@ -133,11 +133,6 @@ export function referenceToMarkdown(attrs: ReferenceAttrs): string {
         : inlineText(text)
     }
     case "context": {
-      // Context badges serialize to their full prefix text on send (e.g.
-      // "Task: Fix login bug\nDescription: …"), which is stored in
-      // meta.injectPrefix. This text is emitted verbatim so the agent receives
-      // the complete context information. When injectPrefix is absent, fall back
-      // to a bracketed label like [Task description].
       const prefix = attrs.meta?.injectPrefix?.trim()
       return prefix || `[${inlineText(attrs.label || attrs.id)}]`
     }

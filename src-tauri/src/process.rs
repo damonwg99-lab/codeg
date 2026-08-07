@@ -1,12 +1,20 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 #[cfg(windows)]
 use std::path::Path;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// How long to keep retrying a spawn the kernel refuses with `ETXTBSY`.
+/// Generous on purpose: the window it covers is another thread's fork→exec gap,
+/// which is microseconds wide when idle but can stretch on a loaded machine.
+const EXEC_BUSY_RETRY_BUDGET: Duration = Duration::from_secs(1);
+/// Upper bound on the wait between `ETXTBSY` retries.
+const EXEC_BUSY_MAX_BACKOFF: Duration = Duration::from_millis(25);
 
 pub fn configure_std_command(command: &mut Command) -> &mut Command {
     #[cfg(windows)]
@@ -122,6 +130,74 @@ where
     command
 }
 
+/// True when the OS refused to exec a file because something holds it open for
+/// writing (`ETXTBSY`). Checked by `ErrorKind` *and* raw errno: the kind is the
+/// portable form, the errno covers a target whose std leaves it unmapped.
+fn is_exec_busy(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::ExecutableFileBusy {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        if err.raw_os_error() == Some(libc::ETXTBSY) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run a process spawn, riding out a transient `ETXTBSY` ("Text file busy").
+///
+/// exec fails with `ETXTBSY` while *any* process holds the target file open for
+/// writing, so a multi-threaded process that writes an executable and then runs
+/// it races itself. Rust opens files `O_CLOEXEC`, but `CLOEXEC` only takes
+/// effect at exec: a `fork()` on another thread — codeg forks constantly, for
+/// git, agents, and other terminals — copies the fd table while the write
+/// descriptor is still open, and that inherited copy keeps the file busy until
+/// the forked child reaches its own exec. An agent that writes `build.sh` and
+/// immediately asks for `terminal/create ./build.sh` can therefore be refused
+/// for a reason that has nothing to do with its command.
+///
+/// That window is self-closing (bounded by the forked child's exec), so
+/// retrying with backoff turns the race into a delay nobody notices. A file
+/// held open by a genuine long-lived writer still fails once the budget is
+/// spent, carrying the original `ETXTBSY` — callers that classify spawn errors
+/// (e.g. the terminal runtime's shell fallback) never see a substitute.
+pub async fn spawn_retrying_exec_busy<T, F>(attempt: F) -> std::io::Result<T>
+where
+    F: FnMut() -> std::io::Result<T>,
+{
+    spawn_retrying_exec_busy_within(EXEC_BUSY_RETRY_BUDGET, attempt).await
+}
+
+/// [`spawn_retrying_exec_busy`] with an explicit budget so tests can exercise
+/// give-up behavior without waiting out the production one.
+async fn spawn_retrying_exec_busy_within<T, F>(
+    budget: Duration,
+    mut attempt: F,
+) -> std::io::Result<T>
+where
+    F: FnMut() -> std::io::Result<T>,
+{
+    // `tokio::time::Instant`, not `std::time::Instant`, so paused-time tests
+    // advance the deadline along with the sleeps instead of waiting for real.
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match attempt() {
+            Err(err) if is_exec_busy(&err) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(err);
+                }
+                tokio::time::sleep(backoff.min(deadline - now)).await;
+                backoff = (backoff * 2).min(EXEC_BUSY_MAX_BACKOFF);
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 /// If `node` is not already in PATH, detect common Node.js version manager
 /// installations and prepend the best matching bin directory to the process
 /// PATH so that **all** downstream code (`which`, `Command`, child processes)
@@ -157,8 +233,11 @@ pub fn ensure_node_in_path() {
     }
 }
 
-/// Search common Node.js version manager directories for a `node` binary and
-/// return the containing bin directory.
+/// Every candidate Node.js version-manager bin directory, newest-version-first
+/// within each manager, WITHOUT checking which actually contains a `node`
+/// binary — the caller decides. Read-only: never mutates PATH. Used by
+/// [`find_node_bin_dir`] (which takes the first candidate that has `node`) and
+/// by env diagnostics (which reports every candidate + whether it has `node`).
 ///
 /// `home` may be `None` in minimal environments (Docker, systemd without HOME).
 /// When `None`, only version managers whose location is determined by an
@@ -175,10 +254,8 @@ pub fn ensure_node_in_path() {
 /// - **n** (Unix) — `$N_PREFIX` or `/usr/local`
 /// - **Homebrew** (macOS) — `/opt/homebrew/opt/node` or `/usr/local/opt/node`
 /// - **Scoop** (Windows) — `%SCOOP%\apps\nodejs*\current`
-fn find_node_bin_dir(home: Option<&std::path::Path>) -> Option<PathBuf> {
+pub(crate) fn node_bin_dir_candidates(home: Option<&std::path::Path>) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-
-    let node_bin = if cfg!(windows) { "node.exe" } else { "node" };
 
     /// Extract a (major, minor, patch) tuple from a version directory name
     /// like `v20.11.1` or `20.11.1` for correct numeric sorting.
@@ -465,8 +542,14 @@ fn find_node_bin_dir(home: Option<&std::path::Path>) -> Option<PathBuf> {
         }
     }
 
-    // Return the first candidate that actually contains a `node` binary.
     candidates
+}
+
+/// The first version-manager candidate bin directory that actually contains a
+/// `node` binary. Thin wrapper over [`node_bin_dir_candidates`].
+fn find_node_bin_dir(home: Option<&std::path::Path>) -> Option<PathBuf> {
+    let node_bin = if cfg!(windows) { "node.exe" } else { "node" };
+    node_bin_dir_candidates(home)
         .into_iter()
         .find(|dir| dir.join(node_bin).is_file())
 }
@@ -513,5 +596,186 @@ pub fn ensure_user_npm_prefix_in_path() {
         {
             prepend_to_path(&bin_dir);
         }
+    }
+}
+
+/// Read `reader` line-by-line as UTF-8-*lossy* text, invoking `on_line` for each
+/// line (trailing newline trimmed) and returning the accumulated text.
+///
+/// Unlike a `Lines`/`next_line()` loop — which returns `Err(InvalidData)` and so
+/// aborts the whole stream on the first non-UTF-8 byte — this preserves a
+/// non-UTF-8 line lossily. PowerShell/npm emit OEM-codepage bytes (e.g. GBK on a
+/// zh-CN Windows) for non-ASCII installer/error text, so without this a single
+/// localized line would truncate both the live log and the failure-diagnostic
+/// tail. A genuine read error records a short note and stops — `break`, never
+/// `continue`, so a persistent error can't spin.
+pub(crate) async fn collect_lines_lossy<R, F>(mut reader: R, mut on_line: F) -> String
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    F: FnMut(&str),
+{
+    use tokio::io::AsyncBufReadExt;
+
+    let mut buf = Vec::new();
+    let mut collected = String::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                // Match `Lines` semantics: strip a trailing '\n' then one '\r'.
+                if buf.last() == Some(&b'\n') {
+                    buf.pop();
+                    if buf.last() == Some(&b'\r') {
+                        buf.pop();
+                    }
+                }
+                let line = String::from_utf8_lossy(&buf);
+                on_line(line.as_ref());
+                if !collected.is_empty() {
+                    collected.push('\n');
+                }
+                collected.push_str(line.as_ref());
+            }
+            Err(e) => {
+                let note = format!("<install reader error: {e}>");
+                on_line(&note);
+                if !collected.is_empty() {
+                    collected.push('\n');
+                }
+                collected.push_str(&note);
+                break;
+            }
+        }
+    }
+    collected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_lines_lossy, spawn_retrying_exec_busy, spawn_retrying_exec_busy_within};
+    use std::io::Cursor;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn collect_lines_lossy_preserves_lines_around_invalid_utf8() {
+        // A non-UTF-8 segment (0xFF 0xFE — invalid start bytes, like GBK output
+        // on a non-English Windows) sits between two valid lines. The old
+        // `next_line()` loop would abort here and drop "third"; this must not.
+        let data = b"first\n\xff\xfe garbage\nthird\n".to_vec();
+        let mut seen: Vec<String> = Vec::new();
+        let collected =
+            collect_lines_lossy(Cursor::new(data), |l| seen.push(l.to_string())).await;
+
+        assert_eq!(seen.len(), 3, "all three lines emitted: {seen:?}");
+        assert_eq!(seen[0], "first");
+        assert_eq!(seen[2], "third");
+        assert!(
+            seen[1].contains('\u{fffd}'),
+            "invalid bytes preserved lossily, not dropped: {:?}",
+            seen[1]
+        );
+        assert!(collected.contains("first") && collected.contains("third"));
+        assert!(collected.contains('\u{fffd}'));
+    }
+
+    #[tokio::test]
+    async fn collect_lines_lossy_handles_crlf_and_partial_last_line() {
+        // CRLF endings trimmed like `Lines`; a final line with no trailing
+        // newline is still emitted (then EOF stops the loop).
+        let data = b"a\r\nb\r\nno-newline".to_vec();
+        let mut seen: Vec<String> = Vec::new();
+        let collected =
+            collect_lines_lossy(Cursor::new(data), |l| seen.push(l.to_string())).await;
+
+        assert_eq!(seen, vec!["a", "b", "no-newline"]);
+        assert_eq!(collected, "a\nb\nno-newline");
+    }
+
+    #[tokio::test]
+    async fn collect_lines_lossy_empty_input_yields_nothing() {
+        let mut seen: Vec<String> = Vec::new();
+        let collected =
+            collect_lines_lossy(Cursor::new(Vec::<u8>::new()), |l| seen.push(l.to_string()))
+                .await;
+
+        assert!(seen.is_empty());
+        assert!(collected.is_empty());
+    }
+
+    /// A spawn refused with `ETXTBSY` is retried until the writer lets go — the
+    /// racing fork→exec window is self-closing, so the caller must see the
+    /// eventual success, not the transient failure.
+    #[tokio::test(start_paused = true)]
+    async fn exec_busy_spawn_is_retried_until_the_file_is_free() {
+        let mut attempts = 0u32;
+        let outcome = spawn_retrying_exec_busy(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
+            } else {
+                Ok("spawned")
+            }
+        })
+        .await;
+
+        assert_eq!(outcome.expect("spawn eventually succeeds"), "spawned");
+        assert_eq!(attempts, 3, "retried until the file was no longer busy");
+    }
+
+    /// Any other spawn failure returns on the first attempt: retrying a missing
+    /// program would only delay the caller's own fallback (the terminal
+    /// runtime's `NotFound` → shell-wrap path).
+    #[tokio::test(start_paused = true)]
+    async fn non_busy_spawn_failure_is_not_retried() {
+        let mut attempts = 0u32;
+        let outcome: std::io::Result<()> = spawn_retrying_exec_busy(|| {
+            attempts += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+        .await;
+
+        assert_eq!(attempts, 1, "no retry for a non-busy error");
+        assert_eq!(
+            outcome.expect_err("error surfaces").kind(),
+            std::io::ErrorKind::NotFound,
+            "original kind reaches the caller's fallback classifier"
+        );
+    }
+
+    /// A file held open by a long-lived writer gives up once the budget is
+    /// spent and reports the original `ETXTBSY` — never swallowed, never
+    /// reclassified.
+    #[tokio::test(start_paused = true)]
+    async fn persistently_busy_spawn_gives_up_with_the_original_error() {
+        let mut attempts = 0u32;
+        let outcome: std::io::Result<()> =
+            spawn_retrying_exec_busy_within(Duration::from_millis(20), || {
+                attempts += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
+            })
+            .await;
+
+        assert!(
+            attempts > 1,
+            "budget allowed at least one retry: {attempts}"
+        );
+        assert_eq!(
+            outcome.expect_err("error surfaces").kind(),
+            std::io::ErrorKind::ExecutableFileBusy
+        );
+    }
+
+    /// `ETXTBSY` arriving as a bare errno, with no `ErrorKind` mapping, is still
+    /// recognized — and a neighboring errno is not.
+    #[cfg(unix)]
+    #[test]
+    fn raw_etxtbsy_errno_is_recognized_as_exec_busy() {
+        assert!(super::is_exec_busy(&std::io::Error::from_raw_os_error(
+            libc::ETXTBSY
+        )));
+        assert!(!super::is_exec_busy(&std::io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
     }
 }

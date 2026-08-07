@@ -1,5 +1,5 @@
 import { type ReactElement } from "react"
-import { render, screen } from "@testing-library/react"
+import { fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { describe, expect, it } from "vitest"
 
@@ -128,5 +128,156 @@ describe("AgentToolCallPart title", () => {
       )
     )
     expect(screen.queryByText("abcd1234")).not.toBeInTheDocument()
+  })
+})
+
+describe("AgentToolCallPart cursor task outcome envelope", () => {
+  it("folds the success envelope into a duration suffix instead of a JSON body", () => {
+    renderCard({
+      ...basePart(
+        JSON.stringify({ _toolName: "task", description: "run the build" }),
+        "output-available"
+      ),
+      output: '{"durationMs":39894,"isBackground":false}',
+    })
+    expect(screen.getByText("39.9s")).toBeInTheDocument()
+    // The folded duration has no body, so the capsule is a static "Completed"
+    // chip (not an expandable button) and the raw envelope never renders.
+    expect(screen.getByLabelText("Completed")).toBeInTheDocument()
+    expect(screen.queryByText(/durationMs/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/isBackground/)).not.toBeInTheDocument()
+  })
+
+  it("renders the error envelope as an error box (wire status stays completed)", () => {
+    renderCard({
+      ...basePart(JSON.stringify({ _toolName: "task" }), "output-available"),
+      output: '{"error":"Invalid arguments:\\nsubagent_type mismatch"}',
+    })
+    expect(screen.getByText(/Invalid arguments:/)).toBeInTheDocument()
+    expect(screen.queryByText(/{"error"/)).not.toBeInTheDocument()
+    // The capsule reports Error, not Completed.
+    expect(screen.getByLabelText("Error")).toBeInTheDocument()
+  })
+
+  it("shows a background launch as still running instead of Completed", () => {
+    renderCard({
+      ...basePart(JSON.stringify({ _toolName: "task" }), "output-available"),
+      output: '{"isBackground":true}',
+    })
+    // The completion envelope only acknowledges the launch: the pill carries
+    // the running label…
+    const trigger = screen.getByLabelText("Running in background")
+    // …and the body shows the visible running indicator, not raw JSON.
+    fireEvent.click(trigger)
+    expect(screen.getByText("Running in background")).toBeInTheDocument()
+    expect(screen.queryByText(/isBackground/)).not.toBeInTheDocument()
+  })
+
+  it("never folds outputs of non-cursor sub-agents (no _toolName stamp)", () => {
+    // Another agent's sub-agent legitimately returning JSON error text: the
+    // envelope must NOT repaint the card as failed — the text renders as-is.
+    renderCard({
+      ...basePart(
+        JSON.stringify({ subagent_type: "Explore", description: "map" }),
+        "output-available"
+      ),
+      output: '{"error":"not an envelope"}',
+    })
+    expect(screen.queryByLabelText("Error")).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "Completed" }))
+    expect(screen.getByText(/not an envelope/)).toBeInTheDocument()
+  })
+
+  it("keeps rendering genuine report text as the body", () => {
+    renderCard({
+      ...basePart(
+        JSON.stringify({ subagent_type: "Explore", description: "map" }),
+        "output-available"
+      ),
+      output: "All 3 checks passed.",
+    })
+    // Completed non-error capsules mount collapsed; expand to see the body.
+    fireEvent.click(screen.getByRole("button", { name: "Completed" }))
+    expect(screen.getByText("All 3 checks passed.")).toBeInTheDocument()
+  })
+
+  it("reads cursor's subagentType oneof case as the title prefix", () => {
+    renderCard(
+      basePart(
+        JSON.stringify({
+          _toolName: "task",
+          description: "run the build",
+          subagentType: { case: "generalPurpose", value: {} },
+        }),
+        "input-available"
+      )
+    )
+    expect(
+      screen.getByText("generalPurpose: run the build")
+    ).toBeInTheDocument()
+  })
+})
+
+describe("AgentToolCallPart live subagent transcript", () => {
+  const withTranscript = (
+    state: ToolCallPart["state"],
+    entries: NonNullable<ToolCallPart["agentTranscript"]>
+  ): ToolCallPart => ({
+    ...basePart(
+      JSON.stringify({ subagent_type: "Explore", description: "scan" }),
+      state
+    ),
+    agentTranscript: entries,
+  })
+
+  /** The capsule body is collapsed by default while running (matching the
+   *  existing child-tool-call UX) — expand it via the pill trigger. */
+  const expandRunningCapsule = () =>
+    fireEvent.click(screen.getByRole("button", { name: "Running" }))
+
+  it("renders text and thinking entries while running", () => {
+    renderCard(
+      withTranscript("input-available", [
+        { type: "thinking", text: "planning the sweep" },
+        { type: "text", text: "found three matches" },
+      ])
+    )
+    expandRunningCapsule()
+    expect(screen.getByText("Live activity")).toBeInTheDocument()
+    expect(screen.getByText("planning the sweep")).toBeInTheDocument()
+    expect(screen.getByText("found three matches")).toBeInTheDocument()
+  })
+
+  it("skips empty thinking entries and renders nothing when settled", () => {
+    renderCard(
+      withTranscript("input-available", [{ type: "thinking", text: "   " }])
+    )
+    expandRunningCapsule()
+    // Label shows (the list is non-empty) but the blank entry renders nothing.
+    expect(screen.getByText("Live activity")).toBeInTheDocument()
+
+    // A settled card never shows the transcript section — the store stops
+    // attaching it, and even a stale prop must not render.
+    const settled = withTranscript("output-available", [
+      { type: "text", text: "stale transcript" },
+    ])
+    renderCard({ ...settled, output: "final result" })
+    fireEvent.click(screen.getByRole("button", { name: "Completed" }))
+    expect(screen.queryByText("stale transcript")).not.toBeInTheDocument()
+    expect(screen.getByText("final result")).toBeInTheDocument()
+  })
+
+  it("bounds the rendered tail to the newest entries", () => {
+    const entries = Array.from({ length: 25 }, (_, i) => ({
+      type: "text" as const,
+      text: `entry-${i}`,
+    }))
+    renderCard(withTranscript("input-available", entries))
+    expandRunningCapsule()
+    // 25 entries, tail bound 20 → the first five never mount.
+    expect(screen.queryByText("entry-0")).not.toBeInTheDocument()
+    expect(screen.queryByText("entry-4")).not.toBeInTheDocument()
+    expect(screen.getByText("entry-5")).toBeInTheDocument()
+    expect(screen.getByText("entry-24")).toBeInTheDocument()
   })
 })

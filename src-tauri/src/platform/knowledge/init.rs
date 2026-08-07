@@ -29,6 +29,18 @@ const RULES_CONTENT: &str = "\
 - AI generated non-task-related documents → `_knowledge/.private/ai-intermediate/`
 - Architecture/design docs → `_knowledge/docs/`
 - All task-related files must be saved under `_knowledge/.private/tasks/{task_id}/`
+
+## Git Branch Tracking
+- When you create or switch to a new git branch for this task, record it in:
+  `_knowledge/.private/tasks/{task_id}/.branch-log.md`
+- Format: one branch per line, `- {repo_name}: {branch_name}`
+- Example: `- codeg-api: feat/order-refactor`
+- Update this file each time you start work on a different branch.
+
+## Database Script Tracking
+- Database migration or schema change scripts (`.sql`) should be saved to:
+  `_knowledge/.private/tasks/{task_id}/ai-intermediate/`
+- Use a descriptive filename, e.g. `V20260718__add_login_log.sql`
 ";
 
 /// Default `README.md` content for `_knowledge/`.

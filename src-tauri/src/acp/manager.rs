@@ -10,11 +10,16 @@ use sea_orm::{
     TransactionTrait,
 };
 
-use crate::acp::connection::{spawn_agent_connection, AgentConnection, ConnectionCommand};
+use crate::acp::connection::{
+    spawn_agent_connection, AgentConnection, ConnectionCommand, GoalControlAction, SteerOutcome,
+};
 use crate::acp::error::AcpError;
 use crate::acp::feedback::{
     bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback,
     SessionFeedbackAccess, MAX_FEEDBACK_CHARS, MAX_FEEDBACK_RESPONSE_BYTES,
+};
+use crate::acp::plan_approval::{
+    PlanApprovalAnswer, RegisteredPlanApproval, SessionPlanApprovalAccess,
 };
 use crate::acp::question::{
     build_outcome, QuestionAnswer, QuestionOutcome, QuestionSpec, RegisteredQuestion,
@@ -36,6 +41,14 @@ use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmit
 /// event payload so a large paste can't bloat the ring buffer, the per-channel
 /// IM message, or the webhook body.
 const USER_PROMPT_PREVIEW_MAX_CHARS: usize = 500;
+
+/// Grace window `disconnect_all` waits after firing every `Disconnect` before
+/// hard-killing surviving agent process trees. Long enough for a driver thread
+/// to unwind and run its own post-loop cleanup (delegation/question/plan-approval
+/// reclaim), short enough not to stall a quit noticeably. It is NOT there to
+/// make the agent's death gentler — the graceful path ends in the same
+/// `kill_tree`.
+const DISCONNECT_ALL_GRACE: Duration = Duration::from_millis(500);
 
 /// True for ids in the parsers' turn-id namespace (`turn-<digits>`), which every
 /// parser assigns via `format!("turn-{}", n)`. A broadcast `message_id` must
@@ -210,6 +223,14 @@ pub struct ConnectionManager {
     /// no cap, no cumulative growth; entries are removed on answer / cancel /
     /// connection teardown.
     pending_questions: Arc<Mutex<HashMap<String, PendingQuestionEntry>>>,
+    /// In-flight Grok `exit_plan_mode` approvals awaiting the user's decision,
+    /// keyed by the globally-unique `approval_id`. The connection's ext handler
+    /// parks on the receiver; the answer / cancel path resolves (and removes) the
+    /// matching sender. Shared across `clone_ref` clones so the connection-facing
+    /// `register_plan_approval` and the command-facing `answer_plan_approval`
+    /// touch the same map. At most one per connection (the agent is blocked in
+    /// its `exit_plan_mode` call) — no cap, no cumulative growth.
+    pending_plan_approvals: Arc<Mutex<HashMap<String, PendingPlanApprovalEntry>>>,
 }
 
 /// A parked `ask_user_question` awaiting its answer. The `sender` resolves the
@@ -219,6 +240,14 @@ struct PendingQuestionEntry {
     parent_connection_id: String,
     questions: Vec<QuestionSpec>,
     sender: tokio::sync::oneshot::Sender<QuestionOutcome>,
+}
+
+/// A parked Grok `exit_plan_mode` approval awaiting the user's decision. The
+/// `sender` resolves the blocked ext-request round-trip in the connection's
+/// handler. `parent_connection_id` routes the resolved event + answer.
+struct PendingPlanApprovalEntry {
+    parent_connection_id: String,
+    sender: tokio::sync::oneshot::Sender<PlanApprovalAnswer>,
 }
 
 impl Default for ConnectionManager {
@@ -236,6 +265,7 @@ impl ConnectionManager {
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
+            pending_plan_approvals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -248,6 +278,7 @@ impl ConnectionManager {
             delegation_injection: self.delegation_injection.clone(),
             probe_locks: self.probe_locks.clone(),
             pending_questions: self.pending_questions.clone(),
+            pending_plan_approvals: self.pending_plan_approvals.clone(),
         }
     }
 
@@ -273,6 +304,7 @@ impl ConnectionManager {
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
+            pending_plan_approvals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -315,6 +347,7 @@ impl ConnectionManager {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         let mut map = self.connections.lock().await;
         map.insert(id.to_string(), conn);
@@ -357,6 +390,7 @@ impl ConnectionManager {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         self.connections.lock().await.insert(id.to_string(), conn);
         rx
@@ -696,6 +730,14 @@ impl ConnectionManager {
         {
             let mut s = state_arc.write().await;
             if s.turn_in_flight {
+                // Names the gate, not just the outcome: the linked path checks
+                // the same flag once before its side effects and again here, and
+                // the two lines share a module target with no file/line in the
+                // default format — identical text would be unattributable.
+                tracing::debug!(
+                    connection_id = %conn_id,
+                    "[ACP] prompt rejected at the send gate: a turn is already in flight"
+                );
                 return Err(AcpError::TurnInProgress);
             }
             s.turn_in_flight = true;
@@ -783,7 +825,7 @@ impl ConnectionManager {
         &self,
         db: &AppDatabase,
         conn_id: &str,
-        blocks: Vec<PromptInputBlock>,
+        mut blocks: Vec<PromptInputBlock>,
         folder_id: Option<i32>,
         conversation_id: Option<i32>,
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
@@ -857,8 +899,31 @@ impl ConnectionManager {
         // InProgress or broadcasting a phantom user message. The frontend turns
         // this rejection into a queued message above the input box.
         if turn_in_flight {
+            // Distinct from `send_prompt_inner`'s send-gate line so a log reader
+            // can tell which of the two checks bounced the prompt.
+            tracing::debug!(
+                connection_id = %conn_id,
+                "[ACP] prompt rejected before admission: a turn is already in flight"
+            );
             return Err(AcpError::TurnInProgress);
         }
+
+        // Re-hydrate uploaded image attachments (web / remote-workspace mode
+        // sends empty-payload marker blocks with a `file://` uri into the
+        // uploads root; see `prompt_hydration`). Deliberately placed AFTER
+        // admission — the connection-exists check (`clone_prompt_lock` above)
+        // and the busy reject — so garbage or concurrent prompts never
+        // trigger file reads, and the prompt lock we hold serializes
+        // hydration per connection (a natural concurrency bound). Still
+        // BEFORE any side effect (linking / row creation / status flip) and
+        // before the `user_blocks_from_prompt` projection below, so a failure
+        // aborts cleanly and the viewer broadcast, the sender echo, and the
+        // agent all see the full bytes.
+        crate::acp::prompt_hydration::hydrate_prompt_blocks(
+            &mut blocks,
+            &crate::paths::codeg_uploads_root(),
+        )
+        .await?;
 
         if !already_linked {
             match (conversation_id, folder_id) {
@@ -1015,17 +1080,39 @@ impl ConnectionManager {
             .await;
         }
 
-        // ─── First-prompt injection: KB Rules + Task Context ───
+        // ─── Context injection: KB Rules + Task Context ───
         // Context is built in `acp::context_injection` and wrapped in markers
         // so the frontend can hide it from the user while the agent's LLM
-        // still sees it.
-        let blocks = if !already_linked {
-            let (cid, fid) = {
-                let s = state_arc.read().await;
-                (s.conversation_id, s.folder_id)
-            };
+        // still sees it. The original `!already_linked` gate checked whether a
+        // conversation row already existed, which ALWAYS skipped injection for
+        // task-created conversations (create_conversation_for_task creates the
+        // row before the first prompt). We instead track a per-connection
+        // `prompt_turn_count` (incremented below, under the prompt lock): the
+        // first prompt on this connection (count == 0) gets the full
+        // KB-rules/task-context injection; later prompts get a compact
+        // re-injection preamble every `CODEG_REINJECTION_INTERVAL` turns so a
+        // long-running session keeps its file-storage / branch-tracking rules.
+        // The conversation row's `message_count` is deliberately NOT used: it
+        // is only ever set at creation (0) and stays 0 for a live session.
+        let (cid, fid, prompt_turn_count) = {
+            let s = state_arc.read().await;
+            (s.conversation_id, s.folder_id, s.prompt_turn_count)
+        };
+        let use_decomp_injection = match prompt_turn_count {
+            // First prompt → only when the user's message carries
+            // decomposition intent.
+            0 => crate::acp::context_injection::has_decomposition_intent_in_blocks(
+                &blocks,
+            ),
+            // Follow-up prompt → every re-injection cycle regardless of intent,
+            // so a long-running session keeps the decomposition rule in mind.
+            _ => true,
+        };
+
+        let blocks = if prompt_turn_count == 0 {
+            // First prompt on this connection → full context injection.
+            let mut injected_blocks = Vec::new();
             if let (Some(cid), Some(fid)) = (cid, fid) {
-                let mut injected_blocks = Vec::new();
                 if let Some(block) =
                     crate::acp::context_injection::build_first_prompt_injection(
                         &db.conn, cid, fid,
@@ -1034,18 +1121,48 @@ impl ConnectionManager {
                 {
                     injected_blocks.push(block);
                 }
-                if !injected_blocks.is_empty() {
-                    injected_blocks.extend(blocks);
-                    injected_blocks
-                } else {
-                    blocks
+            }
+            if use_decomp_injection {
+                injected_blocks
+                    .push(crate::acp::context_injection::build_decomposition_instruction_block());
+            }
+            if injected_blocks.is_empty() {
+                blocks
+            } else {
+                injected_blocks.extend(blocks);
+                injected_blocks
+            }
+        } else if let Some(cid) = cid {
+            // Follow-up prompt → compact re-injection when due. This fires for
+            // ALL sessions (task-linked or not), so the decomposition rule is
+            // periodically refreshed to counter long-context forgetting.
+            if crate::acp::context_injection::should_reinject(
+                prompt_turn_count,
+                0,
+                0,
+                crate::acp::context_injection::re_injection_interval_from_env(),
+            ) {
+                let mut reinjected = Vec::with_capacity(blocks.len() + 2);
+                if use_decomp_injection {
+                    reinjected
+                        .push(crate::acp::context_injection::build_decomposition_instruction_block());
                 }
+                if let Some(block) =
+                    crate::acp::context_injection::build_reinjection_block(&db.conn, cid).await
+                {
+                    reinjected.push(block);
+                }
+                reinjected.extend(blocks);
+                reinjected
             } else {
                 blocks
             }
         } else {
             blocks
         };
+        // Mark this prompt as consumed so the NEXT send is a follow-up turn
+        // (first-prompt injection fires once per connection).
+        state_arc.write().await.prompt_turn_count += 1;
 
         // Capture a bounded preview of the user's message BEFORE `blocks` is
         // moved into `send_prompt_inner`. Only on the genuine UI path
@@ -1185,6 +1302,27 @@ impl ConnectionManager {
                 config_id,
                 value_id,
             })
+            .await
+            .map_err(|_| AcpError::ProcessExited)
+    }
+
+    /// Pause or clear the session's active Codex goal via the connection loop
+    /// (codex-acp #293). Looked up by connectionId; the loop sources the
+    /// sessionId from the live session, so callers only supply the action.
+    pub async fn goal_control(
+        &self,
+        conn_id: &str,
+        action: GoalControlAction,
+    ) -> Result<(), AcpError> {
+        let cmd_tx = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            conn.cmd_tx.clone()
+        };
+        cmd_tx
+            .send(ConnectionCommand::GoalControl { action })
             .await
             .map_err(|_| AcpError::ProcessExited)
     }
@@ -1359,6 +1497,10 @@ impl ConnectionManager {
         // underneath us, but we never SET it: not setting the gate is precisely
         // why a dropped fork can't wedge the connection.
         if state_arc.read().await.turn_in_flight {
+            tracing::debug!(
+                connection_id = %conn_id,
+                "[ACP] fork rejected: a turn is already in flight"
+            );
             return Err(AcpError::TurnInProgress);
         }
 
@@ -1592,6 +1734,7 @@ impl ConnectionManager {
                         updated_at: Set(now),
                         deleted_at: Set(None),
                         pinned_at: Set(None),
+                        origin_cwd: Set(None),
                     };
                     let inserted = sibling.insert(txn).await?;
                     Ok(inserted.id)
@@ -1815,16 +1958,104 @@ impl ConnectionManager {
         disconnected
     }
 
+    /// Disconnect every connection, then hard-kill any surviving agent process
+    /// trees as a shutdown backstop.
+    ///
+    /// The graceful path (send `Disconnect` → the connection driver thread
+    /// breaks its command loop → `run_connection` unwinds → the vendored
+    /// `sacp-tokio` `ChildGuard::drop` runs `kill_tree`) is enough on its own
+    /// *when it gets to run*. It doesn't at process exit: `run_connection` is
+    /// driven on a dedicated `std::thread` (see `spawn_agent`), and when Tauri's
+    /// `ExitRequested` handler returns the process terminates those threads
+    /// mid-flight — often before the driver reaches `ChildGuard::drop` — so the
+    /// agent CLI (and its own children, e.g. MCP servers / a forked `node`) is
+    /// reparented and lingers until it independently notices its stdin EOF
+    /// (~30s for Claude Code / node).
+    ///
+    /// So: fire every `Disconnect`, give the graceful path a short grace window,
+    /// then synchronously `kill_tree` whatever is still running.
+    ///
+    /// What the window actually buys is NOT a gentler death for the agent — the
+    /// graceful path ends in the same `kill_tree` — it is time for the driver
+    /// thread's own post-loop cleanup (delegation-token revoke, `cancel_by_parent`
+    /// for delegations / questions / plan approvals), which at quit previously
+    /// got no time at all.
+    ///
+    /// Each pid is read from its live cell as late as possible — after the
+    /// window, inside the kill loop — never from an up-front snapshot. That is
+    /// load-bearing in both directions:
+    /// - A connection whose process was reaped during the window has already
+    ///   had its cell zeroed by the `on_exit` callback, so the backstop skips it
+    ///   instead of `kill_tree`-ing a pid the OS may have recycled onto an
+    ///   unrelated process tree. A connection that merely *ended* keeps its pid
+    ///   and still gets swept — `ChildGuard::drop` signals without waiting, so
+    ///   "the driver returned" is not "the agent is gone".
+    /// - A connection whose child spawned *after* quit began (still `Connecting`
+    ///   when the map was drained) publishes its pid into the same cell, so the
+    ///   backstop still reaches it — an up-front snapshot would read `0` and
+    ///   leak exactly the orphan this exists to kill.
+    ///
+    /// Only pids this manager spawned (and their descendants) are touched;
+    /// `child_pid == 0` (never spawned, already finished, or a test/viewer entry
+    /// that owns no process) is skipped.
     pub async fn disconnect_all(&self) -> usize {
-        let cmd_txs: Vec<_> = {
+        let handles: Vec<(
+            tokio::sync::mpsc::Sender<ConnectionCommand>,
+            Arc<std::sync::atomic::AtomicU32>,
+        )> = {
             let mut connections = self.connections.lock().await;
-            connections.drain().map(|(_, conn)| conn.cmd_tx).collect()
+            connections
+                .drain()
+                .map(|(_, conn)| (conn.cmd_tx, conn.child_pid))
+                .collect()
         };
-        let disconnected = cmd_txs.len();
-        for cmd_tx in cmd_txs {
-            let _ = cmd_tx.send(ConnectionCommand::Disconnect).await;
+        let disconnected = handles.len();
+        // `try_send`, not `send().await`: this is the shutdown path, and the
+        // backstop below is only reachable if every send returns. A connection
+        // whose command queue is full (32 deep) would otherwise park the whole
+        // quit here — precisely the wedged connection whose tree most needs
+        // killing. A dropped `Disconnect` just means that connection skips the
+        // graceful path and gets hard-killed instead.
+        for (cmd_tx, _) in &handles {
+            let _ = cmd_tx.try_send(ConnectionCommand::Disconnect);
         }
         tracing::info!("[ACP] disconnect_all count={}", disconnected);
+
+        if disconnected == 0 {
+            return 0;
+        }
+
+        // Grace window: let the drivers unwind and run their own cleanup.
+        tokio::time::sleep(DISCONNECT_ALL_GRACE).await;
+
+        // Backstop: hard-kill whatever is still running. Runs on a blocking
+        // thread so the synchronous `kill_tree` doesn't stall the async runtime
+        // while a `block_on(disconnect_all())` shutdown caller waits on it.
+        let pid_cells: Vec<Arc<std::sync::atomic::AtomicU32>> =
+            handles.into_iter().map(|(_, pid)| pid).collect();
+        let _ = tokio::task::spawn_blocking(move || {
+            for cell in pid_cells {
+                // Load here, not before the window — see the doc comment.
+                let pid = cell.load(std::sync::atomic::Ordering::SeqCst);
+                if pid == 0 {
+                    continue;
+                }
+                match kill_tree::blocking::kill_tree(pid) {
+                    Ok(_) => {
+                        tracing::info!(
+                            "[ACP] disconnect_all backstop killed process tree pid={pid}"
+                        );
+                    }
+                    Err(e) => {
+                        // The process can still exit between the load and the
+                        // kill; that error is expected, not a failure.
+                        tracing::debug!("[ACP] disconnect_all backstop kill_tree pid={pid}: {e}");
+                    }
+                }
+            }
+        })
+        .await;
+
         disconnected
     }
 
@@ -1941,17 +2172,37 @@ impl ConnectionManager {
             )));
         }
         let text = trimmed.to_string();
-        let (state, emitter) = self
-            .get_state_and_emitter(conn_id)
-            .await
-            .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.to_string()))?;
-        // Per-connection capability gate: reject if THIS agent never got the
-        // `check_user_feedback` tool (e.g. its session started before the feature
-        // was enabled) — the note could never be read. `feedback_tool_available`
-        // is fixed at launch, so a plain read is race-free.
-        if !state.read().await.feedback_tool_available {
+        let (state, cmd_tx, emitter) = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.to_string()))?;
+            (
+                conn.state.clone(),
+                conn.cmd_tx.clone(),
+                conn.emitter.clone(),
+            )
+        };
+        // Channel-aware eligibility: a note is deliverable natively (the
+        // `_session/steering` push, synthesized at initialize) or through the
+        // `check_user_feedback` pull tool. Reject only when NEITHER channel
+        // exists — e.g. a session launched before the feature was enabled (no
+        // tool) on an adapter without proven native steering.
+        // `native_steering_available` is re-read on every call so a
+        // `startedNewTurn` downgrade mid-session silently reroutes later
+        // notes to the pull path.
+        let (native, tool_available) = {
+            let s = state.read().await;
+            (s.native_steering_available, s.feedback_tool_available)
+        };
+        if !native && !tool_available {
             return Err(AcpError::FeedbackDisabled);
         }
+
+        if native {
+            return Self::submit_feedback_native(conn_id, state, cmd_tx, emitter, text).await;
+        }
+
         let item = FeedbackItem::new_pending(
             uuid::Uuid::new_v4().to_string(),
             text,
@@ -1972,6 +2223,113 @@ impl ConnectionManager {
             return Err(AcpError::NoActiveTurn);
         }
         Ok(item)
+    }
+
+    /// Native `_session/steering` delivery — the push half of
+    /// [`Self::submit_feedback`], cancellation-shielded.
+    ///
+    /// SHIELD (fork_session's pattern): once `ConnectionCommand::Steer` is
+    /// enqueued, the connection loop performs the injection REGARDLESS of
+    /// whether this caller survives. An HTTP caller disconnecting mid-await
+    /// must not leave "injected but unrecorded" state — no `FeedbackItem`, no
+    /// broadcast, absent from reconnect snapshots — so enqueue → outcome →
+    /// record → emit runs in a DETACHED task and the caller merely awaits the
+    /// JoinHandle to relay the result to a still-live client.
+    ///
+    /// Invariants (asserted by tests):
+    /// * NO DOUBLE DELIVERY. A natively-injected note is `Delivered` from
+    ///   birth, and `read_pending_feedback` only returns `Pending` — so even
+    ///   with the `check_user_feedback` tool still injected (it is, by
+    ///   design), a pull can never hand the agent the same text again.
+    /// * UNGATED EMIT. The pull path's `emit_with_state_gated(turn_in_flight)`
+    ///   is exactly wrong here: the adapter's `injected` reply is the
+    ///   authoritative fact the content reached the turn. Gating on a
+    ///   just-settled turn would misreport `NoActiveTurn`, and the caller
+    ///   would resubmit the same text as a prompt → duplicate. A delivered
+    ///   note recorded right after `TurnComplete` is harmless — the notes
+    ///   list renders only while prompting, and the next turn's `UserMessage`
+    ///   clears `feedback`.
+    async fn submit_feedback_native(
+        conn_id: &str,
+        state: Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+        cmd_tx: tokio::sync::mpsc::Sender<ConnectionCommand>,
+        emitter: EventEmitter,
+        text: String,
+    ) -> Result<FeedbackItem, AcpError> {
+        // Cheap pre-flight, NOT the authoritative check (that's the loop's
+        // idle arm replying `NoActiveTurn`): skip the round-trip when no turn
+        // is in flight at all.
+        if !state.read().await.turn_in_flight {
+            return Err(AcpError::NoActiveTurn);
+        }
+        let conn_id_for_task = conn_id.to_string();
+        let handle = tokio::spawn(async move {
+            let outcome: Result<FeedbackItem, AcpError> = async {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                cmd_tx
+                    .send(ConnectionCommand::Steer {
+                        text: text.clone(),
+                        reply: reply_tx,
+                    })
+                    .await
+                    .map_err(|_| AcpError::ProcessExited)?;
+                let steer = reply_rx.await.map_err(|_| {
+                    AcpError::protocol("Steer reply channel closed".to_string())
+                })??;
+                match steer {
+                    // Honored opt-in: the content was NOT consumed and is
+                    // still host-owned. Surface the frontend's existing
+                    // turn-end fallback (resubmit as a normal prompt).
+                    SteerOutcome::PromptRequired => return Err(AcpError::NoActiveTurn),
+                    SteerOutcome::Injected => {}
+                    SteerOutcome::StartedNewTurn => {
+                        // The adapter ignored the opt-in and detached a turn
+                        // (stale binary lying about its version?). The content
+                        // IS consumed — record it delivered, NEVER resend —
+                        // but this adapter can't be trusted with the idle race
+                        // again: downgrade to the MCP pull channel for the
+                        // rest of the session.
+                        tracing::warn!(
+                            "[ACP][feedback] _session/steering returned startedNewTurn \
+                             (conn={conn_id_for_task}); downgrading native steering for \
+                             this session"
+                        );
+                        state.write().await.native_steering_available = false;
+                    }
+                }
+                let item = FeedbackItem::new_delivered(
+                    uuid::Uuid::new_v4().to_string(),
+                    text,
+                    chrono::Utc::now(),
+                );
+                // Ungated on purpose — see the invariant on this fn's doc.
+                emit_with_state(
+                    &state,
+                    &emitter,
+                    AcpEvent::FeedbackSubmitted { item: item.clone() },
+                )
+                .await;
+                Ok(item)
+            }
+            .await;
+            // Surface real failures even when the caller is gone (the
+            // detached task's Result would otherwise drop silently).
+            // `NoActiveTurn` is an expected reroute, not a failure.
+            if let Err(ref e) = outcome {
+                if !matches!(e, AcpError::NoActiveTurn) {
+                    tracing::error!(
+                        "[ACP][ERROR] native feedback submit failed (conn={conn_id_for_task}): {e}"
+                    );
+                }
+            }
+            outcome
+        });
+        match handle.await {
+            Ok(result) => result,
+            Err(join_err) => Err(AcpError::protocol(format!(
+                "steer task did not complete: {join_err}"
+            ))),
+        }
     }
 
     /// Read the pending feedback for a connection WITHOUT marking it delivered.
@@ -2248,6 +2606,159 @@ impl ConnectionManager {
         if let Some((state, emitter)) = self.get_state_and_emitter(conn_id).await {
             for question_id in drained {
                 emit_with_state(&state, &emitter, AcpEvent::QuestionResolved { question_id }).await;
+            }
+        }
+    }
+
+    /// Register a pending Grok `exit_plan_mode` approval on `conn_id`, broadcast
+    /// `PlanApprovalRequest` (so every attached client renders the card and a
+    /// mid-turn attach recovers it from the snapshot), and return the receiver
+    /// the connection's ext handler awaits. `None` when the connection is gone
+    /// (nothing to approve) OR when one is already pending on it (the agent is
+    /// blocked in a single `exit_plan_mode` call; a second would orphan the
+    /// first). Mirrors [`Self::register_question`].
+    pub async fn register_plan_approval(
+        &self,
+        conn_id: &str,
+        tool_call_id: String,
+        plan_markdown: String,
+    ) -> Option<RegisteredPlanApproval> {
+        let (state, emitter) = self.get_state_and_emitter(conn_id).await?;
+        let approval_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut reg = self.pending_plan_approvals.lock().await;
+            if reg.values().any(|e| e.parent_connection_id == conn_id) {
+                return None;
+            }
+            reg.insert(
+                approval_id.clone(),
+                PendingPlanApprovalEntry {
+                    parent_connection_id: conn_id.to_string(),
+                    sender: tx,
+                },
+            );
+        }
+        // Ungated emit: the agent is blocked in the tool call, so the card must
+        // show regardless of any turn-flag timing.
+        emit_with_state(
+            &state,
+            &emitter,
+            AcpEvent::PlanApprovalRequest {
+                approval_id: approval_id.clone(),
+                tool_call_id,
+                plan_markdown,
+            },
+        )
+        .await;
+        // Teardown event-ordering race (mirrors `register_question`): the
+        // cleanup guard's `cancel_plan_approvals_by_parent` may have drained this
+        // entry between the insert above and the emit just now — its
+        // `PlanApprovalResolved` could then have raced ahead of our
+        // `PlanApprovalRequest`, leaving a card up with no live backend waiter.
+        // Emit a compensating `PlanApprovalResolved` (ordered after our request)
+        // and decline.
+        if self
+            .compensate_if_plan_approval_drained(&approval_id, &state, &emitter)
+            .await
+        {
+            return None;
+        }
+        Some(RegisteredPlanApproval {
+            approval_id,
+            answer_rx: rx,
+        })
+    }
+
+    /// Returns `true` — after emitting a clearing `PlanApprovalResolved` — when
+    /// `approval_id` is no longer pending, i.e. a teardown sweep drained it in the
+    /// window after its `PlanApprovalRequest` was broadcast. Mirrors
+    /// [`Self::compensate_if_question_drained`].
+    async fn compensate_if_plan_approval_drained(
+        &self,
+        approval_id: &str,
+        state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::SessionState>>,
+        emitter: &EventEmitter,
+    ) -> bool {
+        if self.pending_plan_approvals.lock().await.contains_key(approval_id) {
+            return false;
+        }
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::PlanApprovalResolved {
+                approval_id: approval_id.to_string(),
+            },
+        )
+        .await;
+        true
+    }
+
+    /// Resolve a pending plan approval with the user's decision (from any
+    /// client). Removes the one-shot atomically (first answer wins; a duplicate /
+    /// already-resolved id is an idempotent no-op), sends the decision to the
+    /// blocked ext handler, and broadcasts `PlanApprovalResolved` so the card
+    /// clears on every client. Routing uses the entry's stored parent connection
+    /// (the `approval_id` is the authoritative key), so a stale `conn_id` from the
+    /// caller can't misroute. Mirrors [`Self::answer_question`].
+    pub async fn answer_plan_approval(
+        &self,
+        conn_id: &str,
+        approval_id: &str,
+        answer: PlanApprovalAnswer,
+    ) -> Result<(), AcpError> {
+        let _ = conn_id;
+        let entry = self.pending_plan_approvals.lock().await.remove(approval_id);
+        let Some(entry) = entry else {
+            // Already answered / canceled / gone elsewhere — idempotent success.
+            return Ok(());
+        };
+        // Ignore a dropped receiver: the handler may have abandoned the wait
+        // (teardown) at the same instant; the resolved event below still clears
+        // the card.
+        let _ = entry.sender.send(answer);
+        if let Some((state, emitter)) =
+            self.get_state_and_emitter(&entry.parent_connection_id).await
+        {
+            emit_with_state(
+                &state,
+                &emitter,
+                AcpEvent::PlanApprovalResolved {
+                    approval_id: approval_id.to_string(),
+                },
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    /// Cancel every pending plan approval parked on a connection that is tearing
+    /// down (the `run_connection` cleanup guard calls this). Dropping each
+    /// entry's sender resolves the handler's await as a disconnect (Grok keeps
+    /// plan mode active, re-surfaces on reconnect); the `PlanApprovalResolved`
+    /// broadcast clears the card. Mirrors [`Self::cancel_questions_by_parent`].
+    pub async fn cancel_plan_approvals_by_parent(&self, conn_id: &str) {
+        let drained: Vec<String> = {
+            let mut reg = self.pending_plan_approvals.lock().await;
+            let ids: Vec<String> = reg
+                .iter()
+                .filter(|(_, e)| e.parent_connection_id == conn_id)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &ids {
+                reg.remove(id);
+            }
+            ids
+        };
+        if drained.is_empty() {
+            return;
+        }
+        // Best-effort card clear: the connection may already be out of the map
+        // (disconnect removes it before this sweep), so tolerate `None`.
+        if let Some((state, emitter)) = self.get_state_and_emitter(conn_id).await {
+            for approval_id in drained {
+                emit_with_state(&state, &emitter, AcpEvent::PlanApprovalResolved { approval_id })
+                    .await;
             }
         }
     }
@@ -2570,6 +3081,35 @@ impl SessionQuestionAccess for ConnectionManagerQuestionLookup {
     }
 }
 
+/// Production impl of [`SessionPlanApprovalAccess`] for the Grok `exit_plan_mode`
+/// ext bridge. Registers / cancels the parent connection's pending plan approval
+/// by delegating to `ConnectionManager`. Mirrors `ConnectionManagerQuestionLookup`
+/// so the connection handler stays unit-testable with an in-memory stub.
+#[derive(Clone)]
+pub struct ConnectionManagerPlanApprovalLookup {
+    pub manager: Arc<ConnectionManager>,
+}
+
+#[async_trait::async_trait]
+impl SessionPlanApprovalAccess for ConnectionManagerPlanApprovalLookup {
+    async fn register_plan_approval(
+        &self,
+        parent_connection_id: &str,
+        tool_call_id: String,
+        plan_markdown: String,
+    ) -> Option<RegisteredPlanApproval> {
+        self.manager
+            .register_plan_approval(parent_connection_id, tool_call_id, plan_markdown)
+            .await
+    }
+
+    async fn cancel_plan_approvals_by_parent(&self, parent_connection_id: &str) {
+        self.manager
+            .cancel_plan_approvals_by_parent(parent_connection_id)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2619,7 +3159,165 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
+    }
+
+    /// Spawn a two-level process tree: `sh` (the stand-in for the agent CLI)
+    /// backgrounds a `sleep` grandchild (the stand-in for the agent's own
+    /// children — an MCP server, a forked `node`) and records its pid. The
+    /// grandchild is what the backstop assertions are about: it is the process
+    /// that gets reparented and lingers when only the direct child is killed.
+    ///
+    /// Returns the direct child — keep it alive, dropping a `Child` does NOT
+    /// kill it — and the grandchild pid.
+    #[cfg(unix)]
+    async fn spawn_process_tree(pidfile: &std::path::Path) -> (std::process::Child, i32) {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 30 & echo $! > '{}'; wait", pidfile.display()))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        for _ in 0..150 {
+            if let Ok(raw) = std::fs::read_to_string(pidfile) {
+                if let Ok(pid) = raw.trim().parse::<i32>() {
+                    return (child, pid);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Bail-out path still reaps the tree, so a failing test can't leave a
+        // `sleep` behind for 30s.
+        let _ = kill_tree::blocking::kill_tree(child.id());
+        let _ = child.wait();
+        panic!("grandchild never recorded its pid");
+    }
+
+    /// True once `pid` is gone. `kill(pid, 0)` sends no signal, it only probes
+    /// existence; polling keeps the assertion from racing kernel teardown.
+    #[cfg(unix)]
+    async fn wait_until_dead(pid: i32) -> bool {
+        for _ in 0..150 {
+            // SAFETY: signal 0 only probes for existence; it sends no signal.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    fn is_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes for existence; it sends no signal.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Quit has to kill the agent's whole process TREE. Killing just the direct
+    /// child leaves its children reparented and lingering — that orphan window
+    /// is the entire reason the backstop exists.
+    ///
+    /// The test connection's command receiver is dropped, so the graceful path
+    /// is unavailable and the kill can only come from the backstop.
+    /// Unix-only (relies on `sh` / `kill(2)`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnect_all_backstop_kills_the_whole_agent_process_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut child, gpid) = spawn_process_tree(&dir.path().join("g.pid")).await;
+
+        let mgr = ConnectionManager::new();
+        let conn = fake_connection("conn-tree", None);
+        conn.child_pid
+            .store(child.id(), std::sync::atomic::Ordering::SeqCst);
+        mgr.connections
+            .lock()
+            .await
+            .insert("conn-tree".to_string(), conn);
+
+        assert_eq!(mgr.disconnect_all().await, 1);
+        assert!(
+            wait_until_dead(gpid).await,
+            "grandchild {gpid} survived — the quit backstop did not kill the tree"
+        );
+        let _ = child.wait();
+    }
+
+    /// A connection still `Connecting` when quit begins publishes its pid AFTER
+    /// the map is drained. Reading the pids up front would see `0` there and
+    /// skip it, leaking exactly the orphan this exists to kill — so the load
+    /// has to happen after the grace window, from the live cell.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnect_all_backstop_reaches_a_child_that_spawns_during_the_grace_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut child, gpid) = spawn_process_tree(&dir.path().join("g.pid")).await;
+
+        let mgr = ConnectionManager::new();
+        let conn = fake_connection("conn-late", None);
+        // Still 0 at drain time, exactly like a connection whose agent process
+        // hasn't launched yet.
+        let cell = Arc::clone(&conn.child_pid);
+        mgr.connections
+            .lock()
+            .await
+            .insert("conn-late".to_string(), conn);
+
+        let pid = child.id();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cell.store(pid, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        assert_eq!(mgr.disconnect_all().await, 1);
+        assert!(
+            wait_until_dead(gpid).await,
+            "grandchild {gpid} survived — a pid published during the grace window was missed"
+        );
+        let _ = child.wait();
+    }
+
+    /// The mirror image: once the agent process has been reaped, the `on_exit`
+    /// callback zeroes the cell and the backstop must leave that pid alone.
+    /// Without the clear, a quit fires `kill_tree` at a pid whose process is
+    /// already dead and reaped — and if the OS recycled that number, the victim
+    /// is an unrelated process tree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnect_all_backstop_leaves_a_cleared_pid_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut child, gpid) = spawn_process_tree(&dir.path().join("g.pid")).await;
+
+        let mgr = ConnectionManager::new();
+        let conn = fake_connection("conn-cleared", None);
+        conn.child_pid
+            .store(child.id(), std::sync::atomic::Ordering::SeqCst);
+        let cell = Arc::clone(&conn.child_pid);
+        mgr.connections
+            .lock()
+            .await
+            .insert("conn-cleared".to_string(), conn);
+
+        // Stands in for the driver unwinding mid-window: the process is gone
+        // and the guard has zeroed the cell.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cell.store(0, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        assert_eq!(mgr.disconnect_all().await, 1);
+        // Settle: a wrongly-issued SIGTERM would have landed by now.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            is_alive(gpid),
+            "backstop killed a tree whose pid the driver had already cleared"
+        );
+
+        let _ = kill_tree::blocking::kill_tree(child.id());
+        let _ = child.wait();
     }
 
     /// Build a broadcaster + subscribed receiver. Subscribing here (not lazily
@@ -2791,6 +3489,7 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         mgr.connections
             .lock()
@@ -3124,6 +3823,7 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         let mgr = ConnectionManager::new();
         mgr.connections
@@ -4696,6 +5396,7 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         let mgr = Arc::new(ConnectionManager::new());
         {
@@ -5069,6 +5770,7 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
+            child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         let mgr = ConnectionManager::new();
         {
@@ -5291,6 +5993,7 @@ mod tests {
             message: "agent exploded".into(),
             agent_type: "claude_code".into(),
             code: Some("sdk_not_installed".into()),
+            details: None,
             terminal: true,
         });
         let captured = s.last_error.as_ref().expect("error must be captured");
@@ -5304,6 +6007,7 @@ mod tests {
             message: "second failure".into(),
             agent_type: "claude_code".into(),
             code: None,
+            details: None,
             terminal: true,
         });
         let captured = s.last_error.as_ref().unwrap();
@@ -5405,6 +6109,230 @@ mod tests {
         assert_eq!(state.read().await.feedback.len(), 1, "only the valid note stuck");
     }
 
+    // --- native steering (push channel) ----------------------------------
+
+    async fn mark_native_steering_ready(mgr: &ConnectionManager, conn_id: &str) {
+        let state = mgr.get_state(conn_id).await.unwrap();
+        let mut s = state.write().await;
+        s.native_steering_available = true;
+        s.turn_in_flight = true;
+    }
+
+    /// Play the connection loop's role: receive one `Steer` command and reply
+    /// the given outcome. Returns the text the command carried.
+    fn answer_steer(
+        mut rx: tokio::sync::mpsc::Receiver<ConnectionCommand>,
+        outcome: Result<SteerOutcome, AcpError>,
+    ) -> tokio::task::JoinHandle<String> {
+        tokio::spawn(async move {
+            match rx.recv().await {
+                Some(ConnectionCommand::Steer { text, reply }) => {
+                    let _ = reply.send(outcome);
+                    text
+                }
+                _ => panic!("expected a Steer command"),
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn native_submit_injected_records_delivered_and_pull_stays_empty() {
+        let mgr = ConnectionManager::new();
+        let rx = mgr
+            .insert_test_connection_live("c1", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        mark_native_steering_ready(&mgr, "c1").await;
+        // The pull tool coexists by design — and must see NOTHING (the
+        // no-double-delivery invariant: native notes are Delivered from birth,
+        // `read_pending_feedback` only returns Pending).
+        set_feedback_tool_available(&mgr, "c1").await;
+        let fake_loop = answer_steer(rx, Ok(SteerOutcome::Injected));
+
+        let item = mgr.submit_feedback("c1", "  ship it  ".into()).await.unwrap();
+        assert_eq!(item.status, FeedbackStatus::Delivered);
+        assert!(item.delivered_at.is_some());
+        assert_eq!(item.text, "ship it");
+        // The wire carried the trimmed text.
+        assert_eq!(fake_loop.await.unwrap(), "ship it");
+
+        let state = mgr.get_state("c1").await.unwrap();
+        {
+            let s = state.read().await;
+            assert_eq!(s.feedback.len(), 1);
+            assert_eq!(s.feedback[0].status, FeedbackStatus::Delivered);
+            assert!(s.native_steering_available, "injected must not downgrade");
+        }
+        assert!(
+            mgr.read_pending_feedback("c1").await.is_empty(),
+            "a check_user_feedback pull must never re-deliver a natively-injected note"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_submit_prompt_required_maps_to_no_active_turn_and_records_nothing() {
+        let mgr = ConnectionManager::new();
+        let rx = mgr
+            .insert_test_connection_live("c1", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        mark_native_steering_ready(&mgr, "c1").await;
+        let fake_loop = answer_steer(rx, Ok(SteerOutcome::PromptRequired));
+
+        let err = mgr.submit_feedback("c1", "note".into()).await.unwrap_err();
+        assert!(matches!(err, AcpError::NoActiveTurn));
+        let _ = fake_loop.await;
+
+        let state = mgr.get_state("c1").await.unwrap();
+        let s = state.read().await;
+        // Content was NOT consumed (honored opt-in): nothing recorded, and the
+        // channel stays native — the caller resubmits as a normal prompt.
+        assert!(s.feedback.is_empty());
+        assert!(s.native_steering_available);
+    }
+
+    #[tokio::test]
+    async fn native_submit_started_new_turn_records_delivered_and_downgrades_to_pull() {
+        let mgr = ConnectionManager::new();
+        let rx = mgr
+            .insert_test_connection_live("c1", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        mark_native_steering_ready(&mgr, "c1").await;
+        set_feedback_tool_available(&mgr, "c1").await;
+        let fake_loop = answer_steer(rx, Ok(SteerOutcome::StartedNewTurn));
+
+        // The adapter ignored the opt-in: content consumed → recorded
+        // Delivered (never resent), and the session downgrades to pull.
+        let item = mgr.submit_feedback("c1", "note one".into()).await.unwrap();
+        assert_eq!(item.status, FeedbackStatus::Delivered);
+        let _ = fake_loop.await;
+        let state = mgr.get_state("c1").await.unwrap();
+        assert!(
+            !state.read().await.native_steering_available,
+            "startedNewTurn must downgrade native steering for the session"
+        );
+
+        // The NEXT note rides the pull path: lands Pending, no Steer command
+        // (the loop receiver was consumed above — a native attempt would fail
+        // on the dead channel, so an Ok(Pending) proves the pull branch ran).
+        let second = mgr.submit_feedback("c1", "note two".into()).await.unwrap();
+        assert_eq!(second.status, FeedbackStatus::Pending);
+        let pending = mgr.read_pending_feedback("c1").await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].text, "note two");
+    }
+
+    #[tokio::test]
+    async fn native_submit_records_even_when_turn_settles_before_the_reply() {
+        // The ungated-emit invariant: the adapter's `injected` reply is
+        // authoritative even if `TurnComplete` lands first. A gated emit here
+        // would misreport NoActiveTurn → the frontend would resend the same
+        // text as a prompt → duplicate.
+        let mgr = ConnectionManager::new();
+        let rx = mgr
+            .insert_test_connection_live("c1", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        mark_native_steering_ready(&mgr, "c1").await;
+        let state = mgr.get_state("c1").await.unwrap();
+
+        let state_for_loop = state.clone();
+        let mut rx = rx;
+        let fake_loop = tokio::spawn(async move {
+            match rx.recv().await {
+                Some(ConnectionCommand::Steer { reply, .. }) => {
+                    // The turn settles BETWEEN the injection and the reply.
+                    state_for_loop.write().await.turn_in_flight = false;
+                    let _ = reply.send(Ok(SteerOutcome::Injected));
+                }
+                _ => panic!("expected a Steer command"),
+            }
+        });
+
+        let item = mgr.submit_feedback("c1", "late note".into()).await.unwrap();
+        assert_eq!(item.status, FeedbackStatus::Delivered);
+        let _ = fake_loop.await;
+        assert_eq!(state.read().await.feedback.len(), 1);
+
+        // The next turn's UserMessage clears the (turn-scoped) note — the
+        // post-turn residue is bounded and harmless.
+        state.write().await.apply_event(&AcpEvent::UserMessage {
+            message_id: "m-next".into(),
+            blocks: Vec::new(),
+        });
+        assert!(state.read().await.feedback.is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_submit_records_despite_caller_cancellation() {
+        // Cancellation-shield regression, mirroring
+        // `fork_persists_despite_caller_cancellation`: once `Steer` is
+        // enqueued the adapter may consume the text regardless of caller
+        // liveness, so the Delivered record + broadcast must not be tied to
+        // the caller's future.
+        let mgr = ConnectionManager::new();
+        let rx = mgr
+            .insert_test_connection_live("c1", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        mark_native_steering_ready(&mgr, "c1").await;
+
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut rx = rx;
+        let fake_loop = tokio::spawn(async move {
+            if let Some(ConnectionCommand::Steer { reply, .. }) = rx.recv().await {
+                go_rx.await.ok(); // withhold the outcome until the caller is gone
+                let _ = reply.send(Ok(SteerOutcome::Injected));
+            }
+            rx // keep the receiver alive
+        });
+
+        // Drive the submit under a short timeout: the shielded task enqueues
+        // `Steer` and blocks on the withheld reply; the timeout DROPS this
+        // caller future.
+        let timed = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            mgr.submit_feedback("c1", "shielded note".into()),
+        )
+        .await;
+        assert!(
+            timed.is_err(),
+            "caller must be dropped before the withheld outcome is delivered"
+        );
+
+        // Release the outcome: the DETACHED task records the note anyway.
+        go_tx.send(()).ok();
+        let _ = fake_loop.await;
+        let state = mgr.get_state("c1").await.unwrap();
+        let mut recorded = false;
+        for _ in 0..200 {
+            {
+                let s = state.read().await;
+                if s.feedback.len() == 1 && s.feedback[0].status == FeedbackStatus::Delivered {
+                    recorded = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            recorded,
+            "native delivery must be recorded despite caller cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_only_session_accepts_notes_without_the_pull_tool() {
+        // The native channel needs no MCP companion (that's the point):
+        // eligibility is channel-aware, not tool-only.
+        let mgr = ConnectionManager::new();
+        let rx = mgr
+            .insert_test_connection_live("c1", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        mark_native_steering_ready(&mgr, "c1").await;
+        // feedback_tool_available stays false.
+        let fake_loop = answer_steer(rx, Ok(SteerOutcome::Injected));
+        let item = mgr.submit_feedback("c1", "no tool needed".into()).await.unwrap();
+        assert_eq!(item.status, FeedbackStatus::Delivered);
+        let _ = fake_loop.await;
+    }
+
     // --- ask_user_question: register / answer / cancel -------------------
 
     fn q_spec() -> Vec<QuestionSpec> {
@@ -5423,6 +6351,7 @@ mod tests {
                     description: String::new(),
                 },
             ],
+            is_secret: false,
         }]
     }
 
@@ -5539,6 +6468,104 @@ mod tests {
             .await
             .unwrap();
         assert!(reg_b.answer_rx.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn register_then_answer_plan_approval_resolves_and_clears() {
+        let mgr = ConnectionManager::new();
+        mgr.insert_test_connection("pa", AgentType::Grok, None, EventEmitter::Noop)
+            .await;
+        let reg = mgr
+            .register_plan_approval("pa", "call-1".into(), "# Plan\n- step".into())
+            .await
+            .expect("registered");
+        // SessionState reflects the pending approval for snapshot recovery.
+        {
+            let state = mgr.get_state("pa").await.unwrap();
+            let guard = state.read().await;
+            let pending = guard.pending_plan_approval.as_ref().expect("pending set");
+            assert_eq!(pending.plan_markdown, "# Plan\n- step");
+            assert_eq!(pending.tool_call_id, "call-1");
+        }
+
+        mgr.answer_plan_approval(
+            "pa",
+            &reg.approval_id,
+            crate::acp::plan_approval::PlanApprovalAnswer {
+                decision: crate::acp::plan_approval::PlanApprovalDecision::RequestChanges,
+                feedback: Some("use SSE".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The blocked ext handler's receiver resolves with the user's decision.
+        let got = reg.answer_rx.await.expect("answer delivered");
+        assert_eq!(
+            got.decision,
+            crate::acp::plan_approval::PlanApprovalDecision::RequestChanges
+        );
+        assert_eq!(got.feedback.as_deref(), Some("use SSE"));
+        // pending_plan_approval cleared after resolve.
+        assert!(mgr
+            .get_state("pa")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .pending_plan_approval
+            .is_none());
+
+        // Idempotent: answering an already-resolved id is a no-op success.
+        mgr.answer_plan_approval(
+            "pa",
+            &reg.approval_id,
+            crate::acp::plan_approval::PlanApprovalAnswer {
+                decision: crate::acp::plan_approval::PlanApprovalDecision::Approve,
+                feedback: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn register_plan_approval_refuses_second_pending_on_same_connection() {
+        // At most one approval per connection (the agent is blocked in exit_plan_mode).
+        let mgr = ConnectionManager::new();
+        mgr.insert_test_connection("pa2", AgentType::Grok, None, EventEmitter::Noop)
+            .await;
+        let _reg = mgr
+            .register_plan_approval("pa2", "c1".into(), "plan".into())
+            .await
+            .expect("first registers");
+        assert!(mgr
+            .register_plan_approval("pa2", "c2".into(), "plan2".into())
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_plan_approvals_by_parent_drops_sender_and_clears() {
+        let mgr = ConnectionManager::new();
+        mgr.insert_test_connection("pax", AgentType::Grok, None, EventEmitter::Noop)
+            .await;
+        let reg = mgr
+            .register_plan_approval("pax", "c".into(), "plan".into())
+            .await
+            .unwrap();
+        mgr.cancel_plan_approvals_by_parent("pax").await;
+        // Dropping the sender surfaces to the parked handler as a recv error
+        // (which it renders as a disconnect reply — plan mode stays active).
+        assert!(reg.answer_rx.await.is_err());
+        assert!(mgr
+            .get_state("pax")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .pending_plan_approval
+            .is_none());
     }
 
     #[tokio::test]

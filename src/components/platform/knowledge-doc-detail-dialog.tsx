@@ -41,6 +41,7 @@ export function KnowledgeDocDetailDialog({
   open,
   onClose,
   onDeleted,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   onUpdated: _onUpdated,
 }: KnowledgeDocDetailDialogProps) {
   const t = useTranslations("Platform")

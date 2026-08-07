@@ -44,9 +44,6 @@ interface ChatInputProps {
   /** Show the composer's flowing active-session border. Set only for the active
    *  tab when tiled across multiple sessions; passed through to MessageInput. */
   showActiveFlow?: boolean
-  /** The conversation ID this ChatInput belongs to. Passed through to MessageInput
-   *  to prevent badge drafts from leaking across tabs. */
-  conversationId?: number | null
   queue?: QueuedMessage[]
   onEnqueue?: (draft: PromptDraft, modeId: string | null) => void
   onQueueReorder?: (items: QueuedMessage[]) => void
@@ -59,6 +56,12 @@ interface ChatInputProps {
   onSaveQueueEdit?: (draft: PromptDraft) => void
   onCancelQueueEdit?: () => void
   onForkSend?: (draft: PromptDraft, modeId?: string | null) => void
+  /** Inject the draft's text into the RUNNING turn over the native steering
+   *  channel. Present only when the session's live-feedback channel is native
+   *  (`useSessionFeedback().channel === "native"`); resolves once recorded,
+   *  rejects on any failure (incl. the turn-end race) so MessageInput can run
+   *  its own enqueue fallback / draft preservation. */
+  onSteer?: (text: string) => Promise<void>
   onAddFeedback?: () => void
   feedbackAddDisabled?: boolean
   /**
@@ -114,6 +117,7 @@ export const ChatInput = memo(function ChatInput({
   onSaveQueueEdit,
   onCancelQueueEdit,
   onForkSend,
+  onSteer,
   onAddFeedback,
   feedbackAddDisabled,
   allowOfflineCompose = false,
@@ -121,17 +125,33 @@ export const ChatInput = memo(function ChatInput({
   onInjectConsumed,
   flush = false,
   tall = false,
-  conversationId,
 }: ChatInputProps) {
   const t = useTranslations("Folder.chat.chatInput")
   const isConnected = status === "connected"
   const isPrompting = status === "prompting"
   const isConnecting = status === "connecting"
 
+  // Active/historical conversations dock the composer at the very bottom of the
+  // message list. The attached folder/branch selector row now sits at the
+  // composer's bottom edge, so the docked composer keeps only a tight bottom gap
+  // (pb-1) — matching the row's own `pt-1` top gap, so the selectors read as
+  // evenly spaced above and below rather than floating over a wide margin. The
+  // welcome/draft composer (`flush`) uses the same pb-1 but supplies its own
+  // px-4 gutter.
   return (
     <div
-      className={cn("pt-0 pb-1", !flush && "px-4")}
+      className={cn("pt-0", flush ? "pb-1" : "px-4 pb-1")}
       onContextMenu={(event) => event.stopPropagation()}
+      // Touch and pen open a context menu from a LONG PRESS, which Radix arms on
+      // pointerdown — and the whole conversation panel (composer included) sits
+      // inside its own context-menu trigger. Without this, a slow tap on any
+      // composer control (the agent icon, the send button, …) pops the
+      // conversation menu. Mouse presses keep bubbling, so the panel's
+      // selection bookkeeping is untouched; the composer's OWN context menu
+      // still arms, since its trigger is nested below this wrapper.
+      onPointerDown={(event) => {
+        if (event.pointerType !== "mouse") event.stopPropagation()
+      }}
     >
       {queue &&
         queue.length > 0 &&
@@ -179,11 +199,11 @@ export const ChatInput = memo(function ChatInput({
         onSaveQueueEdit={onSaveQueueEdit}
         onCancelQueueEdit={onCancelQueueEdit}
         onForkSend={onForkSend}
+        onSteer={onSteer}
         onAddFeedback={onAddFeedback}
         feedbackAddDisabled={feedbackAddDisabled}
         injectContent={injectContent}
         onInjectConsumed={onInjectConsumed}
-        conversationId={conversationId}
         placeholder={
           isConnecting
             ? t("connecting")

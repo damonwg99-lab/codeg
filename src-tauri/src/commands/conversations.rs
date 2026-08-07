@@ -3,29 +3,37 @@ use std::collections::{HashMap, HashSet};
 use crate::app_error::AppCommandError;
 use crate::db::entities::conversation;
 use crate::db::entities::folder::FolderKind;
-
+use crate::db::service::{
+    conversation_service, folder_service, import_service, platform_task_conversation_service,
+    tab_service,
+};
 /// Event emitted when task-conversation links change (unlink / delete cleanup).
 /// Must match the constant in task.rs so the frontend receives the same event.
-const PLATFORM_TASK_CONVERSATION_CHANGED_EVENT: &str = "platform_task_conversation://changed";
-use crate::db::service::{conversation_service, folder_service, import_service, platform_task_conversation_service, tab_service};
+pub(crate) const PLATFORM_TASK_CONVERSATION_CHANGED_EVENT: &str = "platform_task_conversation://changed";
 #[cfg(feature = "tauri-runtime")]
 use crate::db::AppDatabase;
 use crate::models::*;
+use crate::parsers::acp_native::AcpNativeParser;
 use crate::parsers::claude::ClaudeParser;
 use crate::parsers::cline::ClineParser;
 use crate::parsers::codebuddy::CodeBuddyParser;
 use crate::parsers::codex::CodexParser;
 use crate::parsers::gemini::GeminiParser;
+use crate::parsers::cursor::CursorParser;
 use crate::parsers::grok::GrokParser;
 use crate::parsers::hermes::HermesParser;
 use crate::parsers::kimi_code::KimiCodeParser;
 use crate::parsers::pi::PiParser;
 use crate::parsers::openclaw::OpenClawParser;
 use crate::parsers::opencode::OpenCodeParser;
-use crate::parsers::{path_eq_for_matching, AgentParser, ParseError};
+use crate::parsers::{
+    folder_name_from_path, normalize_path_for_matching, path_eq_for_matching, AgentParser,
+    ParseError,
+};
 use crate::web::event_bridge::{
-    emit_event, ConversationChange, EventEmitter, TabsChanged, CONVERSATION_CHANGED_EVENT,
-    TABS_CHANGED_EVENT,
+    emit_event, ConversationChange, ConversationsBulkChanged, EventEmitter, ImportScanProgress,
+    TabsChanged, CONVERSATIONS_BULK_CHANGED_EVENT, CONVERSATION_CHANGED_EVENT,
+    IMPORT_SCAN_PROGRESS_EVENT, TABS_CHANGED_EVENT,
 };
 
 pub async fn list_all_conversations_core(
@@ -166,7 +174,7 @@ fn list_conversations_sync(
     let mut all_conversations = Vec::new();
     let mut seen_keys = HashSet::new();
 
-    let parsers: Vec<(AgentType, Box<dyn AgentParser>)> = vec![
+    let mut parsers: Vec<(AgentType, Box<dyn AgentParser>)> = vec![
         (AgentType::ClaudeCode, Box::new(ClaudeParser::new())),
         (AgentType::Codex, Box::new(CodexParser::new())),
         (AgentType::OpenCode, Box::new(OpenCodeParser::new())),
@@ -178,7 +186,13 @@ fn list_conversations_sync(
         (AgentType::KimiCode, Box::new(KimiCodeParser::new())),
         (AgentType::Pi, Box::new(PiParser::new())),
         (AgentType::Grok, Box::new(GrokParser::new())),
+        (AgentType::Cursor, Box::new(CursorParser::new())),
     ];
+    // Registered custom agents read back from codeg's own ACP transcripts, so
+    // their sessions participate in folder grouping and stats like any other.
+    for custom in crate::acp::custom_registry::all() {
+        parsers.push((custom, Box::new(AcpNativeParser::new(custom))));
+    }
 
     for (at, parser) in &parsers {
         if let Some(ref filter) = agent_type {
@@ -286,6 +300,10 @@ pub async fn get_conversation(
             AgentType::KimiCode => Box::new(KimiCodeParser::new()),
             AgentType::Pi => Box::new(PiParser::new()),
             AgentType::Grok => Box::new(GrokParser::new()),
+            AgentType::Cursor => Box::new(CursorParser::new()),
+            // Custom ACP agents have no native store to reverse-engineer;
+            // their history is codeg's own ACP transcript.
+            AgentType::Custom(_) => Box::new(AcpNativeParser::new(agent_type)),
         };
 
         parser
@@ -377,6 +395,15 @@ pub async fn import_local_conversations_core(
     emitter: &EventEmitter,
     folder_id: i32,
 ) -> Result<ImportResult, AppCommandError> {
+    // Share IMPORT_GUARD with the batch importer: `(external_id, agent_type)`
+    // has no DB unique index, so this legacy path racing a batch import (or a
+    // second legacy call) could double-insert. try_lock rejects the overlap
+    // rather than queueing — matching `import_selected_sessions_core`. (No UI
+    // still calls this command; it is kept only for API/back-compat.)
+    let _guard = IMPORT_GUARD
+        .try_lock()
+        .map_err(|_| AppCommandError::invalid_input("An import is already in progress"))?;
+
     let folder = folder_service::get_folder_by_id(conn, folder_id)
         .await
         .map_err(AppCommandError::from)?
@@ -408,6 +435,428 @@ pub async fn import_local_conversations(
     folder_id: i32,
 ) -> Result<ImportResult, AppCommandError> {
     import_local_conversations_core(&db.conn, &EventEmitter::Tauri(app), folder_id).await
+}
+
+/// Serializes concurrent batch imports: `(external_id, agent_type)` has no DB
+/// unique index (and adding one now could fail on historical duplicates), so
+/// two overlapping imports could double-insert the same session. `try_lock`
+/// instead of queueing — a second import racing the first is a user mistake to
+/// surface, not work to serialize.
+static IMPORT_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The DB's stored string for an [`AgentType`] (its snake_case serde name) —
+/// the same conversion `import_one` uses for the `agent_type` column.
+fn agent_type_db_str(at: &AgentType) -> String {
+    serde_json::to_value(at)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+/// Minimal projection of a `folder` row for scan/import reconciliation (keeps
+/// `build_scan_result` constructible in tests without full SeaORM models).
+struct ScanFolderRow {
+    id: i32,
+    path: String,
+    name: String,
+    deleted: bool,
+}
+
+async fn load_folder_rows(
+    conn: &sea_orm::DatabaseConnection,
+) -> Result<Vec<ScanFolderRow>, AppCommandError> {
+    use sea_orm::EntityTrait;
+    let rows = crate::db::entities::folder::Entity::find()
+        .all(conn)
+        .await
+        .map_err(crate::db::error::DbError::from)
+        .map_err(AppCommandError::from)?;
+    Ok(rows
+        .into_iter()
+        .map(|f| ScanFolderRow {
+            id: f.id,
+            path: f.path,
+            name: f.name,
+            deleted: f.deleted_at.is_some(),
+        })
+        .collect())
+}
+
+/// Normalized path → folder row, preferring a live row when a soft-deleted
+/// variant of the same normalized path also exists (both can coexist since
+/// `UNIQUE(path)` is on the raw string).
+fn index_folder_rows(rows: &[ScanFolderRow]) -> HashMap<String, &ScanFolderRow> {
+    let mut index: HashMap<String, &ScanFolderRow> = HashMap::new();
+    for row in rows {
+        let slot = index.entry(normalize_path_for_matching(&row.path)).or_insert(row);
+        if slot.deleted && !row.deleted {
+            *slot = row;
+        }
+    }
+    index
+}
+
+/// Pure grouping/reconciliation for the import-picker scan.
+/// `imported_index` maps `(agent_type_db_str, external_id)` → "a live row
+/// exists" (false = only soft-deleted rows).
+fn build_scan_result(
+    summaries: Vec<(AgentType, ConversationSummary)>,
+    imported_index: &HashMap<(String, String), bool>,
+    folder_rows: &[ScanFolderRow],
+) -> ScanResult {
+    struct GroupAcc {
+        path: String,
+        name: String,
+        exists_in_codeg: bool,
+        folder_id: Option<i32>,
+        agent_types: Vec<AgentType>,
+        sessions: Vec<ScanSession>,
+    }
+
+    let folder_index = index_folder_rows(folder_rows);
+    let mut groups: HashMap<String, GroupAcc> = HashMap::new();
+    let mut no_folder_count = 0u32;
+
+    for (at, summary) in summaries {
+        let raw_path = match summary.folder_path.as_deref().map(str::trim) {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => {
+                no_folder_count += 1;
+                continue;
+            }
+        };
+        let key = normalize_path_for_matching(&raw_path);
+        let entry = groups.entry(key.clone()).or_insert_with(|| {
+            let row = folder_index.get(&key).copied();
+            GroupAcc {
+                // Reuse the stored row's exact path string so the import-side
+                // add_folder upsert hits the same UNIQUE(path) key instead of
+                // minting a near-duplicate from a trailing-slash/case variant.
+                path: row.map(|r| r.path.clone()).unwrap_or_else(|| raw_path.clone()),
+                name: row
+                    .map(|r| r.name.clone())
+                    .or_else(|| summary.folder_name.clone())
+                    .unwrap_or_else(|| folder_name_from_path(&raw_path)),
+                exists_in_codeg: row.map(|r| !r.deleted).unwrap_or(false),
+                folder_id: row.map(|r| r.id),
+                agent_types: Vec::new(),
+                sessions: Vec::new(),
+            }
+        });
+        if !entry.agent_types.contains(&at) {
+            entry.agent_types.push(at);
+        }
+        let status = match imported_index.get(&(agent_type_db_str(&at), summary.id.clone())) {
+            None => ScanSessionStatus::New,
+            Some(true) => ScanSessionStatus::Imported,
+            Some(false) => ScanSessionStatus::Deleted,
+        };
+        entry.sessions.push(ScanSession {
+            external_id: summary.id,
+            agent_type: at,
+            title: summary.title,
+            started_at: summary.started_at,
+            ended_at: summary.ended_at,
+            message_count: summary.message_count,
+            model: summary.model,
+            git_branch: summary.git_branch,
+            status,
+        });
+    }
+
+    let mut folders: Vec<ScanFolder> = groups
+        .into_values()
+        .map(|mut g| {
+            g.sessions
+                .sort_by_key(|s| std::cmp::Reverse(s.started_at));
+            ScanFolder {
+                path: g.path,
+                name: g.name,
+                exists_in_codeg: g.exists_in_codeg,
+                folder_id: g.folder_id,
+                agent_types: g.agent_types,
+                sessions: g.sessions,
+            }
+        })
+        .collect();
+
+    fn importable(f: &ScanFolder) -> u32 {
+        f.sessions
+            .iter()
+            .filter(|s| s.status == ScanSessionStatus::New)
+            .count() as u32
+    }
+    folders.sort_by(|a, b| {
+        importable(b)
+            .cmp(&importable(a))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    let total_sessions = folders.iter().map(|f| f.sessions.len() as u32).sum();
+    let importable_count = folders.iter().map(importable).sum();
+
+    ScanResult {
+        folders,
+        no_folder_count,
+        total_sessions,
+        importable_count,
+    }
+}
+
+/// Scan every local agent's sessions and reconcile them against the DB for the
+/// import-picker window. Emits [`IMPORT_SCAN_PROGRESS_EVENT`] once per parser
+/// while the walk runs.
+///
+/// The scan also refreshes the conversations that are ALREADY imported, from
+/// the same parse it just did: a title generated after the first import, and
+/// the transcript's own last-activity time when the user kept working on the
+/// session in the agent's own CLI (see
+/// [`import_service::sync_imported_sessions`]). Without this, a re-scan can
+/// only ever offer the *new* sessions — the picker does not let you re-select
+/// an imported one — so an already-imported conversation would keep the
+/// `updated_at` it had at import time forever, and sit in the wrong place in a
+/// recency-sorted sidebar. Each refreshed row is broadcast so every window and
+/// web client re-sorts live.
+pub async fn scan_importable_sessions_core(
+    conn: &sea_orm::DatabaseConnection,
+    emitter: &EventEmitter,
+) -> Result<ScanResult, AppCommandError> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let progress_emitter = emitter.clone();
+    let summaries =
+        import_service::collect_local_summaries(move |agent_type, done, total, session_count| {
+            emit_event(
+                &progress_emitter,
+                IMPORT_SCAN_PROGRESS_EVENT,
+                ImportScanProgress {
+                    agent_type,
+                    done,
+                    total,
+                    session_count,
+                },
+            );
+        })
+        .await;
+
+    let conv_rows = conversation::Entity::find()
+        .filter(conversation::Column::ExternalId.is_not_null())
+        .all(conn)
+        .await
+        .map_err(crate::db::error::DbError::from)
+        .map_err(AppCommandError::from)?;
+    let mut imported_index: HashMap<(String, String), bool> = HashMap::new();
+    for row in &conv_rows {
+        let Some(external_id) = row.external_id.clone() else {
+            continue;
+        };
+        let live = row.deleted_at.is_none();
+        let entry = imported_index
+            .entry((row.agent_type.clone(), external_id))
+            .or_insert(live);
+        *entry = *entry || live;
+    }
+
+    // Refresh the already-imported rows in place before answering, then
+    // broadcast each one so open sidebars re-sort without a refetch.
+    for id in import_service::sync_imported_sessions(conn, &conv_rows, &summaries).await {
+        emit_conversation_upsert(emitter, conn, id).await;
+    }
+
+    let folder_rows = load_folder_rows(conn).await?;
+    Ok(build_scan_result(summaries, &imported_index, &folder_rows))
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn scan_importable_sessions(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+) -> Result<ScanResult, AppCommandError> {
+    scan_importable_sessions_core(&db.conn, &EventEmitter::Tauri(app)).await
+}
+
+/// Batch-import the selected sessions, creating (or reopening) each target
+/// folder as needed. Test seam for [`import_selected_sessions_core`]: takes the
+/// scanned summaries as input instead of walking the filesystem.
+pub(crate) async fn import_selected_from_summaries(
+    conn: &sea_orm::DatabaseConnection,
+    emitter: &EventEmitter,
+    summaries: Vec<(AgentType, ConversationSummary)>,
+    selections: Vec<SelectedSessionKey>,
+) -> Result<ImportSelectedResult, AppCommandError> {
+    const MAX_ERRORS: usize = 10;
+
+    // Defense-in-depth mirror of collect_local_summaries' child filter: a
+    // delegation child must never import as a root row, so a selection key
+    // pointing at one resolves to not_found.
+    let mut by_key: HashMap<(AgentType, String), (AgentType, ConversationSummary)> = summaries
+        .into_iter()
+        .filter(|(_, c)| c.parent_id.is_none())
+        .map(|(at, c)| ((at, c.id.clone()), (at, c)))
+        .collect();
+
+    // Group the resolved selections by normalized cwd. Duplicate keys in the
+    // request resolve once (the map entry is consumed); a key that no longer
+    // resolves — vanished from disk since the scan, cwd-less, or bogus — counts
+    // as not_found.
+    let mut not_found = 0u32;
+    let mut groups: HashMap<String, Vec<(AgentType, ConversationSummary)>> = HashMap::new();
+    let mut seen_keys: HashSet<(AgentType, String)> = HashSet::new();
+    for key in selections {
+        if !seen_keys.insert((key.agent_type, key.external_id.clone())) {
+            continue;
+        }
+        let Some((at, summary)) = by_key.remove(&(key.agent_type, key.external_id)) else {
+            not_found += 1;
+            continue;
+        };
+        let raw_path = match summary.folder_path.as_deref().map(str::trim) {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => {
+                not_found += 1;
+                continue;
+            }
+        };
+        groups
+            .entry(normalize_path_for_matching(&raw_path))
+            .or_default()
+            .push((at, summary));
+    }
+
+    let folder_rows = load_folder_rows(conn).await?;
+    let folder_index = index_folder_rows(&folder_rows);
+
+    let mut result = ImportSelectedResult {
+        imported: 0,
+        updated: 0,
+        skipped: 0,
+        not_found,
+        failed: 0,
+        created_folders: 0,
+        folders: Vec::new(),
+        errors: Vec::new(),
+    };
+    let mut touched_folder_ids: Vec<i32> = Vec::new();
+
+    // Deterministic folder order (normalized path) so results and tests are
+    // stable regardless of HashMap iteration.
+    let mut ordered: Vec<(String, Vec<(AgentType, ConversationSummary)>)> =
+        groups.into_iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (norm_key, items) in ordered {
+        let row = folder_index.get(&norm_key).copied();
+        // Import into the stored row's exact path when one normalize-matches
+        // (see build_scan_result); otherwise the parser cwd creates the folder.
+        let target_path = row.map(|r| r.path.clone()).unwrap_or_else(|| {
+            items[0]
+                .1
+                .folder_path
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string()
+        });
+        let created = row.map(|r| r.deleted).unwrap_or(true);
+
+        // `add_folder` is the only fallible step here — `import_summaries` is
+        // resilient (per-row failures are counted, never aborting the group), so
+        // a partial failure still commits and reports its good rows and still
+        // broadcasts the folder it created.
+        match folder_service::add_folder(conn, &target_path)
+            .await
+            .map_err(AppCommandError::from)
+        {
+            Ok(entry) => {
+                let folder_id = entry.id;
+                let (tally, _updated_ids, failed_in_group) =
+                    import_service::import_summaries_resilient(conn, folder_id, &items).await;
+                result.imported += tally.imported;
+                result.updated += tally.updated;
+                result.skipped += tally.skipped;
+                result.failed += failed_in_group;
+                if created {
+                    result.created_folders += 1;
+                }
+                touched_folder_ids.push(folder_id);
+                result.folders.push(ImportFolderOutcome {
+                    path: target_path.clone(),
+                    folder_id,
+                    created,
+                    imported: tally.imported,
+                    updated: tally.updated,
+                    skipped: tally.skipped,
+                });
+                if failed_in_group > 0 && result.errors.len() < MAX_ERRORS {
+                    result
+                        .errors
+                        .push(format!("{target_path}: {failed_in_group} session(s) failed"));
+                }
+                // Broadcast every touched folder: even a pre-existing row may
+                // have flipped is_open/deleted_at in add_folder, and clients
+                // need the row to place the imported conversations — so this
+                // fires even when some of the group's rows failed.
+                if let Ok(Some(detail)) = folder_service::get_folder_by_id(conn, folder_id).await {
+                    crate::commands::folders::emit_folder_upsert(emitter, detail);
+                }
+            }
+            // The folder itself could not be created/reopened — the whole group
+            // produced nothing, so there is no folder to broadcast.
+            Err(e) => {
+                result.failed += items.len() as u32;
+                if result.errors.len() < MAX_ERRORS {
+                    result.errors.push(format!("{target_path}: {e}"));
+                }
+            }
+        }
+    }
+
+    // One nudge instead of per-row upserts: clients answer with a single full
+    // refetch, which also covers refreshed titles (see the event's doc).
+    if result.imported > 0 || result.updated > 0 {
+        emit_event(
+            emitter,
+            CONVERSATIONS_BULK_CHANGED_EVENT,
+            ConversationsBulkChanged {
+                imported: result.imported,
+                updated: result.updated,
+                folder_ids: touched_folder_ids,
+            },
+        );
+    }
+
+    Ok(result)
+}
+
+/// Import the selected scanned sessions. Re-walks the parsers rather than
+/// trusting client-echoed summaries — the scan is moments old and the disk is
+/// the source of truth. Runs under [`IMPORT_GUARD`]; if the picker window is
+/// closed mid-import the future still completes and events still broadcast.
+pub async fn import_selected_sessions_core(
+    conn: &sea_orm::DatabaseConnection,
+    emitter: &EventEmitter,
+    selections: Vec<SelectedSessionKey>,
+) -> Result<ImportSelectedResult, AppCommandError> {
+    if selections.is_empty() {
+        return Err(AppCommandError::invalid_input("No sessions selected"));
+    }
+    let _guard = IMPORT_GUARD
+        .try_lock()
+        .map_err(|_| AppCommandError::invalid_input("An import is already in progress"))?;
+
+    let summaries = import_service::collect_local_summaries(|_, _, _, _| {}).await;
+    import_selected_from_summaries(conn, emitter, summaries, selections).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn import_selected_sessions(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    selections: Vec<SelectedSessionKey>,
+) -> Result<ImportSelectedResult, AppCommandError> {
+    import_selected_sessions_core(&db.conn, &EventEmitter::Tauri(app), selections).await
 }
 
 /// Build the `meta["codeg.delegation"]` value for a delegation child loaded
@@ -448,13 +897,43 @@ fn build_historical_delegation_meta(child: &DbConversationSummary) -> serde_json
     serde_json::Value::Object(obj)
 }
 
-/// Walk every `delegate_to_agent` ToolUse block in `turns` and, when its
-/// `tool_use_id` matches a child conversation in `children`, set
-/// `meta["codeg.delegation"]` to the DB-derived snapshot. Skips blocks
-/// whose meta is already populated so the live-broker write (when present)
-/// always wins. Tool-name match is by substring to cover the
-/// MCP-prefixed (`mcp__codeg-mcp__delegate_to_agent`) and bare forms
-/// the host may have emitted.
+/// The broker-minted task id a `delegate_to_agent` result announces. Codex
+/// persists the ack as prose (`Delegation successful. task_id=<id>. Call
+/// get_delegation_status …`); other hosts return `{"task_id":"<id>"}` — both
+/// are covered by reading `task_id` followed by `=` or `:`. Mirrors the
+/// frontend's `parseDelegateTaskId` (`lib/delegation-card.ts`).
+fn parse_delegate_task_id(output: &str) -> Option<String> {
+    let at = output.find("task_id")? + "task_id".len();
+    let rest = output[at..].trim_start();
+    // Closing quote of a JSON key, then the separator, then the value's quote.
+    let rest = rest.strip_prefix('"').unwrap_or(rest).trim_start();
+    let rest = rest.strip_prefix(['=', ':'])?.trim_start();
+    let rest = rest.strip_prefix('"').unwrap_or(rest);
+    let id: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+/// Walk every `delegate_to_agent` ToolUse block in `turns` and, when it can be
+/// matched to a child conversation in `children`, set `meta["codeg.delegation"]`
+/// to the DB-derived snapshot. Skips blocks whose meta is already populated so
+/// the live-broker write (when present) always wins. Tool-name match is by
+/// substring to cover the MCP-prefixed (`mcp__codeg-mcp__delegate_to_agent`)
+/// and bare forms the host may have emitted.
+///
+/// Matching is by `parent_tool_use_id` first, then by the broker's task id.
+/// The fallback is what covers codex: its rollout names the call `call_<id>`,
+/// while the broker — which sees the call over the ACP wire, where code mode
+/// renames every inner call — recorded `exec-<uuid>`. The two never meet, so
+/// every codex delegation card lost its `child_conversation_id` and with it the
+/// "查看会话" affordance. The task id round-trips: the broker mirrors it into
+/// `delegation_call_id`, and the ack the model received carries it verbatim.
 fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationSummary]) {
     if children.is_empty() {
         return;
@@ -463,6 +942,31 @@ fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationS
         .iter()
         .filter_map(|c| c.parent_tool_use_id.as_deref().map(|tu| (tu, c)))
         .collect();
+    let by_task_id: HashMap<&str, &DbConversationSummary> = children
+        .iter()
+        .filter_map(|c| c.delegation_call_id.as_deref().map(|id| (id, c)))
+        .collect();
+
+    // The task id lives on the call's RESULT, which the parsers emit as a
+    // separate block (usually a later turn), so collect it up front.
+    let mut task_id_by_call: HashMap<String, String> = HashMap::new();
+    if !by_task_id.is_empty() {
+        for turn in turns.iter() {
+            for block in turn.blocks.iter() {
+                if let ContentBlock::ToolResult {
+                    tool_use_id: Some(tu),
+                    output_preview: Some(output),
+                    ..
+                } = block
+                {
+                    if let Some(task_id) = parse_delegate_task_id(output) {
+                        task_id_by_call.insert(tu.clone(), task_id);
+                    }
+                }
+            }
+        }
+    }
+
     for turn in turns.iter_mut() {
         for block in turn.blocks.iter_mut() {
             if let ContentBlock::ToolUse {
@@ -478,7 +982,12 @@ fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationS
                 if !tool_name.contains("delegate_to_agent") {
                     continue;
                 }
-                if let Some(child) = by_parent_tool_use_id.get(tu.as_str()) {
+                let child = by_parent_tool_use_id.get(tu.as_str()).or_else(|| {
+                    task_id_by_call
+                        .get(tu.as_str())
+                        .and_then(|task_id| by_task_id.get(task_id.as_str()))
+                });
+                if let Some(child) = child {
                     *meta = Some(serde_json::json!({
                         "codeg.delegation": build_historical_delegation_meta(child),
                     }));
@@ -503,17 +1012,22 @@ pub async fn get_folder_conversation_core(
         .await
         .map_err(AppCommandError::from)?;
 
-    let (mut turns, session_stats, resolved_ext_id, parsed_title, transcript_watermark) =
+    let (mut turns, session_stats, resolved_ext_id, parsed_title, parsed_model, transcript_watermark) =
         if let Some(ref ext_id) = summary.external_id {
         let at = summary.agent_type;
         let eid = ext_id.clone();
         let db_created_at = summary.created_at;
-        let folder_path_for_fallback = {
-            let folder = folder_service::get_folder_by_id(conn, summary.folder_id)
+        // Prefer the recorded origin cwd (set when a removed task worktree's
+        // conversations were re-parented) over the current folder's path — the
+        // session file still carries the ORIGINAL cwd, so matching on the new
+        // parent folder would never find it.
+        let folder_path_for_fallback = match summary.origin_cwd.clone() {
+            Some(cwd) => Some(cwd),
+            None => folder_service::get_folder_by_id(conn, summary.folder_id)
                 .await
                 .ok()
-                .flatten();
-            folder.map(|f| f.path)
+                .flatten()
+                .map(|f| f.path),
         };
         tokio::task::spawn_blocking(move || -> Result<_, AppCommandError> {
             let parser: Box<dyn AgentParser> = match at {
@@ -528,6 +1042,8 @@ pub async fn get_folder_conversation_core(
                 AgentType::KimiCode => Box::new(KimiCodeParser::new()),
                 AgentType::Pi => Box::new(PiParser::new()),
                 AgentType::Grok => Box::new(GrokParser::new()),
+                AgentType::Cursor => Box::new(CursorParser::new()),
+                AgentType::Custom(_) => Box::new(AcpNativeParser::new(at)),
             };
             match parser.get_conversation(&eid) {
                 Ok(d) => Ok((
@@ -535,6 +1051,7 @@ pub async fn get_folder_conversation_core(
                     d.session_stats,
                     None,
                     d.summary.title,
+                    d.summary.model,
                     d.transcript_watermark,
                 )),
                 Err(crate::parsers::ParseError::ConversationNotFound(_)) => {
@@ -574,13 +1091,14 @@ pub async fn get_folder_conversation_core(
                                         d.session_stats,
                                         Some(new_ext_id),
                                         d.summary.title,
+                                        d.summary.model,
                                         d.transcript_watermark,
                                     ));
                                 }
                             }
                         }
                     }
-                    Ok((vec![], None, None, None, None))
+                    Ok((vec![], None, None, None, None, None))
                 }
                 Err(e) => Err(parse_error_to_app_error(e)),
             }
@@ -593,7 +1111,7 @@ pub async fn get_folder_conversation_core(
             .with_detail(e.to_string())
         })??
     } else {
-        (vec![], None, None, None, None)
+        (vec![], None, None, None, None, None)
     };
 
     // If we resolved a different external_id (e.g. ACP UUID → parser branch ID),
@@ -604,6 +1122,15 @@ pub async fn get_folder_conversation_core(
 
     let mut summary = summary;
     summary.message_count = turns.len() as u32;
+    // The transcript is the richer source for the session's model. Codex is
+    // the concrete case: an ACP-driven row is created before any
+    // `turn_context` names a model, so the DB column can stay NULL forever
+    // while the rollout file knows the answer. Fill the *returned* summary
+    // only — the row itself is left alone — so the usage sync's
+    // session-model fallback and the detail view both see it.
+    if summary.model.is_none() {
+        summary.model = parsed_model;
+    }
 
     // Historical recovery for the read-only sub-agent viewer: JSONL parsers
     // don't carry `meta["codeg.delegation"]`, so a reloaded conversation
@@ -788,6 +1315,7 @@ fn apply_in_flight_message_id(
 pub async fn get_folder_conversation_with_live_core(
     conn: &sea_orm::DatabaseConnection,
     manager: &crate::acp::manager::ConnectionManager,
+    chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
     emitter: &EventEmitter,
     conversation_id: i32,
 ) -> Result<DbConversationDetail, AppCommandError> {
@@ -812,6 +1340,9 @@ pub async fn get_folder_conversation_with_live_core(
                     Ok(true) => {
                         detail.summary.title = Some(parsed.to_string());
                         emit_conversation_upsert(emitter, conn, conversation_id).await;
+                        chat_channel_manager
+                            .sync_conversation_title(conn, conversation_id, parsed)
+                            .await;
                     }
                     Ok(false) => {}
                     Err(e) => tracing::error!(
@@ -838,11 +1369,13 @@ pub async fn get_folder_conversation(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
     manager: tauri::State<'_, crate::acp::manager::ConnectionManager>,
+    chat_channel_manager: tauri::State<'_, crate::chat_channel::manager::ChatChannelManager>,
     conversation_id: i32,
 ) -> Result<DbConversationDetail, AppCommandError> {
     get_folder_conversation_with_live_core(
         &db.conn,
         &manager,
+        &chat_channel_manager,
         &EventEmitter::Tauri(app),
         conversation_id,
     )
@@ -1320,16 +1853,36 @@ pub async fn update_conversation_title_core(
         .map_err(AppCommandError::from)
 }
 
+/// Re-read the persisted conversation title and best-effort sync it to any
+/// bound chat-channel threads (e.g. Telegram forum topics). Lives in
+/// `commands/` so web handlers route through a `_core` helper instead of
+/// calling the db service layer directly.
+pub async fn sync_conversation_title_to_channels_core(
+    conn: &sea_orm::DatabaseConnection,
+    chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
+    conversation_id: i32,
+) {
+    if let Ok(conv) = conversation_service::get_by_id(conn, conversation_id).await {
+        if let Some(title) = conv.title.as_deref() {
+            chat_channel_manager
+                .sync_conversation_title(conn, conversation_id, title)
+                .await;
+        }
+    }
+}
+
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn update_conversation_title(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
+    chat_channel_manager: tauri::State<'_, crate::chat_channel::manager::ChatChannelManager>,
     conversation_id: i32,
     title: String,
 ) -> Result<(), AppCommandError> {
     update_conversation_title_core(&db.conn, conversation_id, title).await?;
     emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, conversation_id).await;
+    sync_conversation_title_to_channels_core(&db.conn, &chat_channel_manager, conversation_id).await;
     Ok(())
 }
 
@@ -1436,8 +1989,9 @@ pub async fn delete_conversation_with_cleanup_core(
     if let Some(folder_id) = folder_id {
         cleanup_chat_folder_for_deleted_conversation(conn, folder_id).await;
     }
-    // Remove all task-conversation links referencing this conversation so the
-    // task detail page no longer shows a link to a deleted conversation.
+    // Cluster A: drop any task-conversation links pointing at this conversation
+    // so the task detail page no longer shows a dangling reference to a deleted
+    // conversation. Decoupled per D26: body lives in the platform service.
     platform_task_conversation_service::delete_by_conversation(conn, conversation_id)
         .await
         .map_err(AppCommandError::from)?;
@@ -1532,6 +2086,7 @@ mod tests {
             parent_id: Some(1),
             parent_tool_use_id: Some(parent_tool_use_id.into()),
             delegation_call_id: Some("call-1".into()),
+            origin_cwd: None,
         }
     }
 
@@ -1844,6 +2399,83 @@ mod tests {
             inner.get("error_code").is_none(),
             "completed has no error_code"
         );
+    }
+
+    fn tool_result_turn(tool_use_id: &str, output: &str) -> MessageTurn {
+        MessageTurn {
+            id: "t2".into(),
+            // Tool results are folded into the assistant turn that owns them.
+            role: TurnRole::Assistant,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: Some(tool_use_id.into()),
+                output_preview: Some(output.into()),
+                is_error: false,
+                agent_stats: None,
+                images: Vec::new(),
+            }],
+            timestamp: chrono::Utc::now(),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+        }
+    }
+
+    /// codex's rollout names the call `call_<id>` while the broker recorded the
+    /// ACP-side `exec-<uuid>` — the two never meet, so the card lost its
+    /// `child_conversation_id` (and the "查看会话" affordance) entirely. The
+    /// broker's task id, echoed in the ack the model received, is the bridge.
+    #[test]
+    fn inject_delegation_meta_falls_back_to_the_task_id() {
+        let mut turns = vec![
+            tool_use_turn(Some("call_73UFK2"), "mcp__codeg_mcp__delegate_to_agent"),
+            tool_result_turn(
+                "call_73UFK2",
+                "Delegation successful. task_id=8ff4c14c-740c-4482-b758-8f2091f97063. \
+                 Call get_delegation_status with this id in the task_ids array.",
+            ),
+        ];
+        let mut child = summary_child(2890, "exec-0fb6db94-3042-4cc4-b492-2edd1804c1fa", "completed");
+        child.delegation_call_id = Some("8ff4c14c-740c-4482-b758-8f2091f97063".into());
+
+        inject_delegation_meta(&mut turns, &[child]);
+
+        let inner = first_block_meta(&turns[0])
+            .and_then(|m| m.get("codeg.delegation").cloned())
+            .expect("meta should be set");
+        assert_eq!(inner["child_conversation_id"], 2890);
+    }
+
+    #[test]
+    fn inject_delegation_meta_does_not_bind_a_foreign_task_id() {
+        let mut turns = vec![
+            tool_use_turn(Some("call_a"), "delegate_to_agent"),
+            tool_result_turn("call_a", "Delegation successful. task_id=aaaa."),
+        ];
+        let mut child = summary_child(1, "exec-zzz", "completed");
+        child.delegation_call_id = Some("bbbb".into());
+
+        inject_delegation_meta(&mut turns, &[child]);
+
+        assert!(
+            first_block_meta(&turns[0]).is_none(),
+            "a different task's child must not be bound"
+        );
+    }
+
+    #[test]
+    fn parse_delegate_task_id_reads_both_ack_shapes() {
+        assert_eq!(
+            parse_delegate_task_id("Delegation successful. task_id=8ff4c14c-740c. Call …")
+                .as_deref(),
+            Some("8ff4c14c-740c")
+        );
+        assert_eq!(
+            parse_delegate_task_id(r#"{"task_id":"abc-123","status":"running"}"#).as_deref(),
+            Some("abc-123")
+        );
+        assert_eq!(parse_delegate_task_id("no id here"), None);
+        assert_eq!(parse_delegate_task_id("task_id="), None);
     }
 
     #[test]
@@ -3197,6 +3829,560 @@ mod tests {
         assert!(
             saw_parent_upsert,
             "parent must re-broadcast an Upsert for child_count convergence"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Import-picker scan reconciliation (`build_scan_result`) and batch
+    // import (`import_selected_from_summaries`).
+    // ──────────────────────────────────────────────────────────────────────
+
+    fn scan_summary(
+        id: &str,
+        agent: AgentType,
+        cwd: Option<&str>,
+        ts: chrono::DateTime<chrono::Utc>,
+    ) -> (AgentType, ConversationSummary) {
+        (
+            agent,
+            ConversationSummary {
+                id: id.into(),
+                agent_type: agent,
+                folder_path: cwd.map(String::from),
+                folder_name: cwd.map(folder_name_from_path),
+                title: Some(format!("title-{id}")),
+                started_at: ts,
+                ended_at: None,
+                message_count: 1,
+                model: None,
+                git_branch: None,
+                parent_id: None,
+                parent_tool_use_id: None,
+                delegation_call_id: None,
+            },
+        )
+    }
+
+    fn key_of(agent: AgentType, id: &str) -> SelectedSessionKey {
+        SelectedSessionKey {
+            agent_type: agent,
+            external_id: id.into(),
+        }
+    }
+
+    #[test]
+    fn scan_groups_normalized_path_variants_into_one_folder() {
+        // A trailing-slash cwd variant must land in the same group as the bare
+        // path — otherwise the picker shows one folder twice and an import
+        // could mint a near-duplicate folder row.
+        let summaries = vec![
+            scan_summary("s1", AgentType::ClaudeCode, Some("/tmp/proj"), at(0)),
+            scan_summary("s2", AgentType::Codex, Some("/tmp/proj/"), at(10)),
+        ];
+        let result = build_scan_result(summaries, &HashMap::new(), &[]);
+
+        assert_eq!(result.folders.len(), 1);
+        let folder = &result.folders[0];
+        assert_eq!(folder.path, "/tmp/proj");
+        assert!(!folder.exists_in_codeg);
+        assert_eq!(folder.folder_id, None);
+        assert_eq!(
+            folder.agent_types,
+            vec![AgentType::ClaudeCode, AgentType::Codex]
+        );
+        // Sessions sort newest-first inside the group.
+        assert_eq!(folder.sessions[0].external_id, "s2");
+        assert_eq!(result.total_sessions, 2);
+        assert_eq!(result.importable_count, 2);
+    }
+
+    #[test]
+    fn scan_marks_status_new_imported_deleted() {
+        let summaries = vec![
+            scan_summary("new", AgentType::ClaudeCode, Some("/tmp/p"), at(0)),
+            scan_summary("live", AgentType::ClaudeCode, Some("/tmp/p"), at(1)),
+            scan_summary("gone", AgentType::ClaudeCode, Some("/tmp/p"), at(2)),
+        ];
+        let mut imported_index = HashMap::new();
+        imported_index.insert(("claude_code".to_string(), "live".to_string()), true);
+        imported_index.insert(("claude_code".to_string(), "gone".to_string()), false);
+
+        let result = build_scan_result(summaries, &imported_index, &[]);
+        let by_id: HashMap<&str, ScanSessionStatus> = result.folders[0]
+            .sessions
+            .iter()
+            .map(|s| (s.external_id.as_str(), s.status))
+            .collect();
+
+        assert_eq!(by_id["new"], ScanSessionStatus::New);
+        assert_eq!(by_id["live"], ScanSessionStatus::Imported);
+        assert_eq!(by_id["gone"], ScanSessionStatus::Deleted);
+        assert_eq!(result.total_sessions, 3);
+        assert_eq!(result.importable_count, 1, "only New counts as importable");
+    }
+
+    #[test]
+    fn scan_counts_sessions_without_folder_path_instead_of_listing_them() {
+        let summaries = vec![
+            scan_summary("has", AgentType::Codex, Some("/tmp/p"), at(0)),
+            scan_summary("none", AgentType::Codex, None, at(1)),
+            scan_summary("blank", AgentType::Codex, Some("   "), at(2)),
+        ];
+        let result = build_scan_result(summaries, &HashMap::new(), &[]);
+
+        assert_eq!(result.folders.len(), 1);
+        assert_eq!(result.no_folder_count, 2);
+        assert_eq!(result.total_sessions, 1);
+    }
+
+    #[test]
+    fn scan_prefers_stored_row_path_and_live_row_over_deleted_variant() {
+        // The DB stores raw strings (UNIQUE on the exact bytes), so a live and
+        // a soft-deleted variant of the same normalized path can coexist. The
+        // scan must surface the LIVE row's exact path, or a later add_folder
+        // would resurrect the deleted variant instead.
+        let rows = vec![
+            ScanFolderRow {
+                id: 1,
+                path: "/tmp/proj/".into(),
+                name: "proj-deleted".into(),
+                deleted: true,
+            },
+            ScanFolderRow {
+                id: 2,
+                path: "/tmp/proj".into(),
+                name: "proj".into(),
+                deleted: false,
+            },
+        ];
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::ClaudeCode,
+            Some("/tmp/proj///"),
+            at(0),
+        )];
+        let result = build_scan_result(summaries, &HashMap::new(), &rows);
+
+        let folder = &result.folders[0];
+        assert_eq!(folder.path, "/tmp/proj", "live row's stored path wins");
+        assert_eq!(folder.name, "proj");
+        assert!(folder.exists_in_codeg);
+        assert_eq!(folder.folder_id, Some(2));
+    }
+
+    #[test]
+    fn scan_soft_deleted_folder_reports_not_exists_but_keeps_id() {
+        let rows = vec![ScanFolderRow {
+            id: 9,
+            path: "/tmp/gone".into(),
+            name: "gone".into(),
+            deleted: true,
+        }];
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::Codex,
+            Some("/tmp/gone"),
+            at(0),
+        )];
+        let result = build_scan_result(summaries, &HashMap::new(), &rows);
+
+        let folder = &result.folders[0];
+        assert!(
+            !folder.exists_in_codeg,
+            "a soft-deleted row is not a live folder — import will reopen it"
+        );
+        assert_eq!(folder.folder_id, Some(9));
+    }
+
+    #[test]
+    fn scan_sorts_folders_by_importable_count_then_path() {
+        let mut imported_index = HashMap::new();
+        imported_index.insert(("codex".to_string(), "b1".to_string()), true);
+        let summaries = vec![
+            scan_summary("b1", AgentType::Codex, Some("/tmp/b"), at(0)),
+            scan_summary("a1", AgentType::Codex, Some("/tmp/a"), at(1)),
+            scan_summary("a2", AgentType::Codex, Some("/tmp/a"), at(2)),
+        ];
+        let result = build_scan_result(summaries, &imported_index, &[]);
+
+        let paths: Vec<&str> = result.folders.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["/tmp/a", "/tmp/b"], "2 importable before 0");
+    }
+
+    #[tokio::test]
+    async fn batch_import_creates_missing_folder_and_imports() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+
+        let summaries = vec![
+            scan_summary("s1", AgentType::ClaudeCode, Some("/tmp/proj-a"), at(0)),
+            scan_summary("s2", AgentType::Codex, Some("/tmp/proj-a"), at(1)),
+        ];
+        let result = import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![
+                key_of(AgentType::ClaudeCode, "s1"),
+                key_of(AgentType::Codex, "s2"),
+            ],
+        )
+        .await
+        .expect("batch import");
+
+        assert_eq!(result.imported, 2);
+        assert_eq!(result.created_folders, 1);
+        assert_eq!(result.failed, 0);
+        assert_eq!(result.folders.len(), 1);
+        assert!(result.folders[0].created);
+
+        let folder_rows = crate::db::entities::folder::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(folder_rows.len(), 1);
+        assert_eq!(folder_rows[0].path, "/tmp/proj-a");
+        assert!(folder_rows[0].is_open, "created folder must open in sidebar");
+
+        let convs = conversation::Entity::find().all(&db.conn).await.unwrap();
+        assert_eq!(convs.len(), 2);
+        assert!(convs.iter().all(|c| c.folder_id == folder_rows[0].id));
+    }
+
+    #[tokio::test]
+    async fn batch_import_reuses_stored_path_for_trailing_slash_variant() {
+        use sea_orm::EntityTrait;
+        let db = fresh_in_memory_db().await;
+        let seeded_id = seed_folder(&db, "/tmp/proj-b").await;
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::ClaudeCode,
+            Some("/tmp/proj-b/"),
+            at(0),
+        )];
+        let result = import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::ClaudeCode, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.created_folders, 0);
+        assert!(!result.folders[0].created);
+        assert_eq!(result.folders[0].folder_id, seeded_id);
+
+        let folder_rows = crate::db::entities::folder::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            folder_rows.len(),
+            1,
+            "the trailing-slash cwd must NOT mint a near-duplicate folder row"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_import_reopens_soft_deleted_folder_without_duplicate() {
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/proj-c").await;
+
+        let row = crate::db::entities::folder::Entity::find_by_id(folder_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = row.into_active_model();
+        active.deleted_at = Set(Some(chrono::Utc::now()));
+        active.is_open = Set(false);
+        active.update(&db.conn).await.unwrap();
+
+        let summaries = vec![scan_summary(
+            "s1",
+            AgentType::ClaudeCode,
+            Some("/tmp/proj-c"),
+            at(0),
+        )];
+        let result = import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            summaries,
+            vec![key_of(AgentType::ClaudeCode, "s1")],
+        )
+        .await
+        .expect("batch import");
+
+        assert_eq!(result.imported, 1);
+        assert_eq!(
+            result.created_folders, 1,
+            "reopening a soft-deleted row counts as creating a folder"
+        );
+
+        let folder_rows = crate::db::entities::folder::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(folder_rows.len(), 1, "reopened in place, not duplicated");
+        assert!(folder_rows[0].deleted_at.is_none());
+        assert!(folder_rows[0].is_open);
+    }
+
+    #[tokio::test]
+    async fn batch_import_skips_already_imported_and_counts_missing_keys() {
+        let db = fresh_in_memory_db().await;
+
+        let make = || {
+            vec![scan_summary(
+                "s1",
+                AgentType::ClaudeCode,
+                Some("/tmp/proj-d"),
+                at(0),
+            )]
+        };
+        let first = import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            make(),
+            vec![key_of(AgentType::ClaudeCode, "s1")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.imported, 1);
+
+        let second = import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            make(),
+            vec![
+                key_of(AgentType::ClaudeCode, "s1"),
+                key_of(AgentType::Codex, "does-not-exist"),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.skipped, 1, "re-import of an existing row skips");
+        assert_eq!(second.not_found, 1, "unresolvable key counts as not_found");
+    }
+
+    #[tokio::test]
+    async fn batch_import_never_resurrects_a_deleted_conversation() {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
+            Set};
+        let db = fresh_in_memory_db().await;
+
+        let make = || {
+            vec![scan_summary(
+                "s1",
+                AgentType::ClaudeCode,
+                Some("/tmp/proj-e"),
+                at(0),
+            )]
+        };
+        import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            make(),
+            vec![key_of(AgentType::ClaudeCode, "s1")],
+        )
+        .await
+        .unwrap();
+
+        let row = conversation::Entity::find()
+            .filter(conversation::Column::ExternalId.eq("s1"))
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = row.into_active_model();
+        active.deleted_at = Set(Some(chrono::Utc::now()));
+        active.update(&db.conn).await.unwrap();
+
+        let again = import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            make(),
+            vec![key_of(AgentType::ClaudeCode, "s1")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.imported, 0);
+        assert_eq!(again.skipped, 1);
+
+        let rows = conversation::Entity::find().all(&db.conn).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].deleted_at.is_some(),
+            "a deleted conversation stays deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_import_selection_of_delegation_child_counts_not_found() {
+        let db = fresh_in_memory_db().await;
+
+        let (agent, mut child) =
+            scan_summary("child", AgentType::Hermes, Some("/tmp/proj-f"), at(0));
+        child.parent_id = Some("root".into());
+
+        let result = import_selected_from_summaries(
+            &db.conn,
+            &EventEmitter::Noop,
+            vec![(agent, child)],
+            vec![key_of(AgentType::Hermes, "child")],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(
+            result.not_found, 1,
+            "a delegation child must never import as a root row"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_import_emits_folder_upserts_and_one_bulk_event() {
+        use crate::web::event_bridge::{
+            WebEventBroadcaster, CONVERSATIONS_BULK_CHANGED_EVENT, FOLDER_CHANGED_EVENT,
+        };
+        use std::sync::Arc;
+
+        let db = fresh_in_memory_db().await;
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let emitter = EventEmitter::test_web_only(broadcaster.clone());
+
+        let summaries = vec![
+            scan_summary("s1", AgentType::ClaudeCode, Some("/tmp/proj-g"), at(0)),
+            scan_summary("s2", AgentType::Codex, Some("/tmp/proj-h"), at(1)),
+        ];
+        let result = import_selected_from_summaries(
+            &db.conn,
+            &emitter,
+            summaries,
+            vec![
+                key_of(AgentType::ClaudeCode, "s1"),
+                key_of(AgentType::Codex, "s2"),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.imported, 2);
+
+        let mut folder_events = 0;
+        let mut bulk_events = 0;
+        while let Ok(evt) = rx.try_recv() {
+            match evt.channel.as_str() {
+                FOLDER_CHANGED_EVENT => folder_events += 1,
+                CONVERSATIONS_BULK_CHANGED_EVENT => {
+                    bulk_events += 1;
+                    let p = &*evt.payload;
+                    assert_eq!(p["imported"], 2);
+                    assert_eq!(p["folder_ids"].as_array().unwrap().len(), 2);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(folder_events, 2, "one folder upsert per touched folder");
+        assert_eq!(bulk_events, 1, "exactly one bulk nudge, never per-row spam");
+    }
+
+    #[tokio::test]
+    async fn import_selected_sessions_core_rejects_concurrent_and_empty() {
+        let db = fresh_in_memory_db().await;
+
+        assert!(
+            import_selected_sessions_core(&db.conn, &EventEmitter::Noop, vec![])
+                .await
+                .is_err(),
+            "empty selection is invalid input"
+        );
+
+        let _held = IMPORT_GUARD.try_lock().expect("guard free in test");
+        assert!(
+            import_selected_sessions_core(
+                &db.conn,
+                &EventEmitter::Noop,
+                vec![key_of(AgentType::ClaudeCode, "x")],
+            )
+            .await
+            .is_err(),
+            "a second import racing the guard must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_import_shares_the_guard_with_batch_import() {
+        // The retained legacy command must NOT bypass IMPORT_GUARD — otherwise a
+        // legacy import racing a batch import could double-insert on a DB with no
+        // unique index. With the guard held it is rejected BEFORE the folder
+        // lookup, so even a valid folder id surfaces the guard error, not a hit.
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/legacy-guard").await;
+
+        let _held = IMPORT_GUARD.try_lock().expect("guard free in test");
+        let err = import_local_conversations_core(&db.conn, &EventEmitter::Noop, folder_id)
+            .await
+            .expect_err("legacy import must be rejected while an import is in progress");
+        let msg = format!("{err:?}").to_lowercase();
+        assert!(
+            msg.contains("already in progress"),
+            "expected the guard error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_summaries_counts_row_failures_without_aborting() {
+        // A row whose insert fails (here: a non-existent folder_id → FK violation
+        // with PRAGMA foreign_keys=ON) is logged and counted as `failed`, never
+        // aborting the batch or stranding the good rows — so a mid-group DB error
+        // can't lose the committed tally or the folder broadcast.
+        let db = fresh_in_memory_db().await;
+        let items = vec![
+            scan_summary("s1", AgentType::ClaudeCode, Some("/tmp/x"), at(0)),
+            scan_summary("s2", AgentType::Codex, Some("/tmp/x"), at(1)),
+        ];
+
+        let (tally, updated_ids, failed) =
+            import_service::import_summaries_resilient(&db.conn, 999_999, &items).await;
+        assert_eq!(failed, 2, "both rows fail the folder FK and are counted");
+        assert_eq!(tally.imported, 0);
+        assert_eq!(tally.updated, 0);
+        assert!(updated_ids.is_empty());
+
+        // Same items into a real folder import cleanly — the resilient loop did
+        // not corrupt state or leave a half-open transaction.
+        let folder_id = seed_folder(&db, "/tmp/x").await;
+        let (tally2, _ids, failed2) =
+            import_service::import_summaries_resilient(&db.conn, folder_id, &items).await;
+        assert_eq!(failed2, 0);
+        assert_eq!(tally2.imported, 2);
+    }
+
+    #[tokio::test]
+    async fn legacy_strict_import_summaries_propagates_row_failure() {
+        // The legacy per-folder importer keeps its strict contract: a DB error
+        // propagates as Err rather than being swallowed into a 0/0/0 tally, so
+        // its back-compat command still surfaces failures. (The batch path uses
+        // the resilient variant instead.)
+        let db = fresh_in_memory_db().await;
+        let items = vec![scan_summary(
+            "s1",
+            AgentType::ClaudeCode,
+            Some("/tmp/x"),
+            at(0),
+        )];
+        assert!(
+            import_service::import_summaries(&db.conn, 999_999, &items)
+                .await
+                .is_err(),
+            "a row FK violation must propagate through the strict importer"
         );
     }
 }

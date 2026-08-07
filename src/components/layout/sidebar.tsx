@@ -2,25 +2,23 @@
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import {
-  ChevronsDownUp,
-  ChevronsUpDown,
   Crosshair,
-  FolderOpen,
   Funnel,
-  KanbanSquare,
+  ListChevronsDownUp,
+  ListChevronsUpDown,
   Search,
+  ListTodo,
   SquarePen,
   Zap,
   type LucideIcon,
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { useActiveFolder } from "@/contexts/active-folder-context"
-import { usePlatform } from "@/contexts/platform-context"
-import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { useSidebarContext } from "@/contexts/sidebar-context"
 import { useTabActions } from "@/contexts/tab-context"
 import { useSearchDialog } from "@/contexts/search-dialog-context"
 import { useAutomationsView } from "@/contexts/automations-view-context"
+import { useTasksView } from "@/contexts/tasks-view-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import {
   SidebarConversationList,
@@ -31,6 +29,7 @@ import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
@@ -39,13 +38,20 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { useIsMobile } from "@/hooks/use-mobile"
 import { useIsMac } from "@/hooks/use-is-mac"
+import { usePlatform } from "@/hooks/use-platform"
+import { useZoomLevel } from "@/hooks/use-appearance"
 import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
 import { formatShortcutLabel } from "@/lib/keyboard-shortcuts"
+import { isDesktop } from "@/lib/platform"
+import { leftChromeReserve } from "@/lib/window-chrome"
+import { PlatformSidebarSection } from "@/components/layout/platform-sidebar-section"
 import {
   loadShowCompleted,
+  loadShowWorktrees,
   loadSortMode,
   loadSectionOrder,
   saveShowCompleted,
+  saveShowWorktrees,
   saveSortMode,
   saveSectionOrder,
   type SidebarSortMode,
@@ -75,26 +81,23 @@ const SHORTCUT_BADGE_CLASS = cn(
  * route — on one geometry instead of copy-pasting the className. Each row is a
  * `group` so a `group-hover`-revealed trailing element works.
  */
-function SidebarNavButton({
+export function SidebarNavButton({
   icon: Icon,
   label,
   onClick,
   active,
   trailing,
-  disabled,
 }: {
   icon: LucideIcon
   label: string
   onClick: () => void
   active?: boolean
   trailing?: ReactNode
-  disabled?: boolean
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      disabled={disabled}
       title={label}
       aria-current={active ? "page" : undefined}
       className={cn(
@@ -102,8 +105,7 @@ function SidebarNavButton({
         "text-[0.875rem] text-sidebar-foreground outline-none",
         "transition-colors duration-150 hover:bg-sidebar-accent",
         "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-        active && "bg-sidebar-primary/8",
-        disabled && "opacity-50 pointer-events-none"
+        active && "bg-sidebar-primary/8"
       )}
     >
       <Icon className="h-[0.875rem] w-[0.875rem] shrink-0 text-muted-foreground" />
@@ -113,29 +115,33 @@ function SidebarNavButton({
   )
 }
 
-interface SidebarProps {
-  /** Custom content for the sidebar header area (replaces default title).
-   *  Used by PlatformProvider to render a project switcher dropdown. */
-  headerContent?: ReactNode
-}
-
-export function Sidebar({ headerContent }: SidebarProps) {
+export function Sidebar() {
   const t = useTranslations("Folder.sidebar")
-  const pt = useTranslations("Platform.nav")
   const { isOpen, toggle } = useSidebarContext()
   const { activeFolder } = useActiveFolder()
-  const { activeProjectId, activeFolderIds, activeProject } = usePlatform()
-  const { allFolders } = useAppWorkspace()
   const { openNewConversationTab, openChatModeTab } = useTabActions()
   const { setOpen: setSearchOpen } = useSearchDialog()
   const { unseenFailures } = useAutomationsView()
+  const { attentionCount } = useTasksView()
   const { routeId, setRoute, openConversations } = useWorkbenchRoute()
   const isMac = useIsMac()
+  const { isMac: platformIsMac } = usePlatform()
+  const { zoomLevel } = useZoomLevel()
   const { shortcuts } = useShortcutSettings()
   const isMobile = useIsMobile()
   const listRef = useRef<SidebarConversationListHandle>(null)
+  // On desktop the header's top-left is owned by the fixed window-chrome overlay
+  // (sidebar toggle + remote); reserve exactly its width so the view controls
+  // and drag region clear it. The reserve scales with the app zoom to track the
+  // rem-sized overlay buttons. Mobile has no overlay (the sidebar is a Sheet).
+  const leftReserve = leftChromeReserve(platformIsMac && isDesktop(), zoomLevel)
 
+  // `showCompleted` defaults OFF and `showWorktrees` defaults ON (the mount
+  // effect below reconciles a persisted override). Each initial value matches
+  // its own default so the pre-hydration render doesn't flash as the stored
+  // preference is applied.
   const [showCompleted, setShowCompleted] = useState(false)
+  const [showWorktrees, setShowWorktrees] = useState(true)
   const [sortMode, setSortMode] = useState<SidebarSortMode>("created")
   const [sectionOrder, setSectionOrder] =
     useState<SidebarSectionOrder>("folders-first")
@@ -160,6 +166,7 @@ export function Sidebar({ headerContent }: SidebarProps) {
     // Hydrate from localStorage after mount to keep SSR/CSR markup consistent.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setShowCompleted(loadShowCompleted())
+    setShowWorktrees(loadShowWorktrees())
     setSortMode(loadSortMode())
     setSectionOrder(loadSectionOrder())
   }, [])
@@ -167,6 +174,11 @@ export function Sidebar({ headerContent }: SidebarProps) {
   const handleSetShowCompleted = useCallback((value: boolean) => {
     setShowCompleted(value)
     saveShowCompleted(value)
+  }, [])
+
+  const handleSetShowWorktrees = useCallback((value: boolean) => {
+    setShowWorktrees(value)
+    saveShowWorktrees(value)
   }, [])
 
   const handleSetSortMode = useCallback((value: string) => {
@@ -193,22 +205,13 @@ export function Sidebar({ headerContent }: SidebarProps) {
   }, [allExpanded])
 
   const handleNewConversation = useCallback(() => {
+    // On mobile the sidebar is a Sheet overlay — close it so the new
+    // conversation is visible (mirrors tapping a conversation card, which the
+    // list wrapper already closes on).
+    if (isMobile) toggle()
     // Starting a conversation always returns to the conversation workspace (in
     // case a route like Automations was taking over the content region).
     openConversations()
-
-    // When a project context is active, force the conversation to the project's
-    // root Folder (not the current repo's folder). This ensures all project
-    // conversations live under the same root for grouping.
-    if (activeProjectId && activeProject?.folderId) {
-      // Find the root folder in allFolders to get its path
-      const rootFolder = allFolders.find((f) => f.id === activeProject.folderId)
-      if (rootFolder) {
-        openNewConversationTab(rootFolder.id, rootFolder.path)
-        return
-      }
-    }
-
     // Defense-in-depth: with no active folder (e.g. a cold start that recovered
     // to nothing, or all folders closed) fall back to folderless chat mode
     // rather than no-op, so this entry point is never a dead end.
@@ -219,29 +222,57 @@ export function Sidebar({ headerContent }: SidebarProps) {
     openNewConversationTab(activeFolder.id, activeFolder.path)
   }, [
     activeFolder,
-    activeProjectId,
-    activeProject,
-    allFolders,
     openChatModeTab,
     openNewConversationTab,
     openConversations,
+    isMobile,
+    toggle,
   ])
 
   if (!isOpen) return null
 
   return (
-    <aside className="@container/sidebar flex h-full min-h-0 flex-col overflow-hidden bg-sidebar text-sidebar-foreground select-none">
-      <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border pl-4 pr-2">
-        {/* ── Header slot: custom content or default title ── */}
-        <div className="flex min-w-0 items-center gap-2 flex-1">
-          {headerContent ?? (
+    <aside className="@container/sidebar flex h-full min-h-0 flex-col overflow-hidden text-sidebar-foreground select-none">
+      <div
+        className={cn(
+          "flex h-10 shrink-0 items-center gap-2 pr-2",
+          // Desktop: the fixed left window-chrome overlay (reserved below) owns
+          // the top-left, so drop the header's own left padding. Off-image the
+          // divider is border-border/50, matching the conversation / file detail
+          // headers. But the sidebar sits on a FROSTED surface (ws-surface-sidebar)
+          // while those headers sit on the transparent canvas: with a workspace
+          // background image on, a border-border/50 hairline washes out against the
+          // frosted shade, so it takes the boosted `ws-chrome-border` (like the
+          // frosted status bar) to stay legible. Mobile (Sheet): keep the original
+          // title padding + a full-strength divider — mobile is unchanged.
+          isMobile
+            ? "border-b border-border pl-4"
+            : "border-b border-border/50 ws-chrome-border pl-0"
+        )}
+      >
+        {isMobile ? (
+          <div className="flex min-w-0 items-center gap-4">
             <h2 className="truncate text-[0.875rem] font-bold tracking-[-0.00625rem] text-sidebar-foreground">
               {t("title")}
             </h2>
-          )}
-        </div>
-        {/* ── 3 icon buttons (always visible) ── */}
+          </div>
+        ) : (
+          // Reserve exactly the fixed left overlay's width so the view controls
+          // clear it; the empty reserved space is a window-drag region.
+          <div
+            data-tauri-drag-region
+            className="h-full shrink-0"
+            style={{ width: leftReserve }}
+          />
+        )}
+        {/* Draggable filler between the two clusters — the header is the
+            window's top edge, so its empty space must move the window. */}
+        <div data-tauri-drag-region className="h-full min-w-0 flex-1" />
         <div className="flex items-center gap-0.5">
+          {/* Locate the active conversation in the list below (moved here from
+              the conversation detail header). Always shown, sitting just before
+              the view-options funnel. The sidebar is unmounted while collapsed,
+              so `listRef` is live whenever this button is visible. */}
           <Button
             variant="ghost"
             size="icon"
@@ -252,20 +283,30 @@ export function Sidebar({ headerContent }: SidebarProps) {
           >
             <Crosshair aria-hidden="true" className="h-3.5 w-3.5" />
           </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-6 w-6 shrink-0 text-muted-foreground"
-            onClick={handleToggleExpandAll}
-            title={toggleExpandLabel}
-            aria-label={toggleExpandLabel}
-          >
-            {allExpanded ? (
-              <ChevronsDownUp aria-hidden="true" className="h-3.5 w-3.5" />
-            ) : (
-              <ChevronsUpDown aria-hidden="true" className="h-3.5 w-3.5" />
-            )}
-          </Button>
+          {/* Expand/collapse-all keeps a standalone header button on mobile; on
+              desktop it's folded into the view-options menu below. */}
+          {isMobile && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-6 w-6 shrink-0 text-muted-foreground"
+              onClick={handleToggleExpandAll}
+              title={toggleExpandLabel}
+              aria-label={toggleExpandLabel}
+            >
+              {allExpanded ? (
+                <ListChevronsDownUp
+                  aria-hidden="true"
+                  className="h-3.5 w-3.5"
+                />
+              ) : (
+                <ListChevronsUpDown
+                  aria-hidden="true"
+                  className="h-3.5 w-3.5"
+                />
+              )}
+            </Button>
+          )}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
@@ -279,11 +320,32 @@ export function Sidebar({ headerContent }: SidebarProps) {
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
+              {/* Desktop only: expand/collapse lives in this menu (it kept its
+                  standalone header button on mobile). */}
+              {!isMobile && (
+                <>
+                  <DropdownMenuItem onSelect={handleToggleExpandAll}>
+                    {allExpanded ? (
+                      <ListChevronsDownUp className="h-4 w-4" />
+                    ) : (
+                      <ListChevronsUpDown className="h-4 w-4" />
+                    )}
+                    {toggleExpandLabel}
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                </>
+              )}
               <DropdownMenuCheckboxItem
                 checked={showCompleted}
                 onCheckedChange={handleSetShowCompleted}
               >
                 {t("showCompleted")}
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={showWorktrees}
+                onCheckedChange={handleSetShowWorktrees}
+              >
+                {t("showWorktrees")}
               </DropdownMenuCheckboxItem>
               <DropdownMenuSeparator />
               <DropdownMenuLabel>{t("sortBy")}</DropdownMenuLabel>
@@ -325,29 +387,7 @@ export function Sidebar({ headerContent }: SidebarProps) {
           the list below. Each row is a `group` so its shortcut hint reveals on
           hover / keyboard focus. */}
       <div className="flex shrink-0 flex-col gap-0.5 px-1.5 pt-1.5">
-        {/* ── Platform nav items (always visible) ── */}
-        <SidebarNavButton
-          icon={FolderOpen}
-          label={pt("projectList")}
-          active={
-            routeId === "project-list" ||
-            routeId === "project-detail" ||
-            routeId === "create-project"
-          }
-          onClick={() => setRoute("project-list")}
-        />
-        <SidebarNavButton
-          icon={KanbanSquare}
-          label={pt("taskKanban")}
-          active={routeId === "task-kanban" || routeId === "task-detail"}
-          onClick={() =>
-            activeProjectId
-              ? setRoute("task-kanban", { projectId: activeProjectId })
-              : setRoute("project-list")
-          }
-          disabled={!activeProjectId}
-        />
-        {/* ── Existing nav items ── */}
+        <PlatformSidebarSection />
         <SidebarNavButton
           icon={SquarePen}
           label={t("newChat")}
@@ -383,9 +423,24 @@ export function Sidebar({ headerContent }: SidebarProps) {
             ) : null
           }
         />
+        <SidebarNavButton
+          icon={ListTodo}
+          label={t("tasks")}
+          active={routeId === "tasks"}
+          onClick={() => setRoute("tasks")}
+          trailing={
+            attentionCount > 0 ? (
+              // Attention (not failure): tasks waiting on the user — primary
+              // tint like the shortcut chips, not destructive.
+              <span className="ml-auto inline-flex h-[0.9375rem] min-w-[0.9375rem] shrink-0 items-center justify-center rounded-full bg-primary/10 px-1 font-mono text-[0.625rem] font-medium leading-none text-primary">
+                {attentionCount}
+              </span>
+            ) : null
+          }
+        />
       </div>
 
-      {/* ── Scrollable conversation list (always visible) ── */}
+      {/* On mobile, clicking a conversation card auto-closes the Sheet */}
       <div
         className="flex flex-col flex-1 min-h-0 overflow-hidden pt-1.5"
         onClick={
@@ -402,8 +457,8 @@ export function Sidebar({ headerContent }: SidebarProps) {
         <SidebarConversationList
           ref={listRef}
           showCompleted={showCompleted}
+          showWorktrees={showWorktrees}
           sortMode={sortMode}
-          folderFilter={activeFolderIds}
           sectionOrder={sectionOrder}
         />
       </div>

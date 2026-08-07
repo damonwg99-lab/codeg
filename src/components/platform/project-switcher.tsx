@@ -1,8 +1,8 @@
 "use client"
 
 import { useTranslations } from "next-intl"
-import { Briefcase, ChevronDown } from "lucide-react"
 import { usePlatform } from "@/contexts/platform-context"
+import { useProjectSwitchCoordinator } from "@/hooks/use-project-switch-coordinator"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -10,9 +10,14 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { Button } from "@/components/ui/button"
+import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 
-interface ProjectSwitcherProps {
-  onSwitch?: (newProjectId: number) => void
+function projectInitials(name: string | null | undefined): string {
+  const label = (name ?? "").trim()
+  if (!label) return "?"
+  const parts = label.split(/\s+/).filter(Boolean)
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase()
+  return (parts[0][0] + parts[1][0]).toUpperCase()
 }
 
 /**
@@ -20,16 +25,17 @@ interface ProjectSwitcherProps {
  * Uses DropdownMenu style to match RepoSelector.
  * - No projects: hidden (returns null).
  * - Projects exist: shows a dropdown with project names.
+ *
+ * Switching goes through `useProjectSwitchCoordinator`, so the active tab is
+ * retargeted to the new project's root folder (same unified workspace state the
+ * folder picker below the chat input drives) and a bottom-right toast confirms
+ * the switch — keeping top and bottom switching consistent.
  */
-export function ProjectSwitcher({ onSwitch }: ProjectSwitcherProps) {
+export function ProjectSwitcher() {
   const t = useTranslations("Platform.switcher")
-  const {
-    activeProjectId,
-    setActiveProjectId,
-    activeProject,
-    projects,
-    hasProjects,
-  } = usePlatform()
+  const { activeProjectId, activeProject, projects, hasProjects } =
+    usePlatform()
+  const { switchProject } = useProjectSwitchCoordinator()
 
   // Hide when no projects exist — the sidebar empty-state already provides
   // a "Create project" entry point.
@@ -39,14 +45,7 @@ export function ProjectSwitcher({ onSwitch }: ProjectSwitcherProps) {
 
   const handleSelect = (id: number) => {
     if (id === activeProjectId) return
-    // Route navigation is handled by useProjectSwitchCoordinator
-    // (via the onSwitch callback in FolderTitleBar) — it redirects
-    // project-specific pages to their list/kanban views on project switch.
-    if (onSwitch) {
-      onSwitch(id)
-    } else {
-      setActiveProjectId(id)
-    }
+    switchProject(id)
   }
 
   return (
@@ -54,14 +53,16 @@ export function ProjectSwitcher({ onSwitch }: ProjectSwitcherProps) {
       <DropdownMenuTrigger asChild>
         <Button
           variant="ghost"
-          size="sm"
-          className="h-7 gap-1 text-[0.8125rem]"
+          size="icon"
+          className="h-7 w-7"
+          title={activeProject?.name ?? t("placeholder")}
+          aria-label={activeProject?.name ?? t("placeholder")}
         >
-          <Briefcase className="h-3.5 w-3.5" />
-          <span className="truncate max-w-[120px]">
-            {activeProject?.name ?? t("placeholder")}
-          </span>
-          <ChevronDown className="h-3 w-3" />
+          <Avatar className="h-5 w-5">
+            <AvatarFallback className="text-[0.625rem] bg-primary/10 text-primary">
+              {projectInitials(activeProject?.name)}
+            </AvatarFallback>
+          </Avatar>
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start">
@@ -71,6 +72,11 @@ export function ProjectSwitcher({ onSwitch }: ProjectSwitcherProps) {
             className={p.id === activeProjectId ? "bg-accent" : ""}
             onClick={() => handleSelect(p.id)}
           >
+            <Avatar className="h-4 w-4">
+              <AvatarFallback className="text-[0.5rem] bg-muted text-muted-foreground">
+                {projectInitials(p.name)}
+              </AvatarFallback>
+            </Avatar>
             {p.name}
           </DropdownMenuItem>
         ))}

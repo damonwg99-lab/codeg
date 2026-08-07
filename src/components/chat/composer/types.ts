@@ -1,13 +1,7 @@
 import type { AgentType } from "@/lib/types"
 
-/** The kinds of inline reference the composer can embed. */
-export type ReferenceKind =
-  | "file"
-  | "agent"
-  | "session"
-  | "commit"
-  | "skill"
-  | "context"
+/** The five kinds of inline reference the composer can embed. */
+export type ReferenceKind = "file" | "agent" | "session" | "commit" | "skill" | "context"
 
 export const REFERENCE_KINDS: readonly ReferenceKind[] = [
   "file",
@@ -63,20 +57,13 @@ export interface ReferenceMeta {
    * `/` when absent.
    */
   invocationPrefix?: "/" | "$"
-  /**
-   * context: inject option group ("basic" | "conversations" | "kb_docs" |
-   * "attachments"). Read by `referenceToMarkdown` for context badge serialization.
-   */
+  /** context: platform inject group (taskDescription / kb_doc / task_attachment / conversation). */
   injectGroup?: string
-  /**
-   * context: the full prefix text to serialize on send (e.g.
-   * "Task: Fix login bug\nDescription: …"). When present, `referenceToMarkdown`
-   * emits this verbatim; when absent, it falls back to `[label]`.
-   */
+  /** context: the prefix line text serialized for the AI prompt. */
   injectPrefix?: string
-  /** context: file path for kb_docs/attachments (carried for injectedDocsJson). */
+  /** context: file path of the injected doc, relative to the project root. */
   injectDocPath?: string
-  /** context: KB doc ID for kb_docs/attachments (carried for injectedDocsJson). */
+  /** context: KB doc id in the platform_knowledge_doc table. */
   injectDocId?: number
 }
 

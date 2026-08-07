@@ -109,6 +109,14 @@ pub fn build_router(
             "/import_local_conversations",
             post(handlers::conversations::import_local_conversations),
         )
+        .route(
+            "/scan_importable_sessions",
+            post(handlers::conversations::scan_importable_sessions),
+        )
+        .route(
+            "/import_selected_sessions",
+            post(handlers::conversations::import_selected_sessions),
+        )
         .route("/list_folders", post(handlers::conversations::list_folders))
         .route("/get_stats", post(handlers::conversations::get_stats))
         .route(
@@ -188,8 +196,36 @@ pub fn build_router(
             post(handlers::folders::update_folder_color),
         )
         .route(
+            "/update_folder_alias",
+            post(handlers::folders::update_folder_alias),
+        )
+        .route(
             "/update_folder_default_agent",
             post(handlers::folders::update_folder_default_agent),
+        )
+        .route(
+            "/list_folder_links",
+            post(handlers::folder_links::list_folder_links),
+        )
+        .route(
+            "/preview_folder_links",
+            post(handlers::folder_links::preview_folder_links),
+        )
+        .route(
+            "/create_folder_links",
+            post(handlers::folder_links::create_folder_links),
+        )
+        .route(
+            "/rename_folder_link",
+            post(handlers::folder_links::rename_folder_link),
+        )
+        .route(
+            "/repair_folder_link",
+            post(handlers::folder_links::repair_folder_link),
+        )
+        .route(
+            "/remove_folder_link",
+            post(handlers::folder_links::remove_folder_link),
         )
         .route(
             "/add_folder_to_history",
@@ -219,8 +255,8 @@ pub fn build_router(
         )
         .route("/get_file_tree", post(handlers::folders::get_file_tree))
         .route(
-            "/search_files_content",
-            post(handlers::folders::search_files_content),
+            "/list_workspace_files",
+            post(handlers::folders::list_workspace_files),
         )
         .route(
             "/start_workspace_state_stream",
@@ -244,6 +280,10 @@ pub fn build_router(
             post(handlers::folders::open_commit_window),
         )
         .route(
+            "/open_import_sessions_window",
+            post(handlers::folders::open_import_sessions_window),
+        )
+        .route(
             "/open_merge_window",
             post(handlers::folders::open_merge_window),
         )
@@ -259,6 +299,12 @@ pub fn build_router(
         .route("/git_status", post(handlers::git::git_status))
         .route("/git_init", post(handlers::git::git_init))
         .route("/git_log", post(handlers::git::git_log))
+        .route("/git_current_user", post(handlers::git::git_current_user))
+        .route("/git_commit_files", post(handlers::git::git_commit_files))
+        .route(
+            "/git_search_authors",
+            post(handlers::git::git_search_authors),
+        )
         .route(
             "/git_list_all_branches",
             post(handlers::git::git_list_all_branches),
@@ -331,6 +377,10 @@ pub fn build_router(
         .route("/git_pull", post(handlers::git::git_pull))
         .route("/git_push", post(handlers::git::git_push))
         .route("/git_fetch", post(handlers::git::git_fetch))
+        .route(
+            "/git_update_branch",
+            post(handlers::git::git_update_branch),
+        )
         .route("/git_commit", post(handlers::git::git_commit))
         .route("/git_fetch_remote", post(handlers::git::git_fetch_remote))
         .route("/git_delete_branch", post(handlers::git::git_delete_branch))
@@ -363,6 +413,10 @@ pub fn build_router(
             post(handlers::files::rename_file_tree_entry),
         )
         .route(
+            "/move_file_tree_entry",
+            post(handlers::files::move_file_tree_entry),
+        )
+        .route(
             "/delete_file_tree_entry",
             post(handlers::files::delete_file_tree_entry),
         )
@@ -372,14 +426,14 @@ pub fn build_router(
         )
         .route(
             "/upload_attachment",
-            // The 2MiB `UPLOAD_MAX_BYTES` is the *file payload* limit; the
-            // raw multipart body also carries boundary markers, the
+            // `UPLOAD_MAX_BYTES` is the *file payload* limit; the raw
+            // multipart body also carries boundary markers, the
             // `Content-Disposition` headers, and the `session_id` field —
             // ~256-512 bytes of overhead. Without this layer, axum's default
-            // 2MiB `DefaultBodyLimit` rejects a perfectly-sized 2MiB file
-            // before our handler ever sees a chunk. Pad by 64KiB so the
-            // handler's own chunk-summing check (in `files.rs`) stays the
-            // authoritative size boundary.
+            // 2MiB `DefaultBodyLimit` would reject anything bigger before our
+            // handler ever sees a chunk. Pad by 64KiB so the handler's own
+            // chunk-summing check (in `files.rs`) stays the authoritative
+            // size boundary.
             post(handlers::files::upload_attachment)
                 .layer(DefaultBodyLimit::max(UPLOAD_MAX_BYTES as usize + 64 * 1024)),
         )
@@ -571,6 +625,10 @@ pub fn build_router(
             post(handlers::acp::acp_get_agent_status),
         )
         .route("/acp_list_agents", post(handlers::acp::acp_list_agents))
+        .route(
+            "/acp_env_diagnostics",
+            post(handlers::acp::acp_env_diagnostics),
+        )
         .route("/acp_connect", post(handlers::acp::acp_connect))
         .route("/acp_disconnect", post(handlers::acp::acp_disconnect))
         .route(
@@ -585,6 +643,10 @@ pub fn build_router(
             post(handlers::acp::acp_set_config_option),
         )
         .route(
+            "/acp_goal_control",
+            post(handlers::acp::acp_goal_control),
+        )
+        .route(
             "/acp_describe_agent_options",
             post(handlers::acp::acp_describe_agent_options),
         )
@@ -597,6 +659,10 @@ pub fn build_router(
         .route(
             "/acp_answer_question",
             post(handlers::acp::acp_answer_question),
+        )
+        .route(
+            "/acp_answer_plan_approval",
+            post(handlers::acp::acp_answer_plan_approval),
         )
         .route(
             "/acp_list_connections",
@@ -633,6 +699,14 @@ pub fn build_router(
         .route(
             "/acp_update_hermes_config",
             post(handlers::acp::acp_update_hermes_config),
+        )
+        .route(
+            "/acp_cursor_auth_status",
+            post(handlers::acp::acp_cursor_auth_status),
+        )
+        .route(
+            "/acp_cursor_list_models",
+            post(handlers::acp::acp_cursor_list_models),
         )
         .route(
             "/acp_update_kimi_code_config",
@@ -687,6 +761,30 @@ pub fn build_router(
             post(handlers::acp::acp_reorder_agents),
         )
         .route(
+            "/acp_list_custom_agents",
+            post(handlers::acp::acp_list_custom_agents),
+        )
+        .route(
+            "/acp_save_custom_agent",
+            post(handlers::acp::acp_save_custom_agent),
+        )
+        .route(
+            "/acp_delete_custom_agent",
+            post(handlers::acp::acp_delete_custom_agent),
+        )
+        .route(
+            "/acp_fetch_registry_catalog",
+            post(handlers::acp::acp_fetch_registry_catalog),
+        )
+        .route(
+            "/acp_add_registry_agent",
+            post(handlers::acp::acp_add_registry_agent),
+        )
+        .route(
+            "/acp_current_platform",
+            post(handlers::acp::acp_current_platform),
+        )
+        .route(
             "/acp_list_agent_skills",
             post(handlers::acp::acp_list_agent_skills),
         )
@@ -709,6 +807,10 @@ pub fn build_router(
         .route(
             "/opencode_provider_catalog",
             post(handlers::acp::opencode_provider_catalog),
+        )
+        .route(
+            "/codex_bundled_catalog",
+            post(handlers::acp::codex_bundled_catalog),
         )
         .route(
             "/opencode_install_plugins",
@@ -785,6 +887,44 @@ pub fn build_router(
         .route(
             "/science_open_central_dir",
             post(handlers::science::science_open_central_dir),
+        )
+        // ─── Custom skills ───
+        .route("/custom_list", post(handlers::custom_skills::custom_list))
+        .route(
+            "/custom_list_all_install_statuses",
+            post(handlers::custom_skills::custom_list_all_install_statuses),
+        )
+        .route(
+            "/custom_apply_links",
+            post(handlers::custom_skills::custom_apply_links),
+        )
+        .route(
+            "/custom_read_skill",
+            post(handlers::custom_skills::custom_read_skill),
+        )
+        .route(
+            "/custom_create_skill",
+            post(handlers::custom_skills::custom_create_skill),
+        )
+        .route(
+            "/custom_save_skill",
+            post(handlers::custom_skills::custom_save_skill),
+        )
+        .route(
+            "/custom_duplicate_skill",
+            post(handlers::custom_skills::custom_duplicate_skill),
+        )
+        .route(
+            "/custom_import_skill",
+            post(handlers::custom_skills::custom_import_skill),
+        )
+        .route(
+            "/custom_import_from_agent",
+            post(handlers::custom_skills::custom_import_from_agent),
+        )
+        .route(
+            "/custom_delete_skills",
+            post(handlers::custom_skills::custom_delete_skills),
         )
         // ─── Office tools ───
         .route(
@@ -1076,6 +1216,146 @@ pub fn build_router(
             "/automation_cancel_run",
             post(handlers::automation::automation_cancel_run),
         )
+        // ─── Token usage dashboard ───
+        .route(
+            "/token_usage_report",
+            post(handlers::token_usage::token_usage_report),
+        )
+        .route(
+            "/token_usage_facets",
+            post(handlers::token_usage::token_usage_facets),
+        )
+        .route(
+            "/token_usage_status",
+            post(handlers::token_usage::token_usage_status),
+        )
+        .route(
+            "/token_usage_sync",
+            post(handlers::token_usage::token_usage_sync),
+        )
+        // ─── Work tasks ───
+        .route("/work_task_list", post(handlers::work_task::work_task_list))
+        .route("/work_task_get", post(handlers::work_task::work_task_get))
+        .route(
+            "/work_task_events",
+            post(handlers::work_task::work_task_events),
+        )
+        .route(
+            "/work_task_attention_count",
+            post(handlers::work_task::work_task_attention_count),
+        )
+        .route(
+            "/work_task_create",
+            post(handlers::work_task::work_task_create),
+        )
+        .route(
+            "/work_task_update",
+            post(handlers::work_task::work_task_update),
+        )
+        .route(
+            "/work_task_reorder",
+            post(handlers::work_task::work_task_reorder),
+        )
+        .route(
+            "/work_task_delete",
+            post(handlers::work_task::work_task_delete),
+        )
+        .route(
+            "/work_task_start",
+            post(handlers::work_task::work_task_start),
+        )
+        .route(
+            "/work_task_start_all",
+            post(handlers::work_task::work_task_start_all),
+        )
+        .route(
+            "/work_task_retry",
+            post(handlers::work_task::work_task_retry),
+        )
+        .route(
+            "/work_task_requeue",
+            post(handlers::work_task::work_task_requeue),
+        )
+        .route(
+            "/work_task_return",
+            post(handlers::work_task::work_task_return),
+        )
+        .route(
+            "/work_task_cancel",
+            post(handlers::work_task::work_task_cancel),
+        )
+        .route(
+            "/work_task_merge",
+            post(handlers::work_task::work_task_merge),
+        )
+        .route(
+            "/work_task_complete",
+            post(handlers::work_task::work_task_complete),
+        )
+        .route(
+            "/work_task_archive",
+            post(handlers::work_task::work_task_archive),
+        )
+        .route(
+            "/work_task_cleanup",
+            post(handlers::work_task::work_task_cleanup),
+        )
+        .route("/work_task_diff", post(handlers::work_task::work_task_diff))
+        .route(
+            "/work_task_changed_files",
+            post(handlers::work_task::work_task_changed_files),
+        )
+        .route(
+            "/work_task_settings_get",
+            post(handlers::work_task::work_task_settings_get),
+        )
+        .route(
+            "/work_task_settings_effective",
+            post(handlers::work_task::work_task_settings_effective),
+        )
+        .route(
+            "/work_task_settings_get_own",
+            post(handlers::work_task::work_task_settings_get_own),
+        )
+        .route(
+            "/work_task_settings_set",
+            post(handlers::work_task::work_task_settings_set),
+        )
+        .route(
+            "/work_task_settings_delete",
+            post(handlers::work_task::work_task_settings_delete),
+        )
+        .route(
+            "/work_task_template_list",
+            post(handlers::work_task::work_task_template_list),
+        )
+        .route(
+            "/work_task_template_save",
+            post(handlers::work_task::work_task_template_save),
+        )
+        .route(
+            "/work_task_template_delete",
+            post(handlers::work_task::work_task_template_delete),
+        )
+        // ─── Workspace background ───
+        .route(
+            "/background_read",
+            post(handlers::background::background_read),
+        )
+        .route(
+            "/background_set",
+            // A 16MiB image becomes ~21.4MiB once base64-encoded and wrapped in
+            // the JSON envelope; axum's default 2MiB `DefaultBodyLimit` would
+            // 413 any real photo before the handler runs. Raise it to cover the
+            // advertised ceiling; `backgrounds::validate_background` stays the
+            // authoritative size boundary on the decoded bytes.
+            post(handlers::background::background_set)
+                .layer(DefaultBodyLimit::max(24 * 1024 * 1024)),
+        )
+        .route(
+            "/background_clear",
+            post(handlers::background::background_clear),
+        )
         // ─── Pet ───
         .route("/pet_list", post(handlers::pet::pet_list))
         .route("/pet_get", post(handlers::pet::pet_get))
@@ -1113,6 +1393,10 @@ pub fn build_router(
             "/pet_marketplace_install",
             post(handlers::pet::pet_marketplace_install),
         )
+        .route(
+            "/pet_marketplace_asset",
+            post(handlers::pet::pet_marketplace_asset),
+        )
         .route("/pet_celebrate", post(handlers::pet::pet_celebrate))
         .route(
             "/pet_get_current_state",
@@ -1131,70 +1415,13 @@ pub fn build_router(
         )
         .route("/terminal_kill", post(handlers::terminal::terminal_kill))
         .route("/terminal_list", post(handlers::terminal::terminal_list))
-        // ─── Platform (project + task) ───
-        // Routes match the command names used by WebTransport.call()
-        // (call("list_projects") → POST /api/list_projects), so no /platform/
-        // prefix — consistent with all other API routes in this router.
-        .route("/list_projects", post(handlers::project::list_projects))
-        .route("/get_project", post(handlers::project::get_project))
-        .route("/create_project", post(handlers::project::create_project))
-        .route("/update_project", post(handlers::project::update_project))
-        .route("/delete_project", post(handlers::project::delete_project))
-        .route("/list_project_repos", post(handlers::project::list_project_repos))
-        .route("/add_project_repo", post(handlers::project::add_project_repo))
-        .route("/remove_project_repo", post(handlers::project::remove_project_repo))
-        .route("/scan_git_repos", post(handlers::project::scan_git_repos))
-        .route("/get_global_config", post(handlers::project::get_global_config))
-        .route("/set_global_config", post(handlers::project::set_global_config))
-        .route("/save_credential", post(handlers::project::save_credential))
-        .route("/delete_credential", post(handlers::project::delete_credential))
-        .route("/check_credential_exists", post(handlers::project::check_credential_exists))
-        .route("/list_tasks", post(handlers::task::list_tasks))
-        .route("/get_task", post(handlers::task::get_task))
-        .route("/create_task", post(handlers::task::create_task))
-        .route("/update_task", post(handlers::task::update_task))
-        .route("/update_task_status", post(handlers::task::update_task_status))
-        .route("/delete_task", post(handlers::task::delete_task))
-        .route("/link_conversation", post(handlers::task::link_conversation))
-        .route(
-            "/create_conversation_for_task",
-            post(handlers::task::create_conversation_for_task),
-        )
-        .route("/unlink_conversation", post(handlers::task::unlink_conversation))
-        .route("/list_task_conversations", post(handlers::task::list_task_conversations))
-        .route("/get_task_by_conversation", post(handlers::task::get_task_by_conversation))
-        .route("/list_task_type_mappings", post(handlers::task::list_task_type_mappings))
-        .route("/create_task_type_mapping", post(handlers::task::create_task_type_mapping))
-        .route("/update_task_type_mapping", post(handlers::task::update_task_type_mapping))
-        .route("/delete_task_type_mapping", post(handlers::task::delete_task_type_mapping))
-        .route("/create_decomposition", post(handlers::task::create_decomposition))
-        // ─── Knowledge Base ───
-        .route("/scan_knowledge_repo", post(handlers::knowledge::scan_knowledge_repo))
-        .route("/list_knowledge_docs", post(handlers::knowledge::list_knowledge_docs))
-        .route("/search_knowledge_docs", post(handlers::knowledge::search_knowledge_docs))
-        .route("/get_knowledge_doc", post(handlers::knowledge::get_knowledge_doc))
-        .route("/update_knowledge_doc", post(handlers::knowledge::update_knowledge_doc))
-        .route("/delete_knowledge_doc", post(handlers::knowledge::delete_knowledge_doc))
-        .route("/list_skills", post(handlers::knowledge::list_skills))
-        .route("/init_knowledge_repo", post(handlers::knowledge::init_knowledge_repo))
-        .route("/read_kb_doc_content", post(handlers::knowledge::read_kb_doc_content))
-        .route("/start_kb_watch", post(handlers::knowledge::start_kb_watch))
-        .route("/stop_kb_watch", post(handlers::knowledge::stop_kb_watch))
-        .route(
-            "/upload_kb_doc",
-            post(handlers::knowledge::upload_kb_doc)
-                .layer(DefaultBodyLimit::disable()),
-        )
-        .route(
-            "/upload_task_attachment",
-            post(handlers::knowledge::upload_task_attachment)
-                .layer(DefaultBodyLimit::disable()),
-        )
-        .route(
-            "/upload_task_ai_intermediate_doc",
-            post(handlers::knowledge::upload_task_ai_intermediate_doc)
-                .layer(DefaultBodyLimit::disable()),
-        )
+        // ─── Platform (Cluster A/B/C/D/E) ──────────────────────────────
+        // Pulled out into `router_platform::platform_routes()` (a standalone
+        // module) so the giant handler list here doesn't carry every platform
+        // endpoint inline; auth/CORS layers below still gate these routes
+        // exactly like the rest of `api` because `.merge(...)` runs BEFORE
+        // `.layer(require_token)`.
+        .merge(crate::web::router_platform::platform_routes())
         // Catch-all
         .fallback(api_not_found)
         .layer(middleware::from_fn(move |req, next| {
@@ -1269,21 +1496,6 @@ pub fn build_router(
         ServeDir::new(&static_dir).fallback(ServeFile::new(static_dir.join("index.html")));
 
     let static_dir_for_mw = static_dir.clone();
-    // In dev mode (debug profile) add Cache-Control: no-store so the browser
-    // always fetches fresh static files — critical for iterating on the web UI
-    // without restarting the server. In release builds this middleware is
-    // absent so CDN/browser caching works normally for production.
-    #[cfg(debug_assertions)]
-    let no_cache = middleware::from_fn(
-        |req: axum::extract::Request, next: Next| async move {
-            let mut res = next.run(req).await;
-            res.headers_mut().insert(
-                axum::http::header::CACHE_CONTROL,
-                axum::http::HeaderValue::from_static("no-store"),
-            );
-            res
-        },
-    );
     let html_rewrite = middleware::from_fn(move |req: axum::extract::Request, next: Next| {
         let dir = static_dir_for_mw.clone();
         async move {
@@ -1315,18 +1527,12 @@ pub fn build_router(
         }
     });
 
-    let router = Router::new()
+    Router::new()
         .nest("/api", api)
         .merge(ws_route)
         .fallback_service(fallback)
         .layer(html_rewrite)
-        .layer(cors);
-    // In dev builds (debug profile), add Cache-Control: no-store so the browser
-    // always fetches fresh static files — critical for iterating on the web UI
-    // without restarting. In release builds this layer is absent so caching works.
-    #[cfg(debug_assertions)]
-    let router = router.layer(no_cache);
-    router
+        .layer(cors)
         .layer(Extension(state))
         .layer(Extension(shutdown_signal))
 }

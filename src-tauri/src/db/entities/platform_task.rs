@@ -36,6 +36,9 @@ pub struct Model {
     pub kb_refs_json: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub affected_repos_json: Option<String>,
+    // DB 脚本追踪
+    #[sea_orm(column_type = "Text")]
+    pub related_db_scripts_json: Option<String>,
     // Delegation config
     #[sea_orm(column_type = "Text")]
     pub delegation_config: Option<String>,

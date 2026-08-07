@@ -11,41 +11,13 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Button } from "@/components/ui/button"
 import { openProjectBootWindow } from "@/lib/api"
-import { isDesktop, openFileDialog } from "@/lib/platform"
-import { getActiveRemoteConnectionId } from "@/lib/transport"
-import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
-import { useAutoCreateProject } from "@/hooks/use-auto-create-project"
 import { CloneDialog } from "@/components/layout/clone-dialog"
-import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-dialog"
+import { WorkspaceFolderDialog } from "@/components/layout/workspace-folder-dialog"
 
 export function NewFolderDropdown() {
   const t = useTranslations("Folder.folderNameDropdown")
-  const openFolder = useAppWorkspaceStore((s) => s.openFolder)
-  const { autoCreateProject } = useAutoCreateProject()
   const [cloneOpen, setCloneOpen] = useState(false)
-  const [browserOpen, setBrowserOpen] = useState(false)
-
-  async function handleOpenFolder() {
-    // Only use the native Tauri directory dialog when running on the local
-    // desktop. In a remote workspace window we're still inside Tauri, but the
-    // folder we want lives on the remote host — the native dialog would
-    // browse the *local* filesystem and produce a path the remote server
-    // can't open. Fall through to the in-app server-side browser instead.
-    if (isDesktop() && getActiveRemoteConnectionId() === null) {
-      const selected = await openFileDialog({
-        directory: true,
-        multiple: false,
-      })
-      if (selected) {
-        const detail = await openFolder(
-          Array.isArray(selected) ? selected[0] : selected
-        )
-        void autoCreateProject(detail)
-      }
-    } else {
-      setBrowserOpen(true)
-    }
-  }
+  const [workspaceDialogOpen, setWorkspaceDialogOpen] = useState(false)
 
   return (
     <>
@@ -61,7 +33,7 @@ export function NewFolderDropdown() {
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent className="min-w-56" align="start">
-          <DropdownMenuItem onSelect={handleOpenFolder}>
+          <DropdownMenuItem onSelect={() => setWorkspaceDialogOpen(true)}>
             <FolderOpenDot className="h-3.5 w-3.5 shrink-0" />
             {t("openFolder")}
           </DropdownMenuItem>
@@ -69,27 +41,16 @@ export function NewFolderDropdown() {
             <FolderGit2 className="h-3.5 w-3.5 shrink-0" />
             {t("cloneRepository")}
           </DropdownMenuItem>
-          {/* Project Boot launcher — temporarily hidden */}
-          <DropdownMenuItem
-            onSelect={() => openProjectBootWindow()}
-            className="hidden"
-          >
+          <DropdownMenuItem onSelect={() => openProjectBootWindow()}>
             <Rocket className="h-3.5 w-3.5 shrink-0" />
             {t("projectBoot")}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
       <CloneDialog open={cloneOpen} onOpenChange={setCloneOpen} />
-      <DirectoryBrowserDialog
-        open={browserOpen}
-        onOpenChange={setBrowserOpen}
-        onSelect={(path) => {
-          openFolder(path)
-            .then((detail) => void autoCreateProject(detail))
-            .catch((err) => {
-              console.error("[NewFolderDropdown] failed to open folder:", err)
-            })
-        }}
+      <WorkspaceFolderDialog
+        open={workspaceDialogOpen}
+        onOpenChange={setWorkspaceDialogOpen}
       />
     </>
   )

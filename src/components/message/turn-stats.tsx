@@ -7,6 +7,7 @@ import {
   CheckIcon,
   Coins,
   CopyIcon,
+  ListTodo,
   Timer,
 } from "lucide-react"
 import { useLocale, useTranslations } from "next-intl"
@@ -17,6 +18,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { useMessageScroll } from "@/components/message/message-scroll-context"
+import { useCreateTaskFromMessage } from "./use-create-task-from-message"
 import { formatElapsedLabel } from "@/lib/format-elapsed"
 import { formatTokenCount } from "@/lib/token-format"
 import { cn, copyTextToClipboard } from "@/lib/utils"
@@ -52,6 +54,7 @@ export function TurnStats({
   // Reuse the live timer's elapsed-unit strings so the per-turn duration
   // tooltip renders the exact same localized "Xh Ym Zs" format.
   const tLive = useTranslations("Folder.chat.liveTurnStats")
+  const tTasks = useTranslations("Tasks")
   const scroll = useMessageScroll()
   const [isCopied, setIsCopied] = useState(false)
   const timeoutRef = useRef<number>(0)
@@ -91,9 +94,12 @@ export function TurnStats({
   const hasUsage = Boolean(usage)
   const hasDuration = typeof duration_ms === "number" && duration_ms > 0
   const hasCompletedAt = Boolean(completedLabel)
+  // Usage OR duration: some agents (Cursor) never report per-turn token
+  // usage, but a turn with a duration chip is still a substantial reply
+  // worth jumping back from.
   const hasJump =
     isResponseComplete &&
-    hasUsage &&
+    (hasUsage || hasDuration) &&
     typeof previousUserIndex === "number" &&
     Boolean(scroll?.scrollToIndex)
 
@@ -101,6 +107,9 @@ export function TurnStats({
     if (typeof previousUserIndex !== "number") return
     scroll?.scrollToIndex(previousUserIndex, { align: "start", smooth: true })
   }, [previousUserIndex, scroll])
+
+  const getTaskText = useCallback(() => copyText ?? "", [copyText])
+  const handleCreateTask = useCreateTaskFromMessage(getTaskText)
 
   const handleCopy = useCallback(async () => {
     if (isCopied || !hasCopy) return
@@ -143,6 +152,23 @@ export function TurnStats({
             </TooltipTrigger>
             <TooltipContent side="top">
               {isCopied ? t("copied") : t("copyMessage")}
+            </TooltipContent>
+          </Tooltip>
+        )}
+        {hasCopy && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={handleCreateTask}
+                className={iconButtonClass}
+                aria-label={tTasks("createFromMessage")}
+              >
+                <ListTodo aria-hidden="true" className="h-3.5 w-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top">
+              {tTasks("createFromMessage")}
             </TooltipContent>
           </Tooltip>
         )}

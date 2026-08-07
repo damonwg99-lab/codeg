@@ -1,4 +1,10 @@
+import {
+  parseCodexListFilesTitle,
+  parseCodexSearchTitle,
+} from "@/lib/codex-command-action"
+import { CODEX_SCRIPT_TOOL_NAME } from "@/lib/codex-code-mode"
 import { COLLAB_AGENT_TOOL_NAME, isCodexCollabInput } from "@/lib/collab-tool"
+import { WAIT_TOOL_NAME, WRITE_STDIN_TOOL_NAME } from "@/lib/shell-session-tool"
 
 const EXACT_TOOL_NAME_ALIASES: Record<string, string> = {
   shell_command: "bash",
@@ -9,6 +15,11 @@ const EXACT_TOOL_NAME_ALIASES: Record<string, string> = {
   // `rawInput.command` — the command card would fall through to the generic
   // tool renderer (raw ANSI, no terminal title) instead of the Terminal card.
   run_terminal_command: "bash",
+  // Cursor's history parser (`parsers/cursor.rs`) emits the CLI's own tool
+  // identifiers; `shell` carries `rawInput.command`, so alias it to the
+  // Terminal card. Cursor's other tool names (read/edit/grep/glob/ls) already
+  // match their canonical kinds verbatim.
+  shell: "bash",
   exec_command: "exec_command",
   "functions.exec_command": "exec_command",
   "functions.read": "read",
@@ -18,7 +29,6 @@ const EXACT_TOOL_NAME_ALIASES: Record<string, string> = {
   change: "edit",
   "functions.change": "edit",
   changes: "edit",
-  write_stdin: "bash",
   read_file: "read",
   read_text_file: "read",
   readfile: "read",
@@ -58,6 +68,17 @@ const EXACT_TOOL_NAME_ALIASES: Record<string, string> = {
   browser_action: "webfetch",
   use_mcp_tool: "tool",
   // Codex
+  // Code-mode script card (`parsers/codex_code_mode.rs`). MUST be an exact
+  // alias: the freeform `exec(ute)?` matcher below would otherwise collapse it
+  // to "bash" and render the JS source as a shell command.
+  [CODEX_SCRIPT_TOOL_NAME]: CODEX_SCRIPT_TOOL_NAME,
+  // Unified-exec session tools. They keep their own identity (see
+  // `shell-session-tool.ts`) instead of collapsing into "bash": their arguments
+  // carry a session id, not a command, so the Terminal card's title derivation
+  // came up empty and every one of them rendered as a bare "bash" / "wait".
+  // Listed explicitly so no future freeform rule can hijack them.
+  [WAIT_TOOL_NAME]: WAIT_TOOL_NAME,
+  [WRITE_STDIN_TOOL_NAME]: WRITE_STDIN_TOOL_NAME,
   spawn_agent: "agent",
   wait_agent: "task",
   close_agent: "task",
@@ -241,6 +262,23 @@ function inferFromInput(
   const parsed = tryParseInputObject(rawInput)
   if (!parsed) return null
 
+  // Cursor live MCP calls (`mcpToolCall`): rawInput carries the provider and
+  // tool identity. Resolve to `<provider>__<tool>` — the same shape the
+  // history parser emits — so MCP-routed tools (the delegation companions
+  // et al) reach their dedicated cards, and before the `args` key below
+  // misreads the payload as a terminal command.
+  const mcpProvider = parsed.providerIdentifier
+  const mcpTool = parsed.toolName
+  if (
+    typeof mcpProvider === "string" &&
+    typeof mcpTool === "string" &&
+    mcpTool
+  ) {
+    return normalizeToolName(
+      mcpProvider ? `${mcpProvider}__${mcpTool}` : mcpTool
+    )
+  }
+
   if (
     hasAnyKey(parsed, [
       "command",
@@ -269,11 +307,27 @@ function inferFromInput(
   // stream resolves to "question" before the tool result arrives.
   if (hasAnyKey(parsed, ["question", "questions"])) return "question"
 
-  if (hasAnyKey(parsed, ["subagent_type"])) {
+  // `subagent_type` is the Claude Code Task shape; `subagentType` is Cursor's
+  // task tool (a protobuf-es oneof object on the live wire).
+  if (hasAnyKey(parsed, ["subagent_type", "subagentType"])) {
     return "agent"
   }
   if (hasAnyKey(parsed, ["taskId", "task_id", "subject"])) {
     return "task"
+  }
+
+  // Cursor stamps the semantic tool identity in `_toolName` for calls whose
+  // args may not have streamed yet. `task` is Cursor's sub-agent tool — route
+  // it to the Agent card even when the input snapshot is otherwise empty (the
+  // live tool_call is announced before its args are populated). Other values
+  // (`createPlan`, `generateImage`, …) collapse via camelCase → snake_case to
+  // the canonical names the history parser emits.
+  const hinted = parsed._toolName
+  if (typeof hinted === "string" && hinted) {
+    if (hinted === "task") return "agent"
+    return normalizeToolName(
+      hinted.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase()
+    )
   }
 
   const hasPath = hasAnyKey(parsed, ["file_path", "notebook_path", "path"])
@@ -312,8 +366,8 @@ function inferFromInput(
 }
 
 export function normalizeToolName(toolName: string): string {
-  const trimmed = toolName
-    .trim()
+  const raw = toolName.trim()
+  const trimmed = raw
     .replace(/^[:：'"`“”‘’\s]+/, "")
     .replace(/['"`“”‘’\s]+$/, "")
   if (!trimmed) return "tool"
@@ -323,6 +377,19 @@ export function normalizeToolName(toolName: string): string {
 
   const goalUpdate = parseGoalUpdateTitle(trimmed)
   if (goalUpdate) return goalUpdate.toolName
+
+  // codex-acp command-action tool calls (`createCommandActionEvent`) carry no
+  // tool name and no rawInput — only a human title — so the search / list-files
+  // identity has to be read back out of it. Without this the whole title becomes
+  // the "tool name": no search icon, an "other" tool-group tally, and a body
+  // that dumps the raw `{formatted_output, exit_code}` envelope. The sibling
+  // `Read file '<path>'` shape already resolves via the `^read` freeform rule.
+  //
+  // Matched against `raw`, not `trimmed`: these titles END in the quote that
+  // closes the interpolated query/path (`Search for 'TODO'`), and the trailing-
+  // quote strip above would eat it.
+  if (parseCodexSearchTitle(raw)) return "grep"
+  if (parseCodexListFilesTitle(raw)) return "glob"
 
   const canonical = canonicalizeToolName(trimmed)
   const alias = EXACT_TOOL_NAME_ALIASES[canonical]
@@ -394,6 +461,17 @@ export function inferLiveToolName(params: {
   // config") as an Agent card before raw_input is even consulted.
   if ((params.title ?? "").trim().toLowerCase() === "agent") return "agent"
 
+  // Grok plan-mode tools carry their authoritative identity in
+  // `_meta["x.ai/tool"].kind` (`enter_plan`/`exit_plan`), while their human
+  // `title` MUTATES across the lifecycle (`enter_plan_mode` → "Plan: Enter" →
+  // "Plan mode entered"). Resolve them to the canonical name here, ahead of the
+  // title-based fallbacks below, so the live stream routes into the same
+  // <PlanModeCard> (and its tool-group run-break) the historical path resolves
+  // from `x.ai/tool.name`. Scoped to plan-mode so every other Grok tool keeps
+  // its existing resolution. See `extractGrokPlanModeToolName`.
+  const grokPlanMode = extractGrokPlanModeToolName(params.meta)
+  if (grokPlanMode) return grokPlanMode
+
   // codex collab / sub-agent activity (codex-acp 1.0.1 #223). The live ACP
   // tool_call's title is the bare, free-form collab op (`spawn_agent`/
   // `wait_agent`/`close_agent`/…), but its rawInput carries inter-agent fields
@@ -421,6 +499,22 @@ export function inferLiveToolName(params: {
     if (DELEGATION_COMPANION_TOOLS.has(normalizedMeta)) return normalizedMeta
   }
 
+  // The delegation broker stamps `meta["codeg.delegation"]` onto the parent's
+  // `delegate_to_agent` tool call (meta_writer.rs) — an authoritative,
+  // codeg-minted marker no other tool ever carries. It is the ONLY live
+  // identity signal on hosts whose wire loses the MCP tool name entirely:
+  // Cursor announces MCP calls as title "MCP: tool" with empty rawInput and
+  // never resends either, so when the broker claims the call and writes the
+  // running meta, this is what flips the card to the delegation renderer
+  // mid-run (the title-sniff rewrite only lands at completion).
+  if (
+    params.meta &&
+    typeof params.meta === "object" &&
+    "codeg.delegation" in params.meta
+  ) {
+    return "delegate_to_agent"
+  }
+
   // Delegation companion tools also carry their identity in the TITLE on hosts
   // that don't set `claudeCode` meta — notably Grok, whose backend unwraps the
   // `use_tool` envelope so the title becomes the raw `<server>__<tool>` name.
@@ -431,6 +525,16 @@ export function inferLiveToolName(params: {
   // everything else.
   const titleCompanion = normalizeToolName(params.title ?? "")
   if (DELEGATION_COMPANION_TOOLS.has(titleCompanion)) return titleCompanion
+
+  // claude-agent-acp ≥0.63 marks Agent/Task launches with the authoritative
+  // `_meta.claudeCode.subagent: true` (its stated purpose: clients should not
+  // infer subagents from `toolName` or the generic `think` kind). Resolve it
+  // ahead of `inferFromInput` so the Agent card classifies on frame 1 even
+  // when `rawInput` (and its `subagent_type` shape) hasn't streamed yet and
+  // the meta toolName is the legacy `Task`. The Task regression guard below
+  // (meta toolName must NOT override input shape) is untouched: that path
+  // carries no `subagent` flag.
+  if (claudeCodeMarksSubagent(params.meta)) return "agent"
 
   // Input-shape detection runs FIRST so cross-agent heuristics (Claude Code
   // `Task` tool routed via `subagent_type`, OpenCode sub-agent calls, etc.)
@@ -456,6 +560,29 @@ export function inferLiveToolName(params: {
   // heuristic rewrites `memory_recall` to `memory_re`.
   if (metaToolName) return metaToolName.toLowerCase()
 
+  // Grok stamps the authoritative tool name in `_meta["x.ai/tool"].name` while
+  // its `title` MUTATES across the lifecycle. A background-task poll is the
+  // worst case: `get_command_or_subagent_output` → "Get task output: term_…" →
+  // "/bin/bash -lc 'pnpm dev …' (term_b0d)", so the title fallback below named
+  // the same call three different things and finally collapsed it to "bash" —
+  // where the history path (which reads `x.ai/tool.name`) kept the real name.
+  //
+  // Placed AFTER `inferFromInput` so every input-shape classification is
+  // preserved (`search_replace` → "edit" via old_string/new_string,
+  // `run_terminal_command` → "bash" via command, …) and this only decides the
+  // cases where the input shape is silent. See `extractGrokToolName` for the
+  // `use_tool` exclusion.
+  const grokToolName = extractGrokToolName(params.meta)
+  if (grokToolName) return normalizeToolName(grokToolName)
+
+  // codex-acp ≥1.1.8 Plan-mode review gate. The backend seeds this tool call
+  // from the `session/request_permission` (see `is_codex_plan_review`), so it
+  // carries no `rawInput` and its human title is a question ("Implement this
+  // plan?") that the title heuristic below would happily mangle into a tool
+  // name. Resolve the identity from the marker instead — MUST stay above
+  // `byTitle` for that reason.
+  if (codexMarksPlanReview(params.meta)) return "plan_review"
+
   const byTitle = normalizeToolName(params.title ?? "")
   if (byTitle !== "tool") return byTitle
 
@@ -475,4 +602,97 @@ function extractClaudeCodeToolName(
   if (typeof tn !== "string") return null
   const trimmed = tn.trim()
   return trimmed.length > 0 ? trimmed : null
+}
+
+/**
+ * claude-agent-acp ≥0.63 marks Agent/Task tool calls with
+ * `_meta.claudeCode.subagent: true` — the namespaced subagent-launch marker
+ * (ACP 1.2 has no standard subagent ToolKind). Strict `=== true`: any other
+ * shape reads as unmarked.
+ */
+export function claudeCodeMarksSubagent(
+  meta: Record<string, unknown> | null | undefined
+): boolean {
+  if (!meta || typeof meta !== "object") return false
+  const cc = (meta as Record<string, unknown>).claudeCode
+  if (!cc || typeof cc !== "object") return false
+  return (cc as Record<string, unknown>).subagent === true
+}
+
+/**
+ * codex-acp ≥1.1.8 (#351) marks the Plan-mode review gate with
+ * `_meta.codex = {kind: "plan_review", planItemId}`. The backend forwards that
+ * `_meta` onto the tool call it seeds from the permission request, which is the
+ * only identity signal the card has (no `rawInput`, and a question for a title).
+ */
+export function codexMarksPlanReview(
+  meta: Record<string, unknown> | null | undefined
+): boolean {
+  if (!meta || typeof meta !== "object") return false
+  const codex = (meta as Record<string, unknown>).codex
+  if (!codex || typeof codex !== "object") return false
+  return (codex as Record<string, unknown>).kind === "plan_review"
+}
+
+/**
+ * claude-agent-acp ≥0.63 exposes the tool's human-readable description as
+ * `_meta.claudeCode.title` (for Bash: the model-authored `description` input;
+ * falls back to the command upstream). The ACP `title` stays the raw command,
+ * so this is the display-friendly label — available from frame 1, including
+ * on eager permission tool calls, before `rawInput` streams in.
+ */
+export function extractClaudeCodeMetaTitle(
+  meta: Record<string, unknown> | null | undefined
+): string | null {
+  if (!meta || typeof meta !== "object") return null
+  const cc = (meta as Record<string, unknown>).claudeCode
+  if (!cc || typeof cc !== "object") return null
+  const title = (cc as Record<string, unknown>).title
+  if (typeof title !== "string") return null
+  const trimmed = title.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+/**
+ * Grok stamps the authoritative tool identity in `_meta["x.ai/tool"]`
+ * (`{ name, kind, namespace, label }`). For its plan-mode tools this returns the
+ * canonical `enter_plan_mode` / `exit_plan_mode` name (which `normalizeToolName`
+ * then aliases to `enterplanmode`/`exitplanmode`); `null` for every other Grok
+ * tool and every non-Grok host, so their existing title/alias resolution is
+ * preserved. Keyed on the stable `kind` discriminator, which — unlike `title` —
+ * does not mutate across the tool_call lifecycle.
+ */
+function extractGrokPlanModeToolName(
+  meta: Record<string, unknown> | null | undefined
+): string | null {
+  if (!meta || typeof meta !== "object") return null
+  const tool = (meta as Record<string, unknown>)["x.ai/tool"]
+  if (!tool || typeof tool !== "object") return null
+  const kind = (tool as Record<string, unknown>).kind
+  if (kind === "enter_plan") return "enter_plan_mode"
+  if (kind === "exit_plan") return "exit_plan_mode"
+  return null
+}
+
+/**
+ * Grok's authoritative tool name from `_meta["x.ai/tool"].name` — the same
+ * field the history parser stores (`parsers/grok.rs`), and the only identity on
+ * the live wire that does NOT mutate across a call's lifecycle (`title` does).
+ *
+ * `use_tool` — Grok's generic MCP envelope — is excluded: the backend unwraps it
+ * and puts the inner `<server>__<tool>` name in the TITLE
+ * (`connection.rs::unwrap_grok_use_tool`), so the envelope name would send every
+ * MCP call (delegation companions included) to the generic tool card.
+ */
+function extractGrokToolName(
+  meta: Record<string, unknown> | null | undefined
+): string | null {
+  if (!meta || typeof meta !== "object") return null
+  const tool = (meta as Record<string, unknown>)["x.ai/tool"]
+  if (!tool || typeof tool !== "object") return null
+  const name = (tool as Record<string, unknown>).name
+  if (typeof name !== "string") return null
+  const trimmed = name.trim()
+  if (!trimmed || trimmed === "use_tool") return null
+  return trimmed
 }

@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, type ReactNode } from "react"
+import { useEffect, type ReactNode } from "react"
 import { useTranslations } from "next-intl"
 import { useShallow } from "zustand/react/shallow"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
@@ -9,21 +9,12 @@ import { useWorkspaceActions } from "@/contexts/workspace-context"
 import { useSortedAvailableAgents } from "@/hooks/use-sorted-available-agents"
 import { onTransportReconnect, subscribe } from "@/lib/platform"
 import {
+  pruneOrphanDraftsOnce,
   runCorrectionOnce,
   runRecoveryOnce,
   useTabStore,
-  useTabActions as useTabActionsBase,
   type TabItem,
 } from "@/stores/tab-store"
-// PLATFORM CUSTOM BEGIN: pending draft / task-link state lives in the
-// separate `platform-tab-slice` store to keep it out of upstream tab-store
-// merge conflicts. Merged into `useTabContext` / `useTabActions` below so
-// the public API stays stable for the 8 consumer components.
-import {
-  usePlatformTabSlice,
-  type PendingTaskLink,
-} from "@/stores/platform-tab-slice"
-// PLATFORM CUSTOM END.
 import {
   CONVERSATION_CHANGED_EVENT,
   TABS_CHANGED_EVENT,
@@ -32,11 +23,7 @@ import {
 } from "@/lib/types"
 
 export type { TabItem }
-export type { PendingTaskLink }
-export {
-  makeConversationTabId,
-  useTabStore,
-} from "@/stores/tab-store"
+export { useTabStore, useTabActions } from "@/stores/tab-store"
 
 interface TabProviderProps {
   children: ReactNode
@@ -190,11 +177,15 @@ export function TabProvider({ children }: TabProviderProps) {
     runCorrectionOnce()
   }, [agentsFresh, tabsHydrated, foldersHydrated])
 
-  // Post-hydration recovery: a draft-only session hydrates to zero tabs; never
-  // leave the workspace blank.
+  // Once tabs AND folders are in: drop restored drafts whose folder is gone
+  // (hydration is deliberately folder-blind), then — only if that leaves nothing
+  // at all — recover a draft so the workspace is never blank. Order matters: an
+  // orphaned draft must not suppress recovery. State is re-read after the prune
+  // because the closure's `rawTabs` predates it.
   useEffect(() => {
     if (!tabsHydrated || !foldersHydrated) return
-    if (rawTabs.length > 0) return
+    pruneOrphanDraftsOnce()
+    if (useTabStore.getState().rawTabs.length > 0) return
     runRecoveryOnce()
   }, [tabsHydrated, foldersHydrated, rawTabs])
 
@@ -210,7 +201,7 @@ export interface TabContextValue {
   tabs: TabItem[]
   activeTabId: string | null
   tabsHydrated: boolean
-  isTileMode: boolean
+  tileByGroup: Record<string, boolean>
   openTab: (
     folderId: number,
     conversationId: number,
@@ -229,7 +220,7 @@ export interface TabContextValue {
   closeTabsByFolder: (folderId: number) => void
   switchTab: (tabId: string) => void
   pinTab: (tabId: string) => void
-  toggleTileMode: () => void
+  toggleGroupTile: (groupId: string) => void
   consumeRemoteActivation: () => boolean
   openNewConversationTab: (
     folderId: number,
@@ -237,9 +228,10 @@ export interface TabContextValue {
     options?: {
       inheritFromActive?: boolean
       folderDefaultAgent?: TabItem["agentType"] | null
+      targetGroup?: string
     }
   ) => void
-  openChatModeTab: () => void
+  openChatModeTab: (options?: { targetGroup?: string }) => void
   setChatDraftWorkingDir: (tabId: string, workingDir: string) => void
   confirmDraftAgent: (tabId: string, agentType: TabItem["agentType"]) => void
   setDraftAgentFromFallback: (
@@ -261,47 +253,23 @@ export interface TabContextValue {
   ) => void
   reorderTabs: (reorderedTabs: TabItem[]) => void
   onPreviewTabReplaced: (callback: (tabId: string) => void) => () => void
-  /**
-   * Pending initial content for newly created conversation tabs. Used by
-   * the task→conversation flow to pre-fill the composer with a context prefix.
-   * Keyed by tabId to prevent badge drafts leaking across tabs.
-   */
-  pendingInitialDrafts: Map<string, string>
-  setPendingInitialDraft: (tabId: string, content: string) => void
-  clearPendingInitialDraft: (tabId: string) => void
-  /**
-   * Pending task link intent for draft tabs. Stored when user selects a task
-   * in the Popover before the conversation is created. Auto-executed after
-   * conversation creation. Keyed by tabId.
-   */
-  pendingTaskLink: Map<string, PendingTaskLink | null>
-  setPendingTaskLink: (
-    tabId: string,
-    taskId: number,
-    role: string,
-    title: string,
-    taskType: string
-  ) => void
-  clearPendingTaskLink: (tabId: string) => void
 }
 
 /**
  * Backwards-compatible whole-value accessor over the tab store. Kept so existing
  * consumers keep working during the incremental selector migration; new/hot
  * consumers should read `useTabStore(selector)` / `useTabActions()` directly to
- * subscribe to the narrowest slice they render. `useShallow` keeps each store's
- * selected slice stable; `useMemo` then merges the two stores (main tab store +
- * platform-tab-slice) into one stable object, so this re-renders only when a
- * read field (tabs/activeTabId/tabsHydrated/isTileMode or a pending* field)
- * changes — matching the former context's behavior.
+ * subscribe to the narrowest slice they render. `useShallow` keeps the returned
+ * object stable, so this re-renders only when a read field (tabs/activeTabId/
+ * tabsHydrated/tileByGroup) changes — matching the former context's behavior.
  */
 export function useTabContext(): TabContextValue {
-  const base = useTabStore(
+  return useTabStore(
     useShallow((s) => ({
       tabs: s.tabs,
       activeTabId: s.activeTabId,
       tabsHydrated: s.tabsHydrated,
-      isTileMode: s.isTileMode,
+      tileByGroup: s.tileByGroup,
       openTab: s.openTab,
       closeTab: s.closeTab,
       closeConversationTab: s.closeConversationTab,
@@ -310,7 +278,7 @@ export function useTabContext(): TabContextValue {
       closeTabsByFolder: s.closeTabsByFolder,
       switchTab: s.switchTab,
       pinTab: s.pinTab,
-      toggleTileMode: s.toggleTileMode,
+      toggleGroupTile: s.toggleGroupTile,
       consumeRemoteActivation: s.consumeRemoteActivation,
       openNewConversationTab: s.openNewConversationTab,
       openChatModeTab: s.openChatModeTab,
@@ -323,44 +291,4 @@ export function useTabContext(): TabContextValue {
       onPreviewTabReplaced: s.onPreviewTabReplaced,
     }))
   )
-  // PLATFORM CUSTOM BEGIN: pending draft / task-link fields come from the
-  // separate platform-tab-slice store, merged here to preserve the public
-  // `TabContextValue` shape consumers already depend on.
-  const platform = usePlatformTabSlice(
-    useShallow((s) => ({
-      pendingInitialDrafts: s.pendingInitialDrafts,
-      setPendingInitialDraft: s.setPendingInitialDraft,
-      clearPendingInitialDraft: s.clearPendingInitialDraft,
-      pendingTaskLink: s.pendingTaskLink,
-      setPendingTaskLink: s.setPendingTaskLink,
-      clearPendingTaskLink: s.clearPendingTaskLink,
-    }))
-  )
-  // PLATFORM CUSTOM END.
-  return useMemo(() => ({ ...base, ...platform }), [base, platform])
-}
-
-/**
- * All tab actions as a shallow-stable object. Actions never change identity, so
- * this hook never triggers a re-render — consumers that only dispatch use it
- * instead of subscribing to any state slice. Merges the main tab-store actions
- * with the platform-tab-slice actions so the public API is unchanged.
- */
-export function useTabActions() {
-  const base = useTabActionsBase()
-  // PLATFORM CUSTOM BEGIN: pending* actions + pendingTaskLink state from the
-  // platform-tab-slice store. `pendingTaskLink` (state) is included here
-  // because conversation-detail-panel.tsx destructures it from useTabActions
-  // alongside clearPendingTaskLink — preserving that secondary-dev API shape.
-  const platform = usePlatformTabSlice(
-    useShallow((s) => ({
-      pendingTaskLink: s.pendingTaskLink,
-      setPendingInitialDraft: s.setPendingInitialDraft,
-      clearPendingInitialDraft: s.clearPendingInitialDraft,
-      setPendingTaskLink: s.setPendingTaskLink,
-      clearPendingTaskLink: s.clearPendingTaskLink,
-    }))
-  )
-  // PLATFORM CUSTOM END.
-  return useMemo(() => ({ ...base, ...platform }), [base, platform])
 }

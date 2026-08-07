@@ -27,6 +27,14 @@ export interface PermissionAllowedPrompt {
 
 export interface ParsedPermissionToolCall {
   title: string
+  /**
+   * Human-readable description from `_meta.claudeCode.title`
+   * (claude-agent-acp ≥0.63; for Bash it is the model-authored `description`
+   * input). The permission path carries the RAW serde spelling `_meta` —
+   * unlike tool parts, whose `AcpEvent` field is named `meta`. Null when the
+   * agent supplied none; the dialog then falls back to `title`.
+   */
+  description: string | null
   normalizedKind: string
   command: string | null
   cwd: string | null
@@ -765,8 +773,20 @@ export function parsePermissionToolCall(
     pickString(toolCallObj, ["title", "tool_name", "toolName", "name"]) ??
     formatFallbackTitle(normalizedKind)
 
+  // `_meta.claudeCode.title` — NOTE the underscore key: the permission
+  // request forwards the raw ACP ToolCallUpdate serialization (serde renames
+  // `meta` → `_meta`), unlike tool parts whose event field is plain `meta`.
+  const description =
+    pickString(
+      asObject(
+        pickValue(asObject(pickValue(toolCallObj, ["_meta"])), ["claudeCode"])
+      ),
+      ["title"]
+    ) ?? null
+
   return {
     title,
+    description,
     normalizedKind,
     command,
     cwd,
@@ -785,4 +805,104 @@ export function parsePermissionToolCall(
     contentText,
     jsonPreview: stringifyJson(toolCallObj ?? toolCall),
   }
+}
+
+/**
+ * Maximum permission-change descriptions rendered for one option, and the
+ * per-description character cap. The wire list is agent-authored and rides the
+ * broadcast event + snapshot, so a bound keeps a pathological (or simply very
+ * broad) grant from turning the permission card into a wall of text. Anything
+ * past the cap is dropped rather than summarized — the option's own name still
+ * states what it does.
+ */
+const MAX_PERMISSION_CHANGES = 6
+const MAX_PERMISSION_CHANGE_CHARS = 200
+
+/**
+ * How long a permission change lasts, and where it is written — normalized from
+ * the wire's `lifetime: {scope, storage?}` pair into one flat token the card can
+ * label directly.
+ *
+ * `persistent` is the deliberate catch-all for a `scope: "persistent"` whose
+ * `storage` we do not recognize: the destination is unknown but the fact that it
+ * OUTLIVES the session is the part the user must not miss, so it degrades to a
+ * weaker warning rather than to silence.
+ */
+export type PermissionChangeScope =
+  | "session"
+  | "process"
+  | "user"
+  | "project"
+  | "project_local"
+  | "persistent"
+
+export interface PermissionOptionChange {
+  /** The agent's own rendered sentence for this change. */
+  description: string
+  /**
+   * `null` when the change carries no lifetime, reports `scope: "unknown"`, or
+   * uses a scope this build does not know — the card then says nothing about
+   * duration rather than guessing at one.
+   */
+  scope: PermissionChangeScope | null
+}
+
+/** Wire `lifetime` → {@link PermissionChangeScope}; see the type's doc. */
+function parseChangeScope(lifetime: unknown): PermissionChangeScope | null {
+  const record = asObject(lifetime)
+  const scope = pickString(record, ["scope"])
+  if (scope === "session") return "session"
+  if (scope === "process") return "process"
+  if (scope !== "persistent") return null
+  switch (pickString(record, ["storage"])) {
+    case "user":
+      return "user"
+    case "project":
+      return "project"
+    case "project_local":
+      return "project_local"
+    default:
+      return "persistent"
+  }
+}
+
+/**
+ * What picking a permission option would change: the agent's own sentence for
+ * each change, plus how long it lasts.
+ *
+ * codex-acp ≥1.1.8 (#342) and claude-agent-acp ≥0.64.1 (#930) both hang
+ * `_meta.permission = {version: 1, changes: [...]}` on a `PermissionOption`,
+ * where every change carries a rendered English sentence ("Allow access to
+ * api.example.com for this session", "Allow all Bash calls"). Only `version: 1`
+ * is read — a future revision may reshape `changes`, and showing it
+ * half-understood is worse than showing nothing.
+ *
+ * `lifetime` is read because `description` alone does NOT always answer "for how
+ * long": codex writes the duration into its sentences, claude does not — it
+ * reports `{scope: "session"}` vs `{scope: "persistent", storage: "project"}`
+ * structurally instead. Left unread, claude's most common card would pair an
+ * "Always Allow" button with "Allow all Bash calls" and never reveal that the
+ * grant expires with the session (or, worse, that it is about to be written into
+ * settings the repo commits). The remaining structural fields (`targets`,
+ * `ruleBehavior`) stay ignored: those `description` really does summarize.
+ */
+export function parsePermissionOptionChanges(
+  meta: Record<string, unknown> | null | undefined
+): PermissionOptionChange[] {
+  const permission = asObject(pickValue(asObject(meta), ["permission"]))
+  if (!permission || permission.version !== 1) return []
+  const changes = permission.changes
+  if (!Array.isArray(changes)) return []
+  const out: PermissionOptionChange[] = []
+  for (const change of changes) {
+    if (out.length >= MAX_PERMISSION_CHANGES) break
+    const record = asObject(change)
+    const description = pickString(record, ["description"])
+    if (!description) continue
+    out.push({
+      description: description.slice(0, MAX_PERMISSION_CHANGE_CHARS),
+      scope: parseChangeScope(pickValue(record, ["lifetime"])),
+    })
+  }
+  return out
 }

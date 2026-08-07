@@ -149,13 +149,56 @@ pub struct GitLogParams {
     pub limit: Option<u32>,
     pub branch: Option<String>,
     pub remote: Option<String>,
+    pub skip: Option<u32>,
+    pub author: Option<String>,
+    pub all_branches: Option<bool>,
+    pub with_files: Option<bool>,
 }
 
 pub async fn git_log(
     Json(params): Json<GitLogParams>,
 ) -> Result<Json<folder_commands::GitLogResult>, AppCommandError> {
+    let result = folder_commands::git_log(
+        params.path,
+        params.limit,
+        params.branch,
+        params.remote,
+        params.skip,
+        params.author,
+        params.all_branches,
+        params.with_files,
+    )
+    .await?;
+    Ok(Json(result))
+}
+
+pub async fn git_current_user(
+    Json(params): Json<PathParams>,
+) -> Result<Json<Option<String>>, AppCommandError> {
+    let result = folder_commands::git_current_user(params.path).await?;
+    Ok(Json(result))
+}
+
+pub async fn git_commit_files(
+    Json(params): Json<GitCommitBranchesParams>,
+) -> Result<Json<Vec<folder_commands::GitLogFileChange>>, AppCommandError> {
+    let result = folder_commands::git_commit_files(params.path, params.commit).await?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitSearchAuthorsParams {
+    pub path: String,
+    pub query: String,
+    pub limit: Option<u32>,
+}
+
+pub async fn git_search_authors(
+    Json(params): Json<GitSearchAuthorsParams>,
+) -> Result<Json<Vec<String>>, AppCommandError> {
     let result =
-        folder_commands::git_log(params.path, params.limit, params.branch, params.remote).await?;
+        folder_commands::git_search_authors(params.path, params.query, params.limit).await?;
     Ok(Json(result))
 }
 
@@ -189,10 +232,18 @@ pub async fn git_has_merge_head(
     Ok(Json(result))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPushInfoParams {
+    pub path: String,
+    /// Target branch; omitted means the checked-out one.
+    pub branch: Option<String>,
+}
+
 pub async fn git_push_info(
-    Json(params): Json<PathParams>,
+    Json(params): Json<GitPushInfoParams>,
 ) -> Result<Json<folder_commands::GitPushInfo>, AppCommandError> {
-    let result = folder_commands::git_push_info(params.path).await?;
+    let result = folder_commands::git_push_info(params.path, params.branch).await?;
     Ok(Json(result))
 }
 
@@ -217,13 +268,20 @@ pub struct GitWorktreeAddParams {
     pub path: String,
     pub branch_name: String,
     pub worktree_path: String,
+    #[serde(default)]
+    pub base: Option<String>,
 }
 
 pub async fn git_worktree_add(
     Json(params): Json<GitWorktreeAddParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    folder_commands::git_worktree_add(params.path, params.branch_name, params.worktree_path)
-        .await?;
+    folder_commands::git_worktree_add(
+        params.path,
+        params.branch_name,
+        params.worktree_path,
+        params.base,
+    )
+    .await?;
     Ok(Json(()))
 }
 
@@ -540,10 +598,38 @@ pub async fn git_fetch(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GitUpdateBranchParams {
+    pub path: String,
+    pub branch: String,
+    pub is_remote: bool,
+    pub credentials: Option<GitCredentials>,
+}
+
+pub async fn git_update_branch(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<GitUpdateBranchParams>,
+) -> Result<Json<folder_commands::GitPullResult>, AppCommandError> {
+    let db = &state.db;
+    let result = folder_commands::git_update_branch_core(
+        &params.path,
+        &params.branch,
+        params.is_remote,
+        params.credentials.as_ref(),
+        db,
+        &state.data_dir,
+    )
+    .await?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GitPushParams {
     pub folder_id: Option<i32>,
     pub path: String,
     pub remote: Option<String>,
+    /// Target branch; omitted means the checked-out one.
+    pub branch: Option<String>,
     pub credentials: Option<GitCredentials>,
 }
 
@@ -559,6 +645,7 @@ pub async fn git_push(
         params.folder_id,
         &params.path,
         params.remote.as_deref(),
+        params.branch.as_deref(),
         params.credentials.as_ref(),
         db,
     )

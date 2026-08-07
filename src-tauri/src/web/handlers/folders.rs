@@ -185,6 +185,23 @@ pub async fn update_folder_color(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UpdateFolderAliasParams {
+    pub folder_id: i32,
+    pub alias: Option<String>,
+}
+
+pub async fn update_folder_alias(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<UpdateFolderAliasParams>,
+) -> Result<Json<FolderDetail>, AppCommandError> {
+    Ok(Json(
+        folder_commands::update_folder_alias_core(&state.db, params.folder_id, params.alias)
+            .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateFolderDefaultAgentParams {
     pub folder_id: i32,
     pub default_agent_type: Option<AgentType>,
@@ -265,21 +282,14 @@ pub async fn get_file_tree(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SearchFilesContentParams {
-    pub base_path: String,
-    pub keyword: String,
-    pub max_results: Option<usize>,
+pub struct ListWorkspaceFilesParams {
+    pub path: String,
 }
 
-pub async fn search_files_content(
-    Json(params): Json<SearchFilesContentParams>,
-) -> Result<Json<Vec<crate::commands::file_search::FileContentMatch>>, AppCommandError> {
-    let result = crate::commands::file_search::search_files_content(
-        params.base_path,
-        params.keyword,
-        params.max_results,
-    )
-    .await?;
+pub async fn list_workspace_files(
+    Json(params): Json<ListWorkspaceFilesParams>,
+) -> Result<Json<Vec<folder_commands::WorkspaceFileEntry>>, AppCommandError> {
+    let result = folder_commands::list_workspace_files(params.path).await?;
     Ok(Json(result))
 }
 
@@ -372,6 +382,29 @@ pub async fn open_merge_window(
     Ok(Json(SettingsNavigationResult { path }))
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenImportSessionsWindowParams {
+    pub focus_path: Option<String>,
+}
+
+/// Web equivalent of `open_import_sessions_window`: returns the navigation
+/// path; the web client opens it in a new browser window.
+pub async fn open_import_sessions_window(
+    Json(params): Json<OpenImportSessionsWindowParams>,
+) -> Result<Json<SettingsNavigationResult>, AppCommandError> {
+    let mut path = "/import-sessions".to_string();
+    if let Some(focus) = params
+        .focus_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        path.push_str(&format!("?focusPath={}", urlencoding::encode(focus)));
+    }
+    Ok(Json(SettingsNavigationResult { path }))
+}
+
 pub async fn open_stash_window(
     Json(params): Json<OpenCommitWindowParams>,
 ) -> Result<Json<SettingsNavigationResult>, AppCommandError> {
@@ -380,11 +413,28 @@ pub async fn open_stash_window(
     }))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenPushWindowParams {
+    pub folder_id: i32,
+    /// Branch to push; omitted targets the checked-out one.
+    pub branch: Option<String>,
+}
+
 pub async fn open_push_window(
-    Json(params): Json<OpenCommitWindowParams>,
+    Json(params): Json<OpenPushWindowParams>,
 ) -> Result<Json<SettingsNavigationResult>, AppCommandError> {
+    // Branch names carry `/` (and may carry `#`/`?`), so they have to be encoded
+    // before riding a query string.
+    let branch_param = params
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("&branch={}", urlencoding::encode(value)))
+        .unwrap_or_default();
     Ok(Json(SettingsNavigationResult {
-        path: format!("/push?folderId={}", params.folder_id),
+        path: format!("/push?folderId={}{branch_param}", params.folder_id),
     }))
 }
 

@@ -48,6 +48,12 @@ fn infer_doc_type(rel_path: &Path) -> String {
         "requirement".to_string()
     } else if parts.iter().any(|p| p == "ai-intermediate") {
         "ai_intermediate".to_string()
+    } else if parts.windows(2).any(|w| w[0] == ".private" && w[1] == "tasks") {
+        // Files directly under `.private/tasks/{task_id}/` are task
+        // attachments (doc_type = "task_attachment"). Files nested under
+        // `.private/tasks/{task_id}/ai-intermediate/` are already matched by
+        // the `ai-intermediate` branch above.
+        "task_attachment".to_string()
     } else {
         "tech_doc".to_string()
     }
@@ -343,6 +349,14 @@ mod tests {
         );
         assert_eq!(
             infer_doc_type(Path::new(".private/ai-intermediate/prd-draft.md")),
+            "ai_intermediate"
+        );
+        assert_eq!(
+            infer_doc_type(Path::new(".private/tasks/96/spec.xlsx")),
+            "task_attachment"
+        );
+        assert_eq!(
+            infer_doc_type(Path::new(".private/tasks/71/ai-intermediate/notes.md")),
             "ai_intermediate"
         );
     }

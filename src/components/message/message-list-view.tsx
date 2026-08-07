@@ -6,6 +6,9 @@ import {
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
 import { ContentPartsRenderer } from "./content-parts-renderer"
+import { ContextCompactionCard } from "./context-compaction-card"
+import { CollapsibleUserMessage } from "./collapsible-user-message"
+import { isContextCompactionMeta } from "@/lib/context-compaction"
 import {
   createMessageTurnAdapter,
   groupGoalRuns,
@@ -23,14 +26,9 @@ import { LiveTurnStats } from "./live-turn-stats"
 import { ReplyArtifacts } from "./reply-artifacts"
 import { UserResourceLinks } from "./user-resource-links"
 import { UserImageAttachments } from "./user-image-attachments"
-import { useSessionStats } from "@/contexts/session-stats-context"
 import { AgentPlanOverlay } from "@/components/chat/agent-plan-overlay"
 import { SubAgentOverlay } from "@/components/chat/sub-agent-overlay"
-import { DecompositionOverlay } from "@/components/chat/decomposition-overlay"
-import { useDecompositionDetector } from "@/hooks/use-decomposition-detector"
-import type { TaskInfo, ProjectInfo } from "@/lib/platform/types"
-import { createTask, createDecomposition } from "@/lib/platform/api"
-import { toast } from "sonner"
+import { PlatformDecompositionBridge } from "@/components/chat/platform-decomposition-bridge"
 import { normalizeToolName } from "@/lib/tool-call-normalization"
 import { isDelegateToAgentToolName } from "@/lib/delegation-card"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
@@ -53,24 +51,16 @@ import {
   Loader2,
   Plus,
   RefreshCw,
+  ListTodo,
 } from "lucide-react"
+import { useCreateTaskFromMessage } from "./use-create-task-from-message"
 import { Button } from "@/components/ui/button"
-import {
-  DecompositionOverlayContextProvider,
-  type DecompositionOverlayStatus,
-} from "@/components/chat/decomposition-overlay-context"
-import { proposalKey } from "@/hooks/use-decomposition-detector"
 import { useTranslations } from "next-intl"
 import {
   buildPlanKey,
   extractLatestPlanEntriesFromMessages,
 } from "@/lib/agent-plan"
-import type {
-  AgentType,
-  ConnectionStatus,
-  MessageTurn,
-  SessionStats,
-} from "@/lib/types"
+import type { AgentType, ConnectionStatus, MessageTurn } from "@/lib/types"
 import { copyTextToClipboard } from "@/lib/utils"
 import { VirtualizedMessageThread } from "@/components/message/virtualized-message-thread"
 import {
@@ -88,7 +78,6 @@ interface MessageListViewProps {
   connStatus?: ConnectionStatus | null
   isActive?: boolean
   sendSignal?: number
-  sessionStats?: SessionStats | null
   detailLoading?: boolean
   detailError?: string | null
   /**
@@ -107,15 +96,16 @@ interface MessageListViewProps {
    * conversation view; disabled in compact embeds (e.g. the sub-agent dialog).
    */
   showMessageNav?: boolean
-  /** Linked task for decomposition overlay context. */
-  linkedTask?: TaskInfo | null
-  /** Available projects for task creation. */
-  projects?: ProjectInfo[]
-  /** Active project id for default selection. */
-  activeProjectId?: number | null
+  /**
+   * Optional phase label for a user turn (work-task transcripts label each
+   * engine-dispatched round: work / retry / return / merge). Called at render
+   * time per user-role turn; MUST be pure — the thread is virtualized, so
+   * items render in arbitrary order and multiplicity. `null` = no divider.
+   */
+  userTurnHeader?: ((group: ResolvedMessageGroup) => string | null) | null
 }
 
-interface ResolvedMessageGroup {
+export interface ResolvedMessageGroup {
   id: string
   role: "user" | "assistant" | "system"
   parts: AdaptedContentPart[]
@@ -127,14 +117,13 @@ interface ResolvedMessageGroup {
   models?: string[]
   /**
    * Wall-clock completion time supplied by the Rust parser. For merged
-   * sub-turns this reflects the last sub-turn's completion (inherited
-   * automatically via `{ ...last.group }`), not first-start + accumulated
-   * duration.
+   * sub-turns this is the latest non-null completion across the run — the
+   * post-turn metadata patch may sit on any sub-turn, not just the last.
    */
   completed_at?: string | null
 }
 
-type ThreadRenderItem =
+export type ThreadRenderItem =
   | {
       key: string
       kind: "turn"
@@ -150,6 +139,19 @@ type ThreadRenderItem =
   | {
       key: string
       kind: "typing"
+    }
+  | {
+      // A context-compaction event hoisted OUT of an assistant turn into its own
+      // standalone timeline element. In history the compaction lands as its own
+      // (assistant-role) turn between the reply that preceded `/compact` and the
+      // next message; rendering it as a "turn" would let
+      // `mergeConsecutiveAssistantTurns` fold it into the preceding reply (so the
+      // divider showed up wedged before that reply's file cards + footer). As a
+      // dedicated kind it breaks the assistant-merge run and renders as a
+      // chrome-less centered divider in the correct between-turns position.
+      key: string
+      kind: "compaction"
+      meta: Record<string, unknown> | null
     }
 
 // Module-scope so the reference is stable across renders — lets the memoized
@@ -267,6 +269,27 @@ function extractTextFromParts(parts: AdaptedContentPart[]): string {
 
 type AssistantTurnItem = Extract<ThreadRenderItem, { kind: "turn" }>
 
+/**
+ * Cache entry for one merged assistant run, keyed on the run's FIRST member
+ * group. Valid only while every member's group reference and item key still
+ * match: group identity flows through the per-turn adapter + group caches, so
+ * member-group equality implies unchanged content AND sourceTurns, while the
+ * keys embed phase/id/index so ordering or phase drift invalidates too. A run
+ * containing the streaming turn misses every batch by construction (the
+ * streaming turn re-adapts per batch) — that residual rebuild is the point;
+ * purely historical runs hit and keep their group/parts/sourceTurns
+ * references stable so HistoricalMessageGroup's memo bails out.
+ */
+export interface MergedAssistantRunCacheEntry {
+  memberGroups: ResolvedMessageGroup[]
+  memberKeys: string[]
+  item: AssistantTurnItem
+}
+export type MergedAssistantRunCache = WeakMap<
+  ResolvedMessageGroup,
+  MergedAssistantRunCacheEntry
+>
+
 function isEmptyTurnItem(item: ThreadRenderItem): boolean {
   if (item.kind !== "turn") return false
   const g = item.group
@@ -277,18 +300,63 @@ function isEmptyTurnItem(item: ThreadRenderItem): boolean {
 }
 
 /**
+ * When a resolved group's ONLY meaningful content is a single context-compaction
+ * tool-call part, return that part's `_meta` (so the caller can hoist it to a
+ * standalone `"compaction"` divider item); otherwise `null`. Empty text parts are
+ * ignored so a bare compaction turn still qualifies. Scoped to assistant groups
+ * with no user resources/images. A compaction part always carries a truthy
+ * `_meta` (`contextCompaction === true`), so a non-null return is unambiguous.
+ */
+function compactionOnlyMeta(
+  group: ResolvedMessageGroup
+): Record<string, unknown> | null {
+  if (group.role !== "assistant") return null
+  if (group.resources.length > 0 || group.images.length > 0) return null
+  const meaningful = group.parts.filter(
+    (p) => !(p.type === "text" && p.text.trim().length === 0)
+  )
+  if (meaningful.length !== 1) return null
+  const only = meaningful[0]
+  if (only.type !== "tool-call" || !isContextCompactionMeta(only.meta)) {
+    return null
+  }
+  return only.meta ?? null
+}
+
+/**
  * Collapse runs of consecutive assistant turn render items into a single
  * synthetic turn so tool-groups straddling a turn boundary fold into one
  * collapsible. Empty (no-content) turn items are treated as transparent and
  * do not break the run — that handles cases where parsers leave empty
  * placeholder turns between tool exchanges.
+ *
+ * Exported for tests.
  */
-function mergeConsecutiveAssistantTurns(
-  items: ThreadRenderItem[]
+export function mergeConsecutiveAssistantTurns(
+  items: ThreadRenderItem[],
+  mergeCache?: MergedAssistantRunCache
 ): ThreadRenderItem[] {
   const result: ThreadRenderItem[] = []
   const skipped: ThreadRenderItem[] = []
   let buffer: AssistantTurnItem[] = []
+
+  // Push the cached merged item instead of rebuilding when the run's
+  // membership (group references + item keys) is unchanged since last render.
+  const reuseCachedMergedRun = (): boolean => {
+    if (!mergeCache) return false
+    const cached = mergeCache.get(buffer[0].group)
+    if (!cached || cached.memberGroups.length !== buffer.length) return false
+    for (let i = 0; i < buffer.length; i++) {
+      if (
+        buffer[i].group !== cached.memberGroups[i] ||
+        buffer[i].key !== cached.memberKeys[i]
+      ) {
+        return false
+      }
+    }
+    result.push(cached.item)
+    return true
+  }
 
   const flush = () => {
     if (buffer.length === 0) {
@@ -300,6 +368,8 @@ function mergeConsecutiveAssistantTurns(
 
     if (buffer.length === 1) {
       result.push(buffer[0])
+    } else if (reuseCachedMergedRun()) {
+      // Reused — nothing to rebuild.
     } else {
       const allParts = buffer.flatMap((it) => it.group.parts)
       // A goal run straddling these merged sub-turns is still live only if the
@@ -325,9 +395,18 @@ function mergeConsecutiveAssistantTurns(
       // agent loops, etc.) would visibly under-report tokens.
       let mergedUsage: import("@/lib/types").TurnUsage | null = null
       let mergedDuration: number | null = null
+      // Post-turn metadata may land on ANY sub-turn (Cursor's reparse patches
+      // the FIRST local sub-turn when the parser emits fewer turns than the
+      // live stream split into), so the merged completion time is the latest
+      // non-null across the run — not whatever the last sub-turn happens to
+      // carry.
+      let mergedCompletedAt: string | null = null
       const seenModels = new Set<string>()
       const mergedModels: string[] = []
       for (const it of buffer) {
+        if (it.group.completed_at) {
+          mergedCompletedAt = it.group.completed_at
+        }
         const u = it.group.usage
         if (u) {
           if (!mergedUsage) {
@@ -354,7 +433,7 @@ function mergeConsecutiveAssistantTurns(
         }
       }
 
-      result.push({
+      const merged: AssistantTurnItem = {
         ...last,
         key: `merged-${first.key}`,
         // Concatenate every sub-turn's raw turns so the artifacts card sees all
@@ -368,7 +447,14 @@ function mergeConsecutiveAssistantTurns(
           duration_ms: mergedDuration,
           model: mergedModels[0] ?? last.group.model,
           models: mergedModels.length > 1 ? mergedModels : undefined,
+          completed_at: mergedCompletedAt,
         },
+      }
+      result.push(merged)
+      mergeCache?.set(first.group, {
+        memberGroups: buffer.map((it) => it.group),
+        memberKeys: buffer.map((it) => it.key),
+        item: merged,
       })
     }
 
@@ -447,6 +533,29 @@ const UserMessageCopyButton = memo(function UserMessageCopyButton({
   )
 })
 
+const UserMessageTaskButton = memo(function UserMessageTaskButton({
+  parts,
+}: {
+  parts: AdaptedContentPart[]
+}) {
+  const t = useTranslations("Tasks")
+  const getText = useCallback(
+    () => unescapeComposerText(extractTextFromParts(parts)),
+    [parts]
+  )
+  const createTask = useCreateTaskFromMessage(getText)
+  return (
+    <MessageAction
+      tooltip={t("createFromMessage")}
+      className="opacity-0 group-hover/user-msg:opacity-100 transition-opacity self-end"
+      onClick={createTask}
+      size="icon-xs"
+    >
+      <ListTodo size={12} />
+    </MessageAction>
+  )
+})
+
 const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   group,
   dimmed = false,
@@ -474,9 +583,10 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
         ) : null}
         {group.role === "user" ? (
           <div className="group/user-msg flex w-fit ml-auto max-w-full items-start gap-1">
+            <UserMessageTaskButton parts={group.parts} />
             <UserMessageCopyButton parts={group.parts} />
             <MessageContent>
-              <ContentPartsRenderer parts={group.parts} role={group.role} />
+              <CollapsibleUserMessage parts={group.parts} />
             </MessageContent>
           </div>
         ) : (
@@ -554,7 +664,6 @@ export function MessageListView({
   connStatus,
   isActive = true,
   sendSignal = 0,
-  sessionStats = null,
   detailLoading = false,
   detailError = null,
   acpLoadError = null,
@@ -562,13 +671,10 @@ export function MessageListView({
   onReload,
   onNewSession,
   showMessageNav = true,
-  linkedTask = null,
-  projects = [],
-  activeProjectId = null,
+  userTurnHeader = null,
 }: MessageListViewProps) {
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
-  const tDecomp = useTranslations("Platform.task")
   // Subscribe to only this conversation's session + derived timeline. Another
   // conversation's streaming token no longer re-renders this view; the timeline
   // selector returns a reference-stable array (memoized per session object) so
@@ -580,84 +686,14 @@ export function MessageListView({
   const timelineTurns = useConversationRuntimeStore((s) =>
     selectTimelineTurns(s, conversationId)
   )
-
-  // Decomposition detection: scan assistant messages for sub-task proposals.
-  // Use timelineTurns (which merges DB history + local + streaming) instead
-  // of session.localTurns, so detection works after reopening a conversation
-  // (where turns are loaded from DB, not in localTurns).
-  // IMPORTANT: timelineTurns is ConversationTimelineTurn[] (wrapper with
-  // .turn/.phase/.key). The detector hook expects raw MessageTurn[], so we
-  // must extract .turn from each item. Memoize to avoid recreating the array
-  // on every render (which would bust the detector's useMemo dep).
-  const decompTurns = useMemo(
+  // Project the timeline turns to plain MessageTurn[] so the platform
+  // decomposition bridge can scan them for proposal fences without touching
+  // the runtime store contract. Memoized so the bridge's detector hook sees
+  // a stable reference across renders.
+  const localTurns = useMemo(
     () => timelineTurns.map((item) => item.turn),
     [timelineTurns]
   )
-  const {
-    proposedSubTasks: decompSubTasks,
-    detectedSubTasks: decompDetected,
-    isDismissed: decompDismissed,
-    isConfirmed: decompConfirmed,
-    viewingConfirmed: decompViewingConfirmed,
-    confirmProposal: confirmDecomp,
-    dismissProposal: dismissDecomp,
-    reopenProposal: reopenDecomp,
-    viewConfirmedProposal: viewDecompConfirmed,
-    closeConfirmedView: closeDecompConfirmedView,
-    updateSubTasks: updateDecompSubTasks,
-  } = useDecompositionDetector(decompTurns, conversationId)
-
-  const [decompSubmitting, setDecompSubmitting] = useState(false)
-
-  // Handler for confirming decomposition: batch-create sub-tasks
-  const handleDecompConfirm = useCallback(
-    async (params: {
-      projectId: number
-      parentTaskId: number | null
-      subTasks: import("@/lib/platform/decomposition-parser").ProposedSubTask[]
-    }) => {
-      setDecompSubmitting(true)
-      try {
-        // Store decomposition record for audit
-        if (params.parentTaskId) {
-          await createDecomposition({
-            sourceTaskId: params.parentTaskId,
-            aiGenerated: true,
-            decompositionJson: JSON.stringify(params.subTasks),
-          })
-        }
-        // Create each sub-task
-        for (const sub of params.subTasks) {
-          await createTask({
-            projectId: params.projectId,
-            parentTaskId: params.parentTaskId ?? null,
-            title: sub.title,
-            taskType: sub.taskType,
-            description: sub.description || undefined,
-            priority: sub.priority,
-          })
-        }
-        confirmDecomp()
-        toast.success(
-          tDecomp("decompositionApplied", { count: params.subTasks.length })
-        )
-      } catch (err) {
-        console.error("Failed to create sub-tasks:", err)
-        toast.error(tDecomp("decompositionFailed"))
-      } finally {
-        setDecompSubmitting(false)
-      }
-    },
-    [confirmDecomp, tDecomp]
-  )
-
-  const { setSessionStats } = useSessionStats()
-
-  useEffect(() => {
-    if (isActive) {
-      setSessionStats(sessionStats)
-    }
-  }, [isActive, sessionStats, setSessionStats])
 
   const shouldUseSmoothResize = !(
     isActive &&
@@ -685,6 +721,12 @@ export function MessageListView({
   // `ResolvedMessageGroup`, so `HistoricalMessageGroup`'s `memo` can short-
   // circuit on prop reference equality.
   const [groupCache] = useState<WeakMap<AdaptedMessage, ResolvedMessageGroup>>(
+    () => new WeakMap()
+  )
+
+  // Reuses merged multi-sub-turn assistant items across streaming-batch
+  // re-renders — see MergedAssistantRunCacheEntry for the validity contract.
+  const [mergedRunCache] = useState<MergedAssistantRunCache>(
     () => new WeakMap()
   )
 
@@ -734,12 +776,20 @@ export function MessageListView({
         }
         groupCache.set(msg, group)
       }
+      // Include phase so a turn that briefly coexists across phases (e.g.
+      // a streaming turn that has just been promoted to localTurns while the
+      // liveMessage is still attached) doesn't collide with itself in the
+      // virtualized list. Index disambiguates further within a phase.
+      const key = `${phase}-${msg.id}-${i}`
+      // Hoist a compaction-only turn to its own standalone divider item so it
+      // renders BETWEEN turns instead of being merged into (and wedged inside)
+      // the preceding assistant reply by `mergeConsecutiveAssistantTurns`.
+      const compactionMeta = compactionOnlyMeta(group)
+      if (compactionMeta !== null) {
+        return { key, kind: "compaction" as const, meta: compactionMeta }
+      }
       return {
-        // Include phase so a turn that briefly coexists across phases (e.g.
-        // a streaming turn that has just been promoted to localTurns while the
-        // liveMessage is still attached) doesn't collide with itself in the
-        // virtualized list. Index disambiguates further within a phase.
-        key: `${phase}-${msg.id}-${i}`,
+        key,
         kind: "turn" as const,
         group,
         phase,
@@ -752,7 +802,7 @@ export function MessageListView({
 
     // Collapse consecutive assistant turn render items into a single rendered
     // turn, so tool-groups straddling a turn boundary fold into one collapsible.
-    const items = mergeConsecutiveAssistantTurns(rawItems)
+    const items = mergeConsecutiveAssistantTurns(rawItems, mergedRunCache)
 
     // Compute showStats, isRoleTransition, and previousUserIndex for each turn.
     // previousUserIndex points at the closest preceding user turn (used by the
@@ -761,6 +811,12 @@ export function MessageListView({
     for (let idx = 0; idx < items.length; idx++) {
       const item = items[idx]
       if (item.kind !== "turn") continue
+
+      // Reset before recomputing: a cached merged item carries last render's
+      // values and the conditions below only ever assign `true`.
+      item.showStats = false
+      item.isRoleTransition = false
+      item.previousUserIndex = null
 
       // isRoleTransition: role differs from previous turn item
       if (idx > 0) {
@@ -800,6 +856,7 @@ export function MessageListView({
     timelineTurns,
     turnAdapter,
     groupCache,
+    mergedRunCache,
   ])
 
   const historicalPlanEntries = useMemo(
@@ -811,29 +868,52 @@ export function MessageListView({
     [historicalPlanEntries]
   )
 
-  const renderThreadItem = useCallback((item: ThreadRenderItem) => {
-    switch (item.kind) {
-      case "turn": {
-        const pt = item.isRoleTransition ? 16 : 0
-        return (
-          <div style={pt > 0 ? { paddingTop: pt } : undefined}>
-            <HistoricalMessageGroup
-              group={item.group}
-              dimmed={item.phase === "optimistic"}
-              showStats={item.showStats}
-              previousUserIndex={item.previousUserIndex}
-              isResponseComplete={item.phase === "persisted"}
-              sourceTurns={item.sourceTurns}
-            />
-          </div>
-        )
+  const renderThreadItem = useCallback(
+    (item: ThreadRenderItem) => {
+      switch (item.kind) {
+        case "turn": {
+          const pt = item.isRoleTransition ? 16 : 0
+          const phaseLabel =
+            item.group.role === "user" && userTurnHeader
+              ? userTurnHeader(item.group)
+              : null
+          return (
+            <div style={pt > 0 ? { paddingTop: pt } : undefined}>
+              {phaseLabel ? (
+                <div className="flex items-center gap-2 px-1 pb-3 pt-1">
+                  <span aria-hidden="true" className="h-px flex-1 bg-border" />
+                  <span className="shrink-0 rounded-full border border-border bg-muted/50 px-2 py-0.5 text-[0.625rem] font-medium leading-none text-muted-foreground">
+                    {phaseLabel}
+                  </span>
+                  <span aria-hidden="true" className="h-px flex-1 bg-border" />
+                </div>
+              ) : null}
+              <HistoricalMessageGroup
+                group={item.group}
+                dimmed={item.phase === "optimistic"}
+                showStats={item.showStats}
+                previousUserIndex={item.previousUserIndex}
+                isResponseComplete={item.phase === "persisted"}
+                sourceTurns={item.sourceTurns}
+              />
+            </div>
+          )
+        }
+        case "typing":
+          return <PendingTypingIndicator />
+        case "compaction":
+          // Chrome-less centered divider between turns (no avatar / stats footer).
+          return (
+            <div className="px-1 py-2">
+              <ContextCompactionCard meta={item.meta} />
+            </div>
+          )
+        default:
+          return null
       }
-      case "typing":
-        return <PendingTypingIndicator />
-      default:
-        return null
-    }
-  }, [])
+    },
+    [userTurnHeader]
+  )
 
   const emptyState = useMemo(
     () =>
@@ -948,41 +1028,6 @@ export function MessageListView({
 
   const hasRenderableContent = threadItems.length > 0 || Boolean(liveMessage)
 
-  // ── Decomposition overlay context value ──
-  // Provides status/action for the latest decomposition card in the message stream.
-  // Must be computed before the error/loading early returns so React hooks stay
-  // in consistent order across renders.
-  const decompOverlayStatus: DecompositionOverlayStatus = decompViewingConfirmed
-    ? "open"
-    : decompConfirmed
-      ? "confirmed"
-      : decompDismissed
-        ? "dismissed"
-        : decompSubTasks && decompSubTasks.length > 0
-          ? "open"
-          : "none"
-
-  const decompCurrentProposalKey = proposalKey(decompDetected)
-
-  const decompOnOpenOverlay = decompConfirmed
-    ? viewDecompConfirmed
-    : reopenDecomp
-
-  const decompOverlayCtxValue = useMemo(
-    () => ({
-      currentProposalKey: decompCurrentProposalKey,
-      overlayStatus: decompOverlayStatus,
-      onOpenOverlay: decompOnOpenOverlay,
-      confirmedCount: decompDetected?.length ?? 0,
-    }),
-    [
-      decompCurrentProposalKey,
-      decompOverlayStatus,
-      decompOnOpenOverlay,
-      decompDetected,
-    ]
-  )
-
   if (detailLoading && !hasRenderableContent) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -999,7 +1044,6 @@ export function MessageListView({
   // the history would mislead the user into thinking a follow-up message
   // would extend the same thread.
   const blockingLoadError = acpLoadError ?? null
-
   const fallbackLoadError =
     detailError && !hasRenderableContent ? detailError : null
   const renderedLoadError = blockingLoadError ?? fallbackLoadError
@@ -1053,30 +1097,33 @@ export function MessageListView({
   }
 
   return (
-    <DecompositionOverlayContextProvider value={decompOverlayCtxValue}>
+    <PlatformDecompositionBridge
+      conversationId={conversationId}
+      localTurns={localTurns}
+    >
       <div className="relative flex h-full min-h-0 flex-col">
-        <MessageThread
-          className="flex-1 min-h-0"
-          resize={shouldUseSmoothResize ? "smooth" : undefined}
-        >
-          <AutoScrollOnSend signal={sendSignal} />
-          <VirtualizedMessageThread
-            items={threadItems}
-            getItemKey={getThreadItemKey}
-            renderItem={renderThreadItem}
-            emptyState={emptyState}
-            scrollApiRef={scrollApiRef}
-          />
-          <MessageThreadScrollButton />
-        </MessageThread>
-        {liveMessage && connStatus === "prompting" && (
-          <LiveTurnStats
-            message={liveMessage}
-            agentType={agentType}
-            isStreaming={connStatus === "prompting"}
-          />
-        )}
-        {/* Shared overlay stack pinned to the inline-start edge (top-left in LTR,
+      <MessageThread
+        className="flex-1 min-h-0"
+        resize={shouldUseSmoothResize ? "smooth" : undefined}
+      >
+        <AutoScrollOnSend signal={sendSignal} />
+        <VirtualizedMessageThread
+          items={threadItems}
+          getItemKey={getThreadItemKey}
+          renderItem={renderThreadItem}
+          emptyState={emptyState}
+          scrollApiRef={scrollApiRef}
+        />
+        <MessageThreadScrollButton />
+      </MessageThread>
+      {liveMessage && connStatus === "prompting" && (
+        <LiveTurnStats
+          message={liveMessage}
+          agentType={agentType}
+          isStreaming={connStatus === "prompting"}
+        />
+      )}
+      {/* Shared overlay stack pinned to the inline-start edge (top-left in LTR,
           top-right in RTL). A flex column keeps the order stable regardless of
           each panel's expand/collapse height: the message navigator first, then
           the plan panel, then the sub-agent panel. Empty panels render null and
@@ -1085,56 +1132,31 @@ export function MessageListView({
           edge), rounded on the end side — that expand toward the inline-end on
           hover. Logical `start-0` + `items-start` keep the anchor and the bullet
           on the same side, so the whole stack mirrors cleanly in RTL. */}
-        <div className="pointer-events-none absolute start-0 top-4 z-20 flex max-w-[min(22rem,calc(100%-2rem))] flex-col items-start gap-2">
-          {showMessageNav && userMessageCount > 0 && (
-            <ConversationMessageNav
-              count={userMessageCount}
-              expanded={navExpanded}
-              onToggle={setNavExpanded}
-              entries={navEntries}
-              scrollApiRef={scrollApiRef}
-            />
-          )}
-          <AgentPlanOverlay
-            key={agentPlanOverlayKey}
-            message={liveMessage ?? null}
-            entries={historicalPlanEntries}
-            planKey={historicalPlanKey}
-            defaultExpanded={false}
-            isStreaming={connStatus === "prompting"}
+      <div className="pointer-events-none absolute start-0 top-4 z-20 flex max-w-[min(22rem,calc(100%-2rem))] flex-col items-start gap-2">
+        {showMessageNav && userMessageCount > 0 && (
+          <ConversationMessageNav
+            count={userMessageCount}
+            expanded={navExpanded}
+            onToggle={setNavExpanded}
+            entries={navEntries}
+            scrollApiRef={scrollApiRef}
           />
-          <SubAgentOverlay
-            key={subAgentOverlayKey}
-            delegations={lastAssistantDelegations}
-            overlayKey={subAgentOverlayKey}
-          />
-        </div>
-        {/* Decomposition review dialog — rendered as a Dialog (not in the
-          narrow overlay stack) so it centers properly, matches conversation
-          width, and has a scrollable content area with fixed footer. */}
-        <DecompositionOverlay
-          open={
-            (decompSubTasks !== null &&
-              decompSubTasks.length > 0 &&
-              !decompConfirmed) ||
-            decompViewingConfirmed
-          }
-          onOpenChange={(open) => {
-            if (!open) {
-              if (decompViewingConfirmed) closeDecompConfirmedView()
-              else dismissDecomp()
-            }
-          }}
-          proposedSubTasks={decompSubTasks ?? []}
-          linkedTask={linkedTask ?? null}
-          projects={projects}
-          activeProjectId={activeProjectId ?? null}
-          submitting={decompSubmitting}
-          readOnly={decompViewingConfirmed}
-          onUpdateSubTasks={updateDecompSubTasks}
-          onConfirm={handleDecompConfirm}
+        )}
+        <AgentPlanOverlay
+          key={agentPlanOverlayKey}
+          message={liveMessage ?? null}
+          entries={historicalPlanEntries}
+          planKey={historicalPlanKey}
+          defaultExpanded={false}
+          isStreaming={connStatus === "prompting"}
+        />
+        <SubAgentOverlay
+          key={subAgentOverlayKey}
+          delegations={lastAssistantDelegations}
+          overlayKey={subAgentOverlayKey}
         />
       </div>
-    </DecompositionOverlayContextProvider>
+    </div>
+    </PlatformDecompositionBridge>
   )
 }

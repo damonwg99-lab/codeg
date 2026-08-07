@@ -8,14 +8,17 @@ use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 
 use crate::acp::binary_cache;
+use crate::acp::custom_registry;
 use crate::acp::error::AcpError;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::opencode_plugins::{self, PluginCheckSummary};
 use crate::acp::preflight::{self, PreflightResult};
 use crate::acp::registry;
 use crate::acp::types::{
-    AcpAgentInfo, AgentSkillContent, AgentSkillItem, AgentSkillLayout, AgentSkillLocation,
-    AgentSkillScope, AgentSkillsListResult, ConfigStaleKind, ConnectionStatus, GrokSettings,
+    AcpAgentInfo, AgentDiagnosticsReport, AgentSkillContent, AgentSkillItem, AgentSkillLayout,
+    AgentSkillLocation, AgentSkillScope, AgentSkillsListResult, CodexGranularApproval,
+    CodexSandboxSettings, CodexSandboxStructuredConfig, CodexWorkspaceWrite, ConfigStaleKind,
+    ConnectionStatus, DiagCheck, DiagLevel, DiagSection, DiagnosticsVerdict, GrokSettings,
     GrokStructuredConfig,
 };
 #[cfg(feature = "tauri-runtime")]
@@ -38,7 +41,7 @@ struct AcpAgentsUpdatedEventPayload {
     agent_type: Option<AgentType>,
 }
 
-fn emit_acp_agents_updated(
+pub(crate) fn emit_acp_agents_updated(
     emitter: &EventEmitter,
     reason: &'static str,
     agent_type: Option<AgentType>,
@@ -198,6 +201,54 @@ pub(crate) fn resolve_command_on_path(cmd: &str) -> Option<PathBuf> {
     which::which(cmd).ok()
 }
 
+/// Resolve a binary agent's user-installed CLI (e.g. `cursor-agent` from
+/// Cursor's official install script, a brew `opencode`, or a custom agent's
+/// own tool). Every binary agent may fall back to this when nothing is
+/// cached — the managed cache always wins, the system CLI only fills the
+/// gap, mirroring how npx agents already prefer a PATH install at launch.
+/// Checks PATH first, then `~/.local/bin` — a common install-script target
+/// a macOS GUI app's PATH typically lacks.
+pub(crate) fn resolve_system_agent_binary(cmd: &str) -> Option<PathBuf> {
+    if let Some(path) = resolve_command_on_path(cmd) {
+        return Some(path);
+    }
+    let exe = if cfg!(windows) {
+        format!("{cmd}.exe")
+    } else {
+        cmd.to_string()
+    };
+    let cand = home_dir_or_default().join(".local").join("bin").join(exe);
+    cand.is_file().then_some(cand)
+}
+
+/// Resolve the VENDOR CLI wrapped by an ACP adapter agent (`claude`, `codex`
+/// — see [`registry::acp_adapter_relation`]). codeg never launches this: it is
+/// probed purely so preflight/diagnostics can say "we found your own CLI, but
+/// it doesn't speak ACP" instead of a bare "not installed".
+///
+/// Widest resolution of the three probes, because a false negative here loses
+/// the most convincing evidence: PATH + the npm global prefix (the GUI-PATH-gap
+/// fallback `resolve_npx_command` already implements), then `~/.local/bin` via
+/// [`resolve_system_agent_binary`], then the vendor installers' own dirs.
+pub(crate) async fn resolve_vendor_cli(cmd: &str, extra_dirs: &[&str]) -> Option<PathBuf> {
+    if let Some(path) = resolve_npx_command(cmd).await {
+        return Some(path);
+    }
+    if let Some(path) = resolve_system_agent_binary(cmd) {
+        return Some(path);
+    }
+    let exe = if cfg!(windows) {
+        format!("{cmd}.exe")
+    } else {
+        cmd.to_string()
+    };
+    let home = home_dir_or_default();
+    extra_dirs.iter().find_map(|dir| {
+        let cand = home.join(dir).join(&exe);
+        cand.is_file().then_some(cand)
+    })
+}
+
 /// Resolve the `uvx` (uv tool runner) executable used to launch Python ACP
 /// agents (e.g. Hermes). Checks PATH first (respecting a user's own `uv`),
 /// then codeg's managed uv cache, then the common install locations the
@@ -347,7 +398,7 @@ async fn resolve_npx_command_from_current_npm_prefix(cmd: &str) -> Option<PathBu
     resolve_npx_command_from_npm_prefix(cmd, &prefix)
 }
 
-async fn cached_npm_global_prefix() -> Option<PathBuf> {
+pub(crate) async fn cached_npm_global_prefix() -> Option<PathBuf> {
     cached_npm_global_prefix_with(&NPM_GLOBAL_PREFIX_CACHE, resolve_current_npm_global_prefix).await
 }
 
@@ -471,8 +522,12 @@ pub(crate) async fn verify_agent_installed(agent_type: AgentType) -> Result<(), 
             }
             // Accept any cached version — the Settings page will still
             // surface "upgrade available" for stale caches via its own
-            // version-badge flow.
-            if binary_cache::find_best_cached_binary_for_agent(agent_type, cmd)?.is_none() {
+            // version-badge flow. A user-installed CLI also counts, the same
+            // fallback `build_agent` launches with.
+            let launchable = binary_cache::find_best_cached_binary_for_agent(agent_type, cmd)?
+                .is_some()
+                || resolve_system_agent_binary(cmd).is_some();
+            if !launchable {
                 // INVARIANT: see note above — "is not installed" is a
                 // stable substring the frontend matches against.
                 return Err(AcpError::SdkNotInstalled(format!(
@@ -505,7 +560,10 @@ pub(crate) async fn verify_agent_installed(agent_type: AgentType) -> Result<(), 
 /// Checks both the system global prefix and the user-local prefix
 /// (`~/.codeg/npm-global/`) so packages installed via the EACCES fallback are
 /// found as well.
-async fn detect_npm_global_version(package_name: &str) -> Option<String> {
+///
+/// `pub(crate)` so env diagnostics can report the installed version it sees
+/// (which covers both prefixes, unlike the connect-gate `resolve_npx_command`).
+pub(crate) async fn detect_npm_global_version(package_name: &str) -> Option<String> {
     let npm_path = which::which("npm").ok()?;
 
     // Try the default global prefix first.
@@ -539,6 +597,10 @@ async fn npm_list_version(
     if let Some(p) = prefix {
         cmd.arg(format!("--prefix={}", p.display()));
     }
+    // `kill_on_drop` so a caller that bounds this with `tokio::time::timeout`
+    // (e.g. env diagnostics) actually terminates a hung `npm list` child rather
+    // than orphaning it. No effect on the normal path, which awaits to completion.
+    cmd.kill_on_drop(true);
     let output = cmd.output().await.ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: serde_json::Value = serde_json::from_str(&stdout).ok()?;
@@ -554,20 +616,1450 @@ async fn detect_local_version(agent_type: AgentType) -> Option<String> {
     let meta = registry::get_agent_meta(agent_type);
     match meta.distribution {
         registry::AgentDistribution::Npx { cmd, package, .. } => {
-            if !is_cmd_available(cmd).await {
-                return None;
-            }
+            let resolved = resolve_npx_command(cmd).await?;
             // Try `npm list -g <package_name> --json` to get the real installed version.
             let pkg_name = package_name_from_spec(package);
-            detect_npm_global_version(&pkg_name).await
+            let mut version = detect_npm_global_version(&pkg_name).await;
+            // Same system-install probe the status/list paths run (covers
+            // installs npm can't see: bun/pnpm globals, brew, …), so this
+            // detection agrees with them (a disagreement here clears/flips
+            // the persisted version back and forth).
+            if version.is_none() {
+                version = system_probed_version(agent_type, &resolved, Some(package)).await;
+            }
+            version
         }
-        registry::AgentDistribution::Binary { cmd, .. } => {
-            binary_cache::detect_installed_version(agent_type, cmd)
+        registry::AgentDistribution::Binary { cmd, dir_entry, .. } => {
+            let cached = binary_cache::detect_installed_version(agent_type, cmd)
                 .ok()
-                .flatten()
+                .flatten();
+            if cached.is_some() {
+                return cached;
+            }
+            // A user-installed CLI (no codeg cache) still reports a version
+            // via `<cmd> --version` (e.g. cursor-agent → "2026.07.20-8cc9c0b").
+            // Mirrors the status/list paths — missing a fallback here would
+            // CLEAR the persisted system version below and the next list
+            // would write it back, churning events forever.
+            if dir_entry.is_some() {
+                return system_dir_agent_version(cmd).await;
+            }
+            let bin = resolve_system_agent_binary(cmd)?;
+            system_probed_version(agent_type, &bin, None).await
         }
-        registry::AgentDistribution::Uvx { .. } => binary_cache::uvx_prepared_version(agent_type),
+        registry::AgentDistribution::Uvx {
+            cmd, system_cmd, ..
+        } => {
+            let mut version = binary_cache::uvx_prepared_version(agent_type);
+            // No prepared marker: probe the package's console script on PATH,
+            // then the system-fallback command a launch would actually use
+            // (Hermes: `hermes-acp` from the uvx package vs a pipx `hermes`).
+            if version.is_none() {
+                let bin = resolve_command_on_path(cmd)
+                    .or_else(|| system_cmd.and_then(|(c, _)| resolve_command_on_path(c)));
+                if let Some(bin) = bin {
+                    version = system_probed_version(agent_type, &bin, None).await;
+                }
+            }
+            version
+        }
     }
+}
+
+// ============================================================================
+// Environment diagnostics (`acp_env_diagnostics`)
+//
+// Runs a set of READ-ONLY probes IN THE APP PROCESS (so they reflect the PATH
+// the GUI app actually sees — which differs from the user's terminal PATH and
+// is the root of most "installed but shows not-installed" reports). Never
+// mutates PATH; never dumps arbitrary env (only a safe whitelist, redacted).
+// Split into an impure `collect_diag_inputs` and a pure `build_report` so the
+// verdict heuristic and rendering are unit-testable without shelling out.
+// ============================================================================
+
+/// Per-probe timeout for the external commands diagnostics runs.
+const DIAG_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Env var keys whose *values* are safe to surface in a copyable report. Chosen
+/// so none carry credentials; still run through [`redact_secret`] defensively.
+const DIAG_SAFE_ENV_KEYS: &[&str] = &[
+    "SHELL",
+    "NVM_DIR",
+    "FNM_DIR",
+    "FNM_MULTISHELL_PATH",
+    "VOLTA_HOME",
+    "ASDF_DATA_DIR",
+    "MISE_DATA_DIR",
+    "N_PREFIX",
+    "HOMEBREW_PREFIX",
+    "npm_config_prefix",
+    "LANG",
+];
+
+/// Mask a value that may contain a secret, keyed on the env var *name*. If the
+/// name looks credential-bearing the value is partially masked; otherwise it is
+/// returned verbatim. Multibyte-safe (masks by `char`, mirroring the approach in
+/// `models::model_provider::mask_api_key`) so it never panics on a UTF-8 value.
+fn redact_secret(key: &str, value: &str) -> String {
+    let lower = key.to_ascii_lowercase();
+    let secretish = ["key", "token", "secret", "password", "passwd", "auth", "credential"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    if !secretish {
+        return value.to_string();
+    }
+    let chars: Vec<char> = value.chars().collect();
+    let len = chars.len();
+    if len == 0 {
+        return String::new();
+    }
+    if len <= 8 {
+        return "•".repeat(len);
+    }
+    let first: String = chars[..2].iter().collect();
+    let last: String = chars[len - 2..].iter().collect();
+    format!("{first}{}{last}", "•".repeat(len.saturating_sub(4).min(16)))
+}
+
+/// npm places a package's bin as `<cmd>.cmd` on Windows, bare `<cmd>` elsewhere.
+fn diag_exe_name(cmd: &str) -> String {
+    if cfg!(windows) {
+        format!("{cmd}.cmd")
+    } else {
+        cmd.to_string()
+    }
+}
+
+#[derive(Default, Clone)]
+struct CmdProbe {
+    /// Absolute path `which` resolved to, if any (same resolution the connect
+    /// gate uses).
+    path: Option<String>,
+    /// First `--version`/`-v` output line, if the command ran.
+    version: Option<String>,
+}
+
+#[derive(Default, Clone)]
+struct AgentDiag {
+    name: String,
+    cmd: String,
+    distribution: &'static str,
+    package: Option<String>,
+    node_required: Option<String>,
+    /// Distribution-appropriate launchability, mirroring `verify_agent_installed`:
+    /// npx → `resolve_npx_command`; binary → cached/system binary; uvx →
+    /// `uvx_agent_launchable`. `None` = the agent cannot launch right now. This
+    /// (NOT `resolve_npx`) is what the verdict uses for non-npx agents, so a
+    /// working cached-binary / uvx agent is not misreported as node-missing.
+    launchable: Option<String>,
+    /// `resolve_npx_command(cmd)` — the resolution the new-session page gates on
+    /// (npx agents only; `None` for binary/uvx).
+    resolve_npx: Option<String>,
+    /// `<npm prefix -g>/bin/<cmd>` when it exists.
+    system_prefix_bin: Option<String>,
+    /// `~/.codeg/npm-global/bin/<cmd>` (EACCES fallback) when it exists.
+    user_prefix_bin: Option<String>,
+    /// Homebrew global bin (`/opt/homebrew/bin/<cmd>` etc.) when it exists (macOS).
+    homebrew_bin: Option<String>,
+    /// Version seen by `detect_npm_global_version` (covers BOTH prefixes).
+    detected_version: Option<String>,
+    /// `agent_setting.installed_version` recorded in the DB.
+    db_version: Option<String>,
+    /// Set only for ACP *adapter* agents (Claude Code, Codex): the vendor CLI
+    /// the user probably already installed, which codeg does NOT launch. See
+    /// [`registry::acp_adapter_relation`].
+    adapter: Option<AdapterProbe>,
+}
+
+/// The vendor CLI behind an adapter agent, probed so the report can say "we
+/// found your own `claude`, but codeg launches `claude-agent-acp`" instead of a
+/// bare "not installed" the user reads as plain wrong.
+#[derive(Default, Clone)]
+struct AdapterProbe {
+    /// e.g. "claude".
+    native_cmd: String,
+    /// Where the vendor CLI resolved, if anywhere.
+    native_path: Option<String>,
+    /// First `--version` line of the vendor CLI (bounded probe).
+    native_version: Option<String>,
+    /// Config dir shared by the vendor CLI and the adapter.
+    shared_config_dir: String,
+}
+
+#[derive(Default, Clone)]
+struct TerminalProbe {
+    /// The login-shell probe actually ran and produced output.
+    ran: bool,
+    /// Dirs in the login-shell PATH that are ABSENT from the app PATH — the
+    /// smoking gun for a GUI PATH gap.
+    extra_dirs: Vec<String>,
+    /// `command -v <cmd>` result in the login shell.
+    cmd_resolved: Option<String>,
+    /// Why the probe didn't run (Windows / no `$SHELL` / timeout).
+    note: Option<String>,
+}
+
+#[derive(Default, Clone)]
+struct DiagInputs {
+    os: String,
+    arch: String,
+    app_version: String,
+    app_path: Vec<String>,
+    path_logs: Vec<String>,
+    node: CmdProbe,
+    npm: CmdProbe,
+    npx: CmdProbe,
+    npm_prefix_g: Option<String>,
+    npm_prefix_g_ms: u128,
+    npm_root_g: Option<String>,
+    npm_config_prefix: Option<String>,
+    cached_prefix: Option<String>,
+    /// (candidate bin dir, whether it contains a `node` binary).
+    node_candidates: Vec<(String, bool)>,
+    selected_node_dir: Option<String>,
+    safe_env: Vec<(String, String)>,
+    agent: Option<AgentDiag>,
+    terminal: TerminalProbe,
+}
+
+/// Run a command with a timeout and return its first non-empty stdout line.
+async fn diag_run(program: &Path, args: &[&str]) -> Option<String> {
+    let mut cmd = crate::process::tokio_command(program);
+    cmd.args(args).kill_on_drop(true);
+    let out = tokio::time::timeout(DIAG_PROBE_TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().find_map(|l| {
+        let t = l.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    })
+}
+
+/// Resolve a command on the app PATH and probe its version.
+async fn diag_cmd_probe(cmd: &str, version_args: &[&str]) -> CmdProbe {
+    let path = resolve_command_on_path(cmd);
+    let version = match &path {
+        Some(p) => diag_run(p, version_args).await,
+        None => None,
+    };
+    CmdProbe {
+        path: path.map(|p| p.to_string_lossy().to_string()),
+        version,
+    }
+}
+
+/// Major version from `v20.11.1` / `20.11.1`.
+fn parse_node_major(v: &str) -> Option<u64> {
+    v.trim().trim_start_matches('v').split('.').next()?.parse().ok()
+}
+
+/// Compare the user's login-shell PATH against the app PATH. Unix-only; on
+/// Windows it returns a note (npm bins there are `.cmd` in the prefix root and a
+/// robust login-shell probe is out of scope for v1).
+#[cfg(not(windows))]
+async fn diag_terminal_probe(cmd: &str, app_path: &[String]) -> TerminalProbe {
+    let mut probe = TerminalProbe::default();
+    let shell = match std::env::var("SHELL") {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => {
+            probe.note = Some("$SHELL not set".to_string());
+            return probe;
+        }
+    };
+    // `cmd` is a static registry command name — no shell metacharacters.
+    let script =
+        format!("printf 'CODEG_PATH=%s\\n' \"$PATH\"; command -v {cmd} 2>/dev/null || true");
+    let mut c = crate::process::tokio_command(&shell);
+    c.arg("-lic").arg(&script).kill_on_drop(true);
+    let out = match tokio::time::timeout(DIAG_PROBE_TIMEOUT, c.output()).await {
+        Ok(Ok(o)) => o,
+        _ => {
+            probe.note = Some("login shell probe timed out or failed".to_string());
+            return probe;
+        }
+    };
+    probe.ran = true;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut term_path: Option<String> = None;
+    for line in stdout.lines() {
+        if let Some(p) = line.strip_prefix("CODEG_PATH=") {
+            term_path = Some(p.to_string());
+        } else if line.starts_with('/') && probe.cmd_resolved.is_none() {
+            probe.cmd_resolved = Some(line.trim().to_string());
+        }
+    }
+    if let Some(tp) = term_path {
+        let app_set: std::collections::HashSet<&str> = app_path.iter().map(String::as_str).collect();
+        let mut seen = std::collections::HashSet::new();
+        probe.extra_dirs = tp
+            .split(':')
+            .filter(|d| !d.is_empty() && !app_set.contains(*d))
+            .filter(|d| seen.insert(d.to_string()))
+            .map(String::from)
+            .collect();
+    }
+    probe
+}
+
+#[cfg(windows)]
+async fn diag_terminal_probe(_cmd: &str, _app_path: &[String]) -> TerminalProbe {
+    TerminalProbe {
+        note: Some("Windows: compare PATH manually in PowerShell".to_string()),
+        ..Default::default()
+    }
+}
+
+/// Per-agent resolution probes (the core signals for the not-installed symptom).
+async fn collect_agent_diag(
+    db: &AppDatabase,
+    agent_type: AgentType,
+    npm_prefix_g: Option<&str>,
+) -> AgentDiag {
+    let meta = registry::get_agent_meta(agent_type);
+
+    let db_version = agent_setting_service::get_by_agent_type(&db.conn, agent_type)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|m| m.installed_version);
+
+    let mut diag = AgentDiag {
+        name: meta.name.to_string(),
+        db_version,
+        ..Default::default()
+    };
+
+    // Each distribution resolves launchability differently — mirror the exact
+    // gates `verify_agent_installed` uses so the report agrees with connect.
+    match meta.distribution {
+        registry::AgentDistribution::Npx {
+            cmd,
+            package,
+            node_required,
+            ..
+        } => {
+            diag.cmd = cmd.to_string();
+            diag.distribution = "npx";
+            diag.package = Some(package.to_string());
+            diag.node_required = node_required.map(str::to_string);
+
+            let resolve_npx = resolve_npx_command(cmd)
+                .await
+                .map(|p| p.to_string_lossy().to_string());
+            diag.launchable = resolve_npx.clone();
+            diag.resolve_npx = resolve_npx;
+
+            diag.system_prefix_bin = npm_prefix_g.and_then(|p| {
+                let cand = npm_prefix_bin_dir(Path::new(p)).join(diag_exe_name(cmd));
+                cand.is_file().then(|| cand.to_string_lossy().to_string())
+            });
+            diag.user_prefix_bin = crate::process::user_npm_prefix().and_then(|prefix| {
+                let cand = npm_prefix_bin_dir(&prefix).join(diag_exe_name(cmd));
+                cand.is_file().then(|| cand.to_string_lossy().to_string())
+            });
+            diag.homebrew_bin = if cfg!(target_os = "macos") {
+                ["/opt/homebrew/bin", "/usr/local/bin"].iter().find_map(|d| {
+                    let cand = Path::new(d).join(diag_exe_name(cmd));
+                    cand.is_file().then(|| cand.to_string_lossy().to_string())
+                })
+            } else {
+                None
+            };
+            // `npm list` can hang on a stalled global prefix; bound it (the child
+            // is killed on drop via `npm_list_version`'s `kill_on_drop`).
+            diag.detected_version = tokio::time::timeout(
+                DIAG_PROBE_TIMEOUT,
+                detect_npm_global_version(&package_name_from_spec(package)),
+            )
+            .await
+            .ok()
+            .flatten();
+
+            // Adapter agents only: locate the vendor CLI the user installed
+            // themselves. Unlike preflight (path-only, runs on every Settings
+            // open) this report is on demand, so it can afford `--version` —
+            // naming the exact build is what makes "we DID see your CLI" land.
+            if let Some(relation) = registry::acp_adapter_relation(agent_type) {
+                let native_path = resolve_vendor_cli(relation.native_cmd, relation.extra_dirs).await;
+                let native_version = match &native_path {
+                    Some(p) => diag_run(p, &["--version"]).await,
+                    None => None,
+                };
+                diag.adapter = Some(AdapterProbe {
+                    native_cmd: relation.native_cmd.to_string(),
+                    native_path: native_path.map(|p| p.to_string_lossy().to_string()),
+                    native_version,
+                    shared_config_dir: relation.shared_config_dir.to_string(),
+                });
+            }
+        }
+        registry::AgentDistribution::Binary { cmd, platforms, .. } => {
+            diag.cmd = cmd.to_string();
+            diag.distribution = "binary";
+            // Mirror verify_agent_installed exactly: it first rejects unsupported
+            // platforms, then evaluates
+            // `find_best_cached_binary_for_agent(..)?.is_some() || system`. So
+            // an unsupported platform — and a cache-read *error* — both FAIL
+            // the gate (the latter propagated via `?`) rather than falling
+            // through to the system binary. Reflect both here so diagnostics
+            // never reports "ok" for a case where connect errors out.
+            let supported = platforms
+                .iter()
+                .any(|p| p.platform == registry::current_platform());
+            diag.launchable = if !supported {
+                None
+            } else {
+                match binary_cache::find_best_cached_binary_for_agent(agent_type, cmd) {
+                    Ok(Some((path, _version))) => Some(path),
+                    Ok(None) => resolve_system_agent_binary(cmd),
+                    Err(_) => None,
+                }
+                .map(|p| p.to_string_lossy().to_string())
+            };
+        }
+        registry::AgentDistribution::Uvx {
+            cmd,
+            package,
+            system_cmd,
+            ..
+        } => {
+            diag.cmd = cmd.to_string();
+            diag.distribution = "uvx";
+            diag.package = Some(package.to_string());
+            diag.launchable = uvx_agent_launchable(system_cmd).then(|| {
+                resolve_uvx_command()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| format!("{cmd} (system CLI on PATH)"))
+            });
+        }
+    }
+
+    diag
+}
+
+/// Gather all diagnostics signals (impure: runs commands / reads env, fs, DB).
+async fn collect_diag_inputs(db: &AppDatabase, agent_type: Option<AgentType>) -> DiagInputs {
+    let mut inp = DiagInputs {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        ..Default::default()
+    };
+
+    if let Some(path_os) = std::env::var_os("PATH") {
+        inp.app_path = std::env::split_paths(&path_os)
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+    }
+
+    inp.path_logs = crate::commands::logging::get_recent_logs_core(20, None, Some("[PATH]"))
+        .into_iter()
+        .map(|r| r.message)
+        .collect();
+
+    inp.node = diag_cmd_probe("node", &["-v"]).await;
+    inp.npm = diag_cmd_probe("npm", &["-v"]).await;
+    inp.npx = diag_cmd_probe("npx", &["-v"]).await;
+
+    if let Some(npm_path) = resolve_command_on_path("npm") {
+        let start = std::time::Instant::now();
+        inp.npm_prefix_g = diag_run(&npm_path, &["prefix", "-g"]).await;
+        inp.npm_prefix_g_ms = start.elapsed().as_millis();
+        inp.npm_root_g = diag_run(&npm_path, &["root", "-g"]).await;
+        inp.npm_config_prefix = diag_run(&npm_path, &["config", "get", "prefix"]).await;
+    }
+    inp.cached_prefix = cached_npm_global_prefix()
+        .await
+        .map(|p| p.to_string_lossy().to_string());
+
+    let home = home_dir_or_default();
+    let node_bin = if cfg!(windows) { "node.exe" } else { "node" };
+    for dir in crate::process::node_bin_dir_candidates(Some(home.as_path())) {
+        let has_node = dir.join(node_bin).is_file();
+        let dir_str = dir.to_string_lossy().to_string();
+        if has_node && inp.selected_node_dir.is_none() {
+            inp.selected_node_dir = Some(dir_str.clone());
+        }
+        inp.node_candidates.push((dir_str, has_node));
+    }
+
+    for &key in DIAG_SAFE_ENV_KEYS {
+        if let Ok(val) = std::env::var(key) {
+            if !val.trim().is_empty() {
+                inp.safe_env.push((key.to_string(), redact_secret(key, &val)));
+            }
+        }
+    }
+
+    if let Some(at) = agent_type {
+        let agent = collect_agent_diag(db, at, inp.npm_prefix_g.as_deref()).await;
+        inp.terminal = diag_terminal_probe(&agent.cmd, &inp.app_path).await;
+        inp.agent = Some(agent);
+    }
+
+    inp
+}
+
+fn diag_check(label: &str, value: &str, status: DiagLevel, hint: Option<&str>) -> DiagCheck {
+    DiagCheck {
+        label: label.to_string(),
+        value: value.to_string(),
+        status,
+        hint: hint.map(str::to_string),
+    }
+}
+
+fn diag_verdict(level: DiagLevel, code: &str, summary: &str) -> DiagnosticsVerdict {
+    DiagnosticsVerdict {
+        level,
+        code: code.to_string(),
+        summary: summary.to_string(),
+    }
+}
+
+/// Pure: derive the one-line "likely cause" from gathered inputs.
+fn compute_verdict(inp: &DiagInputs) -> DiagnosticsVerdict {
+    let agent = match &inp.agent {
+        None => {
+            // Base environment report — Node/npm health only.
+            if inp.node.path.is_none() {
+                return diag_verdict(
+                    DiagLevel::Fail,
+                    "node_missing",
+                    "Node.js was not found on the app's PATH.",
+                );
+            }
+            if inp.npm.path.is_none() {
+                return diag_verdict(
+                    DiagLevel::Fail,
+                    "npm_missing",
+                    "npm was not found on the app's PATH.",
+                );
+            }
+            return diag_verdict(
+                DiagLevel::Ok,
+                "ok",
+                "The base Node.js environment looks healthy.",
+            );
+        }
+        Some(a) => a,
+    };
+
+    // Binary/Uvx agents do not depend on Node/npm — judge them by their own
+    // launch gate so a working cached-binary / uvx agent is never misreported.
+    if agent.distribution != "npx" {
+        if agent.launchable.is_some() {
+            return diag_verdict(
+                DiagLevel::Ok,
+                "ok",
+                "The agent is launchable — the environment looks healthy.",
+            );
+        }
+        if agent.db_version.is_some() {
+            return diag_verdict(
+                DiagLevel::Fail,
+                "installed_but_unresolved",
+                "The agent is recorded as installed, but the app cannot locate its runtime.",
+            );
+        }
+        return diag_verdict(
+            DiagLevel::Info,
+            "not_installed",
+            "This agent does not appear to be installed.",
+        );
+    }
+
+    // NPX agents: Node/npm-aware heuristic.
+    if inp.node.path.is_none() {
+        return diag_verdict(
+            DiagLevel::Fail,
+            "node_missing",
+            "Node.js was not found on the app's PATH.",
+        );
+    }
+    if inp.npm.path.is_none() {
+        return diag_verdict(
+            DiagLevel::Fail,
+            "npm_missing",
+            "npm was not found on the app's PATH.",
+        );
+    }
+
+    if let (Some(req), Some(ver)) = (agent.node_required.as_deref(), inp.node.version.as_deref()) {
+        if let (Some(rmaj), Some(nmaj)) = (parse_node_major(req), parse_node_major(ver)) {
+            if nmaj < rmaj {
+                return diag_verdict(
+                    DiagLevel::Fail,
+                    "node_too_old",
+                    "The active Node.js is older than this agent requires.",
+                );
+            }
+        }
+    }
+
+    if agent.resolve_npx.is_none() {
+        // An ACP adapter agent that was never installed is the single most
+        // reported "bug": the user has the vendor CLI and reads "not installed"
+        // as codeg failing to see it. Answer the question they're actually
+        // asking, before the generic not-installed verdict. Node problems above
+        // still win — those block the adapter install itself.
+        if let Some(adapter) = &agent.adapter {
+            if agent.db_version.is_none() && agent.detected_version.is_none() {
+                return if adapter.native_path.is_some() {
+                    diag_verdict(
+                        DiagLevel::Info,
+                        "adapter_missing_native_present",
+                        "Your own vendor CLI is installed, but codeg launches a separate ACP adapter, which is not.",
+                    )
+                } else {
+                    diag_verdict(
+                        DiagLevel::Info,
+                        "adapter_missing",
+                        "codeg launches a separate ACP adapter for this agent, which is not installed.",
+                    )
+                };
+            }
+        }
+        if agent.db_version.is_some() || agent.detected_version.is_some() {
+            if agent.user_prefix_bin.is_some() {
+                return diag_verdict(
+                    DiagLevel::Fail,
+                    "user_prefix_not_on_path",
+                    "Installed into the EACCES fallback prefix (~/.codeg/npm-global), which is not on the app's PATH.",
+                );
+            }
+            if agent.homebrew_bin.is_some() {
+                return diag_verdict(
+                    DiagLevel::Fail,
+                    "homebrew_bin_not_on_path",
+                    "Installed under Homebrew's bin, which is not on the app's PATH (Apple Silicon keg split).",
+                );
+            }
+            if inp.terminal.cmd_resolved.is_some() {
+                return diag_verdict(
+                    DiagLevel::Fail,
+                    "terminal_only_path",
+                    "The command resolves in your terminal but not in the app process — a GUI PATH gap.",
+                );
+            }
+            if inp.npm_prefix_g_ms > NPM_PREFIX_TIMEOUT.as_millis() {
+                return diag_verdict(
+                    DiagLevel::Warn,
+                    "npm_prefix_timeout",
+                    "`npm prefix -g` exceeded the 1.5s probe timeout, so fallback resolution was skipped.",
+                );
+            }
+            return diag_verdict(
+                DiagLevel::Fail,
+                "installed_but_unresolved",
+                "The agent is recorded as installed, but the app cannot locate its executable.",
+            );
+        }
+        return diag_verdict(
+            DiagLevel::Info,
+            "not_installed",
+            "This agent does not appear to be installed.",
+        );
+    }
+
+    diag_verdict(
+        DiagLevel::Ok,
+        "ok",
+        "The agent's command resolves — the environment looks healthy.",
+    )
+}
+
+/// Pure: turn gathered inputs into the structured sections + a copyable text
+/// blob. `generated_at` is injected so the output is deterministic in tests.
+fn build_report(
+    inp: &DiagInputs,
+    generated_at: String,
+    agent_type: Option<AgentType>,
+) -> AgentDiagnosticsReport {
+    let verdict = compute_verdict(inp);
+    let mut sections: Vec<DiagSection> = Vec::new();
+
+    // 1. Runtime
+    let mut runtime = vec![
+        diag_check("os / arch", &format!("{} / {}", inp.os, inp.arch), DiagLevel::Info, None),
+        diag_check("app version", &inp.app_version, DiagLevel::Info, None),
+    ];
+    let fix_failed = inp.path_logs.iter().any(|l| l.contains("fix_path_env failed"));
+    runtime.push(diag_check(
+        "fix_path_env",
+        if fix_failed { "failed at startup" } else { "no failure logged" },
+        if fix_failed { DiagLevel::Warn } else { DiagLevel::Info },
+        Some("app imports the login-shell PATH at startup; a failure leaves a narrow GUI PATH"),
+    ));
+    for (k, v) in &inp.safe_env {
+        runtime.push(diag_check(k, v, DiagLevel::Info, None));
+    }
+    runtime.push(diag_check(
+        "PATH",
+        &format!("{} entries (full list in copied text)", inp.app_path.len()),
+        DiagLevel::Info,
+        None,
+    ));
+    sections.push(DiagSection { title: "Runtime".to_string(), checks: runtime });
+
+    // 2. Node / npm / npx
+    let node_status = |p: &CmdProbe| if p.path.is_some() { DiagLevel::Ok } else { DiagLevel::Fail };
+    let cmd_value = |p: &CmdProbe| match (&p.path, &p.version) {
+        (Some(path), Some(ver)) => format!("{ver}  ({path})"),
+        (Some(path), None) => path.clone(),
+        _ => "NOT FOUND".to_string(),
+    };
+    sections.push(DiagSection {
+        title: "Node / npm".to_string(),
+        checks: vec![
+            diag_check("node", &cmd_value(&inp.node), node_status(&inp.node), None),
+            diag_check("npm", &cmd_value(&inp.npm), node_status(&inp.npm), None),
+            diag_check("npx", &cmd_value(&inp.npx), node_status(&inp.npx), None),
+        ],
+    });
+
+    // 3. npm global prefix
+    let prefix_slow = inp.npm_prefix_g_ms > NPM_PREFIX_TIMEOUT.as_millis();
+    sections.push(DiagSection {
+        title: "npm global prefix".to_string(),
+        checks: vec![
+            diag_check(
+                "npm prefix -g",
+                &format!(
+                    "{}  ({} ms)",
+                    inp.npm_prefix_g.as_deref().unwrap_or("N/A"),
+                    inp.npm_prefix_g_ms
+                ),
+                if prefix_slow { DiagLevel::Warn } else { DiagLevel::Info },
+                prefix_slow.then_some("exceeds the 1.5s gate used at detection time"),
+            ),
+            diag_check("npm root -g", inp.npm_root_g.as_deref().unwrap_or("N/A"), DiagLevel::Info, None),
+            diag_check(
+                "npm config get prefix",
+                inp.npm_config_prefix.as_deref().unwrap_or("N/A"),
+                DiagLevel::Info,
+                None,
+            ),
+            diag_check("cached prefix", inp.cached_prefix.as_deref().unwrap_or("N/A"), DiagLevel::Info, None),
+        ],
+    });
+
+    // 4. Target agent — launchability keyed to its distribution.
+    if let Some(a) = &inp.agent {
+        let launch_label = match a.distribution {
+            "npx" => format!("{} (resolve_npx_command)", a.cmd),
+            "binary" => format!("{} (cached / system binary)", a.cmd),
+            _ => format!("{} (uvx launchable)", a.cmd),
+        };
+        let mut checks = vec![diag_check(
+            &launch_label,
+            a.launchable.as_deref().unwrap_or("NOT RESOLVED"),
+            if a.launchable.is_some() { DiagLevel::Ok } else { DiagLevel::Fail },
+            (a.distribution == "npx").then_some("this is exactly what the new-session page checks"),
+        )];
+        if let Some(p) = &a.package {
+            checks.push(diag_check("package", p, DiagLevel::Info, None));
+        }
+        // npm-prefix detail only applies to npx agents.
+        if a.distribution == "npx" {
+            checks.push(diag_check(
+                "<npm prefix -g>/bin/<cmd>",
+                a.system_prefix_bin.as_deref().unwrap_or("absent"),
+                if a.system_prefix_bin.is_some() { DiagLevel::Ok } else { DiagLevel::Info },
+                None,
+            ));
+            checks.push(diag_check(
+                "~/.codeg/npm-global/bin/<cmd>",
+                a.user_prefix_bin.as_deref().unwrap_or("absent"),
+                if a.user_prefix_bin.is_some() { DiagLevel::Warn } else { DiagLevel::Info },
+                a.user_prefix_bin.as_ref().map(|_| "EACCES fallback dir — reached by the connect gate only if it's on PATH"),
+            ));
+            if cfg!(target_os = "macos") {
+                checks.push(diag_check(
+                    "homebrew bin/<cmd>",
+                    a.homebrew_bin.as_deref().unwrap_or("absent"),
+                    if a.homebrew_bin.is_some() { DiagLevel::Warn } else { DiagLevel::Info },
+                    None,
+                ));
+            }
+            checks.push(diag_check(
+                "detect_npm_global_version",
+                a.detected_version.as_deref().unwrap_or("none"),
+                DiagLevel::Info,
+                Some("covers both prefixes — what the Settings badge uses"),
+            ));
+        }
+        // Adapter agents: show the vendor CLI next to the adapter it is NOT.
+        // Both rows land in `plain_text` too, so a pasted report answers the
+        // "but I have claude installed" question without a round trip.
+        if let Some(ad) = &a.adapter {
+            checks.push(diag_check(
+                &format!("{} (your own CLI)", ad.native_cmd),
+                &match (&ad.native_path, &ad.native_version) {
+                    (Some(path), Some(ver)) => format!("{ver}  ({path})"),
+                    (Some(path), None) => path.clone(),
+                    _ => "not found".to_string(),
+                },
+                DiagLevel::Info,
+                Some(
+                    "codeg never launches this — it launches the ACP adapter above, \
+                     a separate package that shares the same config dir",
+                ),
+            ));
+            checks.push(diag_check(
+                "shared config dir",
+                &ad.shared_config_dir,
+                DiagLevel::Info,
+                Some("read by BOTH your CLI and the adapter — no second login"),
+            ));
+        }
+        checks.push(diag_check(
+            "DB installed_version",
+            a.db_version.as_deref().unwrap_or("none"),
+            DiagLevel::Info,
+            None,
+        ));
+        if let Some(req) = &a.node_required {
+            let ok = inp
+                .node
+                .version
+                .as_deref()
+                .and_then(parse_node_major)
+                .zip(parse_node_major(req))
+                .map(|(n, r)| n >= r)
+                .unwrap_or(true);
+            checks.push(diag_check(
+                "node_required",
+                &format!("≥ {req}"),
+                if ok { DiagLevel::Ok } else { DiagLevel::Fail },
+                (!ok).then_some("the active Node.js is older than required"),
+            ));
+        }
+        sections.push(DiagSection {
+            title: format!("Agent: {} ({})", a.name, a.distribution),
+            checks,
+        });
+    }
+
+    // 5. Node version managers (candidate bin dirs)
+    if !inp.node_candidates.is_empty() {
+        let checks = inp
+            .node_candidates
+            .iter()
+            .map(|(dir, has)| {
+                let selected = inp.selected_node_dir.as_deref() == Some(dir.as_str());
+                diag_check(
+                    "candidate",
+                    dir,
+                    if *has { DiagLevel::Ok } else { DiagLevel::Info },
+                    selected.then_some("← selected (first with a node binary)"),
+                )
+            })
+            .collect();
+        sections.push(DiagSection {
+            title: "Node version-manager candidates".to_string(),
+            checks,
+        });
+    }
+
+    // 6. Terminal comparison
+    let term_checks = if inp.terminal.ran {
+        vec![
+            diag_check(
+                "command -v <cmd> (login shell)",
+                inp.terminal.cmd_resolved.as_deref().unwrap_or("not found"),
+                DiagLevel::Info,
+                None,
+            ),
+            diag_check(
+                "PATH dirs in terminal but not app",
+                &if inp.terminal.extra_dirs.is_empty() {
+                    "none".to_string()
+                } else {
+                    format!("{} (see copied text)", inp.terminal.extra_dirs.len())
+                },
+                if inp.terminal.extra_dirs.is_empty() { DiagLevel::Ok } else { DiagLevel::Warn },
+                (!inp.terminal.extra_dirs.is_empty())
+                    .then_some("the app can't see these dirs — the likely GUI PATH gap"),
+            ),
+        ]
+    } else {
+        vec![diag_check(
+            "login shell probe",
+            inp.terminal.note.as_deref().unwrap_or("did not run"),
+            DiagLevel::Info,
+            None,
+        )]
+    };
+    sections.push(DiagSection { title: "Terminal comparison".to_string(), checks: term_checks });
+
+    let plain_text = render_plain_text(inp, &verdict, &sections, &generated_at, agent_type);
+
+    AgentDiagnosticsReport {
+        generated_at,
+        agent_type,
+        verdict,
+        sections,
+        plain_text,
+    }
+}
+
+/// Pure: render a copyable text report (structured checks + verbose appendices
+/// that are summarized in the UI).
+fn render_plain_text(
+    inp: &DiagInputs,
+    verdict: &DiagnosticsVerdict,
+    sections: &[DiagSection],
+    generated_at: &str,
+    agent_type: Option<AgentType>,
+) -> String {
+    let glyph = |s: DiagLevel| match s {
+        DiagLevel::Ok => "OK  ",
+        DiagLevel::Warn => "WARN",
+        DiagLevel::Fail => "FAIL",
+        DiagLevel::Info => "--  ",
+    };
+    let mut out = String::new();
+    out.push_str("===== Codeg environment diagnostics =====\n");
+    out.push_str(&format!("generated: {generated_at}\n"));
+    if let Some(at) = agent_type {
+        out.push_str(&format!("agent: {at:?}\n"));
+    }
+    out.push_str(&format!("verdict [{}]: {}\n", verdict.code, verdict.summary));
+    for sec in sections {
+        out.push_str(&format!("\n## {}\n", sec.title));
+        for c in &sec.checks {
+            out.push_str(&format!("  [{}] {}: {}\n", glyph(c.status), c.label, c.value));
+            if let Some(h) = &c.hint {
+                out.push_str(&format!("        ↳ {h}\n"));
+            }
+        }
+    }
+    // Appendices (verbose lists shown only summarized in the UI).
+    out.push_str("\n## PATH (app process, in order)\n");
+    for d in &inp.app_path {
+        out.push_str(&format!("  {d}\n"));
+    }
+    if !inp.terminal.extra_dirs.is_empty() {
+        out.push_str("\n## PATH dirs in terminal but NOT in app\n");
+        for d in &inp.terminal.extra_dirs {
+            out.push_str(&format!("  {d}\n"));
+        }
+    }
+    if !inp.path_logs.is_empty() {
+        out.push_str("\n## recent [PATH] logs\n");
+        for l in &inp.path_logs {
+            out.push_str(&format!("  {l}\n"));
+        }
+    }
+    out.push_str("===== end =====\n");
+    out
+}
+
+/// Gather environment-diagnostics for the given agent (or a base env report when
+/// `agent_type` is `None`). Read-only; safe to call from the session page.
+pub(crate) async fn acp_env_diagnostics_core(
+    db: &AppDatabase,
+    agent_type: Option<AgentType>,
+) -> Result<AgentDiagnosticsReport, AcpError> {
+    let inputs = collect_diag_inputs(db, agent_type).await;
+    let generated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %z").to_string();
+    Ok(build_report(&inputs, generated_at, agent_type))
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_env_diagnostics(
+    agent_type: Option<AgentType>,
+    db: State<'_, AppDatabase>,
+) -> Result<AgentDiagnosticsReport, AcpError> {
+    acp_env_diagnostics_core(&db, agent_type).await
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+
+    fn base_inputs() -> DiagInputs {
+        DiagInputs {
+            node: CmdProbe {
+                path: Some("/usr/bin/node".to_string()),
+                version: Some("v20.11.1".to_string()),
+            },
+            npm: CmdProbe {
+                path: Some("/usr/bin/npm".to_string()),
+                version: Some("10.2.4".to_string()),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn agent_installed_unresolved() -> AgentDiag {
+        AgentDiag {
+            name: "Codex CLI".to_string(),
+            cmd: "codex-acp".to_string(),
+            distribution: "npx",
+            db_version: Some("1.1.2".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn redact_only_masks_secretish_keys() {
+        assert_eq!(redact_secret("NVM_DIR", "/home/u/.nvm"), "/home/u/.nvm");
+        assert_eq!(redact_secret("SHELL", "/bin/zsh"), "/bin/zsh");
+        // secret-ish key → masked, and multibyte-safe (no panic / no split).
+        let masked = redact_secret("XAI_API_KEY", "sk-测试secret-1234567890");
+        assert!(masked.contains('•'));
+        assert!(!masked.contains("secret"));
+        assert_eq!(redact_secret("MY_TOKEN", "abcd"), "••••");
+    }
+
+    #[test]
+    fn verdict_node_missing() {
+        let inp = DiagInputs::default();
+        assert_eq!(compute_verdict(&inp).code, "node_missing");
+    }
+
+    #[test]
+    fn verdict_ok_without_agent() {
+        assert_eq!(compute_verdict(&base_inputs()).code, "ok");
+    }
+
+    #[test]
+    fn verdict_user_prefix_not_on_path() {
+        let mut inp = base_inputs();
+        let mut a = agent_installed_unresolved();
+        a.user_prefix_bin = Some("/home/u/.codeg/npm-global/bin/codex-acp".to_string());
+        inp.agent = Some(a);
+        let v = compute_verdict(&inp);
+        assert_eq!(v.code, "user_prefix_not_on_path");
+        assert_eq!(v.level, DiagLevel::Fail);
+    }
+
+    #[test]
+    fn verdict_homebrew_bin_not_on_path() {
+        let mut inp = base_inputs();
+        let mut a = agent_installed_unresolved();
+        a.homebrew_bin = Some("/opt/homebrew/bin/codex-acp".to_string());
+        inp.agent = Some(a);
+        assert_eq!(compute_verdict(&inp).code, "homebrew_bin_not_on_path");
+    }
+
+    #[test]
+    fn verdict_terminal_only_path() {
+        let mut inp = base_inputs();
+        let mut a = agent_installed_unresolved();
+        a.detected_version = Some("1.1.2".to_string());
+        inp.agent = Some(a);
+        inp.terminal.cmd_resolved = Some("/Users/u/.nvm/versions/node/v20/bin/codex-acp".to_string());
+        assert_eq!(compute_verdict(&inp).code, "terminal_only_path");
+    }
+
+    #[test]
+    fn verdict_node_too_old() {
+        let mut inp = base_inputs();
+        inp.node.version = Some("v18.19.0".to_string());
+        let mut a = agent_installed_unresolved();
+        a.node_required = Some("20.0.0".to_string());
+        a.resolve_npx = Some("/x/codex-acp".to_string()); // resolves, but node too old
+        inp.agent = Some(a);
+        assert_eq!(compute_verdict(&inp).code, "node_too_old");
+    }
+
+    #[test]
+    fn verdict_ok_when_resolved() {
+        let mut inp = base_inputs();
+        let mut a = agent_installed_unresolved();
+        a.resolve_npx = Some("/usr/local/bin/codex-acp".to_string());
+        inp.agent = Some(a);
+        assert_eq!(compute_verdict(&inp).code, "ok");
+    }
+
+    #[test]
+    fn verdict_not_installed_when_nothing_recorded() {
+        let mut inp = base_inputs();
+        inp.agent = Some(AgentDiag {
+            cmd: "codex-acp".to_string(),
+            distribution: "npx",
+            ..Default::default()
+        });
+        assert_eq!(compute_verdict(&inp).code, "not_installed");
+    }
+
+    #[test]
+    fn verdict_binary_launchable_ignores_node() {
+        // Binary agents (e.g. Cursor) do not need Node; a launchable cached/system
+        // binary must read "ok" even with no node/npm on PATH — regression guard
+        // against the npx model being applied to every distribution.
+        // node & npm absent
+        let inp = DiagInputs {
+            agent: Some(AgentDiag {
+                name: "Cursor".to_string(),
+                cmd: "cursor-agent".to_string(),
+                distribution: "binary",
+                launchable: Some("/Users/u/.local/bin/cursor-agent".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(compute_verdict(&inp).code, "ok");
+    }
+
+    #[test]
+    fn verdict_binary_recorded_but_unresolved() {
+        let inp = DiagInputs {
+            agent: Some(AgentDiag {
+                cmd: "cursor-agent".to_string(),
+                distribution: "binary",
+                db_version: Some("2026.07.16".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(compute_verdict(&inp).code, "installed_but_unresolved");
+    }
+
+    #[test]
+    fn verdict_uvx_launchable_ok_else_not_installed() {
+        let ok = DiagInputs {
+            agent: Some(AgentDiag {
+                cmd: "hermes".to_string(),
+                distribution: "uvx",
+                launchable: Some("/Users/u/.local/bin/uvx".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(compute_verdict(&ok).code, "ok");
+
+        let missing = DiagInputs {
+            agent: Some(AgentDiag {
+                cmd: "hermes".to_string(),
+                distribution: "uvx",
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(compute_verdict(&missing).code, "not_installed");
+    }
+
+    fn adapter_agent_never_installed(native_path: Option<&str>) -> AgentDiag {
+        AgentDiag {
+            name: "Codex CLI".to_string(),
+            cmd: "codex-acp".to_string(),
+            distribution: "npx",
+            adapter: Some(AdapterProbe {
+                native_cmd: "codex".to_string(),
+                native_path: native_path.map(str::to_string),
+                native_version: native_path.map(|_| "codex-cli 0.145.0".to_string()),
+                shared_config_dir: "~/.codex".to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    // The canonical support ticket: `codex` is on the machine, the adapter is
+    // not. The generic "not installed" verdict reads as codeg being wrong, so
+    // this case gets its own code.
+    #[test]
+    fn verdict_adapter_missing_while_vendor_cli_present() {
+        let mut inp = base_inputs();
+        inp.agent = Some(adapter_agent_never_installed(Some("/opt/homebrew/bin/codex")));
+        let v = compute_verdict(&inp);
+        assert_eq!(v.code, "adapter_missing_native_present");
+        assert_eq!(v.level, DiagLevel::Info);
+    }
+
+    #[test]
+    fn verdict_adapter_missing_without_vendor_cli() {
+        let mut inp = base_inputs();
+        inp.agent = Some(adapter_agent_never_installed(None));
+        assert_eq!(compute_verdict(&inp).code, "adapter_missing");
+    }
+
+    // Node problems still win: they block installing the adapter in the first
+    // place, so explaining the adapter split there would bury the real fix.
+    #[test]
+    fn verdict_node_missing_outranks_adapter_missing() {
+        let inp = DiagInputs {
+            agent: Some(adapter_agent_never_installed(Some(
+                "/opt/homebrew/bin/codex",
+            ))),
+            ..Default::default()
+        };
+        assert_eq!(compute_verdict(&inp).code, "node_missing");
+    }
+
+    // Once the adapter resolves the split is irrelevant — plain ok, no special
+    // casing that would leave an adapter agent permanently "explaining itself".
+    #[test]
+    fn verdict_ok_when_adapter_resolves_even_with_vendor_cli() {
+        let mut inp = base_inputs();
+        let mut a = adapter_agent_never_installed(Some("/opt/homebrew/bin/codex"));
+        a.resolve_npx = Some("/usr/local/bin/codex-acp".to_string());
+        inp.agent = Some(a);
+        assert_eq!(compute_verdict(&inp).code, "ok");
+    }
+
+    // A previously-installed adapter that stopped resolving is a PATH problem,
+    // not an explainer case — the adapter branch must not swallow it.
+    #[test]
+    fn verdict_installed_but_unresolved_still_wins_for_adapter_agents() {
+        let mut inp = base_inputs();
+        let mut a = adapter_agent_never_installed(Some("/opt/homebrew/bin/codex"));
+        a.db_version = Some("1.1.7".to_string());
+        inp.agent = Some(a);
+        assert_eq!(compute_verdict(&inp).code, "installed_but_unresolved");
+    }
+
+    // The pasted report has to answer "but I have codex installed" on its own.
+    #[test]
+    fn report_names_the_vendor_cli_and_shared_config_dir() {
+        let mut inp = base_inputs();
+        inp.agent = Some(adapter_agent_never_installed(Some("/opt/homebrew/bin/codex")));
+        let r = build_report(&inp, "FIXED-TS".to_string(), Some(AgentType::Codex));
+        assert!(r.plain_text.contains("codex (your own CLI)"));
+        assert!(r.plain_text.contains("/opt/homebrew/bin/codex"));
+        assert!(r.plain_text.contains("~/.codex"));
+        assert!(r.plain_text.contains("verdict [adapter_missing_native_present]"));
+    }
+
+    // Non-adapter agents keep the old shape exactly — no stray rows.
+    #[test]
+    fn report_omits_adapter_rows_for_plain_agents() {
+        let mut inp = base_inputs();
+        inp.agent = Some(AgentDiag {
+            name: "Gemini CLI".to_string(),
+            cmd: "gemini".to_string(),
+            distribution: "npx",
+            resolve_npx: Some("/usr/local/bin/gemini".to_string()),
+            ..Default::default()
+        });
+        let r = build_report(&inp, "FIXED-TS".to_string(), Some(AgentType::Gemini));
+        assert!(!r.plain_text.contains("your own CLI"));
+        assert!(!r.plain_text.contains("shared config dir"));
+    }
+
+    #[test]
+    fn build_report_is_deterministic_and_includes_plain_text() {
+        let inp = base_inputs();
+        let r = build_report(&inp, "FIXED-TS".to_string(), None);
+        assert_eq!(r.generated_at, "FIXED-TS");
+        assert!(r.plain_text.contains("Codeg environment diagnostics"));
+        assert!(r.plain_text.contains("verdict [ok]"));
+        assert!(!r.sections.is_empty());
+    }
+}
+
+/// Process-local cache for dir-tree agents' system-binary `--version` probes,
+/// keyed by (path, mtime) so an upgrade re-probes but the status/list paths
+/// don't spawn a subprocess on every call.
+static SYSTEM_BINARY_VERSION_CACHE: std::sync::Mutex<
+    Option<(PathBuf, std::time::SystemTime, String)>,
+> = std::sync::Mutex::new(None);
+
+/// Version of a dir-tree agent's user-installed CLI (PATH / ~/.local/bin),
+/// via a cached `--version` probe. `None` when no system install exists or
+/// the probe fails.
+pub(crate) async fn system_dir_agent_version(cmd: &str) -> Option<String> {
+    let bin = resolve_system_agent_binary(cmd)?;
+    let mtime = std::fs::metadata(&bin).ok()?.modified().ok()?;
+    if let Some((cached_bin, cached_mtime, version)) =
+        SYSTEM_BINARY_VERSION_CACHE.lock().ok()?.as_ref()
+    {
+        if *cached_bin == bin && *cached_mtime == mtime {
+            return Some(version.clone());
+        }
+    }
+    let version = probe_binary_version(&bin).await?;
+    if let Ok(mut cache) = SYSTEM_BINARY_VERSION_CACHE.lock() {
+        *cache = Some((bin, mtime, version.clone()));
+    }
+    Some(version)
+}
+
+/// Process-local cache for system-CLI version probes, keyed by the agent
+/// command's resolved path and invalidated by its mtime. Failures are cached
+/// too — a CLI that does not understand `--version` must not be re-spawned on
+/// every settings refresh — and unlike the single-slot dir-tree cache above,
+/// this one holds an entry per agent so several agents don't evict each other.
+/// One probe result: the binary's mtime when probed, and the version it
+/// reported (`None` = the probe failed, cached so it isn't retried until the
+/// binary changes).
+type ProbeCacheEntry = (std::time::SystemTime, Option<String>);
+
+/// Cache key for a system version probe. The binary path alone is NOT
+/// enough: the declared probe command is editable, so an edit must be a cache
+/// miss rather than a stale hit until the binary's mtime changes — and two
+/// agents sharing a launcher path must not read each other's results when
+/// their probes or npm packages differ.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ProbeCacheKey {
+    bin: PathBuf,
+    /// The declared `version_probe` in force when the entry was written.
+    probe: Option<String>,
+    /// The npm package the npm-list step consults. Part of the key even when
+    /// a probe is declared — a failing probe falls back to the package
+    /// conventions, so the package still shapes the result.
+    package: Option<String>,
+}
+
+fn probe_cache_key(
+    resolved_bin: &std::path::Path,
+    declared_probe: Option<&str>,
+    npm_package: Option<&str>,
+) -> ProbeCacheKey {
+    ProbeCacheKey {
+        bin: resolved_bin.to_path_buf(),
+        probe: declared_probe.map(str::to_string),
+        package: npm_package.map(str::to_string),
+    }
+}
+
+static SYSTEM_PROBE_CACHE: std::sync::Mutex<Option<HashMap<ProbeCacheKey, ProbeCacheEntry>>> =
+    std::sync::Mutex::new(None);
+
+/// First version-looking token in probe output: starts with a digit (a leading
+/// `v` is tolerated and stripped), is dotted, and is drawn from the semver /
+/// calendar-version alphabet. Whitespace tokens are additionally split on `/`
+/// and `@` so `name/version` banners (curl-style `omp/17.1.7`) and npm-style
+/// `package@1.2.3` match; URL-shaped tokens are skipped entirely so a help
+/// link's path segment never reads as a version. Scans lines top-down so a
+/// banner's real version wins over trailing build metadata.
+fn extract_version_token(text: &str) -> Option<String> {
+    fn version_candidate(piece: &str) -> Option<String> {
+        let piece = piece.trim_matches(|c: char| matches!(c, '(' | ')' | ',' | ';' | ':'));
+        let candidate = piece
+            .strip_prefix('v')
+            .or_else(|| piece.strip_prefix('V'))
+            .unwrap_or(piece);
+        let starts_digit = candidate
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit());
+        (starts_digit
+            && candidate.contains('.')
+            && candidate
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')))
+        .then(|| candidate.to_string())
+    }
+    for line in text.lines() {
+        for token in line.split_whitespace() {
+            if token.contains("://") {
+                continue;
+            }
+            if let Some(version) = token.split(['/', '@']).find_map(version_candidate) {
+                return Some(version);
+            }
+        }
+    }
+    None
+}
+
+/// Run a CLI with version args and extract a version token from stdout, then
+/// stderr (some CLIs print their banner there). Bounded like every other
+/// status-path probe.
+async fn probe_cli_version_token(bin: &std::path::Path, args: &[String]) -> Option<String> {
+    let mut cmd = crate::process::tokio_command(bin);
+    cmd.args(args).kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    extract_version_token(&String::from_utf8_lossy(&output.stdout))
+        .or_else(|| extract_version_token(&String::from_utf8_lossy(&output.stderr)))
+}
+
+/// Version of an agent's SYSTEM install (the user's own `npm -g`, bun, brew,
+/// installer script, …), for the status/list paths when codeg has no managed
+/// install record. Works for built-ins and custom agents alike — a declared
+/// `version_probe` only exists on custom definitions, so built-ins always
+/// take the convention path. Cached per (binary, probe, package) (see
+/// [`SYSTEM_PROBE_CACHE`]).
+pub(crate) async fn system_probed_version(
+    agent_type: AgentType,
+    resolved_bin: &std::path::Path,
+    npm_package: Option<&str>,
+) -> Option<String> {
+    let declared_probe = agent_type
+        .custom_id()
+        .and_then(crate::acp::custom_registry::version_probe_of);
+    system_probed_version_with(declared_probe, resolved_bin, npm_package).await
+}
+
+/// Probe order: the declared `version_probe` command wins when it yields a
+/// version; then `npm list -g` for npx packages (exact installed version,
+/// both prefixes); then the near-universal `<cmd> --version` convention. A
+/// declared probe that fails (unknown flag, unparsable banner) falls through
+/// to the conventions rather than reading as "not installed".
+async fn system_probed_version_with(
+    declared_probe: Option<&str>,
+    resolved_bin: &std::path::Path,
+    npm_package: Option<&str>,
+) -> Option<String> {
+    let mtime = std::fs::metadata(resolved_bin).ok()?.modified().ok()?;
+    let key = probe_cache_key(resolved_bin, declared_probe, npm_package);
+    if let Ok(cache) = SYSTEM_PROBE_CACHE.lock() {
+        if let Some((cached_mtime, version)) = cache.as_ref().and_then(|map| map.get(&key)) {
+            if *cached_mtime == mtime {
+                return version.clone();
+            }
+        }
+    }
+
+    let mut version = None;
+    if let Some(probe) = declared_probe {
+        // The declared probe is a full command line (`agent-cli --version`);
+        // its program resolves like an agent command (PATH, then npm prefix).
+        let mut parts = probe.split_whitespace();
+        if let Some(program) = parts.next() {
+            let args: Vec<String> = parts.map(str::to_string).collect();
+            if let Some(path) = resolve_npx_command(program).await {
+                version = probe_cli_version_token(&path, &args).await;
+            }
+        }
+    }
+    if version.is_none() {
+        if let Some(package) = npm_package {
+            version = detect_npm_global_version(&package_name_from_spec(package)).await;
+        }
+    }
+    if version.is_none() {
+        version = probe_cli_version_token(resolved_bin, &["--version".to_string()]).await;
+    }
+
+    if let Ok(mut cache) = SYSTEM_PROBE_CACHE.lock() {
+        cache
+            .get_or_insert_with(HashMap::new)
+            .insert(key, (mtime, version.clone()));
+    }
+    version
+}
+
+/// Run `<binary> --version` and return the first non-empty stdout line.
+/// Bounded by a timeout so a wedged binary can't stall the status endpoint.
+async fn probe_binary_version(bin: &std::path::Path) -> Option<String> {
+    let mut cmd = crate::process::tokio_command(bin);
+    cmd.arg("--version");
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
 }
 
 /// Official npm registry URL – used to bypass local mirror configurations that
@@ -594,7 +2086,7 @@ async fn run_npm_streaming(
     task_id: &str,
     emitter: &EventEmitter,
 ) -> Result<(bool, String), AcpError> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::BufReader;
 
     let mut cmd = crate::process::tokio_command("npm");
     for arg in args {
@@ -612,16 +2104,20 @@ async fn run_npm_streaming(
     let emitter_clone = emitter.clone();
     let task_id_owned = task_id.to_string();
 
+    // `collect_lines_lossy` (not `Lines`/`next_line()`) matters here: npm can
+    // emit OEM-codepage bytes (e.g. GBK on a zh-CN Windows) for localized
+    // OS-level error text, which `next_line()` chokes on and silently drops —
+    // truncating both the live install log and the stderr this function
+    // returns for the caller's error message.
     let stdout_handle = tokio::spawn({
         let emitter = emitter_clone.clone();
         let task_id = task_id_owned.clone();
         async move {
             if let Some(out) = stdout {
-                let reader = BufReader::new(out);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    emit_agent_install_event(&emitter, &task_id, AgentInstallEventKind::Log, &line);
-                }
+                crate::process::collect_lines_lossy(BufReader::new(out), |line| {
+                    emit_agent_install_event(&emitter, &task_id, AgentInstallEventKind::Log, line);
+                })
+                .await;
             }
         }
     });
@@ -630,19 +2126,20 @@ async fn run_npm_streaming(
         let emitter = emitter_clone;
         let task_id = task_id_owned;
         async move {
-            let mut collected = String::new();
-            if let Some(err) = stderr {
-                let reader = BufReader::new(err);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    emit_agent_install_event(&emitter, &task_id, AgentInstallEventKind::Log, &line);
-                    if !collected.is_empty() {
-                        collected.push('\n');
-                    }
-                    collected.push_str(&line);
+            match stderr {
+                Some(err) => {
+                    crate::process::collect_lines_lossy(BufReader::new(err), |line| {
+                        emit_agent_install_event(
+                            &emitter,
+                            &task_id,
+                            AgentInstallEventKind::Log,
+                            line,
+                        );
+                    })
+                    .await
                 }
+                None => String::new(),
             }
-            collected
         }
     });
 
@@ -1014,6 +2511,51 @@ fn codex_auth_json_path() -> PathBuf {
     codex_home_dir().join("auth.json")
 }
 
+/// Header codex reads to decide whether a provider authenticates through the
+/// "actor authorization" path. Mirrors `OPENAI_ACTOR_AUTHORIZATION_HEADER` in
+/// codex's `model-provider-info` crate.
+const CODEX_ACTOR_AUTHORIZATION_HEADER: &str = "x-openai-actor-authorization";
+
+/// Mirrors the header half of codex's
+/// `ModelProviderInfo::uses_openai_actor_authorization`. A
+/// `[model_providers.x.http_headers]` sub-table and an inline
+/// `http_headers = { .. }` both parse to `Value::Table`, so one lookup covers
+/// every spelling.
+fn codex_provider_uses_actor_authorization(
+    provider_table: &toml::map::Map<String, toml::Value>,
+) -> bool {
+    provider_table
+        .get("http_headers")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|headers| {
+            headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case(CODEX_ACTOR_AUTHORIZATION_HEADER)
+                    && value.as_str().is_some_and(|value| !value.trim().is_empty())
+            })
+        })
+}
+
+/// Supply codeg's `requires_openai_auth` default without clobbering the user.
+///
+/// Codex defaults the field to `false` and only reads credentials from
+/// `auth.json` when it is `true`, so `true` is correct for a provider codeg
+/// provisioned itself (key in auth.json, no `env_key`) — and wrong for one the
+/// user configured. Worse, codex's `uses_openai_actor_authorization()` requires
+/// `!requires_openai_auth`, so forcing `true` silently disables that auth path.
+/// Write the default only when the field is absent, and never over a provider
+/// that opted into actor authorization.
+fn ensure_codex_provider_auth_default(provider_table: &mut toml::map::Map<String, toml::Value>) {
+    if provider_table.contains_key("requires_openai_auth")
+        || codex_provider_uses_actor_authorization(provider_table)
+    {
+        return;
+    }
+    provider_table.insert(
+        "requires_openai_auth".to_string(),
+        toml::Value::Boolean(true),
+    );
+}
+
 /// OpenCode reads config from `$XDG_CONFIG_HOME/opencode` (falling back to
 /// `~/.config/opencode`) and credentials from `$XDG_DATA_HOME/opencode`
 /// (falling back to `~/.local/share/opencode`) on every platform. codeg must
@@ -1348,6 +2890,73 @@ fn load_codex_config_toml_raw() -> Option<String> {
     fs::read_to_string(codex_config_toml_path()).ok()
 }
 
+/// Read the compact codex model-catalog *source* sidecar (written next to the
+/// generated catalog) so the structured editor can round-trip the list in
+/// api-key mode, where no DB provider owns it.
+fn load_codex_model_catalog_source_raw() -> Option<String> {
+    let home = codex_home_dir();
+    // 1. codeg's own source sidecar → an exact, byte-stable round-trip.
+    if let Ok(raw) = fs::read_to_string(home.join(crate::acp::codex_model_catalog::SOURCE_REL)) {
+        return Some(raw);
+    }
+    // 2. No sidecar: adopt a pre-existing `model_catalog_json` the user (or an
+    //    older codeg) wrote by hand, so the editor shows those models instead of
+    //    appearing empty — and the next save reproduces them rather than dropping
+    //    the reference.
+    import_existing_codex_catalog_source(&home)
+}
+
+/// Resolve a `model_catalog_json` value into an absolute path the way codex does:
+/// `~/…` against the home dir, absolute paths verbatim, and everything else
+/// relative to `CODEX_HOME`.
+fn resolve_codex_home_relative(value: &str, codex_home: &Path) -> PathBuf {
+    if value == "~" {
+        return home_dir_or_default();
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        return home_dir_or_default().join(rest);
+    }
+    let p = Path::new(value);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        codex_home.join(value)
+    }
+}
+
+/// Read a pre-existing `model_catalog_json` catalog referenced by
+/// `~/.codex/config.toml` and project it into codeg's compact source shape.
+/// Returns `None` when there is no reference, the file is missing/oversized/not
+/// valid JSON, or it yields no usable models.
+fn import_existing_codex_catalog_source(codex_home: &Path) -> Option<String> {
+    let toml_value = fs::read_to_string(codex_home.join("config.toml"))
+        .ok()?
+        .parse::<toml::Value>()
+        .ok()?;
+    let rel = toml_value
+        .get("model_catalog_json")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+
+    let catalog_path = resolve_codex_home_relative(rel, codex_home);
+    // Guard against pathological files (the shape is a small models array).
+    let meta = fs::metadata(&catalog_path).ok()?;
+    if meta.len() > 8 * 1024 * 1024 {
+        return None;
+    }
+    let catalog: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&catalog_path).ok()?).ok()?;
+
+    let root_model = toml_value.get("model").and_then(toml::Value::as_str);
+    let snapshot = crate::acp::codex_catalog_source::cached_or_bundled_snapshot();
+    let config = crate::acp::codex_model_catalog::import_catalog(&catalog, root_model, &snapshot);
+    if crate::acp::codex_model_catalog::is_empty(&config) {
+        return None;
+    }
+    serde_json::to_string(&config).ok()
+}
+
 /// Project codex `config.toml` text into the launch-relevant config map shared
 /// by the settings read-back and the staleness fingerprint. Pure (no I/O) so it
 /// is unit-testable; [`load_codex_local_config_json`] is the on-disk wrapper
@@ -1443,6 +3052,39 @@ fn codex_config_projection_from_toml(raw_toml: &str) -> serde_json::Map<String, 
         }
         if !env_map.is_empty() {
             merged.insert("env".to_string(), serde_json::Value::Object(env_map));
+        }
+    }
+
+    // Sandbox / approval keys. codex reads these when a thread is created
+    // (`thread/start`), never mid-session, so a panel edit must mark running
+    // sessions restart-required — and the fingerprint is the only channel that
+    // does that. Like `modelProvider` above, they deliberately do NOT mirror
+    // into the runtime env; `AgentRuntimeConfig` simply ignores them (it has no
+    // `deny_unknown_fields`). Only non-default values are folded in so an
+    // untouched config keeps its historical fingerprint.
+    let sandbox = parse_codex_sandbox_settings(raw_toml);
+    if let Some(policy) = sandbox.approval_policy {
+        merged.insert(
+            "approvalPolicy".to_string(),
+            serde_json::Value::String(policy),
+        );
+    }
+    if let Some(granular) = sandbox.granular {
+        if let Ok(value) = serde_json::to_value(granular) {
+            merged.insert("approvalGranular".to_string(), value);
+        }
+    }
+    if let Some(mode) = sandbox.sandbox_mode {
+        merged.insert("sandboxMode".to_string(), serde_json::Value::String(mode));
+    }
+    let ws = sandbox.workspace_write;
+    if !ws.writable_roots.is_empty()
+        || ws.network_access
+        || ws.exclude_tmpdir_env_var
+        || ws.exclude_slash_tmp
+    {
+        if let Ok(value) = serde_json::to_value(&ws) {
+            merged.insert("sandboxWorkspaceWrite".to_string(), value);
         }
     }
 
@@ -1560,10 +3202,7 @@ fn persist_codex_local_config(config_patch_json: Option<&str>) -> Result<(), Acp
             "wire_api".to_string(),
             toml::Value::String("responses".to_string()),
         );
-        provider_table.insert(
-            "requires_openai_auth".to_string(),
-            toml::Value::Boolean(true),
-        );
+        ensure_codex_provider_auth_default(provider_table);
     }
 
     if env.is_empty() {
@@ -1666,6 +3305,302 @@ fn persist_codex_native_config_files(
     }
 
     Ok(())
+}
+
+/// Read `~/.codex/config.toml` as the base of a structured sandbox merge.
+/// A missing file is an empty base; a real read error fails loudly so a save can
+/// never silently drop the user's existing config.
+fn read_codex_config_or_empty() -> Result<String, AcpError> {
+    let path = codex_config_toml_path();
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(AcpError::protocol(format!(
+            "read codex config.toml failed: {e}"
+        ))),
+    }
+}
+
+/// The plain-string `approval_policy` values codex 0.145 accepts.
+/// `AskForApproval` also has a `Granular(GranularApprovalConfig)` variant, which
+/// is a TOML *table* rather than a string and is handled separately.
+const CODEX_APPROVAL_POLICIES: &[&str] = &["untrusted", "on-request", "never"];
+
+/// `SandboxMode` — the complete upstream vocabulary.
+const CODEX_SANDBOX_MODES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
+
+/// Parse the sandbox / approval keys backing the Codex panel's structured
+/// controls from a raw `~/.codex/config.toml`. Read-only; uses the `toml` crate
+/// so inline tables (`approval_policy = { granular = { … } }`), dotted keys and
+/// arrays all read correctly. A malformed file yields defaults — the panel then
+/// shows "unset" and the raw editor below it is where the user fixes the syntax.
+fn parse_codex_sandbox_settings(raw_toml: &str) -> CodexSandboxSettings {
+    let Ok(table) = raw_toml.parse::<toml::Table>() else {
+        return CodexSandboxSettings::default();
+    };
+
+    // `approval_policy` is an externally tagged enum: a bare string for the unit
+    // variants, or a single-key table for `granular`. `on-failure` is a serde
+    // alias of `on-request` upstream, so it is folded here rather than shown as
+    // a fourth option the panel would have to round-trip.
+    let approval_item = table.get("approval_policy");
+    let approval_policy = approval_item
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .map(|value| match value {
+            "on-failure" => "on-request",
+            other => other,
+        })
+        .filter(|value| CODEX_APPROVAL_POLICIES.contains(value))
+        .map(str::to_string);
+    let granular = approval_item
+        .and_then(toml::Value::as_table)
+        .and_then(|policy| policy.get("granular"))
+        .and_then(toml::Value::as_table)
+        .map(|granular| {
+            let flag = |key: &str| {
+                granular
+                    .get(key)
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false)
+            };
+            CodexGranularApproval {
+                sandbox_approval: flag("sandbox_approval"),
+                rules: flag("rules"),
+                skill_approval: flag("skill_approval"),
+                request_permissions: flag("request_permissions"),
+                mcp_elicitations: flag("mcp_elicitations"),
+            }
+        });
+
+    let sandbox_mode = table
+        .get("sandbox_mode")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| CODEX_SANDBOX_MODES.contains(value))
+        .map(str::to_string);
+
+    let ws = table
+        .get("sandbox_workspace_write")
+        .and_then(toml::Value::as_table);
+    let ws_flag = |key: &str| {
+        ws.and_then(|t| t.get(key))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    };
+    let writable_roots = ws
+        .and_then(|t| t.get("writable_roots"))
+        .and_then(toml::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    CodexSandboxSettings {
+        approval_policy,
+        granular,
+        sandbox_mode,
+        workspace_write: CodexWorkspaceWrite {
+            writable_roots,
+            network_access: ws_flag("network_access"),
+            exclude_tmpdir_env_var: ws_flag("exclude_tmpdir_env_var"),
+            exclude_slash_tmp: ws_flag("exclude_slash_tmp"),
+        },
+        shadowed_by_default_permissions: table.contains_key("default_permissions"),
+        has_permissions_table: table
+            .get("permissions")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|profiles| !profiles.is_empty()),
+    }
+}
+
+/// A `writable_roots` entry codex will accept as-is. Upstream types the field as
+/// `AbsolutePathBuf`, but a relative entry does NOT error — it is resolved
+/// against `CODEX_HOME`, so `"rel/dir"` silently becomes `~/.codex/rel/dir`.
+/// Rejecting it here is the only way the user learns their path was not what
+/// they meant. Both POSIX (`/x`) and Windows (`C:\x`, `\\server\share`) shapes
+/// are accepted regardless of the host, since the config file is portable.
+fn is_absolute_config_path(value: &str) -> bool {
+    let value = value.trim();
+    if value.starts_with('/') || value.starts_with("\\\\") {
+        return true;
+    }
+    let mut chars = value.chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some(drive), Some(':'), Some('\\' | '/')) => drive.is_ascii_alphabetic(),
+        _ => false,
+    }
+}
+
+/// Apply the Codex panel's sandbox / approval PATCH to the raw config.toml text,
+/// format-preservingly (comments and unmanaged keys are kept). Values are
+/// validated against the upstream vocabularies first, so a UI bug can never
+/// write a config codex refuses to load.
+///
+/// Only the fields the patch actually carries are touched — see
+/// [`CodexSandboxStructuredConfig`] for why that matters. Within a carried
+/// field the removal rules match codex's own defaults: an unset approval/sandbox
+/// drops its key; a `false` flag or empty `writable_roots` drops that key; and a
+/// `[sandbox_workspace_write]` left with no keys at all drops the section.
+fn apply_codex_sandbox_config(
+    base_toml: &str,
+    settings: &CodexSandboxStructuredConfig,
+) -> Result<String, AcpError> {
+    let mut doc = base_toml
+        .parse::<toml_edit::Document>()
+        .map_err(|e| AcpError::protocol(format!("invalid codex config.toml: {e}")))?;
+
+    // `approval_policy` is one externally tagged key, so the preset and the
+    // granular table travel together: either both absent (leave the key alone)
+    // or both present with at most one carrying a value.
+    let approval = settings
+        .approval_policy
+        .as_ref()
+        .map(|policy| policy.as_deref());
+    let granular = settings.granular;
+    if approval.is_some() || granular.is_some() {
+        let preset = approval.flatten();
+        let granular = granular.flatten();
+        if preset.is_some() && granular.is_some() {
+            return Err(AcpError::protocol(
+                "approval_policy cannot be both a preset and a granular table",
+            ));
+        }
+        match (preset, granular) {
+            (Some(policy), _) => {
+                let policy = policy.trim();
+                if !CODEX_APPROVAL_POLICIES.contains(&policy) {
+                    return Err(AcpError::protocol(format!(
+                        "unsupported codex approval_policy: {policy}"
+                    )));
+                }
+                // Assigning a value over an existing `[approval_policy.granular]`
+                // table replaces the whole item, which is what switching away
+                // from granular must do — an emptied table would fail to
+                // deserialize.
+                doc["approval_policy"] = toml_edit::value(policy);
+            }
+            (None, Some(granular)) => {
+                // All five keys are always written: `sandbox_approval`, `rules`
+                // and `mcp_elicitations` have no upstream default, so a partial
+                // table makes codex refuse to load the config.
+                let mut table = toml_edit::Table::new();
+                table.insert(
+                    "sandbox_approval",
+                    toml_edit::value(granular.sandbox_approval),
+                );
+                table.insert("rules", toml_edit::value(granular.rules));
+                table.insert("skill_approval", toml_edit::value(granular.skill_approval));
+                table.insert(
+                    "request_permissions",
+                    toml_edit::value(granular.request_permissions),
+                );
+                table.insert(
+                    "mcp_elicitations",
+                    toml_edit::value(granular.mcp_elicitations),
+                );
+                let mut parent = toml_edit::Table::new();
+                parent.insert("granular", toml_edit::Item::Table(table));
+                doc["approval_policy"] = toml_edit::Item::Table(parent);
+            }
+            (None, None) => {
+                doc.remove("approval_policy");
+            }
+        }
+    }
+
+    if let Some(mode) = settings.sandbox_mode.as_ref() {
+        match mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            Some(mode) => {
+                if !CODEX_SANDBOX_MODES.contains(&mode) {
+                    return Err(AcpError::protocol(format!(
+                        "unsupported codex sandbox_mode: {mode}"
+                    )));
+                }
+                doc["sandbox_mode"] = toml_edit::value(mode);
+            }
+            None => {
+                doc.remove("sandbox_mode");
+            }
+        }
+    }
+
+    let roots = match settings.writable_roots.as_ref() {
+        Some(roots) => {
+            let roots: Vec<String> = roots
+                .iter()
+                .map(|root| root.trim().to_string())
+                .filter(|root| !root.is_empty())
+                .collect();
+            if let Some(bad) = roots.iter().find(|root| !is_absolute_config_path(root)) {
+                return Err(AcpError::protocol(format!(
+                    "writable_roots entries must be absolute paths (codex resolves relative entries against CODEX_HOME): {bad}"
+                )));
+            }
+            Some(roots)
+        }
+        None => None,
+    };
+    let ws_flags = [
+        ("network_access", settings.network_access),
+        ("exclude_tmpdir_env_var", settings.exclude_tmpdir_env_var),
+        ("exclude_slash_tmp", settings.exclude_slash_tmp),
+    ];
+    if roots.is_some() || ws_flags.iter().any(|(_, flag)| flag.is_some()) {
+        let item = &mut doc["sandbox_workspace_write"];
+        if item.is_none() {
+            *item = toml_edit::Item::Table(toml_edit::Table::new());
+        } else if item.as_table_like_mut().is_none() {
+            return Err(AcpError::protocol(
+                "cannot set [sandbox_workspace_write]: it exists but is not a table",
+            ));
+        }
+        if let Some(table) = item.as_table_like_mut() {
+            if let Some(roots) = roots {
+                if roots.is_empty() {
+                    table.remove("writable_roots");
+                } else {
+                    let mut array = toml_edit::Array::new();
+                    for root in &roots {
+                        array.push(root.as_str());
+                    }
+                    table.insert("writable_roots", toml_edit::value(array));
+                }
+            }
+            for (key, flag) in ws_flags {
+                match flag {
+                    Some(true) => {
+                        table.insert(key, toml_edit::value(true));
+                    }
+                    // `false` is codex's own default for every flag here, so
+                    // removing the key and writing `= false` are equivalent —
+                    // removing keeps the file minimal.
+                    Some(false) => {
+                        table.remove(key);
+                    }
+                    None => {}
+                }
+            }
+        }
+        // Prune a section the patch just emptied — including one that was
+        // already empty in the base — so no bare `[sandbox_workspace_write]`
+        // header is left behind.
+        if doc
+            .get("sandbox_workspace_write")
+            .and_then(|item| item.as_table_like())
+            .is_some_and(|table| table.is_empty())
+        {
+            doc.remove("sandbox_workspace_write");
+        }
+    }
+
+    Ok(doc.to_string())
 }
 
 /// Read the raw `~/.grok/config.toml` for the Grok settings panel's config-file
@@ -1784,7 +3719,8 @@ fn parse_grok_settings(raw_toml: &str) -> GrokSettings {
 
     GrokSettings {
         default_reasoning_effort: get("models", "default_reasoning_effort"),
-        permission_mode: get("ui", "permission_mode"),
+        permission_mode: get("ui", "permission_mode")
+            .map(|v| migrate_grok_permission_mode(&v).to_string()),
         custom_model_id,
         custom_base_url,
         custom_api_key,
@@ -1794,22 +3730,49 @@ fn parse_grok_settings(raw_toml: &str) -> GrokSettings {
     }
 }
 
-/// Pure predicate: does this Grok `config.toml` select the "always-approve"
-/// permission mode? Drives whether the ACP launch carries the explicit
-/// `--always-approve` flag. Anything else — "ask", unset, or malformed — is
-/// `false`, so ACP permission requests keep flowing to codeg's UI.
-fn grok_config_selects_always_approve(config_toml: &str) -> bool {
-    parse_grok_settings(config_toml).permission_mode.as_deref() == Some("always-approve")
+/// grok's real `--permission-mode` enum (docs.x.ai / verified against the
+/// 0.2.99 binary). codeg historically wrote a codeg-invented
+/// `permission_mode = "always-approve"` / `"ask"` into `~/.grok/config.toml`,
+/// neither of which grok accepts — `grok --permission-mode always-approve`
+/// errors out. `migrate_grok_permission_mode` maps those legacy markers onto the
+/// real modes so the settings dropdown, the launch flag, and grok's own TUI all
+/// agree.
+const GROK_PERMISSION_MODES: &[&str] = &[
+    "default",
+    "acceptEdits",
+    "auto",
+    "dontAsk",
+    "bypassPermissions",
+    "plan",
+];
+
+/// Legacy → real `permission_mode` value mapping (see [`GROK_PERMISSION_MODES`]).
+/// Unknown values pass through untouched (a user hand-editing config.toml to a
+/// real grok mode is preserved).
+fn migrate_grok_permission_mode(value: &str) -> &str {
+    match value {
+        "always-approve" => "bypassPermissions",
+        "ask" => "default",
+        other => other,
+    }
 }
 
-/// Whether Grok's ACP launch should carry `--always-approve`, read from the
-/// global `~/.grok/config.toml` (the same `[ui].permission_mode` the settings
-/// panel writes). Best-effort: a missing/unreadable config reads as `false`, so
-/// the default preserves codeg's ability to prompt for approvals.
-pub(crate) fn grok_launch_always_approve() -> bool {
-    load_grok_config_toml_raw()
-        .map(|raw| grok_config_selects_always_approve(&raw))
-        .unwrap_or(false)
+/// Pure helper: the `--permission-mode` value this Grok `config.toml` should hand
+/// the ACP launch, or `None` to pass no flag. `default` (grok's own default —
+/// ACP permission requests flow to codeg's UI) and unset/unrecognized values map
+/// to `None`, preserving the historical "ask" behaviour where codeg prompts.
+fn grok_config_permission_mode(config_toml: &str) -> Option<String> {
+    parse_grok_settings(config_toml)
+        .permission_mode
+        .filter(|m| m != "default" && GROK_PERMISSION_MODES.contains(&m.as_str()))
+}
+
+/// The `--permission-mode <value>` Grok's ACP launch should carry, read from the
+/// global `~/.grok/config.toml` `[ui].permission_mode` (legacy-migrated by
+/// `parse_grok_settings`). Best-effort: a missing/unreadable/`default` config
+/// yields `None`, so the default preserves codeg's ability to prompt for approvals.
+pub(crate) fn grok_launch_permission_mode() -> Option<String> {
+    load_grok_config_toml_raw().and_then(|raw| grok_config_permission_mode(&raw))
 }
 
 /// Merge the Grok panel's structured control values into the raw config.toml
@@ -2191,7 +4154,32 @@ struct KimiManagedSpec {
     env: BTreeMap<String, String>,
     model: String,
     max_context_size: Option<i64>,
+    /// `[models.<alias>].capabilities`. Empty ⇒ omit the key entirely, which is
+    /// what "reasoning off" means — see `KIMI_BASE_CAPABILITIES`.
+    capabilities: Vec<String>,
+    /// `[models.<alias>].support_efforts` — the reasoning levels the composer's
+    /// Thinking picker offers. Empty ⇒ omit (kimi degrades to an Off/On toggle).
+    support_efforts: Vec<String>,
+    /// `[models.<alias>].default_effort`. Only written when it is one of
+    /// `support_efforts`; kimi otherwise falls back to the middle entry anyway.
+    default_effort: Option<String>,
 }
+
+/// Input modalities always declared alongside a thinking capability.
+///
+/// kimi reads capabilities permissively — `if (capabilities === undefined) return true`
+/// — so an ABSENT key allows everything, but a PRESENT array allows only what it
+/// lists. Declaring `thinking` therefore has to re-declare the modalities that
+/// were implicitly allowed before, or enabling reasoning would silently revoke
+/// image/video input. `tool_use` mirrors kimi's own `capabilitiesForModel`,
+/// which defaults it on (`model.supportsToolUse ?? true`). Users who need a
+/// narrower set can hand-edit config.toml.
+const KIMI_BASE_CAPABILITIES: &[&str] = &["image_in", "video_in", "tool_use"];
+/// Capability that makes kimi advertise the Thinking picker over ACP at all
+/// (`supportsThinking` = capabilities ∋ thinking | always_thinking).
+const KIMI_CAPABILITY_THINKING: &str = "thinking";
+/// Same, but kimi drops the `Off` row: the model cannot stop reasoning.
+const KIMI_CAPABILITY_ALWAYS_THINKING: &str = "always_thinking";
 
 /// Upsert (`Some`) or remove (`None`) the codeg-managed `[providers.codeg]` +
 /// `[models.codeg-managed]` block in a parsed config.toml document, preserving
@@ -2263,6 +4251,38 @@ fn apply_kimi_managed_block(
                 .filter(|c| *c > 0)
                 .unwrap_or(KIMI_DEFAULT_MAX_CONTEXT_SIZE);
             model_table.insert("max_context_size".to_string(), toml::Value::Integer(ctx));
+            // Reasoning metadata. Each key is omitted when empty so the block
+            // stays byte-identical to the pre-reasoning shape when the feature
+            // is off — kimi treats an absent `capabilities` as "allow all" and
+            // an absent `support_efforts` as "no effort levels".
+            if !spec.capabilities.is_empty() {
+                model_table.insert(
+                    "capabilities".to_string(),
+                    toml::Value::Array(
+                        spec.capabilities
+                            .iter()
+                            .map(|c| toml::Value::String(c.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if !spec.support_efforts.is_empty() {
+                model_table.insert(
+                    "support_efforts".to_string(),
+                    toml::Value::Array(
+                        spec.support_efforts
+                            .iter()
+                            .map(|e| toml::Value::String(e.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if let Some(effort) = &spec.default_effort {
+                model_table.insert(
+                    "default_effort".to_string(),
+                    toml::Value::String(effort.clone()),
+                );
+            }
             models.insert(
                 KIMI_MANAGED_MODEL_ALIAS.to_string(),
                 toml::Value::Table(model_table),
@@ -2525,6 +4545,42 @@ fn project_kimi_managed_config(value: &toml::Value) -> serde_json::Map<String, s
                 serde_json::Value::Number(ctx.into()),
             );
         }
+        // Reasoning metadata. `capabilities` round-trips so the panel can tell
+        // whether reasoning is on (and whether it is the always-on flavour)
+        // without re-deriving it from the effort list.
+        let string_array = |key: &str| -> Option<Vec<serde_json::Value>> {
+            Some(
+                model
+                    .get(key)?
+                    .as_array()?
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| serde_json::Value::String(s.to_string()))
+                    .collect(),
+            )
+        };
+        if let Some(caps) = string_array("capabilities") {
+            merged.insert("capabilities".to_string(), serde_json::Value::Array(caps));
+        }
+        if let Some(efforts) = string_array("support_efforts") {
+            merged.insert(
+                "supportEfforts".to_string(),
+                serde_json::Value::Array(efforts),
+            );
+        }
+        if let Some(effort) = model
+            .get("default_effort")
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            merged.insert(
+                "defaultEffort".to_string(),
+                serde_json::Value::String(effort.to_string()),
+            );
+        }
     }
 
     let has_managed = merged.contains_key("interfaceType");
@@ -2578,6 +4634,17 @@ pub(crate) struct KimiCodeConfigUpdate {
     pub vertex_project: Option<String>,
     pub vertex_location: Option<String>,
     pub raw_config_toml: Option<String>,
+    /// Declare a thinking capability so `kimi acp` advertises its Thinking
+    /// picker at all. `None`/`false` writes no `capabilities` key, leaving
+    /// kimi's permissive default (and no picker) exactly as before.
+    pub reasoning_enabled: Option<bool>,
+    /// Use `always_thinking` instead of `thinking`, dropping the `Off` row.
+    pub always_thinking: Option<bool>,
+    /// The reasoning levels offered in the composer. Passed through to the
+    /// provider verbatim — kimi does no client-side mapping for non-Kimi
+    /// providers, so an unsupported level fails at request time, not here.
+    pub support_efforts: Option<Vec<String>>,
+    pub default_effort: Option<String>,
 }
 
 /// Validate + resolve a `native`-mode update into the managed block to write.
@@ -2652,6 +4719,55 @@ fn build_kimi_managed_spec(update: &KimiCodeConfigUpdate) -> Result<KimiManagedS
         }
     }
 
+    // ---- Reasoning metadata ----
+    // `kimi acp` suppresses its Thinking picker unless the model declares a
+    // thinking capability, and sources the picker's rows from `support_efforts`
+    // ("the single source of truth for efforts"). Both only apply when the user
+    // turned reasoning on; otherwise every key is left out and the block keeps
+    // its previous shape.
+    let reasoning_enabled = update.reasoning_enabled.unwrap_or(false);
+    let mut capabilities: Vec<String> = Vec::new();
+    let mut support_efforts: Vec<String> = Vec::new();
+    let mut default_effort: Option<String> = None;
+
+    if reasoning_enabled {
+        capabilities.push(
+            if update.always_thinking.unwrap_or(false) {
+                KIMI_CAPABILITY_ALWAYS_THINKING
+            } else {
+                KIMI_CAPABILITY_THINKING
+            }
+            .to_string(),
+        );
+        capabilities.extend(KIMI_BASE_CAPABILITIES.iter().map(|c| c.to_string()));
+
+        for raw in update.support_efforts.iter().flatten() {
+            let effort = raw.trim();
+            if effort.is_empty() {
+                continue;
+            }
+            if effort.contains(['\n', '\r']) {
+                return Err(AcpError::protocol(
+                    "kimi thinking effort must not contain newlines",
+                ));
+            }
+            if !support_efforts.iter().any(|e| e == effort) {
+                support_efforts.push(effort.to_string());
+            }
+        }
+
+        // kimi clamps an out-of-range default back to the middle entry, so an
+        // unlisted value is dropped rather than rejected — writing it would
+        // only misrepresent what the composer will actually show.
+        default_effort = update
+            .default_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter(|s| support_efforts.iter().any(|e| e == s))
+            .map(str::to_string);
+    }
+
     Ok(KimiManagedSpec {
         interface_type: interface_type.to_string(),
         base_url,
@@ -2659,6 +4775,9 @@ fn build_kimi_managed_spec(update: &KimiCodeConfigUpdate) -> Result<KimiManagedS
         env,
         model,
         max_context_size: update.max_context_size.filter(|c| *c > 0),
+        capabilities,
+        support_efforts,
+        default_effort,
     })
 }
 
@@ -4776,6 +6895,63 @@ pub(crate) fn skill_storage_spec(agent_type: AgentType) -> Option<SkillStorageSp
             global_dirs: vec![crate::parsers::grok::resolve_grok_home_dir().join("skills")],
             project_rel_dirs: vec![".grok/skills"],
         }),
+        // Cursor discovers skills in `~/.cursor/skills` + the shared
+        // `~/.agents/skills` store (user scope) and `.cursor/skills` /
+        // `.agents/skills` in the workspace (verified against the CLI's own
+        // discovery table). `~/.cursor/skills-cursor` holds Cursor's bundled
+        // builtin skills — listed for visibility but write-protected via
+        // `is_read_only_skill_path`.
+        AgentType::Cursor => Some(SkillStorageSpec {
+            kind: SkillStorageKind::SkillDirectoryOnly,
+            global_dirs: vec![
+                home_dir_or_default().join(".cursor").join("skills"),
+                home_dir_or_default().join(".agents").join("skills"),
+                home_dir_or_default().join(".cursor").join("skills-cursor"),
+            ],
+            project_rel_dirs: vec![".cursor/skills", ".agents/skills"],
+        }),
+        // codeg cannot detect where an arbitrary ACP agent loads skills from,
+        // so custom agents are gated on the user's own declaration: that the
+        // agent reads the shared `.agents/skills` store (the cross-agent
+        // convention OpenCode, Gemini, Cline, Codex, pi, and Cursor already
+        // follow), that it reads a dedicated directory of its own, or both.
+        // The dedicated directory is listed first so linking targets it
+        // without cross-agent side effects on the shared store — the same
+        // ordering rationale as pi and Cursor. Undeclared (or deleted) agents
+        // return `None`, which is also the gate that keeps them out of the
+        // experts / office / science matrices (`supported_agents` derives from
+        // this function). The dedicated path was normalized to absolute at
+        // save time; a non-absolute value (a hand-edited database) is ignored
+        // rather than resolved against an arbitrary working directory.
+        AgentType::Custom(id) => {
+            let decl = crate::acp::custom_registry::skills_decl(id);
+            let mut global_dirs = Vec::new();
+            if let Some(dir) = decl
+                .dir
+                .map(std::path::Path::new)
+                .filter(|p| p.is_absolute())
+            {
+                global_dirs.push(dir.to_path_buf());
+            }
+            if decl.shared_store {
+                global_dirs.push(home_dir_or_default().join(".agents").join("skills"));
+            }
+            if global_dirs.is_empty() {
+                None
+            } else {
+                Some(SkillStorageSpec {
+                    kind: SkillStorageKind::SkillDirectoryOnly,
+                    global_dirs,
+                    // Only the shared convention has a project-local layout;
+                    // a dedicated directory is global by definition.
+                    project_rel_dirs: if decl.shared_store {
+                        vec![".agents/skills"]
+                    } else {
+                        vec![]
+                    },
+                })
+            }
+        }
     }
 }
 
@@ -4865,7 +7041,7 @@ fn skill_name_from_id(id: &str) -> String {
 /// file's YAML frontmatter. Prefers `short-description` (commonly nested under
 /// a `metadata:` block) and falls back to a top-level `description`. Only the
 /// first 4 KiB is read; frontmatter always fits, and skill bodies can be large.
-fn read_skill_description(content_path: &Path) -> Option<String> {
+pub(crate) fn read_skill_description(content_path: &Path) -> Option<String> {
     use std::io::Read;
     let mut file = fs::File::open(content_path).ok()?;
     let mut buf = [0u8; 4096];
@@ -4953,10 +7129,13 @@ fn build_skill_item(
 /// these in the `$` autocomplete and the Skills settings list — but any
 /// write to those files would clobber the CLI's own assets.
 fn is_read_only_skill_path(agent_type: AgentType, skill_path: &Path) -> bool {
-    if agent_type != AgentType::Codex {
-        return false;
-    }
-    let ro_root = codex_home_dir().join("skills").join(".system");
+    let ro_root = match agent_type {
+        AgentType::Codex => codex_home_dir().join("skills").join(".system"),
+        // Cursor's bundled builtin skills; the CLI restores them on update,
+        // so editing/deleting through codeg would silently be undone.
+        AgentType::Cursor => home_dir_or_default().join(".cursor").join("skills-cursor"),
+        _ => return false,
+    };
     skill_path.starts_with(&ro_root)
 }
 
@@ -5115,7 +7294,7 @@ fn locate_existing_skill(
     None
 }
 
-fn locate_existing_skill_across_dirs(
+pub(crate) fn locate_existing_skill_across_dirs(
     dirs: &[PathBuf],
     kind: SkillStorageKind,
     skill_id: &str,
@@ -5153,6 +7332,396 @@ fn trim_non_empty(value: Option<String>) -> Option<String> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Cursor settings panel (cli-config.json + auth / models probes)
+// ---------------------------------------------------------------------------
+
+fn cursor_cli_config_path() -> PathBuf {
+    crate::parsers::cursor::resolve_cursor_config_dir().join("cli-config.json")
+}
+
+fn load_cursor_cli_config_raw() -> Option<String> {
+    fs::read_to_string(cursor_cli_config_path()).ok()
+}
+
+/// Project the structured controls out of a raw cli-config.json text.
+/// Malformed JSON yields defaults (the panel shows the raw text separately).
+pub(crate) fn parse_cursor_settings(raw: &str) -> crate::acp::types::CursorSettings {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return crate::acp::types::CursorSettings::default();
+    };
+    let string_list = |val: Option<&serde_json::Value>| -> Vec<String> {
+        val.and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|i| i.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    crate::acp::types::CursorSettings {
+        sandbox_mode: v
+            .pointer("/sandbox/mode")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        permissions_allow: string_list(v.pointer("/permissions/allow")),
+        permissions_deny: string_list(v.pointer("/permissions/deny")),
+    }
+}
+
+/// Merge the Cursor panel's structured controls into the raw cli-config.json
+/// text. Only the managed keys are touched; every other key (editor prefs,
+/// hints, network, …) is preserved verbatim. `None` fields leave their key
+/// as-is; `Some` fields replace it (lists wholesale).
+fn apply_cursor_structured_config(
+    base: &str,
+    patch: &crate::acp::types::CursorStructuredConfig,
+) -> Result<String, AcpError> {
+    let mut root: serde_json::Value = if base.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(base)
+            .map_err(|e| AcpError::protocol(format!("invalid cursor cli-config.json: {e}")))?
+    };
+    if !root.is_object() {
+        return Err(AcpError::protocol(
+            "invalid cursor cli-config.json: root must be a JSON object",
+        ));
+    }
+    let obj = root.as_object_mut().expect("checked object");
+
+    // Drop the legacy `approvalMode` key an earlier panel version wrote: the
+    // CLI never reads it from cli-config.json (approval mode lives in each
+    // chat's store.db metadata, seeded by the `--force`/`--auto-review`
+    // launch flags), so leaving it around only misleads whoever inspects the
+    // file.
+    obj.remove("approvalMode");
+    if let Some(mode) = &patch.sandbox_mode {
+        let sandbox = obj
+            .entry("sandbox")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(sandbox_obj) = sandbox.as_object_mut() {
+            if mode.trim().is_empty() {
+                sandbox_obj.remove("mode");
+            } else {
+                sandbox_obj.insert("mode".into(), serde_json::Value::String(mode.clone()));
+            }
+        }
+    }
+    let mut set_rules = |key: &str, rules: &Option<Vec<String>>| {
+        if let Some(rules) = rules {
+            let permissions = obj
+                .entry("permissions")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(perm_obj) = permissions.as_object_mut() {
+                let cleaned: Vec<serde_json::Value> = rules
+                    .iter()
+                    .map(|r| r.trim())
+                    .filter(|r| !r.is_empty())
+                    .map(|r| serde_json::Value::String(r.to_string()))
+                    .collect();
+                perm_obj.insert(key.to_string(), serde_json::Value::Array(cleaned));
+            }
+        }
+    };
+    set_rules("allow", &patch.permissions_allow);
+    set_rules("deny", &patch.permissions_deny);
+
+    serde_json::to_string_pretty(&root)
+        .map_err(|e| AcpError::protocol(format!("serialize cursor cli-config failed: {e}")))
+}
+
+/// Validate + write cli-config.json (whole-document; the merge already
+/// preserved unmanaged keys).
+fn persist_cursor_cli_config(text: &str) -> Result<(), AcpError> {
+    let parsed = serde_json::from_str::<serde_json::Value>(text)
+        .map_err(|e| AcpError::protocol(format!("invalid cursor cli-config.json: {e}")))?;
+    if !parsed.is_object() {
+        return Err(AcpError::protocol(
+            "invalid cursor cli-config.json: root must be a JSON object",
+        ));
+    }
+    let path = cursor_cli_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| AcpError::protocol(format!("create cursor config dir failed: {e}")))?;
+    }
+    fs::write(&path, format!("{text}\n"))
+        .map_err(|e| AcpError::protocol(format!("write cursor cli-config failed: {e}")))
+}
+
+/// The cursor-agent binary codeg would launch: managed cache first, then the
+/// user's own install (PATH / ~/.local/bin) — the same order as `build_agent`.
+fn resolve_cursor_binary() -> Option<PathBuf> {
+    if let Ok(Some((path, _))) =
+        binary_cache::find_best_cached_binary_for_agent(AgentType::Cursor, "cursor-agent")
+    {
+        return Some(path);
+    }
+    resolve_system_agent_binary("cursor-agent")
+}
+
+/// The Cursor agent's effective probe env: the saved env (env_json) with the
+/// settings form's live API key applied on top, so `status` / `models` test
+/// exactly the credential on screen rather than a stale saved value.
+///
+/// `api_key` is the form value — `Some(key)` in API-key mode, `Some("")` in
+/// subscription mode to force (and verify) the browser-login credential.
+/// `CURSOR_API_KEY` is always materialized (empty when unset) so
+/// `run_cursor_probe` makes an explicit set-or-remove decision and a stale
+/// inherited key can never leak in and produce a bogus "invalid API key".
+/// `CURSOR_API_BASE_URL` is always cleared — the CLI has no custom-endpoint
+/// support, so a base URL is never a valid probe input.
+async fn cursor_probe_env(db: &AppDatabase, api_key: Option<&str>) -> BTreeMap<String, String> {
+    let mut env: BTreeMap<String, String> =
+        agent_setting_service::get_by_agent_type(&db.conn, AgentType::Cursor)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|m| m.env_json)
+            .and_then(|raw| serde_json::from_str::<BTreeMap<String, String>>(&raw).ok())
+            .unwrap_or_default();
+    if let Some(key) = api_key {
+        env.insert("CURSOR_API_KEY".to_string(), key.trim().to_string());
+    }
+    // Materialize the key so an unset one becomes an explicit empty ⇒ removed.
+    env.entry("CURSOR_API_KEY".to_string()).or_default();
+    // Scrub any stale base URL (legacy env_json row or inherited dev-shell
+    // export): empty ⇒ removed by run_cursor_probe.
+    env.insert("CURSOR_API_BASE_URL".to_string(), String::new());
+    env
+}
+
+/// Run a cursor-agent subcommand with a timeout, capturing stdout.
+async fn run_cursor_probe(
+    args: &[&str],
+    timeout_secs: u64,
+    extra_env: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let bin = resolve_cursor_binary().ok_or_else(|| "cursor-agent is not installed".to_string())?;
+    let mut cmd = crate::process::tokio_command(&bin);
+    cmd.args(args);
+    for (key, value) in extra_env {
+        if value.trim().is_empty() {
+            // This process's env is inherited by the child; an empty value means
+            // "ensure absent" so a stale inherited CURSOR_API_KEY can't leak in.
+            cmd.env_remove(key);
+        } else {
+            cmd.env(key, value);
+        }
+    }
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        cmd.output(),
+    )
+    .await
+    .map_err(|_| format!("cursor-agent {} timed out", args.join(" ")))?
+    .map_err(|e| format!("failed to run cursor-agent: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() && stdout.trim().is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "cursor-agent {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        ));
+    }
+    Ok(stdout)
+}
+
+pub(crate) async fn acp_cursor_auth_status_core(
+    db: &AppDatabase,
+    api_key: Option<String>,
+) -> crate::acp::types::CursorAuthStatus {
+    let binary_path = resolve_cursor_binary().map(|p| p.to_string_lossy().to_string());
+    if binary_path.is_none() {
+        return crate::acp::types::CursorAuthStatus {
+            installed: false,
+            is_authenticated: false,
+            raw_status: None,
+            email: None,
+            membership: None,
+            error: None,
+            binary_path: None,
+        };
+    }
+    let extra_env = cursor_probe_env(db, api_key.as_deref()).await;
+    match run_cursor_probe(&["status", "--format", "json"], 20, &extra_env).await {
+        Ok(stdout) => {
+            // The CLI prints one JSON object; scan to the first `{` so a
+            // leading log line can't break parsing.
+            let json_start = stdout.find('{').unwrap_or(0);
+            match serde_json::from_str::<serde_json::Value>(stdout[json_start..].trim()) {
+                Ok(v) => {
+                    let get_str = |keys: &[&str]| {
+                        keys.iter().find_map(|k| {
+                            v.get(*k)
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                        })
+                    };
+                    // Email is nested under `userInfo` in current CLI output;
+                    // fall back to a top-level field for forward-compatibility.
+                    let email = v
+                        .get("userInfo")
+                        .and_then(|u| u.get("email"))
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| get_str(&["email", "userEmail", "user_email"]));
+                    crate::acp::types::CursorAuthStatus {
+                        installed: true,
+                        is_authenticated: v
+                            .get("isAuthenticated")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
+                        raw_status: get_str(&["status", "message"]),
+                        email,
+                        membership: get_str(&["membershipType", "membership", "plan"]),
+                        error: None,
+                        binary_path: binary_path.clone(),
+                    }
+                }
+                Err(e) => crate::acp::types::CursorAuthStatus {
+                    installed: true,
+                    is_authenticated: false,
+                    raw_status: Some(truncate_probe_output(&stdout)),
+                    email: None,
+                    membership: None,
+                    error: Some(format!("unexpected status output: {e}")),
+                    binary_path: binary_path.clone(),
+                },
+            }
+        }
+        Err(err) => crate::acp::types::CursorAuthStatus {
+            installed: true,
+            is_authenticated: false,
+            raw_status: None,
+            email: None,
+            membership: None,
+            error: Some(err),
+            binary_path,
+        },
+    }
+}
+
+pub(crate) async fn acp_cursor_list_models_core(
+    db: &AppDatabase,
+    api_key: Option<String>,
+) -> crate::acp::types::CursorModelsResult {
+    let extra_env = cursor_probe_env(db, api_key.as_deref()).await;
+    match run_cursor_probe(&["models"], 30, &extra_env).await {
+        Ok(stdout) => {
+            let (models, default_model) = parse_cursor_models(&stdout);
+            crate::acp::types::CursorModelsResult {
+                models,
+                default_model,
+                error: None,
+            }
+        }
+        Err(err) => crate::acp::types::CursorModelsResult {
+            models: Vec::new(),
+            default_model: None,
+            error: Some(err),
+        },
+    }
+}
+
+/// Parse `cursor-agent models` output. Each model line is
+/// `<id> - <label> [(default)]` (e.g. `claude-opus-4-8-high - Opus 4.8 1M`,
+/// `auto - Auto (default)`); a leading `Available models` header and blank
+/// lines are skipped. Returns the entries in CLI order plus the default id.
+fn parse_cursor_models(stdout: &str) -> (Vec<crate::acp::types::CursorModelInfo>, Option<String>) {
+    let mut models: Vec<crate::acp::types::CursorModelInfo> = Vec::new();
+    let mut default_model = None;
+    for line in stdout.lines() {
+        let cleaned = strip_ansi(line);
+        let trimmed = cleaned.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Split id from label on the first " - ". A line with no " - " is only
+        // a model if it's a bare single-token id — otherwise it's prose (the
+        // "Available models" header has a space, so it's skipped below).
+        let (id_raw, label_raw) = trimmed.split_once(" - ").unwrap_or((trimmed, ""));
+        let id = id_raw
+            .trim()
+            .trim_start_matches(['-', '*', '\u{2022}'])
+            .trim();
+        if id.is_empty() || id.contains(char::is_whitespace) {
+            continue;
+        }
+        let is_default = label_raw.contains("(default)") || label_raw.contains("(current)");
+        let label = label_raw
+            .replace("(default)", "")
+            .replace("(current)", "")
+            .trim()
+            .to_string();
+        if is_default {
+            default_model = Some(id.to_string());
+        }
+        if !models.iter().any(|m| m.id == id) {
+            models.push(crate::acp::types::CursorModelInfo {
+                id: id.to_string(),
+                label,
+                is_default,
+            });
+        }
+    }
+    (models, default_model)
+}
+
+/// Strip ANSI SGR escape sequences from CLI output.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for esc in chars.by_ref() {
+                    if esc.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn truncate_probe_output(s: &str) -> String {
+    let t = s.trim();
+    if t.len() > 400 {
+        format!("{}…", &t[..t.char_indices().take_while(|(i, _)| *i < 400).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(400)])
+    } else {
+        t.to_string()
+    }
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_cursor_auth_status(
+    db: State<'_, AppDatabase>,
+    api_key: Option<String>,
+) -> Result<crate::acp::types::CursorAuthStatus, AcpError> {
+    Ok(acp_cursor_auth_status_core(&db, api_key).await)
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_cursor_list_models(
+    db: State<'_, AppDatabase>,
+    api_key: Option<String>,
+) -> Result<crate::acp::types::CursorModelsResult, AcpError> {
+    Ok(acp_cursor_list_models_core(&db, api_key).await)
+}
+
 /// Primary env var keys for each agent type: (api_base_url, api_key, model).
 /// Shared by runtime env resolution, model-provider cascade, and config patching.
 fn agent_env_keys(agent_type: AgentType) -> (&'static str, &'static str, &'static str) {
@@ -5173,6 +7742,13 @@ fn agent_env_keys(agent_type: AgentType) -> (&'static str, &'static str, &'stati
         // overrides the API base URL (both win over ~/.grok/config.toml). Note:
         // `XAI_MODEL` is NOT read by Grok — the earlier placeholder was inert.
         AgentType::Grok => ("GROK_XAI_API_BASE_URL", "XAI_API_KEY", "GROK_DEFAULT_MODEL"),
+        // Cursor's non-interactive credential is `CURSOR_API_KEY` (an
+        // alternative to `cursor-agent login`); `CURSOR_API_BASE_URL` is the
+        // endpoint override (both verified against the 2026.07.16 CLI bundle).
+        // The CLI reads NO model env var — `CURSOR_MODEL` is an inert
+        // placeholder so the generic cascade never lands on OPENAI_* keys;
+        // model selection flows through the Cursor panel / ACP instead.
+        AgentType::Cursor => ("CURSOR_API_BASE_URL", "CURSOR_API_KEY", "CURSOR_MODEL"),
         _ => ("OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"),
     }
 }
@@ -5322,6 +7898,14 @@ pub(crate) fn parse_provider_model(
                 trimmed_raw.map(str::to_string),
             );
         }
+        AgentType::Codex => {
+            // The provider stores a structured model config (JSON) or a legacy
+            // plain slug; OPENAI_MODEL is the default slug either way.
+            let slug = crate::acp::codex_model_catalog::default_slug_for_env(
+                &crate::acp::codex_model_catalog::parse_model_config(trimmed_raw),
+            );
+            out.insert("OPENAI_MODEL".to_string(), slug);
+        }
         _ => {
             out.insert("OPENAI_MODEL".to_string(), trimmed_raw.map(str::to_string));
         }
@@ -5346,8 +7930,11 @@ pub(crate) fn provider_codex_model_action(
     if agent_type != AgentType::Codex {
         return CodexModelAction::NoOp;
     }
-    match raw.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(v) => CodexModelAction::Set(v.to_string()),
+    // Structured config (JSON) or legacy plain slug → root `model` = default slug.
+    match crate::acp::codex_model_catalog::default_slug_for_env(
+        &crate::acp::codex_model_catalog::parse_model_config(raw),
+    ) {
+        Some(slug) => CodexModelAction::Set(slug),
         None => CodexModelAction::Clear,
     }
 }
@@ -5364,6 +7951,7 @@ fn cascade_update_agent_config(
     api_key: &str,
     model_env: &BTreeMap<String, Option<String>>,
     codex_model: &CodexModelAction,
+    codex_model_raw: Option<&str>,
 ) -> Result<(), AcpError> {
     let (url_key, key_key, _) = agent_env_keys(agent_type);
     match agent_type {
@@ -5398,6 +7986,11 @@ fn cascade_update_agent_config(
         AgentType::Hermes => {
             // Hermes self-manages credentials in ~/.hermes/.env via
             // `hermes model` / `hermes setup`; codeg writes no provider creds.
+        }
+        AgentType::Cursor => {
+            // Cursor authenticates via `cursor-agent login` or CURSOR_API_KEY
+            // against Cursor's own backend; there is no third-party
+            // model-provider endpoint to cascade into.
         }
         AgentType::Codex => {
             let auth_path = codex_auth_json_path();
@@ -5475,10 +8068,7 @@ fn cascade_update_agent_config(
                     "wire_api".to_string(),
                     toml::Value::String("responses".to_string()),
                 );
-                provider_table.insert(
-                    "requires_openai_auth".to_string(),
-                    toml::Value::Boolean(true),
-                );
+                ensure_codex_provider_auth_default(provider_table);
             }
             match codex_model {
                 CodexModelAction::Set(model) => {
@@ -5488,6 +8078,28 @@ fn cascade_update_agent_config(
                     table.remove("model");
                 }
                 CodexModelAction::NoOp => {}
+            }
+            // Regenerate the model_catalog_json file from the provider's full
+            // structured model config and reference it (relative to CODEX_HOME).
+            // REPLACE semantics require rewriting the whole catalog every time.
+            let snapshot = crate::acp::codex_catalog_source::cached_or_bundled_snapshot();
+            match crate::acp::codex_model_catalog::write_catalog_files(
+                codex_model_raw.unwrap_or_default(),
+                &codex_home_dir(),
+                &snapshot,
+            ) {
+                Ok(Some(inj)) => {
+                    table.insert(
+                        "model_catalog_json".to_string(),
+                        toml::Value::String(inj.catalog_rel.to_string()),
+                    );
+                }
+                Ok(None) => {
+                    table.remove("model_catalog_json");
+                }
+                Err(e) => {
+                    tracing::warn!("[ModelProvider] write codex catalog failed: {e}");
+                }
             }
             let toml_str = toml::to_string_pretty(&toml_value)
                 .map_err(|e| AcpError::protocol(e.to_string()))?;
@@ -5542,6 +8154,12 @@ fn cascade_update_agent_config(
             // runtime env var through the generic agent settings panel
             // (`acpUpdateAgentEnv`); it does not write provider creds into
             // ~/.grok/config.toml and does not participate in the cascade.
+        }
+        AgentType::Custom(_) => {
+            // Custom agents are deliberately configuration-free: codeg writes
+            // no config file for them and they are excluded from the
+            // model-provider surface, so there is nothing to cascade. Whatever
+            // credentials they need go through the generic launch-env panel.
         }
     }
     Ok(())
@@ -5611,6 +8229,7 @@ pub(crate) async fn cascade_update_model_provider(
             new_api_key,
             &model_env,
             &codex_action,
+            new_model,
         ) {
             tracing::warn!(
                 "[ModelProvider] cascade_update_agent_config({agent_type}) failed: {e}, skipping config update"
@@ -5744,6 +8363,17 @@ pub(crate) fn fingerprint_config(
         hasher.update(b"\x01grok_toml\x01");
         if let Some(toml) = load_grok_config_toml_raw() {
             hasher.update(toml.as_bytes());
+        }
+    }
+    // Same for Cursor's ~/.cursor/cli-config.json: permission rules and
+    // sandbox settings are read at process start, so panel edits must mark
+    // running Cursor sessions restart-required. (The Run Everything
+    // permission mode is a launch flag sourced from env_json, which the
+    // env loop above already hashed.)
+    if agent_type == AgentType::Cursor {
+        hasher.update(b"\x01cursor_cli_config\x01");
+        if let Some(json) = load_cursor_cli_config_raw() {
+            hasher.update(json.as_bytes());
         }
     }
     format!("{:x}", hasher.finalize())
@@ -5938,6 +8568,16 @@ pub async fn acp_set_config_option(
         .await
 }
 
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_goal_control(
+    connection_id: String,
+    action: crate::acp::connection::GoalControlAction,
+    manager: State<'_, ConnectionManager>,
+) -> Result<(), AcpError> {
+    manager.goal_control(&connection_id, action).await
+}
+
 /// Spawn a transient ACP connection for `agent_type` with a silent emitter,
 /// read whatever `SessionConfigOptions` / `SessionModes` the agent advertises,
 /// and tear it down. The returned snapshot drives the delegation-settings UI
@@ -6030,6 +8670,19 @@ pub async fn acp_answer_question(
 ) -> Result<(), AcpError> {
     manager
         .answer_question(&connection_id, &question_id, answer)
+        .await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_answer_plan_approval(
+    connection_id: String,
+    approval_id: String,
+    answer: crate::acp::plan_approval::PlanApprovalAnswer,
+    manager: State<'_, ConnectionManager>,
+) -> Result<(), AcpError> {
+    manager
+        .answer_plan_approval(&connection_id, &approval_id, answer)
         .await
 }
 
@@ -6197,22 +8850,64 @@ pub(crate) async fn acp_get_agent_status_core(
         .map_err(|e| AcpError::protocol(e.to_string()))?;
 
     let (available, installed_version) = match &meta.distribution {
-        registry::AgentDistribution::Npx { cmd, .. } => (
-            true,
-            resolve_npx_command(cmd)
-                .await
-                .and_then(|_| setting.as_ref().and_then(|m| m.installed_version.clone())),
-        ),
-        registry::AgentDistribution::Binary { platforms, cmd, .. } => {
-            let detected = binary_cache::detect_installed_version(agent_type, cmd)
+        registry::AgentDistribution::Npx { cmd, package, .. } => {
+            let resolved = resolve_npx_command(cmd).await;
+            let mut version = resolved
+                .as_ref()
+                .and_then(|_| setting.as_ref().and_then(|m| m.installed_version.clone()));
+            // An agent the user installed themselves (npm -g, bun, brew, …)
+            // resolves but has no managed install record — probe the system
+            // install so it reads as installed rather than demanding a
+            // second, managed copy. Launch already prefers the PATH
+            // resolution, so this only makes the UI agree with what runs.
+            if version.is_none() {
+                if let Some(bin) = &resolved {
+                    version = system_probed_version(agent_type, bin, Some(package)).await;
+                }
+            }
+            (true, version)
+        }
+        registry::AgentDistribution::Binary {
+            platforms,
+            cmd,
+            dir_entry,
+            ..
+        } => {
+            let mut detected = binary_cache::detect_installed_version(agent_type, cmd)
                 .ok()
                 .flatten();
+            // A system install is launchable via the connect path's PATH
+            // fallback, and the frontend gates connect on a non-null
+            // installed_version — report the probed system version so such an
+            // install isn't blocked as "not installed". Dir-tree agents
+            // (Cursor) keep their dedicated probe; everyone else (custom or
+            // built-in) goes through the per-agent probe cache.
+            if detected.is_none() {
+                if dir_entry.is_some() {
+                    detected = system_dir_agent_version(cmd).await;
+                } else if let Some(bin) = resolve_system_agent_binary(cmd) {
+                    detected = system_probed_version(agent_type, &bin, None).await;
+                }
+            }
             (platforms.iter().any(|p| p.platform == platform), detected)
         }
-        registry::AgentDistribution::Uvx { system_cmd, .. } => (
-            uvx_agent_launchable(*system_cmd),
-            binary_cache::uvx_prepared_version(agent_type),
-        ),
+        registry::AgentDistribution::Uvx {
+            cmd, system_cmd, ..
+        } => {
+            let mut version = binary_cache::uvx_prepared_version(agent_type);
+            // Same story as npx: a CLI installed by the user (pipx, uv tool
+            // install, …) is a real install. Probe the package's console
+            // script first, then the system-fallback command a launch would
+            // actually use (Hermes: `hermes-acp` vs a pipx `hermes`).
+            if version.is_none() {
+                let bin = resolve_command_on_path(cmd)
+                    .or_else(|| (*system_cmd).and_then(|(c, _)| resolve_command_on_path(c)));
+                if let Some(bin) = bin {
+                    version = system_probed_version(agent_type, &bin, None).await;
+                }
+            }
+            (uvx_agent_launchable(*system_cmd), version)
+        }
     };
 
     Ok(crate::acp::types::AcpAgentStatus {
@@ -6220,6 +8915,7 @@ pub(crate) async fn acp_get_agent_status_core(
         available,
         enabled: setting.map(|m| m.enabled).unwrap_or(true),
         installed_version,
+        is_acp_adapter: registry::acp_adapter_relation(agent_type).is_some(),
     })
 }
 
@@ -6261,31 +8957,62 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
         let setting = settings_map.get(&agent_type);
         let meta = registry::get_agent_meta(agent_type);
         let (available, dist_type, local_installed_version) = match &meta.distribution {
-            registry::AgentDistribution::Npx { cmd, .. } => {
+            registry::AgentDistribution::Npx { cmd, package, .. } => {
                 // Keep the list path bounded: each list request probes npm
                 // global prefix at most once, then reuses the result across
                 // all NPX agents in the loop.
-                let cached = npx_resolver
-                    .resolve_for_list(cmd)
-                    .await
+                let resolved = npx_resolver.resolve_for_list(cmd).await;
+                let mut version = resolved
+                    .as_ref()
                     .and_then(|_| setting.and_then(|m| m.installed_version.clone()));
-                (true, "npx", cached)
+                // Mirror the status path: an agent's own system install
+                // counts as installed (per-agent cached probe).
+                if version.is_none() {
+                    if let Some(bin) = &resolved {
+                        version = system_probed_version(agent_type, bin, Some(package)).await;
+                    }
+                }
+                (true, "npx", version)
             }
-            registry::AgentDistribution::Binary { platforms, cmd, .. } => {
-                let detected = binary_cache::detect_installed_version(agent_type, cmd)
+            registry::AgentDistribution::Binary {
+                platforms,
+                cmd,
+                dir_entry,
+                ..
+            } => {
+                let mut detected = binary_cache::detect_installed_version(agent_type, cmd)
                     .ok()
                     .flatten();
+                // Mirror the status path: a system install counts as installed
+                // (cached probes — no per-list subprocess after the first
+                // call). Without this, the list would also persist
+                // `installed_version = None` over the detected value.
+                if detected.is_none() {
+                    if dir_entry.is_some() {
+                        detected = system_dir_agent_version(cmd).await;
+                    } else if let Some(bin) = resolve_system_agent_binary(cmd) {
+                        detected = system_probed_version(agent_type, &bin, None).await;
+                    }
+                }
                 (
                     platforms.iter().any(|p| p.platform == platform),
                     "binary",
                     detected,
                 )
             }
-            registry::AgentDistribution::Uvx { system_cmd, .. } => (
-                uvx_agent_launchable(*system_cmd),
-                "uvx",
-                binary_cache::uvx_prepared_version(agent_type),
-            ),
+            registry::AgentDistribution::Uvx {
+                cmd, system_cmd, ..
+            } => {
+                let mut version = binary_cache::uvx_prepared_version(agent_type);
+                if version.is_none() {
+                    let bin = resolve_command_on_path(cmd)
+                        .or_else(|| (*system_cmd).and_then(|(c, _)| resolve_command_on_path(c)));
+                    if let Some(bin) = bin {
+                        version = system_probed_version(agent_type, &bin, None).await;
+                    }
+                }
+                (uvx_agent_launchable(*system_cmd), "uvx", version)
+            }
         };
 
         let mut env = setting
@@ -6341,6 +9068,22 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
         } else {
             None
         };
+        let codex_model_catalog = if agent_type == AgentType::Codex {
+            load_codex_model_catalog_source_raw()
+        } else {
+            None
+        };
+        // Parsed sandbox / approval keys backing the Codex panel's structured
+        // controls. Derived from the same raw text as the advanced editor so the
+        // two stay in sync; an absent config file still yields defaults (all
+        // "unset") so the controls render.
+        let codex_sandbox_settings = if agent_type == AgentType::Codex {
+            Some(parse_codex_sandbox_settings(
+                codex_config_toml.as_deref().unwrap_or(""),
+            ))
+        } else {
+            None
+        };
         let cline_secrets_json = if agent_type == AgentType::Cline {
             load_cline_secrets_json_raw()
         } else {
@@ -6368,6 +9111,21 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
         // (mode / reasoning effort). Derived from the same raw text so the
         // dropdowns and the advanced editor stay in sync.
         let grok_settings = grok_config_toml.as_deref().map(parse_grok_settings);
+        let cursor_cli_config_json = if agent_type == AgentType::Cursor {
+            load_cursor_cli_config_raw()
+        } else {
+            None
+        };
+        // Parsed scalar settings backing the Cursor panel's structured controls
+        // (approval mode / sandbox / permission rules); an absent config file
+        // still yields defaults so the panel renders its editors.
+        let cursor_settings = if agent_type == AgentType::Cursor {
+            Some(parse_cursor_settings(
+                cursor_cli_config_json.as_deref().unwrap_or(""),
+            ))
+        } else {
+            None
+        };
 
         agents.push(AcpAgentInfo {
             agent_type,
@@ -6377,6 +9135,11 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
             description: meta.description.to_string(),
             available,
             distribution_type: dist_type.to_string(),
+            is_acp_adapter: registry::acp_adapter_relation(agent_type).is_some(),
+            custom_source: agent_type
+                .custom_id()
+                .and_then(crate::acp::custom_registry::source_of)
+                .map(|s| s.as_str().to_string()),
             enabled: setting.map(|m| m.enabled).unwrap_or(true),
             sort_order,
             installed_version: local_installed_version,
@@ -6387,11 +9150,24 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
             opencode_auth_json,
             codex_auth_json,
             codex_config_toml,
+            codex_sandbox_settings,
+            codex_model_catalog,
             cline_secrets_json,
             hermes_config_yaml,
             grok_config_toml,
             grok_settings,
+            cursor_cli_config_json,
+            cursor_settings,
             model_provider_id: setting.and_then(|m| m.model_provider_id),
+            icon_url: agent_type
+                .custom_id()
+                .and_then(custom_registry::icon_for)
+                .map(ToString::to_string),
+            // Derived server-side so the skills surfaces need no frontend
+            // knowledge of which agents keep a skill store: all builtins do
+            // today, customs only when the user declared the shared
+            // `.agents/skills` store.
+            skills_capable: skill_storage_spec(agent_type).is_some(),
         });
     }
 
@@ -6581,6 +9357,11 @@ pub(crate) async fn acp_update_agent_env_core(
     // same way.
     let mut merged_env = env;
     let mut codex_action = CodexModelAction::NoOp;
+    // When a Codex provider is bound, capture its structured model list so we can
+    // regenerate the `model_catalog_json` catalog + root `model` after the DB
+    // write. `Some(_)` means "codex provider bound"; the inner option is the
+    // provider's stored model value.
+    let mut codex_bound_model: Option<Option<String>> = None;
     // When a Claude provider is bound, capture the inputs to also rewrite the
     // on-disk config.env below. Claude's model fields live in config.env, which
     // the runtime overlays OVER db env_json (see `build_runtime_env_from_setting`),
@@ -6625,9 +9406,13 @@ pub(crate) async fn acp_update_agent_env_core(
             }
         }
         codex_action = provider_codex_model_action(agent_type, provider.model.as_deref());
-        // Codex's on-disk config is handled by `apply_codex_root_model_action`
+        // Codex's on-disk config (catalog + root model) is regenerated from the
+        // provider's structured model list by `apply_codex_catalog_and_model`
         // below; Gemini's analogous config.env gap is pre-existing and out of
         // scope here. Only Claude needs the local-config cascade on bind.
+        if agent_type == AgentType::Codex {
+            codex_bound_model = Some(provider.model.clone());
+        }
         if agent_type == AgentType::ClaudeCode {
             claude_local_cascade = Some((provider.api_url.clone(), provider.api_key.clone(), model_env));
         }
@@ -6652,12 +9437,20 @@ pub(crate) async fn acp_update_agent_env_core(
             &api_key,
             &model_env,
             &CodexModelAction::NoOp,
+            None,
         ) {
             eprintln!("[acp_update_agent_env] cascade_update_agent_config({agent_type}) failed: {e}");
         }
     }
 
-    if let Err(e) = apply_codex_root_model_action(&codex_action) {
+    if let Some(model_raw) = codex_bound_model {
+        // Codex provider bound: regenerate the catalog + config.toml keys from
+        // the provider's full model list (REPLACE semantics require the whole
+        // list every time).
+        if let Err(e) = apply_codex_catalog_and_model(model_raw.as_deref()) {
+            tracing::error!("[acp_update_agent_env] apply_codex_catalog_and_model failed: {e}");
+        }
+    } else if let Err(e) = apply_codex_root_model_action(&codex_action) {
         tracing::error!("[acp_update_agent_env] apply_codex_root_model_action failed: {e}");
     }
 
@@ -6692,6 +9485,64 @@ fn apply_codex_root_model_action(action: &CodexModelAction) -> Result<(), AcpErr
             table.remove("model");
         }
         CodexModelAction::NoOp => unreachable!(),
+    }
+    let toml_str =
+        toml::to_string_pretty(&toml_value).map_err(|e| AcpError::protocol(e.to_string()))?;
+    persist_codex_native_config_files(None, Some(&toml_str))?;
+    Ok(())
+}
+
+/// Codex: generate the `model_catalog_json` catalog file from a structured
+/// model list and point `~/.codex/config.toml` at it (relative to `CODEX_HOME`),
+/// plus set the root `model` to the default slug. An empty/blank list removes
+/// both keys and the generated files (codex falls back to its default catalog).
+///
+/// This reflows config.toml through the `toml` crate — the same behavior the
+/// provider bind / cascade paths already have. The comment-preserving agent
+/// panel path instead patches the config.toml text on the frontend and only
+/// asks the backend to (re)write the catalog *files* (see
+/// `acp_update_agent_config_core`).
+fn apply_codex_catalog_and_model(raw: Option<&str>) -> Result<(), AcpError> {
+    let snapshot = crate::acp::codex_catalog_source::cached_or_bundled_snapshot();
+    let injection = crate::acp::codex_model_catalog::write_catalog_files(
+        raw.unwrap_or_default(),
+        &codex_home_dir(),
+        &snapshot,
+    )
+    .map_err(|e| AcpError::protocol(e.to_string()))?;
+
+    let config_path = codex_config_toml_path();
+    let mut toml_value = if config_path.exists() {
+        fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|raw| raw.parse::<toml::Value>().ok())
+            .filter(|v| v.is_table())
+            .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()))
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let table = toml_value
+        .as_table_mut()
+        .ok_or_else(|| AcpError::protocol("codex config root must be a TOML table"))?;
+    match &injection {
+        Some(inj) => {
+            table.insert(
+                "model_catalog_json".to_string(),
+                toml::Value::String(inj.catalog_rel.to_string()),
+            );
+            match &inj.default_model {
+                Some(model) => {
+                    table.insert("model".to_string(), toml::Value::String(model.clone()));
+                }
+                None => {
+                    table.remove("model");
+                }
+            }
+        }
+        None => {
+            table.remove("model_catalog_json");
+            table.remove("model");
+        }
     }
     let toml_str =
         toml::to_string_pretty(&toml_value).map_err(|e| AcpError::protocol(e.to_string()))?;
@@ -6768,8 +9619,12 @@ pub(crate) async fn acp_update_agent_config_core(
     opencode_auth_json: Option<String>,
     codex_auth_json: Option<String>,
     codex_config_toml: Option<String>,
+    codex_model_catalog: Option<String>,
+    codex_sandbox: Option<CodexSandboxStructuredConfig>,
     grok_config_toml: Option<String>,
     grok_structured: Option<GrokStructuredConfig>,
+    cursor_cli_config_json: Option<String>,
+    cursor_structured: Option<crate::acp::types::CursorStructuredConfig>,
     emitter: &EventEmitter,
 ) -> Result<(), AcpError> {
     let config_json = config_json.and_then(|raw| {
@@ -6791,11 +9646,37 @@ pub(crate) async fn acp_update_agent_config_core(
     }
 
     if agent_type == AgentType::Codex {
-        if codex_auth_json.is_some() || codex_config_toml.is_some() {
-            persist_codex_native_config_files(
-                codex_auth_json.as_deref(),
-                codex_config_toml.as_deref(),
-            )?;
+        // Mirrors the Grok/Cursor flow. The advanced raw editor sends the whole
+        // file (`codex_config_toml = Some(text)`), so that text is the verbatim
+        // base; the sandbox/approval controls send only a patch, merged onto the
+        // CURRENT on-disk config (read fresh, failing loudly on a real read
+        // error) so a stale in-memory snapshot can't drop keys written by codex
+        // itself or another window since the panel opened.
+        if codex_auth_json.is_some() || codex_config_toml.is_some() || codex_sandbox.is_some() {
+            let merged_toml = match &codex_sandbox {
+                Some(sandbox) => {
+                    let base = match codex_config_toml {
+                        Some(text) => text,
+                        None => read_codex_config_or_empty()?,
+                    };
+                    Some(apply_codex_sandbox_config(&base, sandbox)?)
+                }
+                None => codex_config_toml,
+            };
+            persist_codex_native_config_files(codex_auth_json.as_deref(), merged_toml.as_deref())?;
+        }
+        // The frontend has already patched config.toml's `model_catalog_json` +
+        // root `model` into `codex_config_toml` (comment-preserving text patch);
+        // the backend only (re)writes the generated catalog *files* here.
+        if let Some(raw) = codex_model_catalog.as_deref() {
+            let snapshot = crate::acp::codex_catalog_source::cached_or_bundled_snapshot();
+            if let Err(e) = crate::acp::codex_model_catalog::write_catalog_files(
+                raw,
+                &codex_home_dir(),
+                &snapshot,
+            ) {
+                tracing::error!("[acp_update_agent_config] write codex catalog failed: {e}");
+            }
         }
         emit_acp_agents_updated(emitter, "config_updated", Some(agent_type));
         return Ok(());
@@ -6820,6 +9701,29 @@ pub(crate) async fn acp_update_agent_config_core(
                 None => base,
             };
             persist_grok_native_config_files(Some(&merged))?;
+        }
+        emit_acp_agents_updated(emitter, "config_updated", Some(agent_type));
+        return Ok(());
+    }
+
+    if agent_type == AgentType::Cursor {
+        // Mirrors the Grok flow: the advanced raw editor sends the whole file
+        // (`cursor_cli_config_json = Some(text)`); the structured controls send
+        // only a patch, merged onto the CURRENT on-disk config (read fresh) so
+        // a stale in-memory snapshot can't drop keys written by the CLI's own
+        // `/config` UI since the panel opened.
+        if cursor_cli_config_json.is_some() || cursor_structured.is_some() {
+            let base = match cursor_cli_config_json {
+                Some(text) => text,
+                None => load_cursor_cli_config_raw().unwrap_or_default(),
+            };
+            let merged = match &cursor_structured {
+                Some(patch) => apply_cursor_structured_config(&base, patch)?,
+                None => base,
+            };
+            if !merged.trim().is_empty() {
+                persist_cursor_cli_config(&merged)?;
+            }
         }
         emit_acp_agents_updated(emitter, "config_updated", Some(agent_type));
         return Ok(());
@@ -6865,8 +9769,12 @@ pub(crate) async fn acp_update_agent_config_and_refresh(
     opencode_auth_json: Option<String>,
     codex_auth_json: Option<String>,
     codex_config_toml: Option<String>,
+    codex_model_catalog: Option<String>,
+    codex_sandbox: Option<CodexSandboxStructuredConfig>,
     grok_config_toml: Option<String>,
     grok_structured: Option<GrokStructuredConfig>,
+    cursor_cli_config_json: Option<String>,
+    cursor_structured: Option<crate::acp::types::CursorStructuredConfig>,
     db: &AppDatabase,
     manager: &ConnectionManager,
     data_dir: &Path,
@@ -6878,8 +9786,12 @@ pub(crate) async fn acp_update_agent_config_and_refresh(
         opencode_auth_json,
         codex_auth_json,
         codex_config_toml,
+        codex_model_catalog,
+        codex_sandbox,
         grok_config_toml,
         grok_structured,
+        cursor_cli_config_json,
+        cursor_structured,
         emitter,
     )
     .await?;
@@ -6895,8 +9807,12 @@ pub async fn acp_update_agent_config(
     opencode_auth_json: Option<String>,
     codex_auth_json: Option<String>,
     codex_config_toml: Option<String>,
+    codex_model_catalog: Option<String>,
+    codex_sandbox: Option<CodexSandboxStructuredConfig>,
     grok_config_toml: Option<String>,
     grok_structured: Option<GrokStructuredConfig>,
+    cursor_cli_config_json: Option<String>,
+    cursor_structured: Option<crate::acp::types::CursorStructuredConfig>,
     manager: State<'_, ConnectionManager>,
     db: State<'_, AppDatabase>,
     app: tauri::AppHandle,
@@ -6913,8 +9829,12 @@ pub async fn acp_update_agent_config(
         opencode_auth_json,
         codex_auth_json,
         codex_config_toml,
+        codex_model_catalog,
+        codex_sandbox,
         grok_config_toml,
         grok_structured,
+        cursor_cli_config_json,
+        cursor_structured,
         &db,
         &manager,
         &app_data_dir,
@@ -6960,6 +9880,10 @@ pub async fn acp_update_kimi_code_config(
     vertex_project: Option<String>,
     vertex_location: Option<String>,
     raw_config_toml: Option<String>,
+    reasoning_enabled: Option<bool>,
+    always_thinking: Option<bool>,
+    support_efforts: Option<Vec<String>>,
+    default_effort: Option<String>,
     manager: State<'_, ConnectionManager>,
     db: State<'_, AppDatabase>,
     app: tauri::AppHandle,
@@ -6982,6 +9906,10 @@ pub async fn acp_update_kimi_code_config(
             vertex_project,
             vertex_location,
             raw_config_toml,
+            reasoning_enabled,
+            always_thinking,
+            support_efforts,
+            default_effort,
         },
         &db,
         &manager,
@@ -7235,6 +10163,10 @@ pub(crate) async fn acp_download_agent_binary_core(
                 effective_version,
                 &archive_url,
                 cmd,
+                // A custom version rewrites the URL, so the registry's digest
+                // no longer describes what we are about to fetch — only verify
+                // against the pinned release.
+                custom.is_none().then_some(fallback.sha256).flatten(),
                 move |msg| {
                     emit_agent_install_event(
                         &emitter_clone,
@@ -7351,12 +10283,32 @@ pub async fn acp_install_uv_tool(
 pub(crate) async fn acp_detect_agent_local_version_core(
     agent_type: AgentType,
     conn: &sea_orm::DatabaseConnection,
+    emitter: &EventEmitter,
 ) -> Result<Option<String>, AcpError> {
+    // Snapshot the stored version before probing so we can tell whether this
+    // detection actually moves it. The settings page re-runs this for every
+    // agent on each open; emitting unconditionally would fan a reload storm out
+    // to every `useAcpAgents()` consumer, so we only notify on a real change.
+    let previous = agent_setting_service::get_by_agent_type(conn, agent_type)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|m| m.installed_version);
+
     let detected = detect_local_version(agent_type).await;
     if let Some(version) = detected.clone() {
         let _ =
             agent_setting_service::set_installed_version(conn, agent_type, Some(version.clone()))
                 .await;
+        // Heal the composer's install status. The input box reads
+        // `installed_version` straight from this row and shows "not installed"
+        // while it's null (`acp_list_agents_core` never probes npm for it). When
+        // a live probe discovers a version the DB never recorded — an agent
+        // installed outside codeg, or by a build predating version tracking —
+        // wake `useAcpAgents()` so the composer stops claiming it's missing.
+        if previous.as_deref() != Some(version.as_str()) {
+            emit_acp_agents_updated(emitter, "local_version_detected", Some(agent_type));
+        }
         return Ok(Some(version));
     }
 
@@ -7373,15 +10325,15 @@ pub(crate) async fn acp_detect_agent_local_version_core(
         registry::AgentDistribution::Binary { .. }
     ) {
         let _ = agent_setting_service::set_installed_version(conn, agent_type, None).await;
+        // Mirror the heal in the clearing direction: a binary that vanished from
+        // disk must flip the composer back to "not installed".
+        if previous.is_some() {
+            emit_acp_agents_updated(emitter, "local_version_cleared", Some(agent_type));
+        }
         return Ok(None);
     }
 
-    let fallback = agent_setting_service::get_by_agent_type(conn, agent_type)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|m| m.installed_version);
-    Ok(fallback)
+    Ok(previous)
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -7389,8 +10341,10 @@ pub(crate) async fn acp_detect_agent_local_version_core(
 pub async fn acp_detect_agent_local_version(
     agent_type: AgentType,
     db: State<'_, AppDatabase>,
+    app: tauri::AppHandle,
 ) -> Result<Option<String>, AcpError> {
-    acp_detect_agent_local_version_core(agent_type, &db.conn).await
+    let emitter = EventEmitter::Tauri(app);
+    acp_detect_agent_local_version_core(agent_type, &db.conn, &emitter).await
 }
 
 pub(crate) async fn acp_prepare_npx_agent_core(
@@ -8006,6 +10960,22 @@ pub async fn opencode_provider_catalog(
     Ok(opencode_provider_catalog_core(&data_dir, force_refresh.unwrap_or(false)).await)
 }
 
+/// The official codex model catalog (full `ModelInfo` entries), sourced at
+/// runtime from the codex codeg actually launches (cache + bundled fallback),
+/// used by the settings editor for the official list, "quick-add official", and
+/// as the clone template for custom entries' heavy required fields.
+pub(crate) async fn codex_bundled_catalog_core(force_refresh: bool) -> Vec<serde_json::Value> {
+    crate::acp::codex_catalog_source::runtime_catalog(force_refresh).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn codex_bundled_catalog(
+    force_refresh: Option<bool>,
+) -> Result<Vec<serde_json::Value>, AcpError> {
+    Ok(codex_bundled_catalog_core(force_refresh.unwrap_or(false)).await)
+}
+
 pub(crate) async fn opencode_install_plugins_core(
     names: Option<Vec<String>>,
     task_id: String,
@@ -8262,12 +11232,143 @@ mod tests {
     use super::*;
 
     #[test]
+    fn extract_version_token_finds_the_version_in_common_banners() {
+        assert_eq!(extract_version_token("0.21.0").as_deref(), Some("0.21.0"));
+        assert_eq!(
+            extract_version_token("qwen version 0.21.0\n").as_deref(),
+            Some("0.21.0")
+        );
+        assert_eq!(
+            extract_version_token("goose v1.44.0 (release)").as_deref(),
+            Some("1.44.0")
+        );
+        assert_eq!(
+            extract_version_token("Foo CLI\nversion: 2.3.4-beta.1").as_deref(),
+            Some("2.3.4-beta.1")
+        );
+        // A leading `v` is stripped; the word "version" is not mistaken for one.
+        assert_eq!(
+            extract_version_token("version v10.2.30").as_deref(),
+            Some("10.2.30")
+        );
+        // curl-style `name/version` banners (omp prints exactly this).
+        assert_eq!(
+            extract_version_token("omp/17.1.7").as_deref(),
+            Some("17.1.7")
+        );
+        // npm-style `package@version`, scoped packages included.
+        assert_eq!(
+            extract_version_token("@oh-my-pi/pi-coding-agent@17.1.7").as_deref(),
+            Some("17.1.7")
+        );
+    }
+
+    #[test]
+    fn extract_version_token_rejects_non_versions() {
+        assert!(extract_version_token("").is_none());
+        assert!(extract_version_token("usage: foo [args]").is_none());
+        // Dotted but not digit-led, and digit-led but not dotted.
+        assert!(extract_version_token("node.js required").is_none());
+        assert!(extract_version_token("exit 1").is_none());
+        // A URL's path segment must not read as a version, and slash-split
+        // pieces without a dot don't qualify either.
+        assert!(extract_version_token("docs: https://example.com/2.0/setup").is_none());
+        assert!(extract_version_token("built 2026/07").is_none());
+    }
+
+    #[test]
+    fn probe_cache_key_misses_when_the_declared_probe_or_package_changes() {
+        let bin = std::path::Path::new("/usr/local/bin/agent");
+        // Editing the declared probe MUST be a cache miss — this was the bug:
+        // a path+mtime key kept serving the old probe's result.
+        let auto = probe_cache_key(bin, None, None);
+        let probe_a = probe_cache_key(bin, Some("agent --version"), None);
+        let probe_b = probe_cache_key(bin, Some("agent -V"), None);
+        assert_ne!(auto, probe_a);
+        assert_ne!(probe_a, probe_b);
+        // Removing the probe again returns to the auto key.
+        assert_eq!(probe_cache_key(bin, None, None), auto);
+        // Two agents sharing a launcher but naming different npm packages must
+        // not read each other's auto-path result…
+        let pkg_a = probe_cache_key(bin, None, Some("@scope/a"));
+        let pkg_b = probe_cache_key(bin, None, Some("@scope/b"));
+        assert_ne!(pkg_a, pkg_b);
+        // …and the package stays in the key even with a declared probe: a
+        // failing probe falls back to the package conventions, so the package
+        // still shapes the cached result.
+        assert_ne!(
+            probe_cache_key(bin, Some("agent --version"), Some("@scope/a")),
+            probe_cache_key(bin, Some("agent --version"), Some("@scope/b")),
+        );
+    }
+
+    #[cfg(unix)]
+    fn fake_version_script(dir: &std::path::Path, name: &str, banner: &str) -> PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = dir.join(name);
+        {
+            let mut f = std::fs::File::create(&bin).expect("create script");
+            f.write_all(format!("#!/bin/sh\necho \"{banner}\"\n").as_bytes())
+                .expect("write script");
+        }
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        bin
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn system_probed_version_reads_a_system_cli_via_the_version_convention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = fake_version_script(dir.path(), "fake-agent", "fake-agent version 1.2.3");
+
+        // Unregistered custom id → no declared probe → the auto `--version`
+        // path, exactly what a hand-added agent without a probe gets. The
+        // same path serves built-ins, which can never declare a probe.
+        let version =
+            system_probed_version(AgentType::Custom("probe-e2e-test"), &bin, None).await;
+        assert_eq!(version.as_deref(), Some("1.2.3"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_declared_probe_falls_back_to_the_version_convention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `name/version` banner — the shape that motivated the token split.
+        let bin = fake_version_script(dir.path(), "fallback-agent", "fallback-agent/3.2.1");
+
+        // The declared probe's program doesn't exist, so the probe yields
+        // nothing; the convention path must still read the real install.
+        let version = system_probed_version_with(
+            Some("codeg-missing-probe-cmd-e2e --version"),
+            &bin,
+            None,
+        )
+        .await;
+        assert_eq!(version.as_deref(), Some("3.2.1"));
+    }
+
+    #[test]
     fn parse_grok_settings_reads_documented_keys() {
-        let toml = "[ui]\npermission_mode = \"always-approve\"\n\n\
+        let toml = "[ui]\npermission_mode = \"acceptEdits\"\n\n\
                     [models]\ndefault_reasoning_effort = \"high\"\n";
         let s = parse_grok_settings(toml);
-        assert_eq!(s.permission_mode.as_deref(), Some("always-approve"));
+        assert_eq!(s.permission_mode.as_deref(), Some("acceptEdits"));
         assert_eq!(s.default_reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn parse_grok_settings_migrates_legacy_permission_values() {
+        // codeg's old codeg-invented markers map onto grok's real enum so the
+        // dropdown, launch flag, and grok's TUI agree.
+        let approve = parse_grok_settings("[ui]\npermission_mode = \"always-approve\"\n");
+        assert_eq!(approve.permission_mode.as_deref(), Some("bypassPermissions"));
+        let ask = parse_grok_settings("[ui]\npermission_mode = \"ask\"\n");
+        assert_eq!(ask.permission_mode.as_deref(), Some("default"));
+        // A real grok mode is preserved untouched.
+        let real = parse_grok_settings("[ui]\npermission_mode = \"auto\"\n");
+        assert_eq!(real.permission_mode.as_deref(), Some("auto"));
     }
 
     #[test]
@@ -8287,14 +11388,14 @@ mod tests {
             "",
             &GrokStructuredConfig {
                 default_reasoning_effort: Some("high".into()),
-                permission_mode: Some("ask".into()),
+                permission_mode: Some("acceptEdits".into()),
                 ..Default::default()
             },
         )
         .unwrap();
         let back = parse_grok_settings(&merged);
         assert_eq!(back.default_reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(back.permission_mode.as_deref(), Some("ask"));
+        assert_eq!(back.permission_mode.as_deref(), Some("acceptEdits"));
     }
 
     #[test]
@@ -8305,7 +11406,7 @@ mod tests {
             base,
             &GrokStructuredConfig {
                 default_reasoning_effort: Some("low".into()),
-                permission_mode: Some("always-approve".into()),
+                permission_mode: Some("bypassPermissions".into()),
                 ..Default::default()
             },
         )
@@ -8318,7 +11419,7 @@ mod tests {
         assert!(merged.contains("default = \"grok-4.5\""));
         let back = parse_grok_settings(&merged);
         assert_eq!(back.default_reasoning_effort.as_deref(), Some("low"));
-        assert_eq!(back.permission_mode.as_deref(), Some("always-approve"));
+        assert_eq!(back.permission_mode.as_deref(), Some("bypassPermissions"));
     }
 
     #[test]
@@ -8375,6 +11476,400 @@ mod tests {
             incompatible.is_err(),
             "an incompatible non-table section must error, not clobber"
         );
+    }
+
+    // ---- Codex sandbox / approval structured controls -------------------
+    // Every expectation below was verified against a real codex-cli 0.145.0 by
+    // writing the shape into an isolated `CODEX_HOME` and reading the resulting
+    // `thread/start` sandbox back.
+
+    #[test]
+    fn parse_codex_sandbox_settings_reads_plain_keys() {
+        let s = parse_codex_sandbox_settings(
+            "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n",
+        );
+        assert_eq!(s.approval_policy.as_deref(), Some("never"));
+        assert_eq!(s.sandbox_mode.as_deref(), Some("danger-full-access"));
+        assert!(s.granular.is_none());
+        assert!(!s.shadowed_by_default_permissions);
+    }
+
+    #[test]
+    fn parse_codex_sandbox_settings_normalizes_legacy_on_failure() {
+        // `on-failure` is a serde ALIAS of `on-request` upstream, not a distinct
+        // policy, so the panel must show it as `on-request` rather than as an
+        // unknown value it would then clobber.
+        let s = parse_codex_sandbox_settings("approval_policy = \"on-failure\"\n");
+        assert_eq!(s.approval_policy.as_deref(), Some("on-request"));
+    }
+
+    #[test]
+    fn parse_codex_sandbox_settings_reads_granular_in_both_toml_forms() {
+        let inline = parse_codex_sandbox_settings(
+            "approval_policy = { granular = { sandbox_approval = true, rules = false, \
+             skill_approval = true, request_permissions = false, mcp_elicitations = true } }\n",
+        );
+        let section = parse_codex_sandbox_settings(
+            "[approval_policy.granular]\nsandbox_approval = true\nrules = false\n\
+             skill_approval = true\nrequest_permissions = false\nmcp_elicitations = true\n",
+        );
+        for s in [inline, section] {
+            assert!(s.approval_policy.is_none(), "granular is not a string form");
+            let g = s.granular.expect("granular table");
+            assert!(g.sandbox_approval && g.skill_approval && g.mcp_elicitations);
+            assert!(!g.rules && !g.request_permissions);
+        }
+    }
+
+    #[test]
+    fn parse_codex_sandbox_settings_reads_workspace_write_group() {
+        let s = parse_codex_sandbox_settings(
+            "sandbox_mode = \"workspace-write\"\n\n[sandbox_workspace_write]\n\
+             writable_roots = [\"/srv/one\", \"/srv/two\"]\nnetwork_access = true\n\
+             exclude_slash_tmp = true\n",
+        );
+        assert_eq!(s.workspace_write.writable_roots, ["/srv/one", "/srv/two"]);
+        assert!(s.workspace_write.network_access);
+        assert!(s.workspace_write.exclude_slash_tmp);
+        assert!(!s.workspace_write.exclude_tmpdir_env_var);
+    }
+
+    #[test]
+    fn parse_codex_sandbox_settings_flags_profile_shadowing() {
+        // `default_permissions` makes codex resolve permissions through the
+        // profile pipeline and ignore `sandbox_mode` entirely — verified live:
+        // `:read-only` + `danger-full-access` yields a read-only sandbox.
+        let s = parse_codex_sandbox_settings(
+            "sandbox_mode = \"danger-full-access\"\ndefault_permissions = \":read-only\"\n\n\
+             [permissions.tight]\nfile_system = \"restricted\"\n",
+        );
+        assert!(s.shadowed_by_default_permissions);
+        assert!(s.has_permissions_table);
+    }
+
+    #[test]
+    fn parse_codex_sandbox_settings_ignores_unknown_values_and_bad_toml() {
+        let unknown = parse_codex_sandbox_settings(
+            "approval_policy = \"yolo\"\nsandbox_mode = \"wide-open\"\n",
+        );
+        assert!(unknown.approval_policy.is_none());
+        assert!(unknown.sandbox_mode.is_none());
+        let broken = parse_codex_sandbox_settings("== not toml ==");
+        assert!(broken.sandbox_mode.is_none());
+    }
+
+    /// Set a field: `Some(Some(v))`. Clear it: `Some(None)`. Leave it exactly as
+    /// the base has it: `None` (the struct default).
+    fn set<T>(value: T) -> Option<Option<T>> {
+        Some(Some(value))
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_writes_and_preserves_unmanaged_keys() {
+        let base = "# keep me\nmodel = \"gpt-5\"\n\n[features]\nskills = true\n";
+        let merged = apply_codex_sandbox_config(
+            base,
+            &CodexSandboxStructuredConfig {
+                approval_policy: set("never".into()),
+                sandbox_mode: set("workspace-write".into()),
+                writable_roots: Some(vec!["/srv/extra".into()]),
+                network_access: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(merged.contains("# keep me"), "comments survive");
+        assert!(merged.contains("model = \"gpt-5\""));
+        assert!(merged.contains("skills = true"));
+        let back = parse_codex_sandbox_settings(&merged);
+        assert_eq!(back.approval_policy.as_deref(), Some("never"));
+        assert_eq!(back.sandbox_mode.as_deref(), Some("workspace-write"));
+        assert_eq!(back.workspace_write.writable_roots, ["/srv/extra"]);
+        assert!(back.workspace_write.network_access);
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_writes_all_five_granular_keys() {
+        // `sandbox_approval`, `rules` and `mcp_elicitations` have no upstream
+        // default: a partial table makes codex refuse to load config.toml
+        // ("missing field `sandbox_approval`"), so all five are always written.
+        let merged = apply_codex_sandbox_config(
+            "",
+            &CodexSandboxStructuredConfig {
+                granular: set(CodexGranularApproval {
+                    sandbox_approval: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for key in [
+            "sandbox_approval",
+            "rules",
+            "skill_approval",
+            "request_permissions",
+            "mcp_elicitations",
+        ] {
+            assert!(merged.contains(key), "granular table must carry {key}");
+        }
+        assert!(parse_codex_sandbox_settings(&merged).granular.is_some());
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_switches_granular_back_to_a_preset() {
+        // The string form must REPLACE the table; an emptied `[approval_policy]`
+        // would fail to deserialize as the externally tagged enum.
+        let base = "[approval_policy.granular]\nsandbox_approval = true\nrules = true\n\
+                    skill_approval = false\nrequest_permissions = false\nmcp_elicitations = true\n";
+        let merged = apply_codex_sandbox_config(
+            base,
+            &CodexSandboxStructuredConfig {
+                approval_policy: set("on-request".into()),
+                granular: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let back = parse_codex_sandbox_settings(&merged);
+        assert_eq!(back.approval_policy.as_deref(), Some("on-request"));
+        assert!(back.granular.is_none(), "the granular table is gone");
+        assert!(!merged.contains("sandbox_approval"));
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_keeps_root_keys_out_of_existing_tables() {
+        // TOML positioning guard: a root scalar or the `[approval_policy]`
+        // granular table must not be emitted AFTER an existing section, which
+        // would silently reparent unrelated root keys into that section.
+        let base = "model = \"gpt-5\"\nmodel_provider = \"codeg\"\n\n\
+                    [features]\nskills = true\n\n\
+                    [mcp_servers.ctx]\ncommand = \"npx\"\n";
+        let merged = apply_codex_sandbox_config(
+            base,
+            &CodexSandboxStructuredConfig {
+                granular: set(CodexGranularApproval {
+                    sandbox_approval: true,
+                    rules: true,
+                    ..Default::default()
+                }),
+                sandbox_mode: set("workspace-write".into()),
+                network_access: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let table = merged
+            .parse::<toml::Table>()
+            .expect("merged config must stay valid TOML");
+        assert_eq!(
+            table.get("model").and_then(toml::Value::as_str),
+            Some("gpt-5"),
+            "root keys must stay at the root"
+        );
+        assert_eq!(
+            table.get("model_provider").and_then(toml::Value::as_str),
+            Some("codeg")
+        );
+        assert_eq!(
+            table
+                .get("features")
+                .and_then(toml::Value::as_table)
+                .and_then(|t| t.get("skills"))
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "unmanaged sections keep their own keys"
+        );
+        assert!(table.get("mcp_servers").is_some());
+        let back = parse_codex_sandbox_settings(&merged);
+        assert!(back.granular.is_some());
+        assert_eq!(back.sandbox_mode.as_deref(), Some("workspace-write"));
+        assert!(back.workspace_write.network_access);
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_removes_keys_and_empty_section() {
+        let base = "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n\n\
+                    [sandbox_workspace_write]\nnetwork_access = true\n\n\
+                    [features]\nskills = true\n";
+        let merged = apply_codex_sandbox_config(
+            base,
+            &CodexSandboxStructuredConfig {
+                approval_policy: Some(None),
+                granular: Some(None),
+                sandbox_mode: Some(None),
+                writable_roots: Some(vec![]),
+                network_access: Some(false),
+                exclude_tmpdir_env_var: Some(false),
+                exclude_slash_tmp: Some(false),
+            },
+        )
+        .unwrap();
+        let back = parse_codex_sandbox_settings(&merged);
+        assert!(back.approval_policy.is_none());
+        assert!(back.sandbox_mode.is_none());
+        assert!(
+            !merged.contains("sandbox_workspace_write"),
+            "empty section removed"
+        );
+        assert!(merged.contains("skills = true"), "other sections untouched");
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_leaves_absent_fields_untouched() {
+        // The core of the patch contract. The settings panel sends the raw
+        // config.toml text alongside this patch and the patch wins, so a field
+        // the user did not move must not be written from the panel's (possibly
+        // stale) view — otherwise a hand-edit in the raw editor gets reverted.
+        let base = "approval_policy = \"never\"\nsandbox_mode = \"read-only\"\n\n\
+                    [sandbox_workspace_write]\nwritable_roots = [\"/srv/keep\"]\n\
+                    network_access = true\nexclude_slash_tmp = true\n";
+        let merged = apply_codex_sandbox_config(
+            base,
+            // Only the sandbox mode moved.
+            &CodexSandboxStructuredConfig {
+                sandbox_mode: set("workspace-write".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let back = parse_codex_sandbox_settings(&merged);
+        assert_eq!(back.sandbox_mode.as_deref(), Some("workspace-write"));
+        assert_eq!(
+            back.approval_policy.as_deref(),
+            Some("never"),
+            "an untouched approval must survive the patch"
+        );
+        assert_eq!(back.workspace_write.writable_roots, ["/srv/keep"]);
+        assert!(back.workspace_write.network_access);
+        assert!(back.workspace_write.exclude_slash_tmp);
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_empty_patch_is_a_no_op() {
+        let base = "model = \"gpt-5\"\nsandbox_mode = \"read-only\"\n\n\
+                    [approval_policy.granular]\nsandbox_approval = true\nrules = true\n\
+                    skill_approval = false\nrequest_permissions = false\n\
+                    mcp_elicitations = true\n\n\
+                    [sandbox_workspace_write]\nnetwork_access = true\n";
+        // An all-absent patch must not touch a single key.
+        let merged =
+            apply_codex_sandbox_config(base, &CodexSandboxStructuredConfig::default()).unwrap();
+        assert_eq!(merged.trim(), base.trim());
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_partial_workspace_write_patch() {
+        // Toggling one flag must not disturb its siblings or the roots list.
+        let base = "[sandbox_workspace_write]\nwritable_roots = [\"/srv/keep\"]\n\
+                    network_access = true\n";
+        let merged = apply_codex_sandbox_config(
+            base,
+            &CodexSandboxStructuredConfig {
+                exclude_slash_tmp: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let back = parse_codex_sandbox_settings(&merged);
+        assert_eq!(back.workspace_write.writable_roots, ["/srv/keep"]);
+        assert!(back.workspace_write.network_access);
+        assert!(back.workspace_write.exclude_slash_tmp);
+
+        // Clearing the last remaining key drops the now-bare section header.
+        let emptied = apply_codex_sandbox_config(
+            "[sandbox_workspace_write]\nnetwork_access = true\n",
+            &CodexSandboxStructuredConfig {
+                network_access: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!emptied.contains("sandbox_workspace_write"));
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_rejects_bad_input() {
+        // Relative writable_roots are NOT rejected by codex — they resolve
+        // against CODEX_HOME ("rel/dir" → ~/.codex/rel/dir), silently granting
+        // write access somewhere the user never meant. So codeg rejects them.
+        assert!(apply_codex_sandbox_config(
+            "",
+            &CodexSandboxStructuredConfig {
+                writable_roots: Some(vec!["rel/dir".into()]),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(apply_codex_sandbox_config(
+            "",
+            &CodexSandboxStructuredConfig {
+                sandbox_mode: set("wide-open".into()),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(
+            apply_codex_sandbox_config(
+                "",
+                &CodexSandboxStructuredConfig {
+                    approval_policy: set("never".into()),
+                    granular: set(CodexGranularApproval::default()),
+                    ..Default::default()
+                }
+            )
+            .is_err(),
+            "a string and a granular table cannot coexist"
+        );
+        assert!(
+            apply_codex_sandbox_config("== not toml ==", &CodexSandboxStructuredConfig::default())
+                .is_err(),
+            "a malformed base must error, never silently overwrite the user's config"
+        );
+    }
+
+    #[test]
+    fn apply_codex_sandbox_config_accepts_windows_absolute_roots() {
+        let merged = apply_codex_sandbox_config(
+            "",
+            &CodexSandboxStructuredConfig {
+                writable_roots: Some(vec!["C:\\work\\repo".into(), "\\\\srv\\share".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            parse_codex_sandbox_settings(&merged)
+                .workspace_write
+                .writable_roots
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn codex_projection_folds_sandbox_keys_for_the_fingerprint() {
+        // These keys only take effect at `thread/start`, so a running session
+        // must be marked restart-required when they change; the projection is
+        // what `fingerprint_config` hashes.
+        let plain = codex_config_projection_from_toml("model = \"gpt-5\"\n");
+        assert!(!plain.contains_key("sandboxMode"));
+        assert!(!plain.contains_key("sandboxWorkspaceWrite"));
+        let with_sandbox = codex_config_projection_from_toml(
+            "model = \"gpt-5\"\napproval_policy = \"never\"\n\
+             sandbox_mode = \"workspace-write\"\n\n\
+             [sandbox_workspace_write]\nnetwork_access = true\n",
+        );
+        assert_eq!(
+            with_sandbox.get("approvalPolicy").and_then(|v| v.as_str()),
+            Some("never")
+        );
+        assert_eq!(
+            with_sandbox.get("sandboxMode").and_then(|v| v.as_str()),
+            Some("workspace-write")
+        );
+        assert!(with_sandbox.contains_key("sandboxWorkspaceWrite"));
+        assert_ne!(plain, with_sandbox, "the fingerprint input must change");
     }
 
     #[test]
@@ -8546,18 +12041,25 @@ mod tests {
     }
 
     #[test]
-    fn grok_config_selects_always_approve_only_for_that_mode() {
-        // Only an explicit always-approve arms the launch flag.
-        assert!(grok_config_selects_always_approve(
-            "[ui]\npermission_mode = \"always-approve\"\n"
-        ));
-        // "ask" keeps the flag off so ACP permission requests reach codeg.
-        assert!(!grok_config_selects_always_approve(
-            "[ui]\npermission_mode = \"ask\"\n"
-        ));
-        // Unset / malformed ⇒ false (preserve the ability to prompt).
-        assert!(!grok_config_selects_always_approve(""));
-        assert!(!grok_config_selects_always_approve("== not toml =="));
+    fn grok_config_permission_mode_maps_to_launch_flag() {
+        // Legacy always-approve → real bypassPermissions, passed as the flag.
+        assert_eq!(
+            grok_config_permission_mode("[ui]\npermission_mode = \"always-approve\"\n").as_deref(),
+            Some("bypassPermissions")
+        );
+        // A real granular mode passes through.
+        assert_eq!(
+            grok_config_permission_mode("[ui]\npermission_mode = \"acceptEdits\"\n").as_deref(),
+            Some("acceptEdits")
+        );
+        // `default` (grok's own default) and legacy `ask` keep the flag off so
+        // ACP permission requests reach codeg's UI.
+        assert!(grok_config_permission_mode("[ui]\npermission_mode = \"default\"\n").is_none());
+        assert!(grok_config_permission_mode("[ui]\npermission_mode = \"ask\"\n").is_none());
+        // Unset / malformed / unknown ⇒ no flag (preserve the ability to prompt).
+        assert!(grok_config_permission_mode("").is_none());
+        assert!(grok_config_permission_mode("== not toml ==").is_none());
+        assert!(grok_config_permission_mode("[ui]\npermission_mode = \"bogus\"\n").is_none());
     }
 
     /// Build a `runtime_env` whose `PI_CODING_AGENT_DIR` points at `agent_dir`,
@@ -8885,26 +12387,58 @@ wire_api = "chat"
 
     #[test]
     fn kimi_code_skill_storage_spec_targets_kimi_home() {
-        let spec =
-            skill_storage_spec(AgentType::KimiCode).expect("Kimi Code supports skills");
-        assert_eq!(spec.kind, SkillStorageKind::SkillDirectoryOnly);
-        assert_eq!(spec.project_rel_dirs, vec![".kimi-code/skills"]);
-        let expected = crate::parsers::kimi_code::resolve_kimi_code_home_dir().join("skills");
-        assert_eq!(spec.global_dirs, vec![expected]);
+        // `resolve_kimi_code_home_dir()` reads the process-wide `$HOME` (when
+        // `KIMI_CODE_HOME` is unset), and other tests mutate HOME via `temp_env`.
+        // Pin it (and clear `KIMI_CODE_HOME`) so the spec and the expected path
+        // resolve against one consistent home instead of racing a concurrent
+        // HOME-mutating test. Deriving `expected` from the same production helper
+        // keeps it correct on Windows, where `dirs::home_dir()` ignores HOME.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        temp_env::with_vars(
+            [
+                ("HOME", Some(tmp.path())),
+                ("KIMI_CODE_HOME", None::<&std::path::Path>),
+            ],
+            || {
+                let spec =
+                    skill_storage_spec(AgentType::KimiCode).expect("Kimi Code supports skills");
+                assert_eq!(spec.kind, SkillStorageKind::SkillDirectoryOnly);
+                assert_eq!(spec.project_rel_dirs, vec![".kimi-code/skills"]);
+                let expected =
+                    crate::parsers::kimi_code::resolve_kimi_code_home_dir().join("skills");
+                assert_eq!(spec.global_dirs, vec![expected]);
+            },
+        );
     }
 
     #[test]
     fn pi_skill_storage_spec_targets_pi_agent_dir() {
-        let spec = skill_storage_spec(AgentType::Pi).expect("Pi supports skills");
-        // pi's native dir accepts standalone `.md` files, like Codex.
-        assert_eq!(spec.kind, SkillStorageKind::SkillDirectoryOrMarkdownFile);
-        assert_eq!(spec.project_rel_dirs, vec![".pi/skills", ".agents/skills"]);
-        // Native pi dir first (preferred link target), shared store second.
-        let expected = vec![
-            pi_agent_dir().join("skills"),
-            home_dir_or_default().join(".agents").join("skills"),
-        ];
-        assert_eq!(spec.global_dirs, expected);
+        // `pi_agent_dir()` and `home_dir_or_default()` both read the process-wide
+        // `$HOME`, and other tests mutate HOME via `temp_env`. Pin it (and clear
+        // the BYO `PI_CODING_AGENT_DIR` override) so this test serializes against
+        // those mutators through temp_env's shared lock and reads one consistent
+        // home for both the spec and the expected paths. Deriving `expected` from
+        // the same production helpers keeps it correct on Windows, where
+        // `dirs::home_dir()` ignores the pinned HOME.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        temp_env::with_vars(
+            [
+                ("HOME", Some(tmp.path())),
+                ("PI_CODING_AGENT_DIR", None::<&std::path::Path>),
+            ],
+            || {
+                let spec = skill_storage_spec(AgentType::Pi).expect("Pi supports skills");
+                // pi's native dir accepts standalone `.md` files, like Codex.
+                assert_eq!(spec.kind, SkillStorageKind::SkillDirectoryOrMarkdownFile);
+                assert_eq!(spec.project_rel_dirs, vec![".pi/skills", ".agents/skills"]);
+                // Native pi dir first (preferred link target), shared store second.
+                let expected = vec![
+                    pi_agent_dir().join("skills"),
+                    home_dir_or_default().join(".agents").join("skills"),
+                ];
+                assert_eq!(spec.global_dirs, expected);
+            },
+        );
     }
 
     #[test]
@@ -8942,6 +12476,23 @@ wire_api = "chat"
             bare.get("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"),
             Some(&None)
         );
+    }
+
+    #[test]
+    fn parse_provider_model_codex_uses_default_slug() {
+        // A structured codex catalog resolves OPENAI_MODEL to its default slug,
+        // not the whole JSON blob.
+        let raw = r#"{"models":[{"slug":"gw/a","base":"gpt-5.4"},{"slug":"gw/b","base":"gpt-5.4"}],"default":"gw/b"}"#;
+        let out = parse_provider_model(AgentType::Codex, Some(raw));
+        assert_eq!(out.get("OPENAI_MODEL"), Some(&Some("gw/b".to_string())));
+
+        // A legacy plain slug passes through as the model.
+        let legacy = parse_provider_model(AgentType::Codex, Some("gpt-5.5"));
+        assert_eq!(legacy.get("OPENAI_MODEL"), Some(&Some("gpt-5.5".to_string())));
+
+        // No models → OPENAI_MODEL cleared (None).
+        let empty = parse_provider_model(AgentType::Codex, Some(r#"{"models":[]}"#));
+        assert_eq!(empty.get("OPENAI_MODEL"), Some(&None));
     }
 
     #[test]
@@ -8985,22 +12536,32 @@ wire_api = "chat"
         env.insert("OPENAI_BASE_URL".to_string(), "https://a".to_string());
         env.insert("OPENAI_API_KEY".to_string(), "k1".to_string());
 
-        // Same inputs → same fingerprint (the native-config read is identical
-        // across all calls in this test, so only the env varies).
-        let fp1 = fingerprint_config(agent, &env);
-        assert_eq!(fp1, fingerprint_config(agent, &env));
+        // `fingerprint_config` folds in the on-disk native config, so this test
+        // must pin CODEX_HOME the way the Grok/Cursor fingerprint tests below
+        // pin theirs. Reading the developer's real ~/.codex would make the
+        // "same inputs → same fingerprint" assertions depend on whether another
+        // test happened to be inside its own `temp_env` CODEX_HOME scope at the
+        // time — temp_env mutates the process environment, and only tests that
+        // take its lock are serialized against each other.
+        let dir = tempfile::tempdir().expect("tempdir");
+        temp_env::with_var("CODEX_HOME", Some(dir.path()), || {
+            // Same inputs → same fingerprint (the native-config read is
+            // identical across all calls in this test, so only the env varies).
+            let fp1 = fingerprint_config(agent, &env);
+            assert_eq!(fp1, fingerprint_config(agent, &env));
 
-        // Changing a real config value changes the fingerprint.
-        let mut env_changed = env.clone();
-        env_changed.insert("OPENAI_API_KEY".to_string(), "k2".to_string());
-        assert_ne!(fp1, fingerprint_config(agent, &env_changed));
+            // Changing a real config value changes the fingerprint.
+            let mut env_changed = env.clone();
+            env_changed.insert("OPENAI_API_KEY".to_string(), "k2".to_string());
+            assert_ne!(fp1, fingerprint_config(agent, &env_changed));
 
-        // The per-launch volatile key is excluded — adding it must NOT change
-        // the fingerprint (otherwise OpenClaw would look stale once a real
-        // session id is assigned and the reset flag drops).
-        let mut env_volatile = env.clone();
-        env_volatile.insert("OPENCLAW_RESET_SESSION".to_string(), "1".to_string());
-        assert_eq!(fp1, fingerprint_config(agent, &env_volatile));
+            // The per-launch volatile key is excluded — adding it must NOT
+            // change the fingerprint (otherwise OpenClaw would look stale once a
+            // real session id is assigned and the reset flag drops).
+            let mut env_volatile = env.clone();
+            env_volatile.insert("OPENCLAW_RESET_SESSION".to_string(), "1".to_string());
+            assert_eq!(fp1, fingerprint_config(agent, &env_volatile));
+        });
     }
 
     #[test]
@@ -9031,6 +12592,359 @@ wire_api = "chat"
                 "changing default_reasoning_effort must change the fingerprint"
             );
         });
+    }
+
+    /// Parse a provider table out of a TOML fragment so the auth-default tests
+    /// read like the config.toml a user would actually write.
+    fn provider_table_of(raw: &str) -> toml::map::Map<String, toml::Value> {
+        raw.parse::<toml::Value>()
+            .expect("fragment must parse")
+            .get("model_providers")
+            .and_then(toml::Value::as_table)
+            .and_then(|providers| providers.get("codeg"))
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .expect("fragment must define model_providers.codeg")
+    }
+
+    fn auth_flag_of(table: &toml::map::Map<String, toml::Value>) -> Option<bool> {
+        table.get("requires_openai_auth").and_then(toml::Value::as_bool)
+    }
+
+    #[test]
+    fn codex_auth_default_is_supplied_only_when_absent() {
+        // codeg provisions its provider with the key in auth.json and no
+        // `env_key`, so a provider WE create needs requires_openai_auth = true.
+        let mut fresh = provider_table_of("[model_providers.codeg]\nbase_url = \"https://x/v1\"\n");
+        ensure_codex_provider_auth_default(&mut fresh);
+        assert_eq!(auth_flag_of(&fresh), Some(true));
+
+        // An explicit false is the user's call and must survive every path —
+        // this is the regression the whole change exists for.
+        let mut explicit_false = provider_table_of(
+            "[model_providers.codeg]\nbase_url = \"https://x/v1\"\nrequires_openai_auth = false\n",
+        );
+        ensure_codex_provider_auth_default(&mut explicit_false);
+        assert_eq!(auth_flag_of(&explicit_false), Some(false));
+
+        // An explicit true is left alone rather than rewritten.
+        let mut explicit_true = provider_table_of(
+            "[model_providers.codeg]\nrequires_openai_auth = true\n",
+        );
+        ensure_codex_provider_auth_default(&mut explicit_true);
+        assert_eq!(auth_flag_of(&explicit_true), Some(true));
+    }
+
+    #[test]
+    fn codex_auth_default_yields_to_actor_authorization() {
+        // codex's uses_openai_actor_authorization() is
+        // `!requires_openai_auth && <non-empty x-openai-actor-authorization>`,
+        // so writing the default here would silently disable that auth path.
+        let mut header_present = provider_table_of(
+            "[model_providers.codeg]\nbase_url = \"https://x/v1\"\n\n\
+             [model_providers.codeg.http_headers]\n\
+             x-openai-actor-authorization = \"local-image-extension\"\n",
+        );
+        ensure_codex_provider_auth_default(&mut header_present);
+        assert_eq!(auth_flag_of(&header_present), None);
+
+        // Header matching is case-insensitive, mirroring eq_ignore_ascii_case.
+        let mut mixed_case = provider_table_of(
+            "[model_providers.codeg.http_headers]\n\
+             X-OpenAI-Actor-Authorization = \"local-image-extension\"\n",
+        );
+        ensure_codex_provider_auth_default(&mut mixed_case);
+        assert_eq!(auth_flag_of(&mixed_case), None);
+
+        // An inline table is the same table to the parser.
+        let mut inline = provider_table_of(
+            "[model_providers.codeg]\n\
+             http_headers = { \"x-openai-actor-authorization\" = \"local-image-extension\" }\n",
+        );
+        ensure_codex_provider_auth_default(&mut inline);
+        assert_eq!(auth_flag_of(&inline), None);
+
+        // An empty header value does not enable the path upstream
+        // (`!value.trim().is_empty()`), so the default still applies.
+        let mut empty_value = provider_table_of(
+            "[model_providers.codeg.http_headers]\nx-openai-actor-authorization = \"  \"\n",
+        );
+        ensure_codex_provider_auth_default(&mut empty_value);
+        assert_eq!(auth_flag_of(&empty_value), Some(true));
+
+        // A header plus an explicit true is a contradictory config, but it is
+        // the user's: never rewrite or remove it.
+        let mut header_and_true = provider_table_of(
+            "[model_providers.codeg]\nrequires_openai_auth = true\n\n\
+             [model_providers.codeg.http_headers]\n\
+             x-openai-actor-authorization = \"local-image-extension\"\n",
+        );
+        ensure_codex_provider_auth_default(&mut header_and_true);
+        assert_eq!(auth_flag_of(&header_and_true), Some(true));
+
+        // A quoted key containing dots is ONE literal key, not an http_headers
+        // sub-table, so it must not suppress the default.
+        let mut literal_dotted_key = provider_table_of(
+            "[model_providers.codeg]\n\
+             \"http_headers.x-openai-actor-authorization\" = \"local-image-extension\"\n",
+        );
+        ensure_codex_provider_auth_default(&mut literal_dotted_key);
+        assert_eq!(auth_flag_of(&literal_dotted_key), Some(true));
+    }
+
+    #[test]
+    fn codex_cascade_preserves_explicit_auth_flag_and_headers() {
+        // Repro path 2 from issue #406: editing a bound model provider's URL /
+        // key / model cascades into ~/.codex/config.toml, which used to
+        // overwrite requires_openai_auth on the way through.
+        let dir = tempfile::tempdir().expect("tempdir");
+        temp_env::with_var("CODEX_HOME", Some(dir.path()), || {
+            let config_path = dir.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                "model_provider = \"codeg\"\n\n\
+                 [model_providers.codeg]\n\
+                 base_url = \"https://old.example/v1\"\n\
+                 name = \"codeg\"\n\
+                 wire_api = \"responses\"\n\
+                 requires_openai_auth = false\n\n\
+                 [model_providers.codeg.http_headers]\n\
+                 x-openai-actor-authorization = \"local-image-extension\"\n",
+            )
+            .expect("seed config.toml");
+
+            cascade_update_agent_config(
+                AgentType::Codex,
+                "https://new.example/v1",
+                "sk-test",
+                &BTreeMap::new(),
+                &CodexModelAction::Set("gpt-5-codex".to_string()),
+                None,
+            )
+            .expect("cascade must succeed");
+
+            let written = std::fs::read_to_string(&config_path).expect("read back");
+            let table = provider_table_of(&written);
+            assert_eq!(
+                auth_flag_of(&table),
+                Some(false),
+                "an explicit requires_openai_auth = false must survive the cascade"
+            );
+            assert!(
+                codex_provider_uses_actor_authorization(&table),
+                "the actor-authorization header must survive the cascade"
+            );
+            assert_eq!(
+                table.get("base_url").and_then(toml::Value::as_str),
+                Some("https://new.example/v1"),
+                "the cascade must still apply the new base_url"
+            );
+        });
+    }
+
+    #[test]
+    fn codex_cascade_seeds_auth_flag_for_a_fresh_provider() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        temp_env::with_var("CODEX_HOME", Some(dir.path()), || {
+            cascade_update_agent_config(
+                AgentType::Codex,
+                "https://new.example/v1",
+                "sk-test",
+                &BTreeMap::new(),
+                &CodexModelAction::NoOp,
+                None,
+            )
+            .expect("cascade must succeed");
+
+            let written =
+                std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
+            assert_eq!(
+                auth_flag_of(&provider_table_of(&written)),
+                Some(true),
+                "a provider codeg creates still gets the default"
+            );
+        });
+    }
+
+    #[test]
+    fn codex_cascade_leaves_a_non_codeg_provider_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        temp_env::with_var("CODEX_HOME", Some(dir.path()), || {
+            let config_path = dir.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                "model_provider = \"custom\"\n\n\
+                 [model_providers.custom]\n\
+                 base_url = \"https://old.example/v1\"\n",
+            )
+            .expect("seed config.toml");
+
+            cascade_update_agent_config(
+                AgentType::Codex,
+                "https://new.example/v1",
+                "sk-test",
+                &BTreeMap::new(),
+                &CodexModelAction::NoOp,
+                None,
+            )
+            .expect("cascade must succeed");
+
+            let written = std::fs::read_to_string(&config_path).expect("read back");
+            let parsed = written.parse::<toml::Value>().expect("must parse");
+            let custom = parsed
+                .get("model_providers")
+                .and_then(toml::Value::as_table)
+                .and_then(|providers| providers.get("custom"))
+                .and_then(toml::Value::as_table)
+                .expect("custom provider must survive");
+            assert!(
+                !custom.contains_key("requires_openai_auth"),
+                "only the codeg provider is codeg-managed"
+            );
+        });
+    }
+
+    #[test]
+    fn cursor_fingerprint_tracks_cli_config_changes() {
+        // Cursor's ~/.cursor/cli-config.json (permission rules / sandbox) is
+        // edited via the Cursor settings panel but is NOT in
+        // `agent_local_config_path`, so `fingerprint_config` must fold it in
+        // explicitly — otherwise a permission-rule change never marks a running
+        // Cursor session restart-required.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cli-config.json");
+        temp_env::with_var("CURSOR_CONFIG_DIR", Some(dir.path()), || {
+            let env: BTreeMap<String, String> = BTreeMap::new();
+            let empty_fp = fingerprint_config(AgentType::Cursor, &env);
+
+            std::fs::write(&path, "{\"permissions\":{\"allow\":[\"Shell(ls)\"]}}")
+                .expect("write allow");
+            let allow_fp = fingerprint_config(AgentType::Cursor, &env);
+            assert_ne!(
+                empty_fp, allow_fp,
+                "adding cli-config.json must change the fingerprint"
+            );
+
+            std::fs::write(&path, "{\"permissions\":{\"deny\":[\"Shell(rm)\"]}}")
+                .expect("write deny");
+            let deny_fp = fingerprint_config(AgentType::Cursor, &env);
+            assert_ne!(
+                allow_fp, deny_fp,
+                "changing permission rules must change the fingerprint"
+            );
+        });
+    }
+
+    #[test]
+    fn cursor_structured_config_merges_preserving_unknown_keys() {
+        // The panel's structured save must only touch the managed keys —
+        // editor prefs and other CLI-owned keys survive verbatim, and
+        // empty-string scalars remove their key.
+        let base = r#"{
+  "version": 1,
+  "editor": { "vimMode": true },
+  "approvalMode": "allowlist",
+  "sandbox": { "mode": "disabled", "networkAccess": "full" },
+  "permissions": { "allow": ["Shell(ls)"], "deny": [] }
+}"#;
+        let patch = crate::acp::types::CursorStructuredConfig {
+            sandbox_mode: Some("enabled".to_string()),
+            permissions_allow: Some(vec![
+                "Shell(npm run build)".to_string(),
+                "  ".to_string(), // blank rows are dropped
+            ]),
+            permissions_deny: None, // untouched
+        };
+        let merged = apply_cursor_structured_config(base, &patch).expect("merge");
+        let v: serde_json::Value = serde_json::from_str(&merged).expect("valid json");
+        assert_eq!(v.pointer("/editor/vimMode"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            v.pointer("/sandbox/networkAccess"),
+            Some(&serde_json::json!("full"))
+        );
+        assert!(
+            v.get("approvalMode").is_none(),
+            "the legacy approvalMode key is dropped: the CLI never reads it \
+             from cli-config.json"
+        );
+        assert_eq!(v.pointer("/sandbox/mode"), Some(&serde_json::json!("enabled")));
+        assert_eq!(
+            v.pointer("/permissions/allow"),
+            Some(&serde_json::json!(["Shell(npm run build)"]))
+        );
+        assert_eq!(v.pointer("/permissions/deny"), Some(&serde_json::json!([])));
+    }
+
+    #[tokio::test]
+    async fn cursor_probe_env_materializes_key_and_scrubs_base_url() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+
+        // API-key mode: the form value wins over saved env and is trimmed; the
+        // base URL is always scrubbed to empty (⇒ removed by run_cursor_probe).
+        let env = cursor_probe_env(&db, Some("  my-key  ")).await;
+        assert_eq!(env.get("CURSOR_API_KEY").map(String::as_str), Some("my-key"));
+        assert_eq!(
+            env.get("CURSOR_API_BASE_URL").map(String::as_str),
+            Some("")
+        );
+
+        // Subscription passes an empty key → present but empty, so the probe
+        // strips any inherited value instead of leaking it.
+        let cleared = cursor_probe_env(&db, Some("")).await;
+        assert_eq!(cleared.get("CURSOR_API_KEY").map(String::as_str), Some(""));
+        assert_eq!(
+            cleared.get("CURSOR_API_BASE_URL").map(String::as_str),
+            Some("")
+        );
+
+        // No override + empty DB → key still materialized empty.
+        let none = cursor_probe_env(&db, None).await;
+        assert_eq!(none.get("CURSOR_API_KEY").map(String::as_str), Some(""));
+        assert_eq!(
+            none.get("CURSOR_API_BASE_URL").map(String::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn parse_cursor_models_reads_id_label_and_default() {
+        // Verbatim shape of `cursor-agent models` (id - label [(default)]).
+        let stdout = "Available models\n\n\
+             auto - Auto (default)\n\
+             claude-opus-4-8-high - Opus 4.8 1M\n\
+             gpt-5.3-codex - Codex 5.3\n\
+             claude-fable-5-thinking-high - Fable 5 1M Thinking (NO ZDR)\n";
+        let (models, default_model) = parse_cursor_models(stdout);
+
+        // The "Available models" header (has whitespace, no " - ") is skipped.
+        assert_eq!(models.len(), 4);
+        assert_eq!(default_model.as_deref(), Some("auto"));
+
+        assert_eq!(models[0].id, "auto");
+        assert_eq!(models[0].label, "Auto");
+        assert!(models[0].is_default);
+
+        assert_eq!(models[1].id, "claude-opus-4-8-high");
+        assert_eq!(models[1].label, "Opus 4.8 1M");
+        assert!(!models[1].is_default);
+
+        // A parenthetical that isn't the default marker stays in the label.
+        assert_eq!(models[3].label, "Fable 5 1M Thinking (NO ZDR)");
+    }
+
+    #[test]
+    fn parse_cursor_models_tolerates_ansi_markers_and_bare_ids() {
+        // ANSI SGR + a leading list marker + a bare-id line with no label.
+        let stdout =
+            "\u{1b}[1mAvailable models\u{1b}[0m\n- gpt-5.2 - GPT-5.2\ncomposer-2.5\n";
+        let (models, default_model) = parse_cursor_models(stdout);
+        assert_eq!(default_model, None);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "gpt-5.2");
+        assert_eq!(models[0].label, "GPT-5.2");
+        // Bare id (no " - <label>") → id kept, label empty.
+        assert_eq!(models[1].id, "composer-2.5");
+        assert_eq!(models[1].label, "");
     }
 
     #[tokio::test]
@@ -10703,6 +14617,9 @@ wire_api = "chat"
             env: BTreeMap::new(),
             model: "claude-opus-4-7".to_string(),
             max_context_size: Some(200_000),
+            capabilities: Vec::new(),
+            support_efforts: Vec::new(),
+            default_effort: None,
         };
         let mut doc = toml::Value::Table(toml::map::Map::new());
         // Pre-existing user content that must survive a managed-block write.
@@ -10765,6 +14682,9 @@ wire_api = "chat"
                 env: BTreeMap::new(),
                 model: "kimi-k2.7-code".to_string(),
                 max_context_size: ctx,
+                capabilities: Vec::new(),
+                support_efforts: Vec::new(),
+                default_effort: None,
             };
             let mut doc = toml::Value::Table(toml::map::Map::new());
             apply_kimi_managed_block(&mut doc, Some(&spec)).expect("write managed block");
@@ -10851,6 +14771,10 @@ model = "kimi-for-coding"
             vertex_project: None,
             vertex_location: None,
             raw_config_toml: None,
+            reasoning_enabled: None,
+            always_thinking: None,
+            support_efforts: None,
+            default_effort: None,
         };
         let spec = build_kimi_managed_spec(&update).expect("valid spec");
         // env auth → key lands in the provider env sub-table, NOT the inline field.
@@ -10871,6 +14795,10 @@ model = "kimi-for-coding"
             vertex_project: Some("my-proj".to_string()),
             vertex_location: Some("us-central1".to_string()),
             raw_config_toml: None,
+            reasoning_enabled: None,
+            always_thinking: None,
+            support_efforts: None,
+            default_effort: None,
         };
         let spec = build_kimi_managed_spec(&update).expect("valid vertex spec");
         assert!(spec.api_key.is_none());
@@ -10897,6 +14825,10 @@ model = "kimi-for-coding"
             vertex_project: None,
             vertex_location: None,
             raw_config_toml: None,
+            reasoning_enabled: None,
+            always_thinking: None,
+            support_efforts: None,
+            default_effort: None,
         };
         assert!(build_kimi_managed_spec(&base).is_err());
         let no_model = KimiCodeConfigUpdate {
@@ -10905,6 +14837,223 @@ model = "kimi-for-coding"
             ..base.clone()
         };
         assert!(build_kimi_managed_spec(&no_model).is_err());
+    }
+
+    /// A minimal valid api-key update; reasoning fields are filled per test.
+    fn kimi_reasoning_update(
+        reasoning_enabled: Option<bool>,
+        always_thinking: Option<bool>,
+        support_efforts: Option<Vec<String>>,
+        default_effort: Option<&str>,
+    ) -> KimiCodeConfigUpdate {
+        KimiCodeConfigUpdate {
+            mode: "apikey".to_string(),
+            interface_type: Some("kimi".to_string()),
+            auth_type: None,
+            base_url: None,
+            api_key: Some("sk-x".to_string()),
+            model: Some("kimi-k2".to_string()),
+            max_context_size: None,
+            vertex_project: None,
+            vertex_location: None,
+            raw_config_toml: None,
+            reasoning_enabled,
+            always_thinking,
+            support_efforts,
+            default_effort: default_effort.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn kimi_reasoning_off_writes_no_capability_keys() {
+        // With reasoning off the model block must stay byte-identical to the
+        // pre-feature shape: an ABSENT `capabilities` is what keeps kimi's
+        // permissive "allow every modality" default in force.
+        let spec = build_kimi_managed_spec(&kimi_reasoning_update(None, None, None, None))
+            .expect("valid spec");
+        assert!(spec.capabilities.is_empty());
+        assert!(spec.support_efforts.is_empty());
+        assert!(spec.default_effort.is_none());
+
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        apply_kimi_managed_block(&mut doc, Some(&spec)).expect("applied");
+        let model = doc
+            .get("models")
+            .and_then(|m| m.get(KIMI_MANAGED_MODEL_ALIAS))
+            .and_then(toml::Value::as_table)
+            .expect("model block");
+        assert!(model.get("capabilities").is_none());
+        assert!(model.get("support_efforts").is_none());
+        assert!(model.get("default_effort").is_none());
+    }
+
+    #[test]
+    fn kimi_reasoning_on_declares_thinking_plus_the_permissive_modalities() {
+        // `thinking` alone would REVOKE image/video input, because kimi only
+        // treats an absent capabilities array as "allow all".
+        let spec = build_kimi_managed_spec(&kimi_reasoning_update(
+            Some(true),
+            None,
+            Some(vec!["low".into(), "high".into()]),
+            Some("high"),
+        ))
+        .expect("valid spec");
+        assert_eq!(
+            spec.capabilities,
+            vec!["thinking", "image_in", "video_in", "tool_use"]
+        );
+        assert_eq!(spec.support_efforts, vec!["low", "high"]);
+        assert_eq!(spec.default_effort.as_deref(), Some("high"));
+
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        apply_kimi_managed_block(&mut doc, Some(&spec)).expect("applied");
+        let model = doc
+            .get("models")
+            .and_then(|m| m.get(KIMI_MANAGED_MODEL_ALIAS))
+            .and_then(toml::Value::as_table)
+            .expect("model block");
+        let caps: Vec<&str> = model["capabilities"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert!(caps.contains(&"thinking") && caps.contains(&"image_in"));
+        assert_eq!(
+            model["default_effort"].as_str(),
+            Some("high"),
+            "default_effort must reach config.toml"
+        );
+    }
+
+    #[test]
+    fn kimi_reasoning_off_clears_keys_a_previous_save_wrote() {
+        // Turning reasoning back off must REMOVE the keys, not just stop
+        // refreshing them: a lingering `capabilities` array would keep kimi in
+        // whitelist mode (and keep advertising a Thinking picker) forever.
+        let mut doc = toml::Value::Table(toml::map::Map::new());
+        let on = build_kimi_managed_spec(&kimi_reasoning_update(
+            Some(true),
+            Some(true),
+            Some(vec!["low".into(), "high".into()]),
+            Some("high"),
+        ))
+        .expect("valid spec");
+        apply_kimi_managed_block(&mut doc, Some(&on)).expect("write reasoning on");
+        assert!(doc["models"][KIMI_MANAGED_MODEL_ALIAS]
+            .get("capabilities")
+            .is_some());
+
+        let off = build_kimi_managed_spec(&kimi_reasoning_update(Some(false), None, None, None))
+            .expect("valid spec");
+        apply_kimi_managed_block(&mut doc, Some(&off)).expect("write reasoning off");
+        let model = doc["models"][KIMI_MANAGED_MODEL_ALIAS]
+            .as_table()
+            .expect("model block");
+        assert!(model.get("capabilities").is_none(), "capabilities must go");
+        assert!(model.get("support_efforts").is_none());
+        assert!(model.get("default_effort").is_none());
+        // The keys that are NOT part of reasoning must survive the rewrite.
+        assert_eq!(model["model"].as_str(), Some("kimi-k2"));
+        assert!(model.get("max_context_size").is_some());
+    }
+
+    #[test]
+    fn kimi_reasoning_always_thinking_swaps_the_capability() {
+        let spec = build_kimi_managed_spec(&kimi_reasoning_update(
+            Some(true),
+            Some(true),
+            Some(vec!["high".into()]),
+            None,
+        ))
+        .expect("valid spec");
+        assert!(spec.capabilities.contains(&"always_thinking".to_string()));
+        assert!(!spec.capabilities.contains(&"thinking".to_string()));
+    }
+
+    #[test]
+    fn kimi_reasoning_normalizes_efforts_and_drops_an_unlisted_default() {
+        let spec = build_kimi_managed_spec(&kimi_reasoning_update(
+            Some(true),
+            None,
+            Some(vec![
+                "  low  ".into(),
+                "".into(),
+                "low".into(),
+                "high".into(),
+            ]),
+            // kimi clamps an unlisted default to the middle entry anyway, so
+            // writing it would only misreport what the composer will show.
+            Some("max"),
+        ))
+        .expect("valid spec");
+        assert_eq!(spec.support_efforts, vec!["low", "high"]);
+        assert!(spec.default_effort.is_none());
+    }
+
+    #[test]
+    fn kimi_reasoning_rejects_a_newline_in_an_effort() {
+        let err = build_kimi_managed_spec(&kimi_reasoning_update(
+            Some(true),
+            None,
+            Some(vec!["hi\ngh".into()]),
+            None,
+        ));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn kimi_project_managed_config_round_trips_reasoning_metadata() {
+        let value: toml::Value = r#"
+default_model = "codeg-managed"
+[providers.codeg]
+type = "openai_responses"
+[models.codeg-managed]
+provider = "codeg"
+model = "gpt-5.6-sol"
+max_context_size = 1000000
+capabilities = ["thinking", "image_in", "video_in", "tool_use"]
+support_efforts = ["low", "medium", "high"]
+default_effort = "high"
+"#
+        .parse()
+        .expect("valid toml");
+        let proj = project_kimi_managed_config(&value);
+        let caps: Vec<&str> = proj["capabilities"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(caps.contains(&"thinking"));
+        let efforts: Vec<&str> = proj["supportEfforts"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(efforts, vec!["low", "medium", "high"]);
+        assert_eq!(proj.get("defaultEffort").and_then(|v| v.as_str()), Some("high"));
+    }
+
+    #[test]
+    fn kimi_project_managed_config_omits_reasoning_keys_when_absent() {
+        // The shape the panel wrote before this feature — the projection must
+        // not invent empty arrays, or the panel would read reasoning as "on".
+        let value: toml::Value = r#"
+[providers.codeg]
+type = "kimi"
+[models.codeg-managed]
+provider = "codeg"
+model = "kimi-k2"
+max_context_size = 262144
+"#
+        .parse()
+        .expect("valid toml");
+        let proj = project_kimi_managed_config(&value);
+        assert!(proj.get("capabilities").is_none());
+        assert!(proj.get("supportEfforts").is_none());
+        assert!(proj.get("defaultEffort").is_none());
     }
 
     #[test]

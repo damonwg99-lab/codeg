@@ -135,6 +135,7 @@ pub async fn get_folder_conversation(
     let result = conv_commands::get_folder_conversation_with_live_core(
         &db.conn,
         &state.connection_manager,
+        &state.chat_channel_manager,
         &state.emitter,
         params.conversation_id,
     )
@@ -172,6 +173,34 @@ pub async fn import_local_conversations(
             &state.db.conn,
             &state.emitter,
             params.folder_id,
+        )
+        .await?,
+    ))
+}
+
+pub async fn scan_importable_sessions(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<ScanResult>, AppCommandError> {
+    Ok(Json(
+        conv_commands::scan_importable_sessions_core(&state.db.conn, &state.emitter).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSelectedSessionsParams {
+    pub selections: Vec<SelectedSessionKey>,
+}
+
+pub async fn import_selected_sessions(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<ImportSelectedSessionsParams>,
+) -> Result<Json<ImportSelectedResult>, AppCommandError> {
+    Ok(Json(
+        conv_commands::import_selected_sessions_core(
+            &state.db.conn,
+            &state.emitter,
+            params.selections,
         )
         .await?,
     ))
@@ -279,6 +308,12 @@ pub async fn update_conversation_title(
     .await?;
     conv_commands::emit_conversation_upsert(&state.emitter, &state.db.conn, params.conversation_id)
         .await;
+    conv_commands::sync_conversation_title_to_channels_core(
+        &state.db.conn,
+        &state.chat_channel_manager,
+        params.conversation_id,
+    )
+    .await;
     Ok(Json(()))
 }
 

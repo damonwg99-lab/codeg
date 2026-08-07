@@ -1,6 +1,5 @@
 import {
   Bot,
-  ClipboardList,
   Command,
   FileText,
   Folder,
@@ -78,9 +77,7 @@ export function ReferenceIcon({
       icon = <Command className={ICON_CLASS} />
       break
     case "context":
-      // Injected context items (task info, KB docs, attachments, conversation
-      // summaries) use the clipboard glyph — visually distinct from file/skill.
-      icon = <ClipboardList className={ICON_CLASS} />
+      icon = <FileText className={ICON_CLASS} />
       break
     default:
       return null
@@ -117,7 +114,7 @@ function badgeColorClass(data: ReferenceAttrs): string {
     case "skill":
       return "text-rose-700 dark:text-rose-400"
     case "context":
-      return "text-sky-700 dark:text-sky-400"
+      return "text-cyan-700 dark:text-cyan-400"
   }
 }
 

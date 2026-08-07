@@ -17,6 +17,23 @@ if (typeof Element !== "undefined") {
   Element.prototype.setPointerCapture ??= () => {}
   Element.prototype.releasePointerCapture ??= () => {}
 }
+if (typeof window !== "undefined" && typeof window.matchMedia !== "function") {
+  // jsdom doesn't implement matchMedia; useMediaQuery-based hooks (e.g.
+  // useIsMobile) subscribe to a MediaQueryList on mount. A non-matching stub
+  // keeps them inert in headless tests.
+  window.matchMedia = (query: string): MediaQueryList =>
+    ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }) as MediaQueryList
+}
+
 if (typeof globalThis !== "undefined" && !("ResizeObserver" in globalThis)) {
   // jsdom doesn't implement ResizeObserver; cmdk (the command palette used by
   // the branch/folder pickers) constructs one on mount. A no-op stub is enough

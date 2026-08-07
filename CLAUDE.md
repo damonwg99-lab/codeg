@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-Codeg（Code Generation）是一个多智能体编码工作台，它将多个智能体（Claude Code、Codex CLI、OpenCode、Gemini CLI、OpenClaw、Cline、Hermes 等）统一到一个工作区中，支持会话聚合和多智能体协作，支持桌面安装，服务器/Docker 部署。
+Codeg（Code Generation）是一个多智能体编码工作台，它将多个智能体（Claude Code、Codex CLI、OpenCode、Gemini CLI、OpenClaw、Cline 等）统一到一个工作区中，支持会话聚合和多智能体协作，支持桌面安装，服务器/Docker 部署。
 
 ## 技术栈
 
@@ -12,49 +12,26 @@ Codeg（Code Generation）是一个多智能体编码工作台，它将多个智
 - **服务器运行时**: 独立 Rust 二进制（Axum HTTP + WebSocket）
 - **前端**: Next.js 16（静态导出模式）+ React 19 + TypeScript（strict）
 - **样式**: Tailwind CSS v4 + shadcn/ui（radix-maia 风格）
-- **国际化**: next-intl（10 种语言）
+- **国际化**: next-intl
 - **数据库**: SeaORM + SQLite
 - **包管理器**: pnpm
 
-## 开发与运行命令
+## 代码检查与测试（任务完成后进行必要的检查）
 
 ### 前端
 
 ```bash
-pnpm install                    # 安装依赖（含 monaco-editor postinstall 复制）
-pnpm dev                        # Next.js dev server（Turbopack，无 Rust）
-pnpm build                      # 静态导出到 out/
-
-# 测试
-pnpm test                       # vitest 全跑（CI 用同一条命令）
-pnpm test -- src/lib/path-utils.test.ts   # 跑单个测试文件
-pnpm test:watch                 # 增量重跑
-pnpm test:coverage              # 覆盖率报告 → coverage/index.html
-
-# Lint
-pnpm eslint .                   # ESLint（next/core-web-vitals + typescript + prettier）
+pnpm eslint .                  # lint
+pnpm test                      # vitest 全跑（CI 用同一条命令）
+pnpm test:watch                # 开发时增量重跑
+pnpm test:coverage             # 覆盖率报告（输出到 coverage/index.html）
+pnpm build                     # 静态导出构建
 ```
 
-### 桌面应用（Tauri）
+### 后端 Rust（在 `src-tauri/` 目录下执行）
 
 ```bash
-pnpm tauri dev                  # 全栈开发（自动构建 codeg-mcp sidecar）
-pnpm tauri build                # release 桌面安装包（含 sidecar 打包）
-CODEG_SKIP_SIDECAR=1 pnpm tauri dev  # 跳过 sidecar 构建，前端快速迭代
-pnpm tauri:prepare-sidecars     # 仅构建 codeg-mcp → src-tauri/binaries/
-```
-
-### 服务器模式
-
-```bash
-pnpm server:dev                 # cargo run（开发模式，含 Axum 热重载）
-pnpm server:build               # release 二进制 → src-tauri/target/release/codeg-server
-```
-
-### Rust 检查与测试（在 `src-tauri/` 下执行）
-
-```bash
-# 桌面模式
+# 桌面模式（默认 feature）
 cargo check
 cargo test --features test-utils
 cargo clippy --all-targets --features test-utils -- -D warnings
@@ -62,114 +39,83 @@ cargo clippy --all-targets --features test-utils -- -D warnings
 # 服务器模式
 cargo check --no-default-features --bin codeg-server
 cargo test --no-default-features --bin codeg-server --lib
+cargo clippy --no-default-features --bin codeg-server --lib -- -D warnings
 
-# codeg-mcp
+# codeg-mcp 协作伴生进程（多智能体委托）
 cargo check --no-default-features --bin codeg-mcp
 cargo clippy --no-default-features --bin codeg-mcp -- -D warnings
 
-# 解析器快照
-cargo insta review                                    # 评审快照变化
-INSTA_UPDATE=auto cargo test --features test-utils    # 自动写新 .snap
+# 解析器快照评审（输出变化时）
+cargo insta review
+INSTA_UPDATE=auto cargo test --features test-utils     # 自动写新 .snap
 ```
-
-Rust 集成测试在 `src-tauri/tests/*.rs`，需 `--features test-utils` 才能访问 test scaffolding（`AppState::new_for_test` 等）。
-
-## Codegraph 代码探索（优先使用）
-
-项目已配置 Codegraph MCP（`.codegraph/` 目录），索引了 ~876 文件、17k+ 符号、53k+ 边。**探索代码时必须优先使用 Codegraph 工具，而非 grep/read 手动搜索**：
-
-- **`codegraph_explore`** — 主要工具。用自然语言问题或符号名查询，一次调用返回相关符号的源码 + 调用关系，等效于 Read + 多文件搜索，绝大多数场景只需这一步
-- **`codegraph_search`** — 仅查符号位置（不返回源码），用于快速定位
-- **`codegraph_callers` / `codegraph_callees`** — 查调用链（谁调用了 X / X 调用了谁）
-- **`codegraph_impact`** — 变更影响分析（修改 X 会影响哪些符号）
-- **`codegraph_node`** — 获取单个符号完整源码（当 explore 截断了某个函数体时补充查看）
-
-**使用规则**：
-
-1. 任何"X 怎么工作"、"X 在哪"、"架构"类问题 → 先 `codegraph_explore`，不要先 grep/read
-2. 需要追踪调用链或理解数据流 → `codegraph_explore` 列出路径符号名
-3. 只有 codegraph 未覆盖的细节才用 Read/Grep 补充确认
-4. 文件 watcher 自动同步变更，新文件和修改都会实时反映到索引中
 
 ## 架构
 
-### 三种二进制
+### 双模式运行
 
-| Binary | Feature | 用途 |
-|--------|---------|------|
-| `codeg` | `tauri-runtime`（默认） | 完整桌面应用 |
-| `codeg-server` | 无 feature | 独立 Axum HTTP + WebSocket 服务器 |
-| `codeg-mcp` | 无 feature | per-launch stdio MCP 伴生进程，向代理 CLI 暴露异步子智能体委托工具 |
+项目通过 Cargo feature flags 支持三种二进制：
 
-`codeg-mcp` 通过 UDS/named pipe 连接主进程的 `DelegationBroker`。运行时必须与主二进制同目录，或通过 `CODEG_MCP_BIN` 环境变量指定路径。
+- **`codeg`**（`tauri-runtime`，默认）：完整桌面应用，包含 Tauri 窗口管理、系统通知、自动更新等
+- **`codeg-server`**（无 feature，`--no-default-features`）：独立服务器模式，仅编译 Axum HTTP API + WebSocket
+- **`codeg-mcp`**（无 feature）：per-launch stdio MCP 伴生进程，被注入到代理 CLI 的 MCP 配置中，向 LLM 暴露**异步**子智能体委托工具。
 
-### 共享核心与双模式桥接
+### 共享核心
 
-`AppState` 是共享状态结构（db、连接管理器、终端管理器、事件广播器、委托 broker、聊天频道管理器等）。两种运行模式通过 `EventEmitter` 枚举区分事件发射方式：
-
-- `EventEmitter::Tauri(AppHandle)` — 桌面模式，通过 Tauri 事件系统推送
-- `EventEmitter::WebOnly(Arc<WebEventBroadcaster>)` — 服务器模式，通过 broadcast channel 推送，WebSocket 订阅者消费
-
-`_core` 后缀函数 — 接受普通引用参数（`&AppDatabase`、`&EventEmitter`），供 Web handlers 和 Tauri 命令共用。`#[cfg_attr(feature = "tauri-runtime", tauri::command)]` 标记的函数始终可用，仅在桌面模式注册为 Tauri 命令。
+- **`app_state.rs`** — `AppState` 共享状态结构，两种模式通过 `EventEmitter` 枚举区分事件发射方式
+- **`web/event_bridge.rs`** — `EventEmitter::Tauri(AppHandle)` 或 `EventEmitter::WebOnly(Arc<WebEventBroadcaster>)`
+- **`web/router.rs`** — Axum 路由，接受 `Arc<AppState>`
+- **`web/handlers/`** — HTTP API 端点，全部使用 `Extension<Arc<AppState>>`
 
 ### Rust 后端（`src-tauri/src/`）
 
-- **`app_state.rs`** — 共享状态
-- **`acp/`** — Agent Client Protocol：连接管理（`ConnectionManager`）、生命周期、事件流、反馈、权限请求、会话 fork
-- **`acp/delegation/`** — 多智能体委托核心：`DelegationBroker`、UDS listener、companion spawner、live reply、depth 追踪、meta writer
-- **`chat_channel/`** — 聊天频道子系统（Telegram、Lark/飞书、iLink/微信）：manager、session bridge、command dispatcher、webhook、i18n
-- **`commands/`** — 业务逻辑，部分模块仅桌面模式编译（`#[cfg(feature = "tauri-runtime")]`）
-- **`parsers/`** — 每个智能体一个解析器（claude、cline、codex、gemini、hermes、openclaw、opencode）
+后端负责读取和解析本地文件系统上的代理会话文件：
+
+- **`app_state.rs`** — 共享状态（db、连接管理器、终端管理器、事件广播器）
 - **`models/`** — 共享数据结构
-- **`db/`** — SeaORM entities + 迁移（`migration/mYYYYMMDD_NNNNNN_*.rs`）
-- **`web/`** — Axum 路由、HTTP handlers、WebSocket、auth 中间件、静态文件服务、event bridge
+- **`parsers/`** — 每个智能体一个解析器
+- **`commands/`** — 业务逻辑，`_core` 函数供两种模式共用，`#[tauri::command]` 函数仅桌面模式
+- **`web/`** — Axum HTTP API + WebSocket + 静态文件服务 + 认证中间件
+- **`acp/`** — Agent Client Protocol 连接管理
+- **`db/`** — SeaORM + SQLite
 
 ### 前端（`src/`）
 
-- **`lib/transport/`** — Transport 抽象层：三种实现（`TauriTransport`/`WebTransport`/`RemoteDesktopTransport`），自动检测环境切换。`RemoteDesktopTransport` 用于桌面客户端连接远程 codeg-server
-- **`lib/adapters/`** — AI 响应 → UI 组件的适配器
-- **`lib/types.ts`** — Rust 模型的 TypeScript 镜像
-- **`lib/api.ts`** — 主 API 客户端（通过 `getTransport()` 调用）
-- **`hooks/`** — React hooks（ACP 连接、代理专家、文件树、终端、消息队列等）
-- **`components/chat/composer/`** — TipTap 富文本编辑器 + slash command / mention 建议
-- **`components/ai-elements/`** — Markdown 渲染（rehype/remark 插件链）、代码块、tool call、terminal 输出
-- **`i18n/`** — next-intl 消息文件在 `i18n/messages/`，10 种语言 JSON
+#### 核心库（`lib/`）
+
+- **`transport/`** — Transport 抽象层（自动检测 Tauri/Web 环境切换 `invoke()`/`fetch()`）
+- **`adapters/`** — AI 响应到组件渲染的适配器
+- **`types.ts`** — Rust 模型的 TypeScript 镜像
+- **`api.ts`** — 主 API 客户端
+- **`tauri.ts`** — Tauri API 封装
+
+#### 国际化（`i18n/`）
+
+- 支持 10 种语言：英语、简体中文、繁体中文、日语、韩语、西班牙语、德语、法语、葡萄牙语、阿拉伯语
+- 使用 next-intl 框架，消息文件存放在 `i18n/messages/`
 
 ### 数据流
 
-```
-桌面：invoke() → Tauri command → _core 业务逻辑 → 返回数据
-服务器：fetch() → Axum handler → 同一 _core 业务逻辑 → 返回 JSON
-远程桌面：invoke() → RemoteDesktopTransport → 远端 Axum handler → 返回
-实时：后端事件 → EventEmitter → Tauri 事件 / WebSocket broadcast → 前端
-委托：agent CLI → codeg-mcp（stdio MCP） → UDS → DelegationBroker → 主进程
-```
+桌面模式：前端 `invoke()` → Tauri 命令 → 业务逻辑 → 返回数据
+服务器模式：前端 `fetch()` → Axum HTTP API → 同一业务逻辑 → 返回 JSON
+实时通信：后端事件 → EventEmitter（Tauri 事件 / WebSocket 广播）→ 前端
 
 ### 条件编译约定
 
-- `#[cfg(feature = "tauri-runtime")]` — 仅桌面模式编译（Tauri 窗口、通知、`tauri::State`、file_io、remote_proxy 等）
+- `#[cfg(feature = "tauri-runtime")]` — 仅桌面模式编译（Tauri 窗口、通知、`tauri::State` 参数等）
 - `#[cfg_attr(feature = "tauri-runtime", tauri::command)]` — 函数始终可用，仅在桌面模式标记为 Tauri 命令
-- `_core` 后缀函数 — 接受普通引用参数，两种模式共用
+- `_core` 后缀函数 — 接受普通引用参数（`&AppDatabase`、`&EventEmitter`），供 Web handlers 和 Tauri 命令共用
 
 ## 关键约束
 
 - **仅支持静态导出**：`next.config.ts` 设置 `output: "export"`，不支持动态路由（`[param]`），必须使用查询参数替代
 - **路径别名**：`@/*` 映射到 `./src/*`，导入写法为 `@/lib/utils`、`@/components/ui/button`
-- **vitest globals**：测试中 `describe/it/expect` 全局可用（配置了 `globals: true`），setup 文件 `src/test-setup.ts`
-- **测试文件命名**：前端 `*.test.{ts,tsx}`，Rust parser 快照用 insta（`.snap` 文件）
-- **服务器部署环境变量**：`CODEG_PORT`、`CODEG_HOST`、`CODEG_TOKEN`、`CODEG_DATA_DIR`、`CODEG_STATIC_DIR`、`CODEG_MCP_BIN`、`CODEG_SKIP_SIDECAR`
+- **服务器部署**：通过环境变量配置（`CODEG_PORT`、`CODEG_HOST`、`CODEG_TOKEN`、`CODEG_DATA_DIR`、`CODEG_STATIC_DIR`）
+- **Docker 支持**：多阶段构建（Node.js + Rust），支持 `docker-compose` 一键部署
 
 ## 代码风格
 
 - Prettier：无分号、尾逗号（es5）、2 空格缩进、80 字符宽度
-- ESLint：next/core-web-vitals + typescript + prettier（`prettier/prettier: error`）
-- TypeScript：strict + `noUnusedLocals` + `noUnusedParameters`
-- Rust：2021 edition，`thiserror` 定义错误类型，clippy `-D warnings`
-
-## 业务规则（勿反复确认）
-
-- **项目仓库（platform_repo kind Folder）不在 sidebar 文件夹列表中显示**：仓库 Folder 只用于 git/文件树切换（RepoSelector + BranchDropdown），不在会话分组中出现。只有项目根目录（Regular kind Folder）才出现在 sidebar
-- **新建会话归属项目根 Folder**：项目上下文激活时，Ctrl+N / sidebar 新建会话一律归到项目根 Folder（`activeProject.folderId`），不归到当前选中的 repo Folder
-- **项目切换需要显式操作**：创建项目不隐式切换（不调用 `setActiveProjectId`）；只有项目列表的 Check 按钮才切换项目
-- **项目切换后根 Folder 必须进入 workspace**：`setActiveProjectId` → `loadDetail` → 必须 `addFolderToWorkspaceById(rootFolderId)` + `setActiveFolderId(rootFolderId)`，否则 sidebar 无会话分组、BranchDropdown 不显示、RepoSelector 无数据源
-- **后端创建 Folder 必须发 `folder://changed` 事件**：`create_project_core` 和 `add_project_repo_core` 创建 Folder 后需 emit `folder://changed`（用 `emit_folder_upsert`），否则前端 workspace 无法自动感知新 Folder
+- ESLint：next/core-web-vitals + typescript + prettier
+- TypeScript：strict 模式，启用 `noUnusedLocals` 和 `noUnusedParameters`
+- Rust：2021 edition，使用 `thiserror` 定义错误类型

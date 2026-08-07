@@ -1,7 +1,7 @@
 [
   {
     "name": "delegate_to_agent",
-    "description": "Hand off a self-contained sub-task to a separate local AI agent that runs in its own session. ASYNCHRONOUS: returns a task_id right away and the sub-agent keeps working in the background — this call never blocks. So you can fan out several delegations at once and keep working, then collect the results with get_delegation_status by passing the task_ids array (one id to poll a single task, or many at once to poll the whole fan-out in one call) — or stop one early with cancel_delegation(task_id). The sub-agent CANNOT see this conversation, your open files, or earlier turns — it starts cold, so `task` must carry everything it needs. Best for independent, parallelizable work you can describe up front; not for steps that need your ongoing back-and-forth.",
+    "description": "Hand off a self-contained sub-task to a separate local AI agent that runs in its own session. ASYNCHRONOUS: returns a task_id right away and the sub-agent keeps working in the background — this call never blocks. So you can fan out several delegations at once and keep working, then collect the results with get_delegation_status by passing the task_ids array (one id to poll a single task, or many at once to poll the whole fan-out in one call) — or stop one early with cancel_delegation(task_id). The sub-agent CANNOT see this conversation, your open files, or earlier turns — it starts cold, so `task` must carry everything it needs. Best for independent, parallelizable work you can describe up front; not for steps that need your ongoing back-and-forth. RECOGNIZING AN EXPLICIT DELEGATION REQUEST: the user can name a sub-agent directly in their message — it appears as `@AgentName` or as a Markdown link `[@AgentName](codeg://agent/<agent_type>)`. Such a mention IS an explicit instruction to delegate the associated work to that agent, even when the user never names this tool. If the message names several agents, make one call per agent, each carrying that agent's slice of the work.",
     "inputSchema": {
       "type": "object",
       "required": ["agent_type", "task"],
@@ -19,9 +19,10 @@
             "code_buddy",
             "kimi_code",
             "pi",
-            "grok"
+            "grok",
+            "cursor"
           ],
-          "description": "Which local agent runs the sub-task. Pick the one best suited to the work."
+          "description": "Which local agent runs the sub-task. Pick the one best suited to the work — or, when the user's message names an agent via `@AgentName` / `codeg://agent/<agent_type>`, use that exact `<agent_type>` slug (e.g. `codeg://agent/claude_code` means `claude_code`)."
         },
         "task": {
           "type": "string",
@@ -134,14 +135,14 @@
   },
   {
     "name": "get_session_info",
-    "description": "Look up a session/conversation the user referenced in their message and return what it is: its title, which agent ran it, its status, workspace folder, git branch, model, message count, and token-usage stats — and, on request, a compact view of its most recent messages. Call this whenever the user's message contains a `codeg://session/<number>` reference (a mentioned session) and you need to know what that session is about or what happened in it (e.g. to continue its work or summarize it). Pass the NUMBER from the reference as `session_id` (it is codeg's internal conversation id, NOT the agent's own session id). The result is read-only and never modifies the session. A session that no longer exists returns a `found: false` result you can act on — it is not an error.",
+    "description": "Look up a session/conversation the user referenced in their message and return what it is: its title, which agent ran it, its status, workspace folder, git branch, model, message count, and token-usage stats — and, on request, a compact view of its most recent messages. RECOGNIZING A MENTIONED SESSION: the user can @-mention a past session directly in their message — it appears as a Markdown link `[Session title](codeg://session/<number>)`, whose text is that session's title and whose `<number>` is codeg's internal conversation id (e.g. `[Fix auth](codeg://session/214)` is the session titled 'Fix auth'). Such a mention IS the user explicitly pointing you at that session, even when they never name this tool — call it whenever what that session is about or what happened in it matters to the request (e.g. to continue its work, build on its results, answer questions about it, or summarize it). If the message mentions several sessions, make one call per session. Pass the NUMBER from the reference as `session_id` (it is codeg's internal conversation id, NOT the agent's own session id). The result is read-only and never modifies the session. A session that no longer exists returns a `found: false` result you can act on — it is not an error.",
     "inputSchema": {
       "type": "object",
       "required": ["session_id"],
       "properties": {
         "session_id": {
           "type": "integer",
-          "description": "The number in the `codeg://session/<number>` reference from the user's message (codeg's internal conversation id). For example, given `[Fix auth](codeg://session/214)`, pass 214."
+          "description": "The number in the mentioned session's `codeg://session/<number>` link (codeg's internal conversation id). For example, given the mention `[Fix auth](codeg://session/214)`, pass 214."
         },
         "max_messages": {
           "type": "integer",
@@ -153,7 +154,7 @@
   },
   {
     "name": "create_task_decomposition",
-    "description": "将复杂任务拆解为结构化子任务列表。当用户要求分解、拆分、细化任务时调用此工具，传入子任务数组。不要在回复文本中输出 JSON 代码块。",
+    "description": "Propose a breakdown of a parent task into a list of sub-tasks, so the user can review and confirm them in the CodeG interface before any sub-task is created. This tool is LOCAL-ONLY: it never blocks, makes no broker round-trip, and returns immediately with a confirmation that just echoes the count of proposed sub-tasks. The user reviews the proposal as a card surfaced in the conversation — they can edit, add, or remove sub-tasks, choose a parent task and target project, and confirm (or dismiss) the batch. Do NOT call this tool if the user's request is already clear and atomic; reserve it for non-trivial tasks the user would benefit from reviewing a split for. The proposal itself is the deliverable here — actually creating the sub-tasks is the user's confirmation step, not yours.",
     "inputSchema": {
       "type": "object",
       "required": ["subTasks"],
@@ -161,31 +162,63 @@
         "subTasks": {
           "type": "array",
           "minItems": 1,
-          "description": "拆解后的子任务列表",
+          "description": "One or more proposed sub-tasks. The user reviews, edits, and confirms this list; each confirmed item becomes a real task under the chosen parent.",
           "items": {
             "type": "object",
             "required": ["title", "description"],
             "properties": {
               "title": {
                 "type": "string",
-                "description": "任务标题（必须用中文）"
+                "description": "A concise, action-oriented sub-task title."
               },
               "description": {
                 "type": "string",
-                "description": "任务描述（必须用中文）"
-              },
-              "taskType": {
-                "type": "string",
-                "enum": ["bug", "feature", "task", "improvement"],
-                "description": "任务类型"
+                "description": "What this sub-task entails: the goal, the acceptance criteria, and any constraints a downstream agent should know."
               },
               "priority": {
                 "type": "string",
-                "enum": ["low", "medium", "high", "urgent"],
-                "description": "优先级"
+                "enum": ["low", "medium", "high"],
+                "description": "Suggested priority (default medium if omitted)."
+              },
+              "task_type": {
+                "type": "string",
+                "description": "Optional task-type slug from the platform's configured task-type mapping; omitted means the platform default."
               }
             }
           }
+        }
+      }
+    }
+  },
+  {
+    "name": "task_progress",
+    "description": "Report a short progress milestone for the work task you are executing. It shows up on the task's board card and timeline in real time, so the user can follow along without opening the session. Call it at meaningful checkpoints — finished exploring, tests passing, starting the refactor — not for every small step. Fire-and-forget: it never blocks your work and returns immediately.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["message"],
+      "properties": {
+        "message": {
+          "type": "string",
+          "description": "One-line progress note, e.g. 'tests passing, starting cleanup'."
+        }
+      }
+    }
+  },
+  {
+    "name": "task_complete",
+    "description": "Report the final outcome of the work task you are executing. Call it once, just before you end your reply. Pass verdict 'success' when the change is done and ready to review, 'needs_review' when it works but a human should double-check something specific (say what in the summary), or 'blocked' when you could not complete the task (the summary must say why). The task settles when your turn ends: success and needs_review send it to review, blocked marks it failed. If you never call this tool the task still settles normally from your turn's end.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["verdict"],
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": ["success", "needs_review", "blocked"],
+          "description": "How the task ended from your point of view."
+        },
+        "summary": {
+          "type": "string",
+          "description": "Short result summary shown on the task card: what changed, and anything the reviewer should look at."
         }
       }
     }

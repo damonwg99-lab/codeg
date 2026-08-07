@@ -11,6 +11,7 @@ import { notifyWebUnauthorized } from "./transport/web-connection-store"
 import { getCurrentEffectiveAppLocale } from "./i18n"
 import { TurnBusyError, isTurnInProgressRejection } from "./turn-busy"
 import type { FolderThemeColor } from "./theme-presets"
+import type { FollowUpIntent } from "./task-follow-up"
 import type {
   AgentType,
   AgentDelegationDefaults,
@@ -18,6 +19,13 @@ import type {
   Automation,
   AutomationRun,
   AutomationDraft,
+  WorkTask,
+  WorkTaskChangedFile,
+  WorkTaskConfig,
+  WorkTaskDraft,
+  WorkTaskEvent,
+  WorkTaskFolderSettings,
+  WorkTaskTemplate,
   ConversationSummary,
   ConversationDetail,
   DbConversationDetail,
@@ -29,9 +37,16 @@ import type {
   LiveSessionSnapshot,
   FeedbackItem,
   QuestionAnswer,
+  PlanApprovalAnswer,
   AcpAgentInfo,
   AcpAgentStatus,
+  AgentDiagnosticsReport,
   GrokStructuredConfig,
+  CodexSandboxStructuredConfig,
+  CursorStructuredConfig,
+  CursorAuthStatus,
+  CursorModelsResult,
+  CodexModelInfo,
   AgentSkillScope,
   AgentSkillLayout,
   AgentSkillItem,
@@ -42,13 +57,22 @@ import type {
   LinkOp,
   LinkOpResult,
   ScienceListItem,
+  CustomSkillItem,
+  CustomDeleteResult,
+  CustomImportResult,
   FolderHistoryEntry,
   FolderDetail,
+  FolderLinkDetail,
+  FolderLinkPlan,
+  FolderLinkRequestItem,
   CreateChatConversationResult,
   CreateChatDirResult,
   WorktreeResolution,
   DbConversationSummary,
   ImportResult,
+  ImportSelectedResult,
+  ScanResult,
+  SelectedSessionKey,
   OpenedTab,
   OpenedTabsSnapshot,
   SaveTabsOutcome,
@@ -70,7 +94,7 @@ import type {
   TerminalInfo,
   PromptInputBlock,
   FileTreeNode,
-  FileContentMatch,
+  WorkspaceFileEntry,
   DirectoryEntry,
   DirectoryItem,
   UploadAttachmentResult,
@@ -79,6 +103,7 @@ import type {
   FileSaveResult,
   WorkspaceSnapshotResponse,
   GitLogResult,
+  GitLogFileChange,
   AvailableTerminalShells,
   SystemLanguageSettings,
   SystemProxySettings,
@@ -112,6 +137,11 @@ import type {
   OfficecliInfo,
   OfficecliSkill,
   SkillSyncReport,
+  TokenUsageFacets,
+  TokenUsageFilter,
+  TokenUsageReport,
+  TokenUsageSyncResult,
+  TokenUsageSyncStatus,
 } from "./types"
 
 export async function listConversations(params?: {
@@ -165,6 +195,52 @@ export async function acpConnect(
   })
 }
 
+/**
+ * Drop inline image bytes from blocks whose bytes already live server-side.
+ *
+ * Web / remote-workspace mode uploads each composed image through
+ * `/upload_attachment` and keeps the base64 ONLY for the local thumbnail /
+ * optimistic bubble / queue-edit restore; the sent block carries an empty
+ * payload plus the uploaded file's `file://` uri, and the backend re-inlines
+ * the bytes right before dispatch (`acp::prompt_hydration`). Without this
+ * strip, a couple of screenshots of base64 in the `/acp_prompt` JSON body
+ * would blow axum's 2 MiB `DefaultBodyLimit` and 413 the send.
+ *
+ * `shouldStrip` is false on a local desktop workspace (Tauri IPC has no body
+ * limit and there is no uploads dir to hydrate from), so those blocks pass
+ * through byte-identical. Under `shouldStrip`, a `file://` uri on an image
+ * block can only have come from an upload — every web/remote attach path
+ * routes through `/upload_attachment` first — so uri presence is the marker.
+ * Pure; exported for tests.
+ */
+export function stripUploadedImagePayloads(
+  blocks: PromptInputBlock[],
+  shouldStrip: boolean
+): PromptInputBlock[] {
+  if (!shouldStrip) return blocks
+  return blocks.map((block) => {
+    if (
+      block.type === "image" &&
+      block.data.length > 0 &&
+      block.uri?.startsWith("file://")
+    ) {
+      return { ...block, data: "" }
+    }
+    if (
+      block.type === "resource" &&
+      typeof block.blob === "string" &&
+      block.blob.length > 0 &&
+      (block.mime_type?.startsWith("image/") ?? false) &&
+      block.uri.startsWith("file://")
+    ) {
+      // The embedded-blob shape used for agents that reject native image
+      // blocks (e.g. Grok). Same marker contract: empty blob + uploads uri.
+      return { ...block, blob: "" }
+    }
+    return block
+  })
+}
+
 export async function acpPrompt(
   connectionId: string,
   blocks: PromptInputBlock[],
@@ -175,7 +251,12 @@ export async function acpPrompt(
   try {
     await getTransport().call("acp_prompt", {
       connectionId,
-      blocks,
+      // Strip in every mode where the prompt leaves through an HTTP body:
+      // pure web (`!isDesktop`) and desktop-attached-to-remote-workspace.
+      blocks: stripUploadedImagePayloads(
+        blocks,
+        !isDesktop() || getActiveRemoteConnectionId() !== null
+      ),
       folderId,
       conversationId,
       clientMessageId,
@@ -203,6 +284,16 @@ export async function acpSetConfigOption(
     configId,
     valueId,
   })
+}
+
+/** Pause or clear the session's active Codex goal (codex-acp #293). The backend
+ *  sources the sessionId from the live session, so only the connection + action
+ *  are needed here. */
+export async function acpGoalControl(
+  connectionId: string,
+  action: "pause" | "clear"
+): Promise<void> {
+  return getTransport().call("acp_goal_control", { connectionId, action })
 }
 
 export async function acpCancel(connectionId: string): Promise<void> {
@@ -271,6 +362,25 @@ export async function acpAnswerQuestion(
   })
 }
 
+/**
+ * Submit the user's decision on a blocking Grok `exit_plan_mode` approval
+ * (approve / request-changes / abandon). Resolves the parked ext request on the
+ * backend (and clears the card on every client via the `plan_approval_resolved`
+ * event). Idempotent: answering an already-resolved / unknown `approvalId` is a
+ * no-op success.
+ */
+export async function acpAnswerPlanApproval(
+  connectionId: string,
+  approvalId: string,
+  answer: PlanApprovalAnswer
+): Promise<void> {
+  return getTransport().call("acp_answer_plan_approval", {
+    connectionId,
+    approvalId,
+    answer,
+  })
+}
+
 export async function acpDisconnect(connectionId: string): Promise<void> {
   return getTransport().call("acp_disconnect", { connectionId })
 }
@@ -319,6 +429,13 @@ export async function acpGetAgentStatus(
   agentType: AgentType
 ): Promise<AcpAgentStatus> {
   return getTransport().call("acp_get_agent_status", { agentType })
+}
+
+// Run environment diagnostics for an agent (or a base env report when omitted).
+export async function acpEnvDiagnostics(
+  agentType?: AgentType
+): Promise<AgentDiagnosticsReport> {
+  return getTransport().call("acp_env_diagnostics", { agentType })
 }
 
 export async function acpClearBinaryCache(agentType: AgentType): Promise<void> {
@@ -426,10 +543,23 @@ export async function acpUpdateAgentConfig(
     opencode_auth_json?: string | null
     codex_auth_json?: string | null
     codex_config_toml?: string | null
+    /** Compact structured codex model list; backend regenerates the
+     * `model_catalog_json` catalog files from it (config.toml keys are patched
+     * into `codex_config_toml` text by the caller). */
+    codex_model_catalog?: string | null
+    /** Codex sandbox / approval controls; merged onto the on-disk config.toml
+     * server-side. Governs the turns codex starts itself (/goal, /review,
+     * /compact) — ordinary turns carry the composer preset's policy instead. */
+    codex_sandbox?: CodexSandboxStructuredConfig | null
     grok_config_toml?: string | null
     /** Grok structured controls (mode / reasoning effort); merged onto the
      * on-disk config.toml server-side. */
     grok_structured?: GrokStructuredConfig | null
+    /** Raw ~/.cursor/cli-config.json text (advanced editor; whole file). */
+    cursor_cli_config_json?: string | null
+    /** Cursor structured controls (sandbox / permission rules); merged onto
+     * the on-disk cli-config.json server-side. */
+    cursor_structured?: CursorStructuredConfig | null
   }
 ): Promise<number> {
   return getTransport().call("acp_update_agent_config", {
@@ -438,9 +568,32 @@ export async function acpUpdateAgentConfig(
     opencodeAuthJson: params.opencode_auth_json ?? null,
     codexAuthJson: params.codex_auth_json ?? null,
     codexConfigToml: params.codex_config_toml ?? null,
+    codexModelCatalog: params.codex_model_catalog ?? null,
+    codexSandbox: params.codex_sandbox ?? null,
     grokConfigToml: params.grok_config_toml ?? null,
     grokStructured: params.grok_structured ?? null,
+    cursorCliConfigJson: params.cursor_cli_config_json ?? null,
+    cursorStructured: params.cursor_structured ?? null,
   })
+}
+
+/**
+ * Probe `cursor-agent status --format json` for the Cursor auth card. The
+ * optional live API key lets the probe test what's on screen; subscription
+ * mode passes an empty string to force (and verify) the browser-login
+ * credential.
+ */
+export async function acpCursorAuthStatus(
+  apiKey?: string
+): Promise<CursorAuthStatus> {
+  return getTransport().call("acp_cursor_auth_status", { apiKey })
+}
+
+/** List models via `cursor-agent models` for the Cursor model picker. */
+export async function acpCursorListModels(
+  apiKey?: string
+): Promise<CursorModelsResult> {
+  return getTransport().call("acp_cursor_list_models", { apiKey })
 }
 
 /**
@@ -485,6 +638,14 @@ export async function acpUpdateKimiCodeConfig(params: {
   vertexProject?: string | null
   vertexLocation?: string | null
   rawConfigToml?: string | null
+  /** Declares a thinking capability on the managed model, which is what makes
+   * `kimi acp` advertise its Thinking picker in the composer at all. */
+  reasoningEnabled?: boolean | null
+  /** Declares `always_thinking` instead of `thinking` — no "Off" row. */
+  alwaysThinking?: boolean | null
+  /** The reasoning levels the composer offers; passed to the provider verbatim. */
+  supportEfforts?: string[] | null
+  defaultEffort?: string | null
 }): Promise<number> {
   return getTransport().call("acp_update_kimi_code_config", {
     mode: params.mode,
@@ -497,6 +658,10 @@ export async function acpUpdateKimiCodeConfig(params: {
     vertexProject: params.vertexProject ?? null,
     vertexLocation: params.vertexLocation ?? null,
     rawConfigToml: params.rawConfigToml ?? null,
+    reasoningEnabled: params.reasoningEnabled ?? null,
+    alwaysThinking: params.alwaysThinking ?? null,
+    supportEfforts: params.supportEfforts ?? null,
+    defaultEffort: params.defaultEffort ?? null,
   })
 }
 
@@ -612,6 +777,152 @@ export async function acpReorderAgents(agentTypes: AgentType[]): Promise<void> {
   return getTransport().call("acp_reorder_agents", { agentTypes })
 }
 
+// ---------------------------------------------------------------------------
+// Custom ACP agents — agents the user registers from ACP registry information
+// instead of ones codeg ships hand-written support for.
+// ---------------------------------------------------------------------------
+
+/** One platform's binary release inside a custom agent's distribution spec. */
+export interface CustomAgentBinarySpec {
+  archive: string
+  cmd?: string
+  args?: string[]
+  env?: Record<string, string>
+  sha256?: string
+}
+
+export interface CustomAgentPackageSpec {
+  package: string
+  args?: string[]
+  env?: Record<string, string>
+  /** Console-script name the package installs; derived when omitted. */
+  cmd?: string
+  nodeRequired?: string
+  uvRequired?: string
+  python?: string
+}
+
+/**
+ * A custom agent's launch spec — byte-for-byte the ACP registry's
+ * `distribution` object, so a registry entry can be pasted verbatim.
+ */
+export interface CustomAgentSpec {
+  npx?: CustomAgentPackageSpec
+  uvx?: CustomAgentPackageSpec
+  binary?: Record<string, CustomAgentBinarySpec>
+}
+
+export type CustomDistributionKind = "npx" | "uvx" | "binary"
+
+export interface CustomAgentInfo {
+  registryId: string
+  /** `custom:<registryId>` — pass this wherever an `AgentType` is expected. */
+  agentType: AgentType
+  name: string
+  description: string
+  version: string
+  distributionKind: string
+  spec: CustomAgentSpec
+  iconUrl: string | null
+  /**
+   * User declaration that the agent reads the shared `.agents/skills` store;
+   * with `skillsDir`, gates the skills matrices.
+   */
+  skillsSharedStore: boolean
+  /** The agent's own skills directory (absolute), when declared. */
+  skillsDir: string | null
+  /**
+   * "registry" | "manual". Every whole-definition re-save must send it back,
+   * or the definition's provenance would reset.
+   */
+  source: string
+  /** Optional command that prints the locally installed version. */
+  versionProbe: string | null
+  /** False when the definition cannot launch here (e.g. no build for this OS). */
+  launchable: boolean
+  problem: string | null
+}
+
+/** One entry of the public ACP registry, annotated for the picker. */
+export interface RegistryCatalogAgent {
+  registryId: string
+  name: string
+  description: string
+  version: string | null
+  iconUrl: string | null
+  website: string | null
+  repository: string | null
+  license: string | null
+  distributionKinds: string[]
+  /** codeg already ships hand-written support for this agent. */
+  builtin: boolean
+  /** Already registered as a custom agent. */
+  installed: boolean
+  supportedOnPlatform: boolean
+  spec: CustomAgentSpec
+}
+
+export async function acpListCustomAgents(): Promise<CustomAgentInfo[]> {
+  return getTransport().call("acp_list_custom_agents", {})
+}
+
+export async function acpSaveCustomAgent(params: {
+  registryId: string
+  name: string
+  description?: string
+  version?: string
+  distributionKind: CustomDistributionKind
+  spec: CustomAgentSpec
+  iconUrl?: string | null
+  skillsSharedStore?: boolean
+  skillsDir?: string | null
+  /**
+   * "registry" | "manual". Omitted = the backend keeps the stored row's
+   * provenance (or "manual" for a new row).
+   */
+  source?: string
+  /** Optional version-probe command; full-replace like the skills fields. */
+  versionProbe?: string | null
+}): Promise<void> {
+  return getTransport().call("acp_save_custom_agent", { params })
+}
+
+export async function acpDeleteCustomAgent(
+  registryId: string,
+  deleteTranscripts: boolean
+): Promise<void> {
+  return getTransport().call("acp_delete_custom_agent", {
+    registryId,
+    deleteTranscripts,
+  })
+}
+
+/** Fetch the public ACP registry (network). */
+export async function acpFetchRegistryCatalog(): Promise<
+  RegistryCatalogAgent[]
+> {
+  return getTransport().call("acp_fetch_registry_catalog", {})
+}
+
+export async function acpAddRegistryAgent(
+  registryId: string,
+  distributionKind?: CustomDistributionKind
+): Promise<void> {
+  return getTransport().call("acp_add_registry_agent", {
+    registryId,
+    distributionKind,
+  })
+}
+
+/**
+ * The platform key (`darwin-aarch64`, …) binary distributions are keyed by on
+ * the machine that runs installs — the server in server mode, hence a backend
+ * question rather than a userAgent sniff.
+ */
+export async function acpCurrentPlatform(): Promise<string> {
+  return getTransport().call("acp_current_platform", {})
+}
+
 export async function codexRequestDeviceCode(): Promise<{
   userCode: string
   verificationUrl: string
@@ -656,6 +967,18 @@ export async function opencodeProviderCatalog(
   forceRefresh?: boolean
 ): Promise<OpenCodeCatalogProvider[]> {
   return getTransport().call("opencode_provider_catalog", {
+    forceRefresh: forceRefresh ?? null,
+  })
+}
+
+/** The official codex model catalog (full ModelInfo entries), sourced at runtime
+ *  from the codex codeg actually launches (cache + bundled fallback). Used for
+ *  the official list, "quick-add official", and as the clone template for custom
+ *  entries. Pass `forceRefresh` to bypass the cache and re-run codex. */
+export async function codexBundledCatalog(
+  forceRefresh?: boolean
+): Promise<CodexModelInfo[]> {
+  return getTransport().call("codex_bundled_catalog", {
     forceRefresh: forceRefresh ?? null,
   })
 }
@@ -840,6 +1163,93 @@ export async function scienceReadContent(skillId: string): Promise<string> {
 
 export async function scienceOpenCentralDir(): Promise<string> {
   return getTransport().call("science_open_central_dir")
+}
+
+// ─── Custom (user-authored) skills ──────────────────────────────────────
+// The fourth skill pack: user-created skills in the same central store, told
+// apart from the built-in packs by exclusion. Link statuses reuse the Expert*
+// DTOs (`expertId` carries the custom skill id).
+
+export async function customList(): Promise<CustomSkillItem[]> {
+  return getTransport().call("custom_list")
+}
+
+/** One round-trip snapshot of every (custom skill, agent) link state. */
+export async function customListAllInstallStatuses(): Promise<
+  ExpertInstallStatus[]
+> {
+  return getTransport().call("custom_list_all_install_statuses")
+}
+
+/** Apply a batch of enable/disable ops; returns one result per op. */
+export async function customApplyLinks(ops: LinkOp[]): Promise<LinkOpResult[]> {
+  return getTransport().call("custom_apply_links", { ops })
+}
+
+export async function customReadSkill(id: string): Promise<string> {
+  return getTransport().call("custom_read_skill", { id })
+}
+
+export async function customCreateSkill(params: {
+  id: string
+  content: string
+}): Promise<CustomSkillItem> {
+  return getTransport().call("custom_create_skill", {
+    id: params.id,
+    content: params.content,
+  })
+}
+
+export async function customSaveSkill(params: {
+  id: string
+  content: string
+}): Promise<CustomSkillItem> {
+  return getTransport().call("custom_save_skill", {
+    id: params.id,
+    content: params.content,
+  })
+}
+
+export async function customDuplicateSkill(params: {
+  sourceId: string
+  newId: string
+}): Promise<CustomSkillItem> {
+  return getTransport().call("custom_duplicate_skill", {
+    sourceId: params.sourceId,
+    newId: params.newId,
+  })
+}
+
+export async function customImportSkill(params: {
+  sourcePath: string
+  id?: string | null
+}): Promise<CustomSkillItem> {
+  return getTransport().call("custom_import_skill", {
+    sourcePath: params.sourcePath,
+    id: params.id ?? null,
+  })
+}
+
+/**
+ * Import an agent's own (global-scope) skills into the shared central store so
+ * they can be re-enabled for any agent. Returns one result per id; skills
+ * already in the store are reported as `skipped`, not errors.
+ */
+export async function customImportFromAgent(params: {
+  agentType: AgentType
+  ids: string[]
+}): Promise<CustomImportResult[]> {
+  return getTransport().call("custom_import_from_agent", {
+    agentType: params.agentType,
+    ids: params.ids,
+  })
+}
+
+/** Batch-delete custom skills (cleans up their agent links first). */
+export async function customDeleteSkills(
+  ids: string[]
+): Promise<CustomDeleteResult[]> {
+  return getTransport().call("custom_delete_skills", { ids })
 }
 
 // ─── Office tools ───
@@ -1275,6 +1685,13 @@ export async function updateFolderColor(
   return getTransport().call("update_folder_color", { folderId, color })
 }
 
+export async function updateFolderAlias(
+  folderId: number,
+  alias: string | null
+): Promise<FolderDetail> {
+  return getTransport().call("update_folder_alias", { folderId, alias })
+}
+
 export async function updateFolderDefaultAgent(
   folderId: number,
   defaultAgentType: AgentType | null
@@ -1289,6 +1706,23 @@ export async function importLocalConversations(
   folderId: number
 ): Promise<ImportResult> {
   return getTransport().call("import_local_conversations", { folderId })
+}
+
+/** Walk every local agent's session store and reconcile against the DB for the
+ *  import picker. Slow (filesystem-bound); per-agent progress arrives on the
+ *  `import-scan://progress` side-channel while this call is in flight. */
+export async function scanImportableSessions(): Promise<ScanResult> {
+  return getTransport().call("scan_importable_sessions", {})
+}
+
+/** Batch-import the selected scanned sessions. The backend re-walks the local
+ *  stores (disk is the source of truth), creates or reopens each target folder,
+ *  and broadcasts `folder://changed` + one `conversations://bulk-changed` so
+ *  every window's sidebar converges. Rejected while another import runs. */
+export async function importSelectedSessions(
+  selections: SelectedSessionKey[]
+): Promise<ImportSelectedResult> {
+  return getTransport().call("import_selected_sessions", { selections })
 }
 
 export async function getFolderConversation(
@@ -1360,19 +1794,52 @@ export async function gitFetch(
   })
 }
 
-export async function gitPushInfo(path: string): Promise<GitPushInfo> {
-  return getTransport().call("git_push_info", { path })
+/**
+ * Update a branch WITHOUT checking it out. The checked-out branch falls back to
+ * a normal pull (so a conflict can still come back on `conflict`); any other
+ * local branch is fast-forwarded from its upstream, and a remote branch
+ * (`isRemote`, e.g. `origin/main`) only advances its remote-tracking ref.
+ */
+export async function gitUpdateBranch(
+  path: string,
+  branch: string,
+  isRemote: boolean,
+  credentials?: GitCredentials | null
+): Promise<GitPullResult> {
+  return getTransport().call("git_update_branch", {
+    path,
+    branch,
+    isRemote,
+    credentials: credentials ?? null,
+  })
 }
 
+/** `branch` omitted (or null) reports on the checked-out branch. */
+export async function gitPushInfo(
+  path: string,
+  branch?: string | null
+): Promise<GitPushInfo> {
+  return getTransport().call("git_push_info", {
+    path,
+    branch: branch ?? null,
+  })
+}
+
+/**
+ * Push a branch. `branch` omitted (or null) pushes the checked-out one; naming
+ * one pushes it without checking it out (`git push <remote> <branch>`).
+ */
 export async function gitPush(
   path: string,
   remote?: string | null,
   credentials?: GitCredentials | null,
-  folderId?: number | null
+  folderId?: number | null,
+  branch?: string | null
 ): Promise<GitPushResult> {
   return getTransport().call("git_push", {
     path,
     remote: remote ?? null,
+    branch: branch ?? null,
     credentials: credentials ?? null,
     folderId: folderId ?? null,
   })
@@ -1490,6 +1957,84 @@ export async function gitContinueOperation(
   return getTransport().call("git_continue_operation", { path, operation })
 }
 
+/**
+ * How many `openAppWindow` calls are still waiting on each window name. Two
+ * clicks on the same action are handed the very same reserved window, so a
+ * failure may only tear it down once nothing else is still racing for it.
+ */
+const appWindowReservations = new Map<string, number>()
+
+function reserveAppWindow(name: string): void {
+  appWindowReservations.set(name, (appWindowReservations.get(name) ?? 0) + 1)
+}
+
+/** Drops one reservation and reports how many remain for that name. */
+function releaseAppWindow(name: string): number {
+  const remaining = Math.max(0, (appWindowReservations.get(name) ?? 1) - 1)
+  if (remaining > 0) appWindowReservations.set(name, remaining)
+  else appWindowReservations.delete(name)
+  return remaining
+}
+
+/**
+ * True while a window still shows the blank placeholder we reserved — i.e. it
+ * holds nothing worth keeping. Reading `location` on a cross-origin window
+ * throws; such a window is not one of ours, so treat it as occupied.
+ */
+function isBlankAppWindow(win: Window): boolean {
+  try {
+    return win.location.href === "about:blank"
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Open a same-origin app window (commit / push / settings / …) whose target
+ * path is only known after a backend round trip.
+ *
+ * The window must be RESERVED inside the click's own call stack: in web mode
+ * that round trip is a real HTTP request, far longer than any browser's
+ * user-activation window, so calling `window.open(path)` after the await is
+ * reliably swallowed by the popup blocker. (Issue #410 is the markdown-link
+ * variant of the same bug, where the gap was only a microtask.)
+ *
+ * Reserving with an EMPTY url is what makes this safe to retrofit: an empty
+ * url never navigates, so a name that already maps to an open window is simply
+ * handed back — preserving today's reuse-by-name behaviour, which
+ * `openPushWindow` relies on to retarget an already-open push window. And
+ * because no window features are passed, a `null` return really does mean
+ * "blocked" here, unlike the `noreferrer` popups in ai-elements/link-safety.tsx
+ * (those return null even on success).
+ */
+async function openAppWindow(
+  name: string,
+  resolvePath: () => Promise<{ path: string }>
+): Promise<void> {
+  const win = window.open("", name)
+  if (!win) {
+    throw new Error(
+      "Popup blocked by the browser. Allow popups for this site and try again."
+    )
+  }
+
+  reserveAppWindow(name)
+  try {
+    const { path } = await resolvePath()
+    win.location.href = path
+  } catch (error) {
+    // Tear the placeholder down only once nothing else is waiting on this name
+    // AND nobody has navigated it meanwhile: a concurrent request for the same
+    // window may still succeed, and it shares this exact window. Checking for
+    // the blank placeholder (rather than remembering "I created it") is also
+    // what keeps a window the user already had open — which always carries a
+    // real document — from being closed by an unrelated failure.
+    if (releaseAppWindow(name) === 0 && isBlankAppWindow(win)) win.close()
+    throw error
+  }
+  releaseAppWindow(name)
+}
+
 export async function openMergeWindow(
   folderId: number,
   operation: string,
@@ -1505,16 +2050,14 @@ export async function openMergeWindow(
       remoteConnectionId: getActiveRemoteConnectionId(),
     })
   }
-  const result = await getTransport().call<{ path: string }>(
-    "open_merge_window",
-    {
+  return openAppWindow(`merge-${folderId}`, () =>
+    getTransport().call<{ path: string }>("open_merge_window", {
       folderId,
       operation,
       upstreamCommit: upstreamCommit ?? null,
       locale,
-    }
+    })
   )
-  window.open(result.path, `merge-${folderId}`)
 }
 
 export async function openStashWindow(folderId: number): Promise<void> {
@@ -1526,27 +2069,38 @@ export async function openStashWindow(folderId: number): Promise<void> {
       remoteConnectionId: getActiveRemoteConnectionId(),
     })
   }
-  const result = await getTransport().call<{ path: string }>(
-    "open_stash_window",
-    { folderId, locale }
+  return openAppWindow(`stash-${folderId}`, () =>
+    getTransport().call<{ path: string }>("open_stash_window", {
+      folderId,
+      locale,
+    })
   )
-  window.open(result.path, `stash-${folderId}`)
 }
 
-export async function openPushWindow(folderId: number): Promise<void> {
+/** `branch` preselects the push target; omitted means the checked-out branch. */
+export async function openPushWindow(
+  folderId: number,
+  branch?: string | null
+): Promise<void> {
   const locale = getCurrentEffectiveAppLocale()
   if (isDesktop()) {
     return getShellTransport().call("open_push_window", {
       folderId,
       locale,
       remoteConnectionId: getActiveRemoteConnectionId(),
+      branch: branch ?? null,
     })
   }
-  const result = await getTransport().call<{ path: string }>(
-    "open_push_window",
-    { folderId, locale }
+  // Reusing the window NAME navigates an already-open push window to the new
+  // URL, so the preselected branch applies there too (the desktop path gets the
+  // same effect from the `push://retarget-branch` event).
+  return openAppWindow(`push-${folderId}`, () =>
+    getTransport().call<{ path: string }>("open_push_window", {
+      folderId,
+      locale,
+      branch: branch ?? null,
+    })
   )
-  window.open(result.path, `push-${folderId}`)
 }
 
 export async function gitStashPush(
@@ -1726,6 +2280,69 @@ export async function gitAddFiles(
 
 // Window management commands
 
+// ─── Workspace folder links (multi-folder workspace) ───
+
+/** Links currently registered for `folderId`, with their live on-disk status. */
+export async function listFolderLinks(
+  folderId: number
+): Promise<FolderLinkDetail[]> {
+  return getTransport().call("list_folder_links", { folderId })
+}
+
+/**
+ * Dry run: what names the picked directories would get and which ones would be
+ * skipped. Resolved server-side against the real filesystem, so the dialog can
+ * show the final names before anything is created.
+ */
+export async function previewFolderLinks(
+  folderId: number,
+  paths: string[]
+): Promise<FolderLinkPlan[]> {
+  return getTransport().call("preview_folder_links", { folderId, paths })
+}
+
+/**
+ * Create the links. Entries that can't be linked are skipped rather than
+ * failing the batch — the result is what actually landed.
+ */
+export async function createFolderLinks(
+  folderId: number,
+  items: FolderLinkRequestItem[],
+  gitExclude = true
+): Promise<FolderLinkDetail[]> {
+  return getTransport().call("create_folder_links", {
+    folderId,
+    items,
+    gitExclude,
+  })
+}
+
+/** Rename a link (moves the symlink; the target is untouched). */
+export async function renameFolderLink(
+  linkId: number,
+  newName: string
+): Promise<FolderLinkDetail> {
+  return getTransport().call("rename_folder_link", { linkId, newName })
+}
+
+/** Recreate the symlink for a link whose on-disk entry went missing. */
+export async function repairFolderLink(
+  linkId: number
+): Promise<FolderLinkDetail> {
+  return getTransport().call("repair_folder_link", { linkId })
+}
+
+/**
+ * Drop a link. With `deleteLink` the symlink is removed from the workspace
+ * root; the directory it pointed at is never touched.
+ */
+export async function removeFolderLink(
+  linkId: number,
+  deleteLink = true
+): Promise<void> {
+  return getTransport().call("remove_folder_link", { linkId, deleteLink })
+}
+
 export async function openFolder(path: string): Promise<FolderDetail> {
   return getTransport().call("open_folder", { path })
 }
@@ -1766,11 +2383,12 @@ export async function openCommitWindow(folderId: number): Promise<void> {
       remoteConnectionId: getActiveRemoteConnectionId(),
     })
   }
-  const result = await getTransport().call<{ path: string }>(
-    "open_commit_window",
-    { folderId, locale }
+  return openAppWindow(`commit-${folderId}`, () =>
+    getTransport().call<{ path: string }>("open_commit_window", {
+      folderId,
+      locale,
+    })
   )
-  window.open(result.path, `commit-${folderId}`)
 }
 
 export type SettingsSection =
@@ -1802,15 +2420,37 @@ export async function openSettingsWindow(
     })
   }
   // Web mode: open in new window
-  const result = await getTransport().call<{ path: string }>(
-    "open_settings_window",
-    {
+  return openAppWindow(`settings-${section ?? "general"}`, () =>
+    getTransport().call<{ path: string }>("open_settings_window", {
       section: section ?? null,
       agentType: options?.agentType ?? null,
       locale,
-    }
+    })
   )
-  window.open(result.path, `settings-${section ?? "general"}`)
+}
+
+export interface OpenImportSessionsWindowOptions {
+  /** Folder path the picker should scroll to and preselect once the scan
+   *  completes (the sidebar folder context-menu entry passes its own path). */
+  focusPath?: string | null
+}
+
+export async function openImportSessionsWindow(
+  options?: OpenImportSessionsWindowOptions
+): Promise<void> {
+  const focusPath = options?.focusPath ?? null
+  if (isDesktop()) {
+    return getShellTransport().call("open_import_sessions_window", {
+      focusPath,
+      locale: getCurrentEffectiveAppLocale(),
+      remoteConnectionId: getActiveRemoteConnectionId(),
+    })
+  }
+  return openAppWindow("import-sessions", () =>
+    getTransport().call<{ path: string }>("open_import_sessions_window", {
+      focusPath,
+    })
+  )
 }
 
 export async function openProjectBootWindow(source?: string): Promise<void> {
@@ -2083,6 +2723,30 @@ export async function quickMessagesReorder(ids: number[]): Promise<void> {
   return getTransport().call("quick_messages_reorder", { ids })
 }
 
+// Token usage dashboard
+
+export async function tokenUsageReport(
+  filter: TokenUsageFilter
+): Promise<TokenUsageReport> {
+  return getTransport().call("token_usage_report", { filter })
+}
+
+export async function tokenUsageFacets(): Promise<TokenUsageFacets> {
+  return getTransport().call("token_usage_facets")
+}
+
+export async function tokenUsageStatus(): Promise<TokenUsageSyncStatus> {
+  return getTransport().call("token_usage_status")
+}
+
+/** `full` drops every stored fact and re-parses every transcript — the escape
+ *  hatch for a session file the agent's own CLI grew behind codeg's back. */
+export async function tokenUsageSync(
+  mode: "incremental" | "full" = "incremental"
+): Promise<TokenUsageSyncResult> {
+  return getTransport().call("token_usage_sync", { mode })
+}
+
 // Automations
 
 export async function automationList(): Promise<Automation[]> {
@@ -2147,6 +2811,210 @@ export async function automationCancelRun(runId: number): Promise<void> {
   return getTransport().call("automation_cancel_run", { runId })
 }
 
+// Work tasks
+
+export async function workTaskList(
+  folderId?: number | null
+): Promise<WorkTask[]> {
+  return getTransport().call("work_task_list", { folderId: folderId ?? null })
+}
+
+export async function workTaskGet(id: number): Promise<WorkTask> {
+  return getTransport().call("work_task_get", { id })
+}
+
+export async function workTaskEvents(
+  taskId: number,
+  limit = 500
+): Promise<WorkTaskEvent[]> {
+  return getTransport().call("work_task_events", { taskId, limit })
+}
+
+export async function workTaskCreate(draft: WorkTaskDraft): Promise<WorkTask> {
+  return getTransport().call("work_task_create", { draft })
+}
+
+export async function workTaskUpdate(
+  id: number,
+  draft: WorkTaskDraft
+): Promise<WorkTask> {
+  return getTransport().call("work_task_update", { id, draft })
+}
+
+/** Persist the pending column's drag order (index → sort_order). */
+export async function workTaskReorder(
+  folderId: number,
+  orderedIds: number[]
+): Promise<void> {
+  return getTransport().call("work_task_reorder", { folderId, orderedIds })
+}
+
+export async function workTaskDelete(
+  id: number,
+  deleteWorktree = false
+): Promise<void> {
+  return getTransport().call("work_task_delete", { id, deleteWorktree })
+}
+
+export async function workTaskStart(id: number): Promise<void> {
+  return getTransport().call("work_task_start", { id })
+}
+
+/** Queue every todo of the folder — or of every folder holding todos when
+ *  `folderId` is null. Returns how many were claimed. */
+export async function workTaskStartAll(
+  folderId: number | null
+): Promise<number> {
+  return getTransport().call("work_task_start_all", { folderId })
+}
+
+/** failed → queued. `note` (optional) reaches the retry prompt. */
+export async function workTaskRetry(
+  id: number,
+  note?: string | null
+): Promise<void> {
+  return getTransport().call("work_task_retry", { id, note: note ?? null })
+}
+
+/**
+ * canceled → todo (back onto the board; started again explicitly). `note`
+ * (optional) reaches the next run's prompt — a cancel usually had a reason.
+ */
+export async function workTaskRequeue(
+  id: number,
+  note?: string | null
+): Promise<void> {
+  return getTransport().call("work_task_requeue", { id, note: note ?? null })
+}
+
+/**
+ * Follow up on a reviewed task. `intent` picks the framing the agent receives
+ * (see `lib/task-follow-up`); omitted means `revise`.
+ */
+export async function workTaskReturn(
+  id: number,
+  feedback: string,
+  intent?: FollowUpIntent
+): Promise<void> {
+  return getTransport().call("work_task_return", {
+    id,
+    feedback,
+    intent: intent ?? null,
+  })
+}
+
+/**
+ * Stop a task. `reason` (optional) is the user's own note about why — it lands
+ * on the `canceled` entry of the progress timeline and is never replayed into
+ * a later run's prompt (a requeue carries its own note for that).
+ */
+export async function workTaskCancel(
+  id: number,
+  reason?: string | null
+): Promise<void> {
+  return getTransport().call("work_task_cancel", { id, reason: reason ?? null })
+}
+
+/** Dispatch the agent-driven merge (`message: null` = the agent writes the
+ *  commit message itself); the outcome rides `task://changed` events. */
+export async function workTaskMerge(
+  id: number,
+  message: string | null,
+  deleteWorktree: boolean
+): Promise<void> {
+  return getTransport().call("work_task_merge", {
+    id,
+    message,
+    deleteWorktree,
+  })
+}
+
+/** Finish a reviewed task that has nothing to merge (review → done), taking
+ *  its worktree with it when asked. Refused if the worktree changed after all. */
+export async function workTaskComplete(
+  id: number,
+  deleteWorktree: boolean
+): Promise<void> {
+  return getTransport().call("work_task_complete", { id, deleteWorktree })
+}
+
+export async function workTaskArchive(
+  id: number,
+  archived: boolean
+): Promise<void> {
+  return getTransport().call("work_task_archive", { id, archived })
+}
+
+/** Remove the task's worktree + branch (also retries a failed cleanup). */
+export async function workTaskCleanup(id: number): Promise<void> {
+  return getTransport().call("work_task_cleanup", { id })
+}
+
+/** Unified diff of the worktree vs the task's recorded base. */
+export async function workTaskDiff(
+  id: number,
+  file?: string | null
+): Promise<string> {
+  return getTransport().call("work_task_diff", { id, file: file ?? null })
+}
+
+export async function workTaskChangedFiles(
+  id: number
+): Promise<WorkTaskChangedFile[]> {
+  return getTransport().call("work_task_changed_files", { id })
+}
+
+/** Effective settings after the folder → global → built-in fallback — what
+ *  the engine will actually use for this folder. */
+export async function workTaskSettingsEffective(
+  folderId: number
+): Promise<WorkTaskFolderSettings> {
+  return getTransport().call("work_task_settings_effective", { folderId })
+}
+
+export async function workTaskSettingsGet(
+  folderId: number
+): Promise<WorkTaskFolderSettings> {
+  return getTransport().call("work_task_settings_get", { folderId })
+}
+
+/** The folder's own settings row, or null when it follows the global
+ *  defaults — how the settings dialog tells the two apart. */
+export async function workTaskSettingsGetOwn(
+  folderId: number
+): Promise<WorkTaskFolderSettings | null> {
+  return getTransport().call("work_task_settings_get_own", { folderId })
+}
+
+export async function workTaskSettingsSet(
+  folderId: number,
+  settings: WorkTaskFolderSettings
+): Promise<void> {
+  return getTransport().call("work_task_settings_set", { folderId, settings })
+}
+
+/** Drop the folder's own settings row — it reverts to the global defaults. */
+export async function workTaskSettingsDelete(folderId: number): Promise<void> {
+  return getTransport().call("work_task_settings_delete", { folderId })
+}
+
+export async function workTaskTemplateList(): Promise<WorkTaskTemplate[]> {
+  return getTransport().call("work_task_template_list", {})
+}
+
+/** Upsert by exact name: an existing template of the same name is replaced. */
+export async function workTaskTemplateSave(draft: {
+  name: string
+  title: string
+  config: WorkTaskConfig
+}): Promise<WorkTaskTemplate> {
+  return getTransport().call("work_task_template_save", { draft })
+}
+
+export async function workTaskTemplateDelete(id: number): Promise<void> {
+  return getTransport().call("work_task_template_delete", { id })
+}
+
 // Directory browser (for web/server mode)
 
 export async function getHomeDirectory(): Promise<string> {
@@ -2166,9 +3034,11 @@ export async function listDirectoryWithFiles(
 }
 
 // Hard ceiling for a single attachment, kept in lockstep with the server's
-// `UPLOAD_MAX_BYTES`. Aligned with axum's default multipart body limit (and
-// with the fact that anything larger won't fit a model context anyway).
-export const UPLOAD_MAX_BYTES = 2 * 1024 * 1024
+// `UPLOAD_MAX_BYTES` (`web/handlers/files.rs`, mirrored in
+// `commands/remote_proxy.rs`). Sized to match the desktop drag-drop image
+// limit (`DRAG_DROP_IMAGE_MAX_BYTES`) so the same screenshot attaches in
+// every mode; oversize is rejected up front with a visible toast.
+export const UPLOAD_MAX_BYTES = 20 * 1024 * 1024
 
 // `btoa` only accepts a binary string, and `String.fromCharCode(...bytes)`
 // hits the call-stack limit somewhere around a few hundred KB. Chunk the
@@ -2742,16 +3612,15 @@ export async function getFileTree(
   })
 }
 
-export async function searchFilesContent(
-  basePath: string,
-  keyword: string,
-  maxResults?: number
-): Promise<FileContentMatch[]> {
-  return getTransport().call("search_files_content", {
-    basePath,
-    keyword,
-    maxResults: maxResults ?? null,
-  })
+/**
+ * Flat, gitignore-aware listing of every file/dir under `path`. Ignored
+ * directories are pruned during the backend walk (no depth cap), so deeply
+ * nested files are reachable while the payload stays small. Used by file search.
+ */
+export async function listWorkspaceFiles(
+  path: string
+): Promise<WorkspaceFileEntry[]> {
+  return getTransport().call("list_workspace_files", { path })
 }
 
 export async function startWorkspaceStateStream(
@@ -2861,6 +3730,24 @@ export async function renameFileTreeEntry(
   })
 }
 
+/**
+ * Move a file/directory into a different directory of the same workspace,
+ * keeping its name. `sourcePath` and `destDir` are workspace-relative
+ * (forward slashes); `destDir` is `""` for the workspace root. Resolves to the
+ * moved entry's new workspace-relative path.
+ */
+export async function moveFileTreeEntry(
+  rootPath: string,
+  sourcePath: string,
+  destDir: string
+): Promise<string> {
+  return getTransport().call("move_file_tree_entry", {
+    rootPath,
+    sourcePath,
+    destDir,
+  })
+}
+
 export async function deleteFileTreeEntry(
   rootPath: string,
   path: string
@@ -2886,13 +3773,47 @@ export async function gitLog(
   path: string,
   limit?: number,
   branch?: string,
-  remote?: string
+  remote?: string,
+  skip?: number,
+  author?: string,
+  allBranches?: boolean,
+  withFiles?: boolean
 ): Promise<GitLogResult> {
   return getTransport().call("git_log", {
     path,
     limit: limit ?? null,
     branch: branch ?? null,
     remote: remote ?? null,
+    skip: skip ?? null,
+    author: author ?? null,
+    allBranches: allBranches ?? null,
+    withFiles: withFiles ?? null,
+  })
+}
+
+export async function gitCurrentUser(path: string): Promise<string | null> {
+  return getTransport().call("git_current_user", { path })
+}
+
+export async function gitCommitFiles(
+  path: string,
+  commit: string
+): Promise<GitLogFileChange[]> {
+  return getTransport().call("git_commit_files", { path, commit })
+}
+
+// On-demand author search for the log filter — real repo authors matching
+// `query` (case-insensitive, most-active first). Debounced client-side; no
+// upfront full-repo scan.
+export async function gitSearchAuthors(
+  path: string,
+  query: string,
+  limit?: number
+): Promise<string[]> {
+  return getTransport().call("git_search_authors", {
+    path,
+    query,
+    limit: limit ?? null,
   })
 }
 

@@ -95,19 +95,20 @@ describe("parseUserMessageSegments", () => {
   })
 
   describe("bare invocation tokens → skill badges", () => {
-    it("badges a /command token keeping its prefix", () => {
+    it("badges a /command token, dropping its prefix from the label", () => {
       const segments = parseUserMessageSegments("run /review please")
       expect(segments[0]).toEqual({ kind: "text", text: "run " })
       const skill = segments[1] as { kind: "reference"; attrs: ReferenceAttrs }
       expect(skill.attrs.refType).toBe("skill")
-      expect(skill.attrs.label).toBe("/review")
+      // Badge label matches the composer's inline badge: the bare name, no `/`.
+      expect(skill.attrs.label).toBe("review")
       expect(segments[2]).toEqual({ kind: "text", text: " please" })
     })
 
-    it("badges a $skill token", () => {
+    it("badges a $skill token, dropping its prefix from the label", () => {
       const attrs = onlyReference("$deploy now")
       expect(attrs.refType).toBe("skill")
-      expect(attrs.label).toBe("$deploy")
+      expect(attrs.label).toBe("deploy")
     })
 
     it("does NOT badge a file-ish path", () => {
@@ -144,6 +145,33 @@ describe("parseUserMessageSegments", () => {
           id: "a_(1).ts",
           label: "a_(1).ts",
           uri: "file:///repo/a_(1).ts",
+          meta: { fileKind: "file" },
+        }),
+      ],
+      [
+        // A uri holding `\`, `<` or `>` is angle-wrapped AND backslash-escaped
+        // by escapeLinkDestination; parsing has to decode those escapes or the
+        // recovered uri carries doubled backslashes (wrong path, and one more
+        // doubling per round-trip).
+        "windows file with backslashes",
+        ref({
+          refType: "file",
+          // The basename split is `/`-only, so a backslash-only path yields the
+          // whole path as id (unchanged by the escape decode; `buildFileUri`
+          // never emits this form, but an agent-supplied ResourceLink can).
+          id: "C:\\repo\\app.ts",
+          label: "app.ts",
+          uri: "file:///C:\\repo\\app.ts",
+          meta: { fileKind: "file" },
+        }),
+      ],
+      [
+        "file with angle brackets",
+        ref({
+          refType: "file",
+          id: "a<b>c.ts",
+          label: "a<b>c.ts",
+          uri: "file:///repo/a<b>c.ts",
           meta: { fileKind: "file" },
         }),
       ],

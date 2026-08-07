@@ -14,17 +14,26 @@ pub enum AgentDistribution {
     },
     Binary {
         version: &'static str,
+        /// Command name on PATH (fallback launch + `which` probes). For
+        /// single-file archives this is also the file name copied out of the
+        /// archive into the cache.
         cmd: &'static str,
         args: &'static [&'static str],
         env: &'static [(&'static str, &'static str)],
         platforms: &'static [PlatformBinary],
+        /// `None`: the archive contains one self-contained binary named `cmd`,
+        /// which is copied out into the cache (OpenCode). `Some`: the archive
+        /// is a whole directory tree that must stay intact (bundled runtime,
+        /// e.g. Cursor's agent-cli-package); everything is extracted into the
+        /// per-version cache dir and the entry path inside it is launched.
+        dir_entry: Option<BinaryDirEntry>,
     },
     /// Python agents launched through `uvx` (the `uv` tool runner), which
     /// fetches + caches the pinned package on first use — analogous to npx.
     /// Used for ACP agents distributed as Python packages (e.g. Hermes).
     Uvx {
         version: &'static str,
-        /// The `uvx --from` package spec, e.g. "hermes-agent[acp,mcp]==0.18.2".
+        /// The `uvx --from` package spec, e.g. "hermes-agent[acp,mcp]==0.19.0".
         package: &'static str,
         /// The console-script entry point to run, e.g. "hermes-acp".
         cmd: &'static str,
@@ -48,6 +57,32 @@ pub enum AgentDistribution {
 pub struct PlatformBinary {
     pub platform: &'static str,
     pub url: &'static str,
+    /// Expected hex SHA-256 of the downloaded archive, verified before the
+    /// archive is unpacked. `None` for built-ins: their URLs are repository
+    /// constants reviewed with the code. Custom agents download from
+    /// user-supplied URLs, so the ACP registry's `sha256` is carried through
+    /// and enforced whenever it is published.
+    pub sha256: Option<&'static str>,
+}
+
+/// Launch entry inside an extracted directory-tree archive (see
+/// [`AgentDistribution::Binary::dir_entry`]). Paths are relative to the
+/// archive root, '/'-separated; `windows` names the `.cmd`/`.bat` shim.
+#[derive(Debug, Clone, Copy)]
+pub struct BinaryDirEntry {
+    pub unix: &'static str,
+    pub windows: &'static str,
+}
+
+impl BinaryDirEntry {
+    /// Entry path for the current platform.
+    pub fn for_current_platform(&self) -> &'static str {
+        if cfg!(windows) {
+            self.windows
+        } else {
+            self.unix
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -101,7 +136,9 @@ pub fn current_platform() -> &'static str {
     }
 }
 
-pub fn all_acp_agents() -> Vec<AgentType> {
+/// The twelve built-in agents. Excludes user-registered custom agents — use
+/// [`all_acp_agents`] for the live set.
+pub fn builtin_acp_agents() -> Vec<AgentType> {
     vec![
         AgentType::ClaudeCode,
         AgentType::Codex,
@@ -114,7 +151,16 @@ pub fn all_acp_agents() -> Vec<AgentType> {
         AgentType::KimiCode,
         AgentType::Pi,
         AgentType::Grok,
+        AgentType::Cursor,
     ]
+}
+
+/// Every agent codeg can currently drive: the twelve built-ins followed by the
+/// user's registered custom ACP agents (sorted by id).
+pub fn all_acp_agents() -> Vec<AgentType> {
+    let mut agents = builtin_acp_agents();
+    agents.extend(crate::acp::custom_registry::all());
+    agents
 }
 
 pub fn registry_id_for(agent_type: AgentType) -> &'static str {
@@ -130,6 +176,9 @@ pub fn registry_id_for(agent_type: AgentType) -> &'static str {
         AgentType::KimiCode => "kimi-code",
         AgentType::Pi => "pi-acp",
         AgentType::Grok => "grok-build",
+        AgentType::Cursor => "cursor",
+        // A custom agent's registry id IS its identity.
+        AgentType::Custom(id) => id,
     }
 }
 
@@ -146,11 +195,122 @@ pub fn from_registry_id(id: &str) -> Option<AgentType> {
         "kimi-code" => Some(AgentType::KimiCode),
         "pi-acp" => Some(AgentType::Pi),
         "grok-build" => Some(AgentType::Grok),
+        "cursor" => Some(AgentType::Cursor),
+        // Only ids the user has actually registered resolve. An unregistered
+        // id must stay `None` so the ACP-registry picker still offers it as
+        // "addable" rather than treating it as already supported.
+        other => crate::acp::custom_registry::is_registered(other)
+            .then(|| AgentType::custom(other))
+            .flatten(),
+    }
+}
+
+/// The vendor CLI wrapped by a codeg entry that is really a THIRD-PARTY ACP
+/// *adapter*.
+///
+/// Ten of the twelve built-ins distribute the vendor's own CLI, so a user's
+/// existing global install is found by the launch gate as-is. Claude Code and
+/// Codex are the exceptions: neither `claude` nor `codex` speaks ACP, so codeg
+/// installs a separate adapter package (`claude-agent-acp` / `codex-acp`,
+/// maintained by the Agent Client Protocol org) whose command name has nothing
+/// to do with the vendor CLI's. That mismatch is the single most reported
+/// confusion ("I have claude installed, why does codeg say it isn't?"), so
+/// preflight and diagnostics probe the vendor CLI too and explain the split.
+#[derive(Debug, Clone, Copy)]
+pub struct AcpAdapterRelation {
+    /// The vendor CLI users install themselves, e.g. "claude".
+    pub native_cmd: &'static str,
+    /// Display name for that CLI, e.g. "Claude Code CLI".
+    pub native_label: &'static str,
+    /// Config/credential dir BOTH the vendor CLI and the adapter read, so
+    /// installing the adapter needs no second login.
+    pub shared_config_dir: &'static str,
+    /// Home-relative dirs the vendor's own installers use that a GUI app's PATH
+    /// commonly lacks. Probed after PATH and the npm global prefix.
+    pub extra_dirs: &'static [&'static str],
+    /// Where the "learn more" action points.
+    pub docs_url: &'static str,
+}
+
+/// Adapter relation for an agent, or `None` when codeg's entry IS the vendor's
+/// own CLI (every agent except these two).
+///
+/// Adding an entry here changes what preflight/diagnostics report — keep the
+/// `acp_adapter_relation_covers_only_wrapper_agents` test in sync.
+pub fn acp_adapter_relation(agent_type: AgentType) -> Option<AcpAdapterRelation> {
+    match agent_type {
+        AgentType::ClaudeCode => Some(AcpAdapterRelation {
+            native_cmd: "claude",
+            native_label: "Claude Code CLI",
+            shared_config_dir: "~/.claude",
+            // The native installer targets ~/.local/bin; older builds used
+            // ~/.claude/local.
+            extra_dirs: &[".local/bin", ".claude/local"],
+            docs_url: ACP_ADAPTER_DOCS_URL,
+        }),
+        AgentType::Codex => Some(AcpAdapterRelation {
+            native_cmd: "codex",
+            native_label: "Codex CLI",
+            shared_config_dir: "~/.codex",
+            extra_dirs: &[".local/bin"],
+            docs_url: ACP_ADAPTER_DOCS_URL,
+        }),
+        _ => None,
+    }
+}
+
+/// Docs anchor explaining the adapter/vendor-CLI split. The zh mirror carries
+/// the same explicit `{#acp-adapters}` anchor.
+const ACP_ADAPTER_DOCS_URL: &str = "https://docs.codeg.app/guide/supported-agents#acp-adapters";
+
+/// Minimum adapter version whose `_session/steering` honors the
+/// `_meta.steering.idleBehavior = "promptRequired"` opt-in — one of the three
+/// gates for codeg's NATIVE live-feedback push channel (synthesized into
+/// `SessionState.native_steering_available` at initialize; see
+/// `connection.rs::init_advertises_steering`).
+///
+/// `None` means "never steer natively" even when the adapter advertises
+/// `_meta.steering.supported`: an adapter that ignores the opt-in falls back
+/// to `startedNewTurn` on the turn-end race — a detached turn no host request
+/// owns, which codeg's turn-scoped runtime must never trigger. codex-acp
+/// 1.1.9 ships `_session/steering` but not `promptRequired` (verified against
+/// the published tarball), so it stays `None` until a release implements the
+/// opt-in — then this is a one-line flip plus tests.
+///
+/// Honoring the opt-in is necessary but not sufficient: the ACTIVE path must
+/// also keep the owning `session/prompt` in flight across the steered work
+/// (see the per-arm rationale below).
+///
+/// The static policy alone is NOT enough — launch prefers a PATH-resolved,
+/// user-installed adapter over the pinned npx package (see
+/// `commands::acp::acp_get_agent_status_core`, "Launch already prefers the
+/// PATH resolution"), so the synthesis must ALSO prove the running binary's
+/// `agent_info.version` meets this minimum.
+pub fn steering_prompt_required_min_version(agent_type: AgentType) -> Option<&'static str> {
+    match agent_type {
+        // 0.64.0 (#919) added the `promptRequired` opt-in, but the ACTIVE path
+        // stayed unsound until 0.65.0 (#958): steering is delivered at priority
+        // `now`, which makes the CLI ABORT the running cycle, and that cycle's
+        // ordinary result settled the owning `session/prompt` as a clean
+        // `end_turn` while the steered work was still going — the continuation
+        // then streamed with no turn in flight (#934, reported and reproduced
+        // from codeg). 0.65.0 records a steered turn's results instead of
+        // settling on them and settles at the SDK `idle` spanning both cycles,
+        // so the floor is the FIRST release carrying that fix, not the one that
+        // introduced the opt-in. Every 0.64.x — including 0.64.2, which only
+        // reverted an unrelated ExitPlanMode change — still carries the bug and
+        // is held to the pull channel by the runtime version gate.
+        AgentType::ClaudeCode => Some("0.65.0"),
         _ => None,
     }
 }
 
 pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
+    if let AgentType::Custom(id) = agent_type {
+        return crate::acp::custom_registry::get(id)
+            .cloned()
+            .unwrap_or_else(|| crate::acp::custom_registry::unregistered_meta(id));
+    }
     debug_assert_eq!(
         from_registry_id(registry_id_for(agent_type)),
         Some(agent_type)
@@ -161,9 +321,54 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             supports_mcp: true,
             name: "Claude Code",
             description: "ACP wrapper for Anthropic's Claude",
+            // 0.63.0 (claude-agent-sdk 0.3.220) adds the opt-in
+            // `clientCapabilities._meta["subagent-transcript"]` capability
+            // (#881): when advertised (see `build_client_capabilities`),
+            // subagent text/thought chunks stream with update-level
+            // `_meta.claudeCode.parentToolUseId` instead of being filtered;
+            // codeg routes them into the live Agent capsule. Independent of
+            // the capability, every tool_call now carries
+            // `_meta.claudeCode.subagent: true` on Agent/Task launches and
+            // `_meta.claudeCode.title` (the Bash `description` input) on
+            // normal AND eager-permission tool calls. 0.63.0 also fixes
+            // phantom `tool_progress` heartbeat entries under never-announced
+            // ids (#916), Bash terminal metas keyed off an empty id (#917),
+            // and `permission_denied` resolving unannounced tool calls
+            // (#923). Fast mode's config option now folds the SDK's
+            // `fast_mode_disabled_reason` into its description (#921).
+            // 0.64.0 carries the SAME claude-agent-sdk (0.3.220) and ACP SDK
+            // (1.3.0), so Claude Code's own behavior is unchanged. It adds an
+            // opt-in host-owned steering fallback (#919): a `_session/steering`
+            // request may carry `_meta.steering.idleBehavior = "promptRequired"`,
+            // and when the turn it meant to steer already settled the adapter
+            // returns `{outcome:"promptRequired", reason:"noRunningTurn"}`
+            // WITHOUT consuming the content, so the host resubmits it through a
+            // normal `session/prompt` it owns. 0.64.0 also marks the
+            // per-question
+            // free-text "Other" elicitation field with the deliberately
+            // un-namespaced `_meta._askUserQuestionCustomAnswer` (#929, omitted
+            // from the release notes) — see `question::is_custom_answer_property`.
+            // 0.64.1 (#930, likewise absent from its notes) adopts the
+            // option-level `_meta.permission = {version, changes[]}` contract
+            // codex already speaks, so Claude permission cards now spell out
+            // what each button grants; its `lifetime` is what
+            // `parsePermissionOptionChanges` reads for the duration, since
+            // Claude — unlike codex — never states it in the description.
+            // 0.65.0 (#958) completes the steering contract the opt-in started:
+            // a steered turn's results now only RECORD their outcome and the
+            // turn settles at the SDK `idle` spanning both the interrupted and
+            // the steered cycle, so the owning prompt stays in flight until the
+            // steered work is actually done. That is the fix for #934, which
+            // had forced codeg's native push channel off; it is back on for
+            // Claude alone via `steering_prompt_required_min_version` (see
+            // `manager::submit_feedback` for the two channels). Its other
+            // releases carry nothing else for codeg: 0.64.2 reverted #938's
+            // ExitPlanMode `plan_update` experiment outright, and 0.65.0's
+            // remaining commits are devDependency bumps — the runtime deps and
+            // the Node floor still match 0.64.0's.
             distribution: AgentDistribution::Npx {
-                version: "0.58.1",
-                package: "@agentclientprotocol/claude-agent-acp@0.58.1",
+                version: "0.65.0",
+                package: "@agentclientprotocol/claude-agent-acp@0.65.0",
                 cmd: "claude-agent-acp",
                 args: &[],
                 env: &[],
@@ -177,16 +382,70 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             description: "ACP adapter for OpenAI's coding assistant",
             // codex-acp moved from zed-industries (Rust binary) to the
             // agentclientprotocol org (TypeScript rewrite, npx-distributed).
-            // 1.1.2 depends on `@openai/codex` ^0.144.0 and drives `codex
+            // 1.1.8 depends on `@openai/codex` ^0.145.0 and drives `codex
             // app-server`; since 1.0.1 it also resolves the resumed
             // `model_provider` from `~/.codex/config.toml` (#224), so codeg no
             // longer injects `MODEL_PROVIDER` to keep resumed sessions on the
-            // custom provider. 1.1.0 (#263) also reports `/goal` transitions as a
+            // custom provider. 1.1.0 (#263) reports `/goal` transitions as a
             // structured `session_info_update` (`_meta.codex.goal`) rather than
-            // live agent text — see `crate::acp::codex_goal`.
+            // live agent text — see `crate::acp::codex_goal`. 1.1.3+ adds three
+            // new live signals codeg handles in `connection::emit_conversation_update`:
+            // `subAgentActivity` tool calls (#304, suppressed via
+            // `is_codex_subagent_activity` — redundant with the collab capsule),
+            // retryable turn errors (#289, `_meta.codex.error` → a transient
+            // retry banner via `codex_retry_indicator`), and the
+            // context-compaction lifecycle (#288, `_meta.contextCompaction` tool
+            // call → a dedicated frontend card). 1.1.x also adds Plan mode: the
+            // `collaboration_mode` config option (rendered by the generic
+            // config-option path) and native `request_user_input`, delivered as
+            // an ACP `elicitation/create` request — codeg advertises
+            // `elicitation.form` for Codex and bridges the WHOLE form surface
+            // (Plan-mode questions, MCP-server forms, MCP tool-call approvals)
+            // in `handle_elicitation_request` / `question::classify_elicitation`.
+            // 1.1.5 (#322) also widened codex-acp's MCP config filtering to
+            // project `.codex` layers, which is why codeg forces
+            // `DISABLE_MCP_CONFIG_FILTERING` (see `apply_codex_env_policy`) so
+            // the injected `codeg-mcp` server always survives. 1.1.6 adds
+            // steering (#309): `_session/steering` injects a user prompt into
+            // the LIVE turn (initialize advertises `_meta.steering.supported`)
+            // — codeg keeps codex on the MCP pull channel because 1.1.9 still
+            // lacks the `promptRequired` idle opt-in
+            // (`steering_prompt_required_min_version` → None; flipping it on
+            // is a one-liner once a release implements the opt-in AND its
+            // active `injected` path provably keeps the owning prompt pending
+            // — claude's 0.64.0 didn't, see #934 in the fn comment). 1.1.7
+            // (#326) emits Plan-mode plan
+            // contents as a plain `agent_message_chunk`
+            // (`_meta.codex.phase = "final_answer"`, no `<proposed_plan>` tags),
+            // which the adapter's tag-splitter simply no-ops on — tagged output
+            // from older codex still renders as the proposed-plan card. 1.1.8
+            // (#351) gates Plan mode behind a review confirmation: when a plan
+            // item completes while `collaboration_mode` is `plan`, codex-acp
+            // sends a `session/request_permission` marked
+            // `_meta.codex = {kind:"plan_review", planItemId}` whose `toolCall`
+            // (`plan-review:<itemId>`, kind `switch_mode`, `rawInput.plan`) was
+            // NEVER announced as a `tool_call` — codeg seeds it from the request
+            // (see `is_codex_plan_review` / `handle_permission_request`) so the
+            // follow-up `tool_call_update` has a card to merge into. On approval
+            // codex flips the mode back to default (a mid-turn
+            // `config_option_update`) and runs the implementation turn inside
+            // the SAME `session/prompt`. 1.1.8 (#342) also hangs a structured
+            // `_meta.permission = {version, changes[]}` on each permission
+            // option, whose `changes[].description` codeg surfaces in the
+            // permission card — the contract claude-agent-acp joined in 0.64.1
+            // (#930), so that rendering is no longer codex-only. The
+            // `clientCapabilities.plan` path (structured
+            // `plan_update`s) does NOT apply: sacp 11.0.0's schema has neither
+            // the capability nor the session-update variant, so plans keep
+            // arriving as `agent_message_chunk`s. That also makes 1.1.9 (#354,
+            // which coalesces streamed plan snapshots to one `plan_update`
+            // every 150ms and flushes them at item/turn/permission boundaries)
+            // inert here — it only runs behind that capability, and its
+            // dependency set is byte-identical to 1.1.8's. 1.1.9 still declares
+            // no `engines.node`, so the 20.0.0 floor is retained.
             distribution: AgentDistribution::Npx {
-                version: "1.1.2",
-                package: "@agentclientprotocol/codex-acp@1.1.2",
+                version: "1.1.9",
+                package: "@agentclientprotocol/codex-acp@1.1.9",
                 cmd: "codex-acp",
                 args: &[],
                 env: &[],
@@ -199,8 +458,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Gemini CLI",
             description: "Google's official CLI for Gemini",
             distribution: AgentDistribution::Npx {
-                version: "0.50.0",
-                package: "@google/gemini-cli@0.50.0",
+                version: "0.53.1",
+                package: "@google/gemini-cli@0.53.1",
                 cmd: "gemini",
                 args: &["--acp", "--skip-trust"],
                 env: &[],
@@ -215,12 +474,12 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "OpenClaw",
             description: "OpenClaw is a personal AI assistant you run on your own devices.",
             distribution: AgentDistribution::Npx {
-                version: "2026.6.11",
-                package: "openclaw@2026.6.11",
+                version: "2026.7.1",
+                package: "openclaw@2026.7.1",
                 cmd: "openclaw",
                 args: &["acp"],
                 env: &[],
-                node_required: Some("22.19.0"),
+                node_required: Some("22.22.3"),
             },
         },
         AgentType::Cline => AcpAgentMeta {
@@ -229,8 +488,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Cline",
             description: "Autonomous coding agent CLI",
             distribution: AgentDistribution::Npx {
-                version: "3.0.39",
-                package: "cline@3.0.39",
+                version: "3.0.50",
+                package: "cline@3.0.50",
                 cmd: "cline",
                 args: &["--acp"],
                 env: &[],
@@ -243,36 +502,43 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "OpenCode",
             description: "The open source coding agent",
             distribution: AgentDistribution::Binary {
-                version: "1.17.18",
+                version: "1.18.14",
                 cmd: "opencode",
                 args: &["acp"],
                 env: &[],
                 platforms: &[
                     PlatformBinary {
                         platform: "darwin-aarch64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-darwin-arm64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.14/opencode-darwin-arm64.zip",
+                        sha256: None,
                     },
                     PlatformBinary {
                         platform: "darwin-x86_64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-darwin-x64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.14/opencode-darwin-x64.zip",
+                        sha256: None,
                     },
                     PlatformBinary {
                         platform: "linux-aarch64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-linux-arm64.tar.gz",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.14/opencode-linux-arm64.tar.gz",
+                        sha256: None,
                     },
                     PlatformBinary {
                         platform: "linux-x86_64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-linux-x64.tar.gz",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.14/opencode-linux-x64.tar.gz",
+                        sha256: None,
                     },
                     PlatformBinary {
                         platform: "windows-aarch64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-windows-arm64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.14/opencode-windows-arm64.zip",
+                        sha256: None,
                     },
                     PlatformBinary {
                         platform: "windows-x86_64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.17.18/opencode-windows-x64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.14/opencode-windows-x64.zip",
+                        sha256: None,
                     },
                 ],
+                dir_entry: None,
             },
         },
         AgentType::Hermes => AcpAgentMeta {
@@ -281,13 +547,13 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Hermes Agent",
             description: "Nous Research's self-improving agent (ACP via uvx)",
             distribution: AgentDistribution::Uvx {
-                version: "0.18.2",
-                package: "hermes-agent[acp,mcp]==0.18.2",
+                version: "0.19.0",
+                package: "hermes-agent[acp,mcp]==0.19.0",
                 cmd: "hermes-acp",
                 args: &[],
                 env: &[],
                 uv_required: Some("0.5.0"),
-                // hermes-agent 0.18.2 is `requires-python = ">=3.11,<3.14"`, and
+                // hermes-agent 0.19.0 is `requires-python = ">=3.11,<3.14"`, and
                 // its win32 dep `pywinpty` (>=2.0.0,<3) has no Python 3.14 wheel
                 // (the 2.0.15 source build fails against PyO3's 3.13 ceiling).
                 // Without this pin uvx grabs the machine's default interpreter
@@ -303,8 +569,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "CodeBuddy",
             description: "Tencent Cloud's official AI coding assistant (ACP)",
             distribution: AgentDistribution::Npx {
-                version: "2.118.2",
-                package: "@tencent-ai/codebuddy-code@2.118.2",
+                version: "2.132.0",
+                package: "@tencent-ai/codebuddy-code@2.132.0",
                 cmd: "codebuddy",
                 args: &["--acp"],
                 env: &[],
@@ -317,8 +583,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Kimi Code",
             description: "Moonshot AI's official CLI coding assistant (ACP)",
             distribution: AgentDistribution::Npx {
-                version: "0.23.5",
-                package: "@moonshot-ai/kimi-code@0.23.5",
+                version: "0.33.0",
+                package: "@moonshot-ai/kimi-code@0.33.0",
                 cmd: "kimi",
                 args: &["acp"],
                 env: &[],
@@ -336,7 +602,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             supports_mcp: true,
             name: "Pi",
             description: "Self-extensible coding agent (ACP via pi-acp)",
-            // pi-acp 0.0.31 spawns `pi --mode rpc` as a child, so `pi` (npm
+            // pi-acp 0.0.33 spawns `pi --mode rpc` as a child, so `pi` (npm
             // `@earendil-works/pi-coding-agent`) must be resolvable on PATH —
             // or pointed at a custom build via the `PI_ACP_PI_COMMAND` env
             // (see BYO-pi). Args are empty: the ACP server is the default mode
@@ -344,8 +610,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // 22+ requirement (pi-acp's own engines say >=20). The embedded
             // context env lets pi-acp advertise `promptCapabilities.embeddedContext`.
             distribution: AgentDistribution::Npx {
-                version: "0.0.31",
-                package: "pi-acp@0.0.31",
+                version: "0.0.33",
+                package: "pi-acp@0.0.33",
                 cmd: "pi-acp",
                 args: &[],
                 env: &[("PI_ACP_ENABLE_EMBEDDED_CONTEXT", "true")],
@@ -374,23 +640,85 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // leading `KEY=value` argv and sacp's `parse_env_var` only accepts
             // `[A-Za-z0-9_]` env names, which npm's `@scope:registry` key is not.)
             distribution: AgentDistribution::Npx {
-                version: "0.2.94",
-                package: "@xai-official/grok@0.2.94",
+                version: "0.2.118",
+                package: "@xai-official/grok@0.2.118",
                 cmd: "grok",
                 // Only the ACP subcommand lives here. Grok's ROOT-level launch
-                // flags (`--no-auto-update` always, `--always-approve` only when
-                // the user picked that permission mode) MUST precede this
+                // flags (`--no-auto-update` always, `--permission-mode <value>`
+                // only for a non-default permission mode) MUST precede this
                 // subcommand — `grok agent stdio` itself rejects them (verified
-                // against 0.2.94: it only accepts --debug/--debug-file/
+                // against 0.2.94/0.2.99: it only accepts --debug/--debug-file/
                 // --leader-socket) — so `build_agent` inserts them ahead of these
                 // args rather than appending after.
                 args: &["agent", "stdio"],
                 env: &[],
-                // `@xai-official/grok@0.2.94` declares `engines.node: ">=20"`;
+                // `@xai-official/grok@0.2.118` declares `engines.node: ">=20"`;
                 // surface that in preflight so Node 18 isn't silently accepted.
                 node_required: Some("20.0.0"),
             },
         },
+        AgentType::Cursor => AcpAgentMeta {
+            agent_type,
+            supports_mcp: true,
+            name: "Cursor",
+            description: "Cursor's coding agent (ACP via cursor-agent acp)",
+            // Cursor's CLI ships as a ~230MB directory-tree archive (webpack
+            // chunks + bundled Node runtime + ripgrep); the `cursor-agent`
+            // entry is a shell script that resolves its own directory and
+            // execs the sibling `node`, so the tree must stay intact —
+            // `dir_entry` switches the binary cache to whole-tree extraction.
+            // codeg deliberately does NOT run Cursor's official install
+            // script: it symlinks `~/.local/bin/agent`, which collides with
+            // Grok's CLI of the same name (observed overwriting it).
+            // URL layout follows the ACP registry's `cursor` entry
+            // (downloads.cursor.com/lab/<version>/<os>/<arch>/...); custom
+            // versions substitute into the same pattern.
+            distribution: AgentDistribution::Binary {
+                version: "2026.07.23-e383d2b",
+                cmd: "cursor-agent",
+                args: &["acp"],
+                env: &[],
+                platforms: &[
+                    PlatformBinary {
+                        platform: "darwin-aarch64",
+                        url: "https://downloads.cursor.com/lab/2026.07.23-e383d2b/darwin/arm64/agent-cli-package.tar.gz",
+                        sha256: None,
+                    },
+                    PlatformBinary {
+                        platform: "darwin-x86_64",
+                        url: "https://downloads.cursor.com/lab/2026.07.23-e383d2b/darwin/x64/agent-cli-package.tar.gz",
+                        sha256: None,
+                    },
+                    PlatformBinary {
+                        platform: "linux-aarch64",
+                        url: "https://downloads.cursor.com/lab/2026.07.23-e383d2b/linux/arm64/agent-cli-package.tar.gz",
+                        sha256: None,
+                    },
+                    PlatformBinary {
+                        platform: "linux-x86_64",
+                        url: "https://downloads.cursor.com/lab/2026.07.23-e383d2b/linux/x64/agent-cli-package.tar.gz",
+                        sha256: None,
+                    },
+                    PlatformBinary {
+                        platform: "windows-aarch64",
+                        url: "https://downloads.cursor.com/lab/2026.07.23-e383d2b/windows/arm64/agent-cli-package.zip",
+                        sha256: None,
+                    },
+                    PlatformBinary {
+                        platform: "windows-x86_64",
+                        url: "https://downloads.cursor.com/lab/2026.07.23-e383d2b/windows/x64/agent-cli-package.zip",
+                        sha256: None,
+                    },
+                ],
+                dir_entry: Some(BinaryDirEntry {
+                    unix: "dist-package/cursor-agent",
+                    windows: "dist-package/cursor-agent.cmd",
+                }),
+            },
+        },
+        // Handled by the early return above; kept so the match stays
+        // exhaustive without a catch-all that could swallow a new built-in.
+        AgentType::Custom(_) => unreachable!("custom agents resolve via custom_registry"),
     }
 }
 
@@ -478,64 +806,125 @@ mod tests {
         }
     }
 
+    // Cursor is the only dir-tree binary agent: the archive must be kept
+    // intact (bundled Node runtime) and launched via the in-tree entry
+    // script, never copied out as a single file.
+    #[test]
+    fn cursor_pins_dir_tree_binary() {
+        let meta = get_agent_meta(AgentType::Cursor);
+        assert_binary_version(
+            AgentType::Cursor,
+            "2026.07.23-e383d2b",
+            "/lab/2026.07.23-e383d2b/",
+        );
+        match meta.distribution {
+            AgentDistribution::Binary {
+                cmd,
+                args,
+                platforms,
+                dir_entry,
+                ..
+            } => {
+                assert_eq!(cmd, "cursor-agent");
+                assert_eq!(args, &["acp"]);
+                assert_eq!(platforms.len(), 6);
+                let entry = dir_entry.expect("cursor must use dir-tree extraction");
+                assert_eq!(entry.unix, "dist-package/cursor-agent");
+                assert_eq!(entry.windows, "dist-package/cursor-agent.cmd");
+            }
+            other => panic!("expected binary distribution for Cursor, got {other:?}"),
+        }
+        // OpenCode stays on the single-binary copy-out path.
+        match get_agent_meta(AgentType::OpenCode).distribution {
+            AgentDistribution::Binary { dir_entry, .. } => assert!(dir_entry.is_none()),
+            other => panic!("expected binary distribution for OpenCode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn steering_prompt_required_min_version_gates_claude_only() {
+        // The native-steering policy bit: only an adapter that honors the
+        // `promptRequired` opt-in AND keeps the owning prompt in flight across
+        // a steered turn gets a minimum version. The floor is the release that
+        // fixed the latter (claude-agent-acp 0.65.0 / #958), NOT the one that
+        // introduced the opt-in — every 0.64.x settles the prompt early (#934).
+        // Everyone else stays None and rides the MCP pull channel; codex-acp
+        // 1.1.9 ships steering without the opt-in at all. Flipping an agent on
+        // here without the runtime `agent_info.version` proof is not enough by
+        // design.
+        assert_eq!(
+            steering_prompt_required_min_version(AgentType::ClaudeCode),
+            Some("0.65.0")
+        );
+        assert_eq!(steering_prompt_required_min_version(AgentType::Codex), None);
+        for agent in [
+            AgentType::Gemini,
+            AgentType::OpenClaw,
+            AgentType::Grok,
+            AgentType::Custom("acme"),
+        ] {
+            assert_eq!(steering_prompt_required_min_version(agent), None);
+        }
+    }
+
     #[test]
     fn registry_pins_current_acp_agent_versions() {
         assert_npx_version(
             AgentType::ClaudeCode,
-            "0.58.1",
-            "@agentclientprotocol/claude-agent-acp@0.58.1",
+            "0.65.0",
+            "@agentclientprotocol/claude-agent-acp@0.65.0",
             Some("22.0.0"),
         );
         assert_npx_version(
             AgentType::Gemini,
-            "0.50.0",
-            "@google/gemini-cli@0.50.0",
+            "0.53.1",
+            "@google/gemini-cli@0.53.1",
             Some("20.0.0"),
         );
         assert_npx_version(
             AgentType::OpenClaw,
-            "2026.6.11",
-            "openclaw@2026.6.11",
-            Some("22.19.0"),
+            "2026.7.1",
+            "openclaw@2026.7.1",
+            Some("22.22.3"),
         );
         assert_npx_version(
             AgentType::Cline,
-            "3.0.39",
-            "cline@3.0.39",
+            "3.0.50",
+            "cline@3.0.50",
             Some("22.0.0"),
         );
         assert_npx_version(
             AgentType::CodeBuddy,
-            "2.118.2",
-            "@tencent-ai/codebuddy-code@2.118.2",
+            "2.132.0",
+            "@tencent-ai/codebuddy-code@2.132.0",
             Some("22.0.0"),
         );
         assert_npx_version(
             AgentType::KimiCode,
-            "0.23.5",
-            "@moonshot-ai/kimi-code@0.23.5",
+            "0.33.0",
+            "@moonshot-ai/kimi-code@0.33.0",
             Some("22.19.0"),
         );
         assert_npx_version(
             AgentType::Codex,
-            "1.1.2",
-            "@agentclientprotocol/codex-acp@1.1.2",
+            "1.1.9",
+            "@agentclientprotocol/codex-acp@1.1.9",
             Some("20.0.0"),
         );
-        assert_npx_version(AgentType::Pi, "0.0.31", "pi-acp@0.0.31", Some("22.0.0"));
+        assert_npx_version(AgentType::Pi, "0.0.33", "pi-acp@0.0.33", Some("22.0.0"));
         assert_npx_version(
             AgentType::Grok,
-            "0.2.94",
-            "@xai-official/grok@0.2.94",
+            "0.2.118",
+            "@xai-official/grok@0.2.118",
             Some("20.0.0"),
         );
-        assert_binary_version(AgentType::OpenCode, "1.17.18", "/releases/download/v1.17.18/");
+        assert_binary_version(AgentType::OpenCode, "1.18.14", "/releases/download/v1.18.14/");
         assert_uvx_version(
             AgentType::Hermes,
-            "0.18.2",
-            "hermes-agent[acp,mcp]==0.18.2",
+            "0.19.0",
+            "hermes-agent[acp,mcp]==0.19.0",
             Some("0.5.0"),
-            // hermes-agent 0.18.2 is requires-python `<3.14`; uvx must pin an
+            // hermes-agent 0.19.0 is requires-python `<3.14`; uvx must pin an
             // interpreter it (and its win32 `pywinpty` dep) supports.
             Some("3.13"),
         );
@@ -547,6 +936,33 @@ mod tests {
     // other agent (current and future) keeps it `true`. Iterating the full
     // registry means a newly-added agent that wrongly opts out — or a
     // regression flipping OpenClaw back on — trips this assert.
+    // Only Claude Code and Codex ship as a third-party ACP adapter wrapping a
+    // vendor CLI of a different name. Every other agent's registry `cmd` IS the
+    // vendor CLI, so claiming an adapter relation for one would make preflight
+    // explain a split that doesn't exist.
+    #[test]
+    fn acp_adapter_relation_covers_only_wrapper_agents() {
+        for agent_type in all_acp_agents() {
+            let relation = acp_adapter_relation(agent_type);
+            let expected = matches!(agent_type, AgentType::ClaudeCode | AgentType::Codex);
+            assert_eq!(
+                relation.is_some(),
+                expected,
+                "unexpected adapter relation for {agent_type:?}"
+            );
+            // The whole point is that the vendor CLI's name differs from the
+            // adapter command codeg actually launches.
+            if let Some(relation) = relation {
+                match get_agent_meta(agent_type).distribution {
+                    AgentDistribution::Npx { cmd, .. } => {
+                        assert_ne!(cmd, relation.native_cmd, "{agent_type:?}")
+                    }
+                    other => panic!("expected npx distribution for {agent_type:?}, got {other:?}"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn only_openclaw_opts_out_of_mcp() {
         for agent_type in all_acp_agents() {

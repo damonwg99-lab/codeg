@@ -126,6 +126,7 @@ describe("buildReferenceGroups", () => {
       session: "会话",
       commit: "提交",
       skill: "技能",
+      context: "上下文",
     }
     const groups = buildReferenceGroups("", emptySources(), labels)
     expect(itemsOf(groups, "file")).toBeDefined()

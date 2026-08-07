@@ -13,12 +13,13 @@ import type { ReferenceAttrs } from "./types"
  * intact.
  *
  * The split mirrors the send rule:
- * - `text` blocks → plain-text segments replayed into the editor verbatim. Every
- *   inline reference that was serialized *as text* comes back in that text form:
- *   file links `[name](file://…)` (which `docToPromptBlocks` keeps inline) and
- *   session/commit/agent/skill references alike replay as their inline link/token
- *   text, not re-hydrated badges — consistent across every reference kind on a
- *   queue-edit.
+ * - `text` blocks → plain-text segments, carrying every inline reference that
+ *   was serialized *as text*: file links `[name](file://…)` (which
+ *   `docToPromptBlocks` keeps inline) and session/commit/agent/skill references
+ *   alike. The host re-hydrates those tokens into badges when it replays the
+ *   segment (`restoreBlocksIntoEditor` → `textToSeededInlineContent`), so a
+ *   queue-edit shows the same badges the sender composed; this function stays
+ *   text-level and kind-agnostic.
  * - `resource_link` blocks whose uri is a composer scheme (`file:` / `codeg:`)
  *   → reference badge segments. `docToPromptBlocks` no longer emits file
  *   resource_links (files stay inline above), but this branch still restores any
@@ -27,9 +28,9 @@ import type { ReferenceAttrs } from "./types"
  * - everything else (`image`, embedded `resource`, non-composer `resource_link`)
  *   → out-of-band attachments.
  *
- * The host replays `segments` in order against a live editor (text via
- * `insertTextAtCursor`, references via `insertReference`) and sets
- * `attachments`. Pure and deterministic given an injected `makeId`.
+ * The host replays `segments` in order against a live editor (see
+ * `restoreBlocksIntoEditor`) and sets `attachments`. Pure and deterministic
+ * given an injected `makeId`.
  */
 export type RestoreSegment =
   | { kind: "text"; text: string }
@@ -72,6 +73,25 @@ export function blocksToRestoredDraft(
         break
       }
       case "resource": {
+        // An embedded image blob (how an `image: false` / `embedded_context:
+        // true` agent like Grok carries a pasted image) restores as a thumbnail
+        // image attachment, matching how it was displayed when composed — not as
+        // an inline resource badge. Non-image / text embedded resources keep the
+        // badge form.
+        if (block.mime_type?.startsWith("image/") && block.blob) {
+          // A synthetic `clipboard://` uri (path-less pasted image) is not a
+          // readable path, so keep only a real `file://` origin.
+          const imageUri = block.uri.startsWith("file://") ? block.uri : null
+          attachments.push({
+            id: makeId(),
+            type: "image",
+            data: block.blob,
+            uri: imageUri,
+            name: imageName(imageUri, block.mime_type),
+            mimeType: block.mime_type,
+          })
+          break
+        }
         attachments.push({
           id: makeId(),
           type: "resource",
@@ -90,7 +110,7 @@ export function blocksToRestoredDraft(
           type: "image",
           data: block.data,
           uri: block.uri ?? null,
-          name: imageName(block),
+          name: imageName(block.uri, block.mime_type),
           mimeType: block.mime_type,
         })
         break
@@ -118,14 +138,14 @@ function fileBaseName(uri: string): string {
   }
 }
 
-/** Derive a display name for an image block (mirrors the transcript adapter). */
-function imageName(
-  block: Extract<PromptInputBlock, { type: "image" }>
-): string {
-  if (block.uri && block.uri.trim().length > 0) {
-    const base = fileBaseName(block.uri)
+/** Derive a display name for an image attachment from its origin uri (if any)
+ *  and mime type (mirrors the transcript adapter). Shared by the `image` block
+ *  and embedded image-resource restore paths. */
+function imageName(uri: string | null | undefined, mimeType: string): string {
+  if (uri && uri.trim().length > 0) {
+    const base = fileBaseName(uri)
     if (base) return base
   }
-  const ext = block.mime_type.split("/")[1]?.split("+")[0] ?? "image"
+  const ext = mimeType.split("/")[1]?.split("+")[0] ?? "image"
   return `image.${ext}`
 }

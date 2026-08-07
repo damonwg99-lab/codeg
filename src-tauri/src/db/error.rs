@@ -10,6 +10,11 @@ pub enum DbError {
     NotFound(String),
     #[error("validation error: {0}")]
     Validation(String),
+    /// An operation was attempted on a record whose current state does not
+    /// allow it (e.g. closing a release that is already closed). Carries a
+    /// human-readable reason.
+    #[error("invalid state transition: {0}")]
+    InvalidStateTransition(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

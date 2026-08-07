@@ -27,7 +27,7 @@ import type {
 } from "@/lib/platform/types"
 import { KB_DOC_TYPE_LABELS, KB_SKIP_FILENAMES } from "@/lib/platform/types"
 import { useWorkspaceContext } from "@/contexts/workspace-context"
-import { useActiveFolder } from "@/contexts/active-folder-context"
+import { kbDocAbsPath } from "@/lib/kb-doc-path"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
@@ -81,29 +81,6 @@ function resolveKbDocTypeLabel(
   return t(keyMap[type] as never) ?? KB_DOC_TYPE_LABELS[type]
 }
 
-/** Compute KB doc path relative to the folder root for openFilePreview.
- *  KB docs store filePath relative to the _knowledge/ directory.
- *  Returns null when the path can't be resolved (no folder context or
- *  KB dir outside project root). */
-function kbDocRelPath(
-  kbLocalDir: string | null,
-  rootDir: string,
-  folderPath: string | null,
-  filePath: string
-): string | null {
-  const kbDir = (
-    kbLocalDir ?? `${rootDir.replace(/\\/g, "/")}/_knowledge`
-  ).replace(/\\/g, "/")
-  const fp = folderPath?.replace(/\\/g, "/") ?? ""
-  const normFilePath = filePath.replace(/\\/g, "/")
-  if (!fp) return null
-  if (kbDir.startsWith(fp + "/") || kbDir === fp + "/_knowledge") {
-    const kbRel = kbDir.slice(fp.length + 1)
-    return `${kbRel}/${normFilePath}`
-  }
-  return null
-}
-
 export function KnowledgeManager({
   projectId,
   project,
@@ -113,7 +90,6 @@ export function KnowledgeManager({
 }) {
   const t = useTranslations("Platform")
   const { openFilePreview } = useWorkspaceContext()
-  const { activeFolder } = useActiveFolder()
 
   // ─── State ───
   const [docs, setDocs] = useState<KnowledgeDocInfo[]>([])
@@ -430,13 +406,13 @@ export function KnowledgeManager({
                       className="h-6 w-6"
                       onClick={(e) => {
                         e.stopPropagation()
-                        const relPath = kbDocRelPath(
-                          project.kbLocalDir,
-                          project.rootDir,
-                          activeFolder?.path ?? null,
-                          doc.filePath
+                        void openFilePreview(
+                          kbDocAbsPath(
+                            project.kbLocalDir,
+                            project.rootDir,
+                            doc.filePath
+                          )
                         )
-                        if (relPath) void openFilePreview(relPath)
                       }}
                     >
                       <Eye className="h-3.5 w-3.5" />

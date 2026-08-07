@@ -19,26 +19,43 @@ import type {
 const h = vi.hoisted(() => ({
   handler: null as null | ((change: unknown) => void),
   folderHandler: null as null | ((change: unknown) => void),
+  bulkHandler: null as null | ((change: unknown) => void),
   reconnect: null as null | (() => void),
   folderReconnect: null as null | (() => void),
   disposeSpy: vi.fn(),
   folderDisposeSpy: vi.fn(),
+  bulkDisposeSpy: vi.fn(),
   reconnectUnsubSpy: vi.fn(),
   folderReconnectUnsubSpy: vi.fn(),
   listAll: vi.fn(async () => [] as unknown[]),
   listOpenFolders: vi.fn(async () => [] as unknown[]),
   listAllFolders: vi.fn(async () => [] as unknown[]),
+  closeTabsByFolder: vi.fn(),
+}))
+
+// The folder-delete branch reaches into the tab store imperatively; stub it so
+// this suite stays on the workspace store (the real action is exercised by the
+// sidebar's own remove-folder path).
+vi.mock("@/stores/tab-store", () => ({
+  useTabStore: {
+    getState: () => ({ closeTabsByFolder: h.closeTabsByFolder }),
+  },
 }))
 
 vi.mock("@/lib/platform", () => ({
-  // The provider registers two subscriptions — `conversation://changed` and
-  // `folder://changed` — so capture each handler / dispose spy independently;
-  // the conversation-sync tests keep asserting against `h.handler`/`h.disposeSpy`
+  // The provider registers three subscriptions — `conversation://changed`,
+  // `conversations://bulk-changed`, and `folder://changed` — so route by exact
+  // channel and capture each handler / dispose spy independently; the
+  // conversation-sync tests keep asserting against `h.handler`/`h.disposeSpy`
   // unchanged.
   subscribe: vi.fn(async (event: string, handler: (c: unknown) => void) => {
     if (event === "folder://changed") {
       h.folderHandler = handler
       return h.folderDisposeSpy
+    }
+    if (event === "conversations://bulk-changed") {
+      h.bulkHandler = handler
+      return h.bulkDisposeSpy
     }
     h.handler = handler
     return h.disposeSpy
@@ -120,6 +137,7 @@ function makeFolder(
     color: "inherit",
     parent_id: null,
     kind: "regular",
+    alias: null,
     ...overrides,
   }
 }
@@ -181,10 +199,12 @@ function emitFolder(change: FolderChange) {
 beforeEach(() => {
   h.handler = null
   h.folderHandler = null
+  h.bulkHandler = null
   h.reconnect = null
   h.folderReconnect = null
   h.disposeSpy.mockClear()
   h.folderDisposeSpy.mockClear()
+  h.bulkDisposeSpy.mockClear()
   h.reconnectUnsubSpy.mockClear()
   h.folderReconnectUnsubSpy.mockClear()
   h.listAll.mockClear()
@@ -193,6 +213,7 @@ beforeEach(() => {
   h.listOpenFolders.mockResolvedValue([])
   h.listAllFolders.mockClear()
   h.listAllFolders.mockResolvedValue([])
+  h.closeTabsByFolder.mockClear()
   // The store is a module-level singleton: restore pristine state (including
   // the delete tombstones) so state can't leak between tests.
   resetAppWorkspaceStore()
@@ -339,6 +360,24 @@ describe("upsertFolder list routing", () => {
   })
 })
 
+describe("AppWorkspaceProvider conversations://bulk-changed sync", () => {
+  it("answers a batch-import nudge with one full conversation refetch", async () => {
+    await mountProvider()
+    expect(h.bulkHandler).toBeTypeOf("function")
+    expect(h.listAll).toHaveBeenCalledTimes(1) // initial mount fetch
+    await act(async () => {
+      h.bulkHandler?.({ imported: 3, updated: 1, folder_ids: [7] })
+    })
+    expect(h.listAll).toHaveBeenCalledTimes(2)
+  })
+
+  it("disposes the bulk subscription on unmount", async () => {
+    const { unmount } = await mountProvider()
+    unmount()
+    expect(h.bulkDisposeSpy).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe("AppWorkspaceProvider folder://changed sync", () => {
   it("registers a folder subscription + reconnect backstop on mount", async () => {
     await mountProvider()
@@ -365,6 +404,34 @@ describe("AppWorkspaceProvider folder://changed sync", () => {
       folder: makeFolder({ id: 12, name: "renamed" }),
     })
     expect(screen.getByTestId("folder-ids")).toHaveTextContent("12,13")
+  })
+
+  it("drops a folder from both lists on a folder delete event", async () => {
+    // A task worktree removed after its merge must leave the sidebar right
+    // away — otherwise it lingers until the next full `fetchFolders` (reload).
+    await mountProvider()
+    emitFolder({ kind: "upsert", folder: makeFolder({ id: 12, parent_id: 1 }) })
+    emitFolder({ kind: "upsert", folder: makeFolder({ id: 13 }) })
+    emitFolder({ kind: "deleted", id: 12 })
+    expect(screen.getByTestId("folder-ids")).toHaveTextContent("13")
+    expect(screen.getByTestId("folder-ids")).not.toHaveTextContent("12")
+    expect(screen.getByTestId("all-folder-ids")).not.toHaveTextContent("12")
+  })
+
+  it("ignores a delete for a folder it never knew about", async () => {
+    await mountProvider()
+    emitFolder({ kind: "upsert", folder: makeFolder({ id: 13 }) })
+    emitFolder({ kind: "deleted", id: 99 })
+    expect(screen.getByTestId("folder-ids")).toHaveTextContent("13")
+  })
+
+  it("closes the folder's tabs alongside the removal", async () => {
+    // The backend only deletes PERSISTED tabs; device-local drafts would
+    // otherwise stay open on a cwd that no longer exists.
+    await mountProvider()
+    emitFolder({ kind: "upsert", folder: makeFolder({ id: 12, parent_id: 1 }) })
+    emitFolder({ kind: "deleted", id: 12 })
+    expect(h.closeTabsByFolder).toHaveBeenCalledWith(12)
   })
 
   it("re-fetches folders on transport reconnect (disconnect backstop)", async () => {

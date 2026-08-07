@@ -4,6 +4,7 @@ import type {
   MessageRole,
   TurnUsage,
   AgentExecutionStats,
+  AgentTranscriptEntry,
   ToolCallStatus,
   PlanEntryInfo,
   ImageData,
@@ -14,6 +15,8 @@ import {
 } from "@/lib/adapters/tool-kind-classifier"
 import { normalizeToolName } from "@/lib/tool-call-normalization"
 import { isBackgroundTaskToolCall } from "@/lib/background-task"
+import { isContextCompactionMeta } from "@/lib/context-compaction"
+import { isUnsettledToolCall } from "@/lib/tool-call-lifecycle"
 import { feedbackCheckHasContent } from "@/lib/feedback-check"
 import {
   isPlanLikeToolName,
@@ -23,8 +26,8 @@ import {
 import {
   tokenizeReferenceLinks,
   unescapeReferenceLabel,
+  unwrapReferenceDestination,
 } from "@/lib/reference-link"
-import { stripFeedbackReminder } from "@/lib/feedback-reminder"
 import {
   extractDecompositionSegments,
   parseDecompositionToolInput,
@@ -51,12 +54,29 @@ export type AdaptedToolCallPart = {
   errorText?: string
   agentStats?: AgentExecutionStats | null
   /**
+   * Forwarded ACP tool-call status for live/promoted turns (`ContentBlock.
+   * tool_use.status`); absent/`null` for DB-persisted rows (the Rust `ToolUse`
+   * model has no status field). Consumed via `isUnsettledToolCall` by both the
+   * generic tool-group filter (`dropEmptyInFlightToolCalls`) and the specialized
+   * lane row-builders (`buildDelegationTaskRows` / `buildBackgroundTaskRows`) to
+   * recognise an interrupted arg-less orphan that survives `COMPLETE_TURN`
+   * promotion (its `state` flips to `output-available`, but its status stays
+   * unsettled).
+   */
+  toolStatus?: string | null
+  /**
    * ACP extensibility metadata forwarded from `ContentBlock.tool_use.meta`.
    * Opaque pass-through; the only consumer today is `<DelegatedSubThread>`
    * which reads `meta["codeg.delegation"]` as a binding fallback when the
    * live DelegationContext entry is missing (page refresh, late mount).
    */
   meta?: Record<string, unknown> | null
+  /**
+   * Live subagent transcript (claude-agent-acp ≥0.63), forwarded from
+   * `ContentBlock.tool_result.agent_transcript`. Present only on a RUNNING
+   * Agent card during streaming — promotion and history never carry it.
+   */
+  agentTranscript?: AgentTranscriptEntry[] | null
 }
 
 /**
@@ -103,13 +123,26 @@ export type AdaptedPlanPart = {
 }
 
 /**
- * A structured task decomposition extracted from a ```task_decomposition_json
- * code fence in the assistant's response. Rendered as a `<DecompositionCard>`
- * instead of a raw JSON code block.
- *
- * When `isStreaming` is true, the fence is incomplete (still being written by
- * the agent) — the card renders as a lightweight "generating…" placeholder
- * instead of a full task list.
+ * A codex Plan-mode `<proposed_plan>…</proposed_plan>` block, lifted out of the
+ * assistant's message text and rendered as a dedicated card. Unlike
+ * `AdaptedPlanPart` (a TodoWrite checklist), the body is free-form markdown (the
+ * plan document codex proposes), so it renders through the normal markdown
+ * pipeline inside card chrome. Detection lives purely in the frontend adapter,
+ * so live and reload converge (both hand raw assistant text to the same path).
+ */
+export type AdaptedProposedPlanPart = {
+  type: "proposed-plan"
+  markdown: string
+  isStreaming: boolean
+}
+
+/**
+ * A task-decomposition proposal lifted out of an assistant text block
+ * (```task_decomposition_json fences) or reconstructed from a persisted
+ * `create_task_decomposition` tool_use. The card renders an editable list of
+ * proposed sub-tasks; while the fence is still open, `isStreaming` is true and
+ * `tasks` is empty so the card renders as a lightweight "generating…"
+ * placeholder instead of a full task list.
  */
 export type AdaptedDecompositionPart = {
   type: "decomposition"
@@ -159,6 +192,7 @@ export type AdaptedContentPart =
   | AdaptedGoalRunPart
   | AdaptedGeneratedImagePart
   | AdaptedPlanPart
+  | AdaptedProposedPlanPart
   | AdaptedDecompositionPart
 
 export interface UserResourceDisplay {
@@ -407,6 +441,132 @@ function parseInlineToolResultPayload(payload: string): {
   }
 }
 
+const PROPOSED_PLAN_OPEN = "<proposed_plan>"
+const PROPOSED_PLAN_CLOSE = "</proposed_plan>"
+
+/**
+ * Lift codex Plan-mode `<proposed_plan>…</proposed_plan>` block(s) out of an
+ * assistant text block into dedicated `proposed-plan` parts, leaving surrounding
+ * prose as normal text. Returns `null` when the text has no such block (so it
+ * falls through to the normal text path). While the turn streams, an as-yet
+ * unclosed block renders as a streaming card (its markdown grows in place);
+ * once `</proposed_plan>` arrives it settles. The open/close markers are always
+ * consumed so the raw tags never render, even for an empty or truncated block.
+ */
+function expandProposedPlanText(
+  text: string,
+  isStreaming: boolean
+): AdaptedContentPart[] | null {
+  if (!text.includes(PROPOSED_PLAN_OPEN)) return null
+
+  const parts: AdaptedContentPart[] = []
+  let cursor = 0
+  let sawPlan = false
+
+  for (;;) {
+    const open = text.indexOf(PROPOSED_PLAN_OPEN, cursor)
+    if (open === -1) break
+    sawPlan = true
+
+    const lead = text.slice(cursor, open)
+    if (lead.trim().length > 0) parts.push({ type: "text", text: lead })
+
+    const bodyStart = open + PROPOSED_PLAN_OPEN.length
+    const close = text.indexOf(PROPOSED_PLAN_CLOSE, bodyStart)
+    const stillStreaming = close === -1
+    const body = (
+      stillStreaming ? text.slice(bodyStart) : text.slice(bodyStart, close)
+    ).trim()
+    const streamingCard = stillStreaming && isStreaming
+    if (body.length > 0 || streamingCard) {
+      parts.push({
+        type: "proposed-plan",
+        markdown: body,
+        isStreaming: streamingCard,
+      })
+    }
+
+    if (stillStreaming) {
+      cursor = text.length
+      break
+    }
+    cursor = close + PROPOSED_PLAN_CLOSE.length
+  }
+
+  const trail = text.slice(cursor)
+  if (trail.trim().length > 0) parts.push({ type: "text", text: trail })
+
+  return sawPlan ? parts : null
+}
+
+/**
+ * Extract ```task_decomposition_json code fences from assistant text and
+ * replace them with structured `AdaptedDecompositionPart` cards. Any prose
+ * before/after the fences is preserved as `text` parts.
+ *
+ * Also handles incomplete (streaming) fences: when the opening marker
+ * ```task_decomposition_json is present but the closing ``` hasn't arrived
+ * yet, the text from the opening marker onward is suppressed so the raw JSON
+ * doesn't flash in the UI while streaming. Once the fence closes, the next
+ * adapt cycle will replace it with a proper card.
+ *
+ * HISTORICAL-PATH fallback for rendering decomposition cards from persisted
+ * text blocks (which lack the synthetic decomposition ContentBlock). Live
+ * streaming turns use the turn-builder's synthetic block instead. This
+ * function remains active only for DB-loaded turns where the raw
+ * ```task_decomposition_json text is still embedded in text blocks.
+ *
+ * Returns `null` when no decomposition fences (complete or incomplete) are
+ * found.
+ */
+function expandDecompositionText(text: string): AdaptedContentPart[] | null {
+  // First try complete fences
+  const segments = extractDecompositionSegments(text)
+  if (segments) {
+    const parts: AdaptedContentPart[] = []
+    for (const segment of segments) {
+      if (segment.kind === "text") {
+        if (segment.value.trim()) {
+          parts.push({ type: "text", text: segment.value })
+        }
+      } else {
+        parts.push({
+          type: "decomposition",
+          tasks: segment.tasks ?? [],
+          isStreaming: false,
+        })
+      }
+    }
+    return parts.length > 0 ? parts : null
+  }
+
+  // No complete fence found — check for an incomplete (streaming) fence.
+  // The opening marker ```task_decomposition_json may be present without
+  // its closing ```. In that case, render a lightweight streaming
+  // placeholder card instead of showing raw JSON or suppressing entirely.
+  // Match two scenarios:
+  //   1. Marker followed by newline + partial JSON content (normal streaming)
+  //   2. Marker at end of text with no trailing newline (marker just arrived)
+  const incompletePattern = /```task_decomposition_json(?:\s*\n|\s*$)/
+  const incompleteMatch = incompletePattern.exec(text)
+  if (incompleteMatch) {
+    const before = text.slice(0, incompleteMatch.index)
+    const parts: AdaptedContentPart[] = []
+    if (before.trim()) {
+      parts.push({ type: "text", text: before })
+    }
+    // Streaming placeholder — empty tasks, isStreaming = true
+    parts.push({
+      type: "decomposition",
+      tasks: [],
+      isStreaming: true,
+    })
+    return parts
+  }
+
+  return null
+}
+
 function expandInlineToolText(
   text: string,
   messageId: string,
@@ -493,75 +653,6 @@ function expandInlineToolText(
   }
 
   return parts
-}
-
-/**
- * Extract ```task_decomposition_json code fences from assistant text and
- * replace them with structured `AdaptedDecompositionPart` cards. Any prose
- * before/after the fences is preserved as `text` parts.
- *
- * Also handles incomplete (streaming) fences: when the opening marker
- * `````task_decomposition_json`` is present but the closing ``````` hasn't
- * arrived yet, the text from the opening marker onward is suppressed so the
- * raw JSON doesn't flash in the UI while streaming. Once the fence closes,
- * the next adapt cycle will replace it with a proper card.
- *
- * Returns `null` when no decomposition fences (complete or incomplete) are
- * found.
- */
-/**
- * HISTORICAL-PATH fallback for rendering decomposition cards from persisted
- * text blocks (which lack the synthetic decomposition ContentBlock).
- * Live streaming turns use the turn-builder's Phase 3 synthetic block
- * instead. This function remains active only for DB-loaded turns where the
- * raw ```task_decomposition_json text is still embedded in text blocks.
- */
-function expandDecompositionText(text: string): AdaptedContentPart[] | null {
-  // First try complete fences
-  const segments = extractDecompositionSegments(text)
-  if (segments) {
-    const parts: AdaptedContentPart[] = []
-    for (const segment of segments) {
-      if (segment.kind === "text") {
-        if (segment.value.trim()) {
-          parts.push({ type: "text", text: segment.value })
-        }
-      } else {
-        parts.push({
-          type: "decomposition",
-          tasks: segment.tasks ?? [],
-          isStreaming: false,
-        })
-      }
-    }
-    return parts.length > 0 ? parts : null
-  }
-
-  // No complete fence found — check for an incomplete (streaming) fence.
-  // The opening marker `````task_decomposition_json`` may be present without
-  // its closing ```````. In that case, render a lightweight streaming
-  // placeholder card instead of showing raw JSON or suppressing entirely.
-  // Match two scenarios:
-  //   1. Marker followed by newline + partial JSON content (normal streaming)
-  //   2. Marker at end of text with no trailing newline (marker just arrived)
-  const incompletePattern = /```task_decomposition_json(?:\s*\n|\s*$)/
-  const incompleteMatch = incompletePattern.exec(text)
-  if (incompleteMatch) {
-    const before = text.slice(0, incompleteMatch.index)
-    const parts: AdaptedContentPart[] = []
-    if (before.trim()) {
-      parts.push({ type: "text", text: before })
-    }
-    // Streaming placeholder — empty tasks, isStreaming = true
-    parts.push({
-      type: "decomposition",
-      tasks: [],
-      isStreaming: true,
-    })
-    return parts
-  }
-
-  return null
 }
 
 function normalizeGoalStatusText(status: string): string {
@@ -855,14 +946,11 @@ function handleMarkdownLink(
   resources: UserResourceDisplay[]
 ): string {
   const normalizedLabel = label.trim()
-  // Unwrap a CommonMark angle-bracket destination (`<uri>`) to the bare uri so
-  // scheme tests and the stored value are clean. `match` (returned for
-  // inline-kept refs) keeps the original bracketed form untouched.
-  const rawUri = uri.trim()
-  const normalizedUri =
-    rawUri.startsWith("<") && rawUri.endsWith(">")
-      ? rawUri.slice(1, -1).trim()
-      : rawUri
+  // Unwrap a CommonMark angle-bracket destination (`<uri>`) — and decode the
+  // `\`/`<`/`>` escapes it carries — so scheme tests and the stored chip uri see
+  // the real path, not `file:///C:\\dir`. `match` (returned for inline-kept
+  // refs) keeps the original bracketed form untouched.
+  const normalizedUri = unwrapReferenceDestination(uri)
   // A `codeg://` reference (session / commit / agent) renders as an inline badge
   // in the transcript (markdown-link → ReferenceBadge); never lift it to the
   // bottom resource-chip row. The guard mirrors markdown-link's interception
@@ -1084,15 +1172,6 @@ function adaptContentBlock(
         isStreaming,
       }
 
-    case "decomposition":
-      return {
-        type: "decomposition",
-        tasks: block.tasks,
-        // Use the block's own isStreaming flag (the turn builder sets it
-        // based on whether the fence is complete), not the parameter.
-        isStreaming: block.isStreaming,
-      }
-
     default:
       return null
   }
@@ -1215,7 +1294,12 @@ export function groupConsecutiveToolCalls(
       // Claude Code background-task polls (TaskOutput/TaskStop) render through a
       // dedicated <BackgroundTaskCard> that merges a task's repeated polls, so
       // they break the run instead of folding into a "执行 N 个任务" tool-group.
-      !isBackgroundTaskToolCall(part)
+      !isBackgroundTaskToolCall(part) &&
+      // Context-compaction items (codex `_meta.contextCompaction`, and Grok's
+      // synthesized auto_compact card) render through the dedicated subtle
+      // <ContextCompactionCard>, so they break the run and render standalone
+      // instead of being wrapped in a single-item "调用 1 个工具" tool-group.
+      !isContextCompactionMeta(part.meta)
     ) {
       buffer.push(part)
       continue
@@ -1245,6 +1329,89 @@ export function dropHiddenFeedbackChecks(
     // Surface errors (rare) so a failed check isn't silently swallowed.
     if (part.state === "output-error" || part.errorText?.trim()) return true
     return feedbackCheckHasContent(part.output ?? null)
+  })
+}
+
+/**
+ * Whether a tool-call's `input` string carries any real argument. Treats the
+ * empty shapes an arg-less initial `tool_call` serializes to — `null`, `""`,
+ * `"{}"`, `"[]"`, `"null"`, and any JSON that parses to an empty object/array —
+ * as "no input". Non-JSON but non-empty text counts as input.
+ */
+function toolCallHasInput(input: string | null | undefined): boolean {
+  if (input == null) return false
+  const trimmed = input.trim()
+  if (
+    trimmed === "" ||
+    trimmed === "{}" ||
+    trimmed === "[]" ||
+    trimmed === "null"
+  ) {
+    return false
+  }
+  try {
+    const parsed: unknown = JSON.parse(trimmed)
+    if (parsed == null) return false
+    if (Array.isArray(parsed)) return parsed.length > 0
+    if (typeof parsed === "object") return Object.keys(parsed).length > 0
+  } catch {
+    // Non-JSON but non-empty text → treat as real input.
+  }
+  return true
+}
+
+/**
+ * Drop empty, unsettled generic tool-call parts. claude-agent-acp emits an
+ * arg-less initial `tool_call` at `content_block_start` (`rawInput = {}`) and
+ * fills the real args on a later same-id `tool_call_update`. When a turn is
+ * interrupted and retried (connection error / Claude API retry), the aborted
+ * attempt's arg-less `tool_call` — which carries its own id, never gets refined,
+ * and is never written to the JSONL transcript — lingers in `liveMessage`. It
+ * then inflates the "运行 N 个命令" tool-group count and renders as a blank
+ * `bash · 运行中` card. The settled view (rebuilt from the transcript) never
+ * contains it, hence the live-only mismatch.
+ *
+ * Two render passes see the orphan, so the predicate spans both: (1) during
+ * streaming its state is `input-available` (running); (2) after `COMPLETE_TURN`
+ * the same unpruned `liveMessage` is promoted into `localTurns` and re-adapted
+ * with `isStreaming=false`, flipping the unmatched orphan to `output-available`
+ * — still caught, because its forwarded ACP status stays unsettled until an
+ * authoritative detail reload replaces the promoted copy. DB-persisted history
+ * carries no forwarded status, so it is exempt.
+ *
+ * The lane guard mirrors `groupConsecutiveToolCalls`'s fold condition exactly,
+ * so this only ever removes parts that would fold into a generic tool-group.
+ * Every specialized lane (agent/delegation/ask/feedback/goal via
+ * `isAgentLikeToolName`, plan-mode, background-task) is left untouched — those
+ * render through their own cards and handle their own empty in-flight polls
+ * (see commit 1ddf751b, same disease in the other lanes). Runs before
+ * `groupConsecutiveToolCalls`.
+ */
+export function dropEmptyInFlightToolCalls(
+  parts: AdaptedContentPart[]
+): AdaptedContentPart[] {
+  return parts.filter((part) => {
+    if (part.type !== "tool-call") return true
+    // Specialized lanes render standalone — never our concern.
+    if (
+      isAgentLikeToolName(part.toolName) ||
+      isPlanModeToolName(part.toolName) ||
+      isBackgroundTaskToolCall(part)
+    ) {
+      return true
+    }
+    // Keep unless the part is unsettled — still running (live orphan) or carrying
+    // an unsettled forwarded status (a promoted orphan whose state flipped to
+    // output-available at COMPLETE_TURN). DB-persisted rows have no forwarded
+    // status → settled → always kept here. See `isUnsettledToolCall`.
+    if (!isUnsettledToolCall(part)) {
+      return true
+    }
+    if (part.state === "output-error" || part.errorText?.trim()) return true
+    if (part.output && part.output.trim().length > 0) return true // streaming output → keep
+    if (toolCallHasInput(part.input)) return true // has a real command/args → keep
+    // Empty args + unsettled + no output/error → orphaned arg-less initial call.
+    return false
   })
 }
 
@@ -1654,22 +1821,8 @@ export function adaptMessageTurn(
     const block = turn.blocks[index]
 
     if (turn.role === "assistant" && block.type === "text") {
-      // Merge consecutive text blocks so content spanning multiple blocks
-      // (e.g. a ```task_decomposition_json code fence split across ACP
-      // streaming chunks) can be detected as a single unit.
-      let mergedText = block.text
-      let mergeEnd = index
-      while (
-        mergeEnd + 1 < turn.blocks.length &&
-        turn.blocks[mergeEnd + 1].type === "text"
-      ) {
-        mergeEnd++
-        mergedText +=
-          "\n" + (turn.blocks[mergeEnd] as { type: "text"; text: string }).text
-      }
-
       const goalExpandedParts = expandGoalUpdateText(
-        mergedText,
+        block.text,
         turn.id,
         index,
         text.toolCallFailed,
@@ -1677,32 +1830,39 @@ export function adaptMessageTurn(
       )
       if (goalExpandedParts) {
         adaptedContent.push(...goalExpandedParts)
-        index = mergeEnd
         continue
       }
 
       const expandedParts = expandInlineToolText(
-        mergedText,
+        block.text,
         turn.id,
         index,
         text.toolCallFailed
       )
       if (expandedParts) {
         adaptedContent.push(...expandedParts)
-        index = mergeEnd
         continue
       }
 
-      // 3rd: extract task_decomposition_json code blocks → structured cards
-      const decompExpanded = expandDecompositionText(mergedText)
-      if (decompExpanded) {
-        adaptedContent.push(...decompExpanded)
-        index = mergeEnd
+      // Codex Plan mode emits its plan as a `<proposed_plan>…</proposed_plan>`
+      // block inside the assistant text; render it as a dedicated card instead
+      // of raw text with visible tags. Covers live + reload (same adapter).
+      const proposedPlanParts = expandProposedPlanText(block.text, isStreaming)
+      if (proposedPlanParts) {
+        adaptedContent.push(...proposedPlanParts)
         continue
       }
 
-      // No expansion matched — fall through to adaptContentBlock for each
-      // individual block (default text rendering).
+      // Decomposition: lift ```task_decomposition_json code fences out of the
+      // assistant text and render them as structured `decomposition` cards.
+      // Ordering (D15): runs AFTER proposed-plan extraction (so a plan body
+      // containing an embedded decomp fence is not mis-parsed here) and BEFORE
+      // the default text fallback below.
+      const decompParts = expandDecompositionText(block.text)
+      if (decompParts) {
+        adaptedContent.push(...decompParts)
+        continue
+      }
     }
 
     if (block.type === "tool_use") {
@@ -1741,15 +1901,18 @@ export function adaptMessageTurn(
         continue
       }
 
-      // Historical path: detect create_task_decomposition tool_use →
-      // decomposition block. Same pattern as plan block detection above.
+      // Historical path: detect a persisted `create_task_decomposition`
+      // tool_use and render it as a `decomposition` card (same pattern as
+      // the plan-block detection above). Only fires for DB-loaded turns;
+      // live turns use the synthetic decomposition ContentBlock from the
+      // turn-builder, so the historical path stays consistent.
       if (!isStreaming && block.tool_name === "create_task_decomposition") {
         const decompTasks = parseDecompositionToolInput(
           block.input_preview ?? ""
         )
         if (decompTasks && decompTasks.length > 0) {
-          // Consume paired tool_result so its acknowledgment text
-          // doesn't render as an orphan tool-result part.
+          // Consume paired tool_result so its acknowledgment text doesn't
+          // render as an orphan tool-result part.
           if (block.tool_use_id && resultMap.get(block.tool_use_id)) {
             matchedResultIds.add(block.tool_use_id)
           } else {
@@ -1808,6 +1971,7 @@ export function adaptMessageTurn(
             : undefined,
           agentStats: matchedResult.agent_stats ?? undefined,
           meta: block.meta ?? null,
+          agentTranscript: matchedResult.agent_transcript ?? undefined,
         })
       } else {
         // Position-based matching: if this tool_use has no ID, check next block
@@ -1842,6 +2006,7 @@ export function adaptMessageTurn(
               : undefined,
             agentStats: positionalResult.agent_stats ?? undefined,
             meta: block.meta ?? null,
+            agentTranscript: positionalResult.agent_transcript ?? undefined,
           })
         } else {
           // For live streaming, unmatched tools are still running.
@@ -1853,6 +2018,10 @@ export function adaptMessageTurn(
             toolName: block.tool_name,
             input: block.input_preview,
             state: isStreaming ? "input-available" : "output-available",
+            // Forward status so a promoted arg-less orphan (unmatched, no
+            // result) can be recognised after COMPLETE_TURN flips its state to
+            // output-available. See dropEmptyInFlightToolCalls.
+            toolStatus: block.status ?? null,
             meta: block.meta ?? null,
           })
         }
@@ -1883,19 +2052,6 @@ export function adaptMessageTurn(
       ) {
         continue
       }
-      // User-turn text blocks may carry auto-injected system instructions
-      // (decomposition format, live-feedback reminder) bracketed by ⟦codeg:⟧
-      // sentinels. The composer's displayText is untouched (optimistic bubbles
-      // show only the user's words), but the agent's session file contains the
-      // full blocks — including the injected text. On reload / reload-from-disk
-      // the parser recovers those blocks verbatim, so the sentinel content
-      // surfaces in the UI unless we strip it here at the adapter level.
-      if (turn.role === "user" && adapted.type === "text" && adapted.text) {
-        adapted.text = stripFeedbackReminder(adapted.text)
-        // If stripping emptied the block entirely (the message was *only* the
-        // injected instruction), drop it rather than rendering a blank bubble.
-        if (adapted.text.trim() === "") continue
-      }
       adaptedContent.push(adapted)
     }
   }
@@ -1915,7 +2071,9 @@ export function adaptMessageTurn(
           groupConsecutiveBackgroundTasks(
             groupConsecutiveDelegationStatus(
               groupConsecutiveToolCalls(
-                dropHiddenFeedbackChecks(adaptedContent)
+                dropEmptyInFlightToolCalls(
+                  dropHiddenFeedbackChecks(adaptedContent)
+                )
               )
             )
           ),

@@ -266,24 +266,42 @@ pub fn sweep_trash() {
     }
 }
 
-fn installed_binary_path(agent_id: &str, version: &str, cmd_name: &str) -> Option<PathBuf> {
-    let bin_name = if cfg!(target_os = "windows") {
-        format!("{cmd_name}.exe")
-    } else {
-        cmd_name.to_string()
-    };
+/// Dir-tree entry for a cache key, when the agent's archive is extracted as a
+/// whole directory instead of a single copied-out binary (see
+/// `AgentDistribution::Binary::dir_entry`).
+fn dir_entry_for_agent_id(agent_id: &str) -> Option<registry::BinaryDirEntry> {
+    let agent_type = registry::from_registry_id(agent_id)?;
+    match registry::get_agent_meta(agent_type).distribution {
+        registry::AgentDistribution::Binary { dir_entry, .. } => dir_entry,
+        _ => None,
+    }
+}
 
+fn installed_binary_path(agent_id: &str, version: &str, cmd_name: &str) -> Option<PathBuf> {
     let normalized = normalize_version_label(version);
     if normalized.is_empty() {
         return None;
     }
 
-    let path = cache_dir()
+    let platform_dir = cache_dir()
         .ok()?
         .join(agent_id)
         .join(normalized)
-        .join(registry::current_platform())
-        .join(bin_name);
+        .join(registry::current_platform());
+
+    // Dir-tree agents launch an in-tree entry script; probe it by existence
+    // only — the magic-byte check below would reject `#!` shell shims.
+    if let Some(entry) = dir_entry_for_agent_id(agent_id) {
+        let path = platform_dir.join(entry.for_current_platform());
+        return path.is_file().then_some(path);
+    }
+
+    let bin_name = if cfg!(target_os = "windows") {
+        format!("{cmd_name}.exe")
+    } else {
+        cmd_name.to_string()
+    };
+    let path = platform_dir.join(bin_name);
 
     if !path.exists() {
         return None;
@@ -404,11 +422,19 @@ fn parse_version_parts(input: &str) -> Vec<u32> {
 
 /// Same as `ensure_binary_for_agent` but calls `on_progress` with human-readable
 /// status messages during download / extraction.
+/// Download (or reuse) an agent's binary.
+///
+/// `expected_sha256`, when present, is the hex digest the archive must hash to.
+/// Built-in agents pass `None`: their URLs are repository constants reviewed
+/// alongside the code. Custom agents pass the ACP registry's published digest,
+/// because their URL comes from user input or a remote document — see
+/// [`crate::acp::registry::PlatformBinary::sha256`].
 pub async fn ensure_binary_for_agent_with_progress(
     agent_type: AgentType,
     version: &str,
     archive_url: &str,
     cmd_name: &str,
+    expected_sha256: Option<&str>,
     on_progress: impl Fn(&str),
 ) -> Result<PathBuf, AcpError> {
     if let Some(path) = find_cached_binary_for_agent(agent_type, version, cmd_name)? {
@@ -417,7 +443,52 @@ pub async fn ensure_binary_for_agent_with_progress(
     }
 
     let agent_id = agent_cache_key(agent_type);
-    ensure_binary_with_progress(&agent_id, version, archive_url, cmd_name, on_progress).await
+    ensure_binary_with_progress(
+        &agent_id,
+        version,
+        archive_url,
+        cmd_name,
+        expected_sha256,
+        on_progress,
+    )
+    .await
+}
+
+/// Hex SHA-256 of a file, streamed so a large archive never lands in memory.
+fn file_sha256(path: &std::path::Path) -> Result<String, AcpError> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| AcpError::DownloadFailed(format!("failed to open archive for hashing: {e}")))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)
+            .map_err(|e| AcpError::DownloadFailed(format!("failed to read archive: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// Fail unless the downloaded archive matches `expected`. Comparison is
+/// case-insensitive hex; a blank expectation is treated as "not published".
+fn verify_archive_sha256(path: &std::path::Path, expected: Option<&str>) -> Result<(), AcpError> {
+    let Some(expected) = expected.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let actual = file_sha256(path)?;
+    if actual.eq_ignore_ascii_case(expected) {
+        return Ok(());
+    }
+    Err(AcpError::DownloadFailed(format!(
+        "archive checksum mismatch: expected sha256 {expected}, got {actual}"
+    )))
 }
 
 async fn ensure_binary_with_progress(
@@ -425,6 +496,7 @@ async fn ensure_binary_with_progress(
     version: &str,
     archive_url: &str,
     cmd_name: &str,
+    expected_sha256: Option<&str>,
     on_progress: impl Fn(&str),
 ) -> Result<PathBuf, AcpError> {
     if let Some(path) = find_cached_binary(agent_id, version, cmd_name)? {
@@ -454,6 +526,13 @@ async fn ensure_binary_with_progress(
         on_progress(&format!("Downloading {archive_url}"));
         download_file_with_progress(archive_url, &archive_path, &on_progress).await?;
 
+        // Verify BEFORE extracting: a tampered archive must never have its
+        // contents written anywhere but the temp dir this closure cleans up.
+        if expected_sha256.is_some() {
+            on_progress("Verifying checksum...");
+        }
+        verify_archive_sha256(&archive_path, expected_sha256)?;
+
         let extract_dir = tmp_dir.join("extracted");
         std::fs::create_dir_all(&extract_dir)
             .map_err(|e| AcpError::DownloadFailed(format!("failed to create extract dir: {e}")))?;
@@ -469,6 +548,10 @@ async fn ensure_binary_with_progress(
             return Err(AcpError::DownloadFailed(format!(
                 "unsupported archive format: {archive_url}"
             )));
+        }
+
+        if let Some(entry) = dir_entry_for_agent_id(agent_id) {
+            return install_extracted_tree(&extract_dir, &dir, entry, &on_progress);
         }
 
         // Find the binary in extracted files and move to final location.
@@ -501,6 +584,50 @@ async fn ensure_binary_with_progress(
     }
 
     result
+}
+
+/// Move a dir-tree archive's extracted content into the final per-version
+/// cache dir and return the launch entry path inside it. The extracted root
+/// children are renamed (same filesystem) rather than copied; the entry's
+/// existence is validated afterwards so a layout change in the upstream
+/// archive fails loudly instead of caching a dead tree.
+fn install_extracted_tree(
+    extract_dir: &Path,
+    final_dir: &Path,
+    entry: registry::BinaryDirEntry,
+    on_progress: &impl Fn(&str),
+) -> Result<PathBuf, AcpError> {
+    on_progress("Installing extracted files...");
+    let children = std::fs::read_dir(extract_dir)
+        .map_err(|e| AcpError::DownloadFailed(format!("failed to read extracted dir: {e}")))?;
+    for child in children.flatten() {
+        let target = final_dir.join(child.file_name());
+        std::fs::rename(child.path(), &target).map_err(|e| {
+            AcpError::DownloadFailed(format!(
+                "failed to move {} into cache: {e}",
+                child.file_name().to_string_lossy()
+            ))
+        })?;
+    }
+
+    let entry_rel = entry.for_current_platform();
+    let entry_path = final_dir.join(entry_rel);
+    if !entry_path.is_file() {
+        return Err(AcpError::DownloadFailed(format!(
+            "entry '{entry_rel}' not found in archive"
+        )));
+    }
+    // tar preserves the executable bit, but be defensive: the entry shim and
+    // its sibling `node` runtime must both be executable for the spawn to work.
+    set_executable_permissions(&entry_path)?;
+    if let Some(parent) = entry_path.parent() {
+        let node = parent.join("node");
+        if node.is_file() {
+            set_executable_permissions(&node)?;
+        }
+    }
+    on_progress("Binary installed successfully");
+    Ok(entry_path)
 }
 
 pub(crate) fn find_cached_binary(
@@ -691,10 +818,85 @@ mod tests {
         assert_eq!(agent_cache_key(AgentType::Codex), "codex-acp");
     }
 
+    // Cursor's whole-tree install: the extracted archive root (dist-package/…)
+    // is moved intact into the version dir, the entry script is validated and
+    // made executable, and a missing entry fails loudly.
+    #[test]
+    fn install_extracted_tree_moves_root_and_validates_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extract = tmp.path().join("extracted");
+        let package = extract.join("dist-package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("cursor-agent"), "#!/usr/bin/env bash\n").unwrap();
+        std::fs::write(package.join("node"), [0_u8, 1, 2]).unwrap();
+        std::fs::write(package.join("index.js"), "// chunk").unwrap();
+        let final_dir = tmp.path().join("final");
+        std::fs::create_dir_all(&final_dir).unwrap();
+
+        let entry = registry::BinaryDirEntry {
+            unix: "dist-package/cursor-agent",
+            windows: "dist-package/cursor-agent.cmd",
+        };
+        // On Windows the fixture writes the unix name only; skip there — the
+        // path join and rename logic under test is platform-independent.
+        if cfg!(windows) {
+            return;
+        }
+        let installed = install_extracted_tree(&extract, &final_dir, entry, &|_| {}).unwrap();
+        assert_eq!(installed, final_dir.join("dist-package/cursor-agent"));
+        assert!(final_dir.join("dist-package/index.js").is_file());
+        assert!(final_dir.join("dist-package/node").is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&installed).unwrap().permissions().mode();
+            assert_ne!(mode & 0o111, 0, "entry must be executable");
+        }
+        // The extracted staging dir was drained by the rename.
+        assert!(std::fs::read_dir(&extract).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn install_extracted_tree_missing_entry_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extract = tmp.path().join("extracted");
+        std::fs::create_dir_all(extract.join("wrong-root")).unwrap();
+        let final_dir = tmp.path().join("final");
+        std::fs::create_dir_all(&final_dir).unwrap();
+        let entry = registry::BinaryDirEntry {
+            unix: "dist-package/cursor-agent",
+            windows: "dist-package/cursor-agent.cmd",
+        };
+        let err = install_extracted_tree(&extract, &final_dir, entry, &|_| {}).unwrap_err();
+        assert!(err.to_string().contains("not found in archive"), "{err}");
+    }
+
     #[test]
     fn version_normalization_is_consistent() {
         assert_eq!(normalize_version_label("v1.2.15"), "1.2.15");
         assert_eq!(normalize_version_label("V0.9.4 "), "0.9.4");
         assert_eq!(normalize_version_label("1.25.1"), "1.25.1");
+    }
+
+    // Custom agents download from URLs codeg did not vet, so a published
+    // digest must be enforced — and a mismatch must fail BEFORE extraction.
+    #[test]
+    fn archive_checksum_is_enforced_when_published() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("archive");
+        std::fs::write(&archive, b"hello").unwrap();
+        // sha256("hello")
+        let good = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+        assert_eq!(file_sha256(&archive).unwrap(), good);
+        verify_archive_sha256(&archive, Some(good)).expect("matching digest passes");
+        // Registries publish lowercase hex, but accept either case.
+        verify_archive_sha256(&archive, Some(&good.to_uppercase())).expect("case-insensitive");
+        // No published digest → nothing to enforce (built-in agents).
+        verify_archive_sha256(&archive, None).expect("absent digest is not an error");
+        verify_archive_sha256(&archive, Some("   ")).expect("blank digest is not an error");
+
+        let err = verify_archive_sha256(&archive, Some("deadbeef")).unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
     }
 }

@@ -56,6 +56,45 @@ describe("denormalizeSnapshot — active_delegations", () => {
   })
 })
 
+describe("denormalizeSnapshot — subagent attribution on live blocks", () => {
+  it("forwards parent_tool_use_id onto text/thinking, absent field stays undefined", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        live_message: {
+          id: "lm-1",
+          role: "assistant",
+          started_at: "2026-07-28T00:00:00Z",
+          content: [
+            { kind: "text", text: "main" },
+            { kind: "text", text: "sub", parent_tool_use_id: "toolu_p" },
+            {
+              kind: "thinking",
+              text: "sub think",
+              parent_tool_use_id: "toolu_p",
+            },
+          ],
+        },
+      })
+    )
+    const content = patch.liveMessage?.content ?? []
+    expect(content).toHaveLength(3)
+    expect(content[0]).toMatchObject({ type: "text", text: "main" })
+    expect(
+      content[0]?.type === "text" ? content[0].parentToolUseId : "SET"
+    ).toBeUndefined()
+    expect(content[1]).toMatchObject({
+      type: "text",
+      text: "sub",
+      parentToolUseId: "toolu_p",
+    })
+    expect(content[2]).toMatchObject({
+      type: "thinking",
+      text: "sub think",
+      parentToolUseId: "toolu_p",
+    })
+  })
+})
+
 describe("denormalizeSnapshot — config staleness", () => {
   it("carries config_stale / config_stale_kind into the patch", () => {
     const patch = denormalizeSnapshot(
@@ -72,5 +111,28 @@ describe("denormalizeSnapshot — config staleness", () => {
     const patch = denormalizeSnapshot(snap)
     expect(patch.configStale).toBe(false)
     expect(patch.configStaleKind).toBeNull()
+  })
+})
+
+describe("denormalizeSnapshot — last_error", () => {
+  it("carries last_error.message into the patch", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        last_error: {
+          message: " ACP protocol error: Forbidden ",
+          code: "forbidden",
+        },
+      })
+    )
+    expect(patch.lastError).toBe("ACP protocol error: Forbidden")
+    expect(patch.status).toBe("connected")
+  })
+
+  it("defaults lastError to null when the field is absent", () => {
+    const snap = baseSnapshot()
+    delete (snap as { last_error?: unknown }).last_error
+    const patch = denormalizeSnapshot(snap)
+    expect(patch.lastError).toBeNull()
+    expect(patch.status).toBe("connected")
   })
 })

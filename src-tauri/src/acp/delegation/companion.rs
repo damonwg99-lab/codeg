@@ -44,9 +44,10 @@ use tokio::sync::{oneshot, Mutex};
 use crate::acp::delegation::transport::{
     client_ask_round_trip, client_cancel, client_cancel_task_round_trip, client_commit_feedback,
     client_feedback_round_trip, client_round_trip, client_session_round_trip,
-    client_status_round_trip, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
-    BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerRequest, BrokerResponse,
-    BrokerSessionRequest, BrokerStatusRequest,
+    client_status_round_trip, client_task_complete_round_trip, client_task_progress_round_trip,
+    BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
+    BrokerFeedbackRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
+    BrokerStatusRequest, BrokerTaskCompleteRequest, BrokerTaskProgressRequest,
 };
 use crate::acp::question::parse_questions;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
@@ -138,15 +139,23 @@ pub struct CompanionFeatures {
     pub feedback: bool,
     pub ask: bool,
     pub sessions: bool,
+    /// Task-decomposition tool group (`create_task_decomposition`). Off by
+    /// default — the parent opts in via `--features decomposition` so the
+    /// companion only advertises the tool when the platform's decomposition
+    /// runtime is actually live.
     pub decomposition: bool,
+    /// Work-task reporting tools (`task_progress` / `task_complete`) — injected
+    /// only into spawns launched by the task engine.
+    pub tasks: bool,
 }
 
 impl CompanionFeatures {
     /// Parse the comma-joined `--features` value (e.g.
-    /// `delegation,feedback,ask,sessions`). Unknown tokens are ignored. An absent
-    /// value (`None`) defaults to delegation-only — backward compatible with a
-    /// parent that predates feature gating (companion + listener ship together, so
-    /// post-upgrade the parent always passes an explicit `--features`).
+    /// `delegation,feedback,ask,sessions,decomposition`). Unknown tokens are
+    /// ignored. An absent value (`None`) defaults to delegation-only —
+    /// backward compatible with a parent that predates feature gating
+    /// (companion + listener ship together, so post-upgrade the parent
+    /// always passes an explicit `--features`).
     pub fn parse(raw: Option<&str>) -> Self {
         let Some(s) = raw else {
             return Self {
@@ -155,6 +164,7 @@ impl CompanionFeatures {
                 ask: false,
                 sessions: false,
                 decomposition: false,
+                tasks: false,
             };
         };
         let mut f = Self {
@@ -163,6 +173,7 @@ impl CompanionFeatures {
             ask: false,
             sessions: false,
             decomposition: false,
+            tasks: false,
         };
         for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             match tok {
@@ -171,6 +182,7 @@ impl CompanionFeatures {
                 "ask" => f.ask = true,
                 "sessions" => f.sessions = true,
                 "decomposition" => f.decomposition = true,
+                "tasks" => f.tasks = true,
                 _ => {}
             }
         }
@@ -184,6 +196,7 @@ impl CompanionFeatures {
             "ask_user_question" => self.ask,
             "get_session_info" => self.sessions,
             "create_task_decomposition" => self.decomposition,
+            "task_progress" | "task_complete" => self.tasks,
             "delegate_to_agent" | "get_delegation_status" | "cancel_delegation" => self.delegation,
             _ => false,
         }
@@ -199,6 +212,21 @@ pub struct CompanionContext {
     pub token: String,
     /// Tool groups this launch exposes (see [`CompanionFeatures`]).
     pub features: CompanionFeatures,
+    /// Extra `agent_type` slugs (`custom:<id>` wire forms) appended to
+    /// `delegate_to_agent`'s enum at `tools/list` time. The embedded schema
+    /// only knows the built-in agents; the parent passes the custom agents
+    /// registered (and enabled) at injection time via `--custom-agents`.
+    /// Empty when the parent has none (or predates the flag) — the schema is
+    /// then served byte-identical to the embedded file.
+    pub custom_agents: Vec<String>,
+    /// Built-in `agent_type` slugs removed from `delegate_to_agent`'s enum at
+    /// `tools/list` time — the agents the user has disabled in settings,
+    /// passed via `--disabled-agents`. Subtracting companion-side keeps the
+    /// embedded schema the single source of truth for the builtin list and
+    /// its order. Empty when nothing is disabled (or the parent predates the
+    /// flag). Disabled customs never appear here: the parent just leaves them
+    /// out of `custom_agents`.
+    pub disabled_agents: Vec<String>,
 }
 
 /// Per-in-flight-call state. The companion stashes one of these per
@@ -354,7 +382,7 @@ pub async fn dispatch_line(
                     ));
                 }
             };
-            let tools = match all.as_array() {
+            let mut tools = match all.as_array() {
                 Some(arr) => Value::Array(
                     arr.iter()
                         .filter(|t| {
@@ -368,10 +396,71 @@ pub async fn dispatch_line(
                 ),
                 None => all,
             };
+            remove_disabled_agents_from_delegate_enum(&mut tools, &ctx.disabled_agents);
+            append_custom_agents_to_delegate_enum(&mut tools, &ctx.custom_agents);
             LineAction::Respond(ok(id, json!({ "tools": tools })))
         }
         "tools/call" => build_tools_call_spawn(ctx.clone(), inflight, id, req.params).await,
         _ => LineAction::Respond(err(id, -32601, format!("method not found: {}", req.method))),
+    }
+}
+
+/// Remove the parent-declared disabled agents from `delegate_to_agent`'s
+/// `agent_type` enum, so only targets the user can actually launch are
+/// advertised. Same defensive posture as the append below: a missing tool /
+/// property / enum array leaves the tools untouched, and a slug the embedded
+/// list doesn't contain is a no-op — a parent/companion version skew can
+/// narrow the enum, never corrupt it.
+fn remove_disabled_agents_from_delegate_enum(tools: &mut Value, disabled_agents: &[String]) {
+    if disabled_agents.is_empty() {
+        return;
+    }
+    let Some(arr) = tools.as_array_mut() else {
+        return;
+    };
+    let Some(variants) = arr
+        .iter_mut()
+        .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("delegate_to_agent"))
+        .and_then(|t| t.pointer_mut("/inputSchema/properties/agent_type/enum"))
+        .and_then(|e| e.as_array_mut())
+    else {
+        return;
+    };
+    variants.retain(|variant| {
+        variant
+            .as_str()
+            .map(|slug| !disabled_agents.iter().any(|d| d == slug))
+            .unwrap_or(true)
+    });
+}
+
+/// Append the parent-provided custom-agent slugs to `delegate_to_agent`'s
+/// `agent_type` enum. The embedded schema stays the single source of truth
+/// for the built-in list (and its order); customs are appended after it,
+/// de-duplicated, so a stale double-send can never corrupt the schema. A
+/// missing tool / property / enum array (feature-filtered list, or a future
+/// schema shape change) leaves the tools untouched rather than erroring —
+/// serving the narrower built-in enum is strictly better than serving no
+/// tools at all.
+fn append_custom_agents_to_delegate_enum(tools: &mut Value, custom_agents: &[String]) {
+    if custom_agents.is_empty() {
+        return;
+    }
+    let Some(arr) = tools.as_array_mut() else {
+        return;
+    };
+    let Some(variants) = arr
+        .iter_mut()
+        .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("delegate_to_agent"))
+        .and_then(|t| t.pointer_mut("/inputSchema/properties/agent_type/enum"))
+        .and_then(|e| e.as_array_mut())
+    else {
+        return;
+    };
+    for slug in custom_agents {
+        if !variants.iter().any(|v| v.as_str() == Some(slug)) {
+            variants.push(Value::String(slug.clone()));
+        }
     }
 }
 
@@ -549,8 +638,8 @@ async fn build_tools_call_spawn(
             // then return a confirmation the LLM sees as the tool result.
             // The front-end detects the tool_call block on the ACP stream
             // and synthesises a DecompositionCard directly.
-            let input_str = match arguments.get("subTasks") {
-                Some(v) => serde_json::to_string(v).unwrap_or_default(),
+            let sub_tasks = match arguments.get("subTasks") {
+                Some(v) => v,
                 None => {
                     return LineAction::Respond(err(
                         id,
@@ -559,29 +648,74 @@ async fn build_tools_call_spawn(
                     ));
                 }
             };
-            let sub_tasks: Vec<serde_json::Value> = match serde_json::from_str::<Vec<serde_json::Value>>(&input_str) {
-                Ok(arr) if !arr.is_empty() => arr,
-                Ok(_) => {
+            let arr: Vec<&Value> = match sub_tasks.as_array() {
+                Some(arr) if !arr.is_empty() => arr.iter().collect(),
+                _ => {
                     return LineAction::Respond(err(
                         id,
                         -32602,
                         "create_task_decomposition requires a non-empty subTasks array",
                     ));
                 }
-                Err(_) => {
-                    return LineAction::Respond(err(
-                        id,
-                        -32602,
-                        "create_task_decomposition subTasks must be a valid JSON array",
-                    ));
-                }
             };
-            let count = sub_tasks.len();
+            let count = arr.len();
             let msg = format!(
                 "Decomposition proposal received ({count} sub-tasks). \
                  The user can review and confirm them in the CodeG interface."
             );
             LineAction::Respond(ok(id, Value::String(msg)))
+        }
+        "task_progress" => {
+            let message = arguments
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let Some(message) = message else {
+                return LineAction::Respond(err(
+                    id,
+                    -32602,
+                    "task_progress requires a non-empty `message` string",
+                ));
+            };
+            let req = BrokerTaskProgressRequest {
+                token: ctx.token.clone(),
+                message,
+            };
+            // No external_handle: a fire-and-forget report has nothing to
+            // cancel broker-side.
+            let round_trip =
+                Box::pin(async move { client_task_progress_round_trip(&socket, &req).await });
+            register_and_spawn(inflight, id, None, round_trip, render_task_ack).await
+        }
+        "task_complete" => {
+            let verdict = arguments
+                .get("verdict")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            if !matches!(verdict, "success" | "needs_review" | "blocked") {
+                return LineAction::Respond(err(
+                    id,
+                    -32602,
+                    "task_complete requires `verdict` of success | needs_review | blocked",
+                ));
+            }
+            let summary = arguments
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let req = BrokerTaskCompleteRequest {
+                token: ctx.token.clone(),
+                verdict: verdict.to_string(),
+                summary,
+            };
+            let round_trip =
+                Box::pin(async move { client_task_complete_round_trip(&socket, &req).await });
+            register_and_spawn(inflight, id, None, round_trip, render_task_ack).await
         }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
     }
@@ -1086,6 +1220,27 @@ pub fn render_session_result(outcome: &Value) -> Value {
     })
 }
 
+/// Map a `task_progress` / `task_complete` round-trip outcome (a
+/// `{ recorded, note? }` ack) into an MCP `tools/call` result. A report that
+/// could not be attributed (no active work task for this session) is readable
+/// text with `isError: false` — the agent just carries on with its work.
+pub fn render_task_ack(outcome: &Value) -> Value {
+    let recorded = outcome
+        .get("recorded")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let text = outcome
+        .get("note")
+        .and_then(|v| v.as_str())
+        .unwrap_or(if recorded { "Recorded." } else { "Not recorded." })
+        .to_string();
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": false,
+        "structuredContent": outcome.clone(),
+    })
+}
+
 /// Build the human-readable summary block for a found session: a metadata header
 /// plus, when present, a "Recent messages" section.
 fn render_session_summary_text(o: &Value) -> String {
@@ -1209,6 +1364,7 @@ mod tests {
             ask: false,
             sessions: false,
             decomposition: false,
+            tasks: false,
         })
     }
 
@@ -1218,6 +1374,8 @@ mod tests {
             socket_path: "/tmp/codeg-mcp-companion-test-nope.sock".into(),
             token: "tok".into(),
             features,
+            custom_agents: Vec::new(),
+            disabled_agents: Vec::new(),
         }
     }
 
@@ -1257,7 +1415,7 @@ mod tests {
         assert!(names.contains(&"delegate_to_agent"));
         assert!(names.contains(&"get_delegation_status"));
         assert!(names.contains(&"cancel_delegation"));
-        // delegate_to_agent schema still enumerates all 11 agent types.
+        // delegate_to_agent schema still enumerates all 12 agent types.
         let delegate = tools
             .iter()
             .find(|t| t["name"] == "delegate_to_agent")
@@ -1265,12 +1423,13 @@ mod tests {
         let agents = delegate["inputSchema"]["properties"]["agent_type"]["enum"]
             .as_array()
             .unwrap();
-        assert_eq!(agents.len(), 11);
+        assert_eq!(agents.len(), 12);
         assert!(agents.iter().any(|a| a == "hermes"));
         assert!(agents.iter().any(|a| a == "code_buddy"));
         assert!(agents.iter().any(|a| a == "kimi_code"));
         assert!(agents.iter().any(|a| a == "pi"));
         assert!(agents.iter().any(|a| a == "grok"));
+        assert!(agents.iter().any(|a| a == "cursor"));
         // get_delegation_status takes a single id param — task_ids (required) —
         // plus wait_ms. The legacy single `task_id` param is gone.
         let status = tools
@@ -1282,6 +1441,104 @@ mod tests {
         assert!(status["inputSchema"]["properties"]["wait_ms"].is_object());
         let required = status["inputSchema"]["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "task_ids"));
+    }
+
+    #[tokio::test]
+    async fn custom_agents_extend_the_delegate_enum_after_the_builtins() {
+        let mut ctx = ctx();
+        // The duplicate and the already-built-in slug exercise the de-dup: a
+        // parent that double-sends (or somehow lists a builtin) must not
+        // produce a corrupted enum.
+        ctx.custom_agents = vec![
+            "custom:goose".into(),
+            "custom:amp".into(),
+            "custom:goose".into(),
+            "codex".into(),
+        ];
+        let line = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let resp = unwrap_respond(dispatch_line(&ctx, Arc::new(InflightCalls::new()), line).await);
+        let tools = resp.result.unwrap()["tools"].clone();
+        let delegate = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "delegate_to_agent")
+            .cloned()
+            .unwrap();
+        let agents = delegate["inputSchema"]["properties"]["agent_type"]["enum"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(agents.len(), 14, "12 builtins + 2 distinct customs");
+        // Builtins keep the embedded order and come first.
+        assert_eq!(agents[0], "claude_code");
+        assert_eq!(agents[12], "custom:goose");
+        assert_eq!(agents[13], "custom:amp");
+        // The other delegation tools carry no agent_type and are untouched.
+        let status = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "get_delegation_status")
+            .unwrap();
+        assert!(status["inputSchema"]["properties"]["agent_type"].is_null());
+    }
+
+    // Disabled builtins are subtracted from the enum (the user's settings
+    // toggles must narrow the advertised targets), the remaining builtins keep
+    // the embedded order, enabled customs still append after them, and a slug
+    // the embedded list doesn't know is a harmless no-op — version skew can
+    // narrow the enum, never corrupt it.
+    #[tokio::test]
+    async fn disabled_agents_are_subtracted_from_the_delegate_enum() {
+        let mut ctx = ctx();
+        ctx.disabled_agents = vec!["codex".into(), "grok".into(), "not-an-agent".into()];
+        ctx.custom_agents = vec!["custom:goose".into()];
+        let line = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let resp = unwrap_respond(dispatch_line(&ctx, Arc::new(InflightCalls::new()), line).await);
+        let tools = resp.result.unwrap()["tools"].clone();
+        let delegate = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "delegate_to_agent")
+            .cloned()
+            .unwrap();
+        let agents = delegate["inputSchema"]["properties"]["agent_type"]["enum"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(agents.len(), 11, "12 builtins - 2 disabled + 1 custom");
+        assert!(!agents.contains(&serde_json::json!("codex")));
+        assert!(!agents.contains(&serde_json::json!("grok")));
+        // Survivors keep the embedded order, customs still come last.
+        assert_eq!(agents[0], "claude_code");
+        assert_eq!(agents[1], "open_code");
+        assert_eq!(agents[10], "custom:goose");
+    }
+
+    // An empty disabled list (the parent omitted `--disabled-agents`) leaves
+    // the schema byte-identical to the embedded builtin set — the exact
+    // behavior every pre-flag parent relies on.
+    #[tokio::test]
+    async fn empty_disabled_list_serves_the_embedded_builtin_enum_unchanged() {
+        let line = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let resp = unwrap_respond(dispatch_for_test(line).await);
+        let tools = resp.result.unwrap()["tools"].clone();
+        let delegate = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "delegate_to_agent")
+            .cloned()
+            .unwrap();
+        let agents = delegate["inputSchema"]["properties"]["agent_type"]["enum"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(agents.len(), 12);
+        assert_eq!(agents[0], "claude_code");
+        assert_eq!(agents[11], "cursor");
     }
 
     #[tokio::test]
@@ -1681,6 +1938,7 @@ mod tests {
         ask: false,
         sessions: false,
         decomposition: false,
+        tasks: false,
     };
     const BOTH: CompanionFeatures = CompanionFeatures {
         delegation: true,
@@ -1688,6 +1946,7 @@ mod tests {
         ask: false,
         sessions: false,
         decomposition: false,
+        tasks: false,
     };
     const ASK_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -1695,6 +1954,7 @@ mod tests {
         ask: true,
         sessions: false,
         decomposition: false,
+        tasks: false,
     };
     const SESSIONS_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -1702,6 +1962,15 @@ mod tests {
         ask: false,
         sessions: true,
         decomposition: false,
+        tasks: false,
+    };
+    const DECOMPOSITION_ONLY: CompanionFeatures = CompanionFeatures {
+        delegation: false,
+        feedback: false,
+        ask: false,
+        sessions: false,
+        decomposition: true,
+        tasks: false,
     };
 
     fn list_tool_names(action: LineAction) -> Vec<String> {
@@ -1723,17 +1992,27 @@ mod tests {
         assert!(!def.sessions);
         assert!(!def.decomposition);
         // Explicit list, whitespace + unknown tokens tolerated.
-        let all = CompanionFeatures::parse(Some(" delegation , feedback , ask , sessions , decomposition ,bogus"));
+        let all = CompanionFeatures::parse(Some(
+            " delegation , feedback , ask , sessions , decomposition ,bogus",
+        ));
         assert!(all.delegation && all.feedback && all.ask && all.sessions && all.decomposition);
         let fb = CompanionFeatures::parse(Some("feedback"));
-        assert!(!fb.delegation && fb.feedback && !fb.ask);
+        assert!(!fb.delegation && fb.feedback && !fb.ask && !fb.decomposition);
         let ask = CompanionFeatures::parse(Some("ask"));
-        assert!(!ask.delegation && !ask.feedback && ask.ask);
+        assert!(!ask.delegation && !ask.feedback && ask.ask && !ask.decomposition);
         let sessions = CompanionFeatures::parse(Some("sessions"));
-        assert!(!sessions.delegation && !sessions.feedback && !sessions.ask && sessions.sessions);
+        assert!(
+            !sessions.delegation && !sessions.feedback && !sessions.ask && sessions.sessions
+                && !sessions.decomposition
+        );
+        let dec = CompanionFeatures::parse(Some("decomposition"));
+        assert!(!dec.delegation && !dec.feedback && !dec.ask && !dec.sessions && dec.decomposition);
         // Empty string → nothing enabled.
         let none = CompanionFeatures::parse(Some(""));
-        assert!(!none.delegation && !none.feedback && !none.ask && !none.sessions && !none.decomposition);
+        assert!(
+            !none.delegation && !none.feedback && !none.ask && !none.sessions
+                && !none.decomposition
+        );
     }
 
     #[tokio::test]
@@ -1974,6 +2253,49 @@ mod tests {
         let e = resp.error.unwrap();
         assert_eq!(e.code, -32602);
         assert!(e.message.contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn create_task_decomposition_surfaces_and_dispatches_locally() {
+        // decomposition-only ctx → only create_task_decomposition is listed.
+        let names = list_tool_names(
+            dispatch_with_features(
+                DECOMPOSITION_ONLY,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        assert_eq!(names, vec!["create_task_decomposition".to_string()]);
+
+        // tools/call with a valid subTasks array is answered locally with a
+        // confirmation message (no broker round-trip).
+        let line = json!({
+            "jsonrpc": "2.0", "id": 34, "method": "tools/call",
+            "params": {
+                "name": "create_task_decomposition",
+                "arguments": {
+                    "subTasks": [
+                        { "title": "Step 1", "description": " Wire scaffold" },
+                        { "title": "Step 2", "description": " Wire tests" }
+                    ]
+                }
+            }
+        })
+        .to_string();
+        let resp = unwrap_respond(dispatch_with_features(DECOMPOSITION_ONLY, &line).await);
+        let msg = resp.result.unwrap();
+        assert!(msg.as_str().unwrap().contains("Decomposition proposal received (2 sub-tasks)"));
+
+        // Missing subTasks → synchronous -32602.
+        let bad = json!({
+            "jsonrpc": "2.0", "id": 35, "method": "tools/call",
+            "params": { "name": "create_task_decomposition", "arguments": {} }
+        })
+        .to_string();
+        let resp = unwrap_respond(dispatch_with_features(DECOMPOSITION_ONLY, &bad).await);
+        let e = resp.error.unwrap();
+        assert_eq!(e.code, -32602);
+        assert!(e.message.contains("subTasks"));
     }
 
     #[test]
@@ -2217,6 +2539,8 @@ mod tests {
             socket_path: sock,
             token: "tok".into(),
             features: FEEDBACK_ONLY,
+            custom_agents: Vec::new(),
+            disabled_agents: Vec::new(),
         };
         let inflight = Arc::new(InflightCalls::new());
         // tools/call → Spawn (registers the inflight entry).

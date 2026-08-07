@@ -1,6 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { getAgentLabel } from "@/lib/custom-agents"
 import { isDesktop } from "@/lib/platform"
 import Image from "next/image"
 import { useLocale, useTranslations } from "next-intl"
@@ -16,6 +17,7 @@ import {
   FlaskConical,
   FolderSearch,
   GitFork,
+  Loader2,
   Lock,
   MessageSquarePlus,
   MessageSquareText,
@@ -30,7 +32,7 @@ import {
   TextSelect,
   Upload,
   X,
-  ClipboardList,
+  Zap,
 } from "lucide-react"
 import {
   DropdownMenu,
@@ -65,6 +67,10 @@ import {
   formatFileRangeLabel,
 } from "@/lib/reference-link"
 import {
+  hasFileTreeDragType,
+  readFileTreeDragPayload,
+} from "@/lib/file-tree-dnd"
+import {
   filesFromClipboard,
   clipboardHasText,
   imageFilesFromClipboardApi,
@@ -83,13 +89,18 @@ import {
   UPLOAD_I18N_KEY_NOT_A_FILE,
   UPLOAD_I18N_KEY_QUOTA_EXCEEDED,
 } from "@/lib/api"
-import { extractAppCommandError } from "@/lib/app-error"
+// Local-IPC file read (never proxied to a remote workspace). Used for the
+// thumbnail preview of a locally-dropped image whose BYTES were uploaded to
+// the remote server — `api.readFileBase64` would route through the remote
+// transport and try to read the local path on the wrong machine.
+import { readFileBase64 as readLocalFileBase64 } from "@/lib/tauri"
+import { extractAppCommandError, toErrorMessage } from "@/lib/app-error"
+import { isNoActiveTurnRejection } from "@/lib/turn-busy"
 import { openFileDialog } from "@/lib/platform"
 import { getActiveRemoteConnectionId } from "@/lib/transport"
 import { ServerFileBrowserDialog } from "@/components/shared/server-file-browser-dialog"
 import { toast } from "sonner"
 import { disposeTauriListener } from "@/lib/tauri-listener"
-import { AGENT_LABELS } from "@/lib/types"
 import type {
   AgentSkillItem,
   AgentType,
@@ -114,6 +125,8 @@ import {
   ConversationFolderBranchPicker,
   useConversationFolderBranchPickerVisible,
 } from "@/components/chat/conversation-context-bar"
+import { ComposerContextUsage } from "@/components/chat/composer-context-usage"
+import { ComposerConnectionStatus } from "@/components/chat/composer-connection-status"
 import { InlineModeSelector } from "@/components/chat/mode-selector"
 import { InlineSessionConfigSelector } from "@/components/chat/session-config-selector"
 import { ModelOptionPicker } from "@/components/chat/model-option-picker"
@@ -143,6 +156,7 @@ import {
   loadMessageInputDraftV2,
   saveMessageInputDraftV2,
 } from "@/lib/message-input-draft"
+import { rankByTextMatch } from "@/lib/fuzzy-text-match"
 import {
   RichComposer,
   type RichComposerHandle,
@@ -164,32 +178,22 @@ import {
   restoreBlocksIntoEditor,
 } from "@/components/chat/composer/composer-commands"
 import {
+  commandInvocationToken,
   commandToReference,
   skillToReference,
 } from "@/components/chat/composer/invocation-reference"
 import { cutSelectionToClipboard } from "@/components/chat/composer/clipboard-actions"
-import { ProjectResourcePicker } from "@/components/platform/task-context-popover"
-import {
-  optionToReferenceAttrs,
-  type ContextInjectPayload,
-} from "@/components/platform/context-inject-panel-utils"
-import { useLinkedTask } from "@/hooks/use-linked-task"
-import { usePlatform } from "@/contexts/platform-context"
-import { useActiveFolder } from "@/contexts/active-folder-context"
-import { useTabContext } from "@/contexts/tab-context"
-import { linkConversation, listKnowledgeDocs } from "@/lib/platform/api"
-import type { KnowledgeDocInfo } from "@/lib/platform/types"
+import { PlatformComposerToolbar } from "./platform-composer-toolbar"
+import { usePlatformTabSlice } from "@/stores/platform-tab-slice"
 import type { ReferenceAttrs } from "@/components/chat/composer/types"
 import type { Editor, JSONContent } from "@tiptap/core"
+import { useReferenceSearch } from "@/components/chat/composer/use-reference-search"
+import { useComposerMentionLabels } from "@/components/chat/composer/use-composer-mention-labels"
 import {
-  useReferenceSearch,
-  type ReferenceGroupLabels,
-} from "@/components/chat/composer/use-reference-search"
-import type { MentionUiLabels } from "@/components/chat/composer/suggestion/types"
-import type {
-  ImageInputAttachment,
-  InputAttachment,
-  ResourceInputAttachment,
+  imageAttachmentToPromptBlock,
+  type ImageInputAttachment,
+  type InputAttachment,
+  type ResourceInputAttachment,
 } from "./message-input-attachments"
 
 /**
@@ -224,10 +228,6 @@ interface MessageInputProps {
   availableCommands?: AvailableCommandInfo[] | null
   promptCapabilities: PromptCapabilitiesInfo
   attachmentTabId?: string | null
-  /** The conversation ID this MessageInput belongs to. When provided,
-   *  overrides the global activeConversationId derived from TabContext —
-   *  prevents badge drafts from leaking into other tab's editors. */
-  conversationId?: number | null
   draftStorageKey?: string | null
   isActive?: boolean
   /** Paint the flowing active-session gradient on the composer border. Set only
@@ -253,6 +253,13 @@ interface MessageInputProps {
    *  draft synchronously (clears on click); the parent re-queues it if the fork
    *  can't run, so it is never lost. */
   onForkSend?: (draft: PromptDraft, modeId?: string | null) => void
+  /** Inject the draft's TEXT into the RUNNING turn (native live-feedback
+   *  steering). Present only on sessions whose feedback channel is native —
+   *  when absent, the prompting branch renders its historical Stop-only form.
+   *  Awaited: resolve = injected + recorded (clear the draft); reject =
+   *  failure, where a turn-end `NoActiveTurn` race falls back to the queue
+   *  and anything else keeps the draft. */
+  onSteer?: (text: string) => Promise<void>
   /** Open the live-feedback dialog (from the "+" menu). When omitted the entry
    *  is hidden (feature off). */
   onAddFeedback?: () => void
@@ -441,26 +448,6 @@ function editorHasFileReference(editor: Editor, uri: string): boolean {
   return found
 }
 
-/** Whether the document already holds a context reference badge for the given
- *  option id (e.g. "taskDescription", "kbDoc:5"). Prevents duplicate badge
- *  insertion when the user injects context from the Popover a second time. */
-function editorHasContextReference(editor: Editor, id: string): boolean {
-  let found = false
-  editor.state.doc.descendants((node) => {
-    if (found) return false
-    if (
-      node.type.name === "reference" &&
-      node.attrs?.refType === "context" &&
-      node.attrs?.id === id
-    ) {
-      found = true
-      return false
-    }
-    return true
-  })
-  return found
-}
-
 /** Drop embedded-attachment reference badges from a draft document before it is
  *  persisted: their bytes live only in the in-memory `embeddedPayloadsRef` map
  *  (never serialized into the draft), so a restored badge would send nothing.
@@ -546,11 +533,11 @@ export function MessageInput({
   onSaveQueueEdit,
   onCancelQueueEdit,
   onForkSend,
+  onSteer,
   onAddFeedback,
   feedbackAddDisabled,
   injectContent,
   onInjectConsumed,
-  conversationId: propConversationId,
 }: MessageInputProps) {
   const t = useTranslations("Folder.chat.messageInput")
   const tQueue = useTranslations("Folder.chat.messageQueue")
@@ -604,6 +591,13 @@ export function MessageInput({
   // Flips true once the RichComposer's async (immediatelyRender:false) editor has
   // mounted, so the hydration effect can use the imperative handle.
   const [composerReady, setComposerReady] = useState(false)
+  // Cluster A — pending initial drafts from task→conversation flow
+  const pendingInitialDrafts = usePlatformTabSlice(
+    (s) => s.pendingInitialDrafts
+  )
+  const clearPendingInitialDraft = usePlatformTabSlice(
+    (s) => s.clearPendingInitialDraft
+  )
   // `attachments` now holds only images; non-image files live inline as editor
   // reference badges. This map carries the real bytes-bearing block for each
   // embedded/data-uri badge, keyed by its synthetic `file://` sentinel uri, and
@@ -619,93 +613,6 @@ export function MessageInput({
   // Keep the collapsed settings popover open while dragging the (virtualized)
   // model list's native scrollbar — see `useScrollbarSafeDismiss`.
   const collapsedSelectorsGuard = useScrollbarSafeDismiss()
-  const [taskPopoverOpen, setTaskPopoverOpen] = useState(false)
-
-  // ─── Task context hooks ───
-  const {
-    tabs,
-    activeTabId,
-    pendingInitialDrafts,
-    clearPendingInitialDraft,
-    setPendingTaskLink,
-  } = useTabContext()
-  const activeConversationId = useMemo(() => {
-    const activeTab = tabs.find((tab) => tab.id === activeTabId)
-    return activeTab?.conversationId ?? null
-  }, [tabs, activeTabId])
-  // Use the prop-provided conversationId (specific to this tab) when available;
-  // fall back to the global activeConversationId for backward compatibility.
-  // This prevents pendingInitialDraft badge consumption from leaking across tabs.
-  const ownConversationId = propConversationId ?? activeConversationId
-  // Only positive IDs are real DB conversation IDs. Virtual (negative) IDs are
-  // placeholders for new conversations that haven't been persisted yet. Use this
-  // to gate backend calls like linkConversation that require a real DB row.
-  const hasPersistedConversation =
-    ownConversationId != null && ownConversationId > 0
-  const {
-    linkedTaskInfo,
-    linkedTask,
-    refresh: refreshLinkedTask,
-  } = useLinkedTask(ownConversationId)
-  const { activeProject } = usePlatform()
-  const { activeFolder } = useActiveFolder()
-
-  // Compute KB dir prefix relative to project root for context injection.
-  // doc.filePath is relative to _knowledge; the agent needs project-root-relative paths.
-  const kbDirPrefix = useMemo(() => {
-    const kbDir = (
-      activeProject?.kbLocalDir ??
-      `${activeProject?.rootDir.replace(/\\/g, "/") ?? ""}/_knowledge`
-    ).replace(/\\/g, "/")
-    const fp = activeFolder?.path?.replace(/\\/g, "/") ?? ""
-    if (!fp) return "_knowledge"
-    if (kbDir.startsWith(fp + "/") || kbDir === fp + "/_knowledge") {
-      return kbDir.slice(fp.length + 1)
-    }
-    return "_knowledge"
-  }, [activeProject?.kbLocalDir, activeProject?.rootDir, activeFolder?.path])
-
-  // ─── KB data for task popover (lazy loaded) ───
-  const [popoverKbDocs, setPopoverKbDocs] = useState<KnowledgeDocInfo[]>([])
-  const [popoverAttachments, setPopoverAttachments] = useState<
-    KnowledgeDocInfo[]
-  >([])
-  const [popoverKbLoading, setPopoverKbLoading] = useState(false)
-
-  useEffect(() => {
-    if (!taskPopoverOpen || !activeProject) return
-    let cancelled = false
-    setPopoverKbLoading(true)
-    async function loadKBData() {
-      try {
-        const projectId = activeProject!.id
-        const allDocs = await listKnowledgeDocs({ projectId })
-        if (!cancelled) {
-          setPopoverKbDocs(
-            allDocs.filter((d) => d.docType !== "task_attachment")
-          )
-          // Attachments: filter by linkedTask when available
-          const taskAttachments = allDocs.filter(
-            (d) => d.docType === "task_attachment"
-          )
-          setPopoverAttachments(
-            linkedTask
-              ? taskAttachments.filter((d) => d.taskId === linkedTask.id)
-              : taskAttachments
-          )
-          setPopoverKbLoading(false)
-        }
-      } catch {
-        if (!cancelled) setPopoverKbLoading(false)
-      }
-    }
-    void loadKBData()
-    return () => {
-      cancelled = true
-    }
-  }, [taskPopoverOpen, activeProject, linkedTask])
-
-  // ─── Quick messages ───
   const [quickMessages, setQuickMessages] = useState<QuickMessage[]>([])
   const [quickMessagesLoading, setQuickMessagesLoading] = useState(false)
   // Whether the async Clipboard read API is usable here. It's absent in
@@ -743,15 +650,16 @@ export function MessageInput({
   // Bridge so the early `onChange` handler can call the editor-driven slash
   // detection that is defined further down (after the slash state).
   const detectSlashTriggerRef = useRef<(() => void) | null>(null)
-  const canAttachImages = promptCapabilities.image
-
-  useEffect(() => {
-    if (isActive && !disabled && !isPrompting) {
-      requestAnimationFrame(() => {
-        editorRef.current?.focus()
-      })
-    }
-  }, [isActive, disabled, isPrompting])
+  // Route pasted / dropped / picked images to the top thumbnail strip whenever
+  // the agent can receive them in ANY form — either as a native ACP image block
+  // (`image`) or as an embedded resource blob (`embedded_context`, e.g. Grok,
+  // which advertises `image: false` but `embeddedContext: true`). Without the
+  // `embedded_context` arm, Grok's images fell through to the generic
+  // file-resource path and rendered as an inline badge instead of a thumbnail.
+  // `buildDraft` still picks the wire encoding per-capability, so the sent
+  // payload is unchanged for each agent — this only unifies the presentation.
+  const canAttachImages =
+    promptCapabilities.image || promptCapabilities.embedded_context
 
   useEffect(() => {
     disabledRef.current = disabled
@@ -771,27 +679,8 @@ export function MessageInput({
   }, [])
 
   // Localized group headings + panel chrome for the `@` mention panel.
-  const referenceGroupLabels = useMemo<ReferenceGroupLabels>(
-    () => ({
-      file: t("mentionGroupFile"),
-      agent: t("mentionGroupAgent"),
-      session: t("mentionGroupSession"),
-      commit: t("mentionGroupCommit"),
-      skill: t("mentionGroupSkill"),
-      context: t("mentionGroupContext"),
-    }),
-    [t]
-  )
-  const mentionUiLabels = useMemo<MentionUiLabels>(
-    () => ({
-      empty: t("mentionEmpty"),
-      loading: t("mentionLoading"),
-      listbox: t("mentionListLabel"),
-      more: t("mentionMore"),
-      count: (count: number) => t("mentionCount", { count }),
-    }),
-    [t]
-  )
+  const { groupLabels: referenceGroupLabels, uiLabels: mentionUiLabels } =
+    useComposerMentionLabels()
 
   // Live data sources for the unified `@` mention panel. Pre-warmed only while
   // this composer is the active one (`enabled`). Referentially stable.
@@ -939,6 +828,25 @@ export function MessageInput({
     hydrateFromBlocks,
   ])
 
+  // Focus the composer the moment the editor exists and this tab is active, so
+  // the caret lands as soon as the chat opens — without waiting for the ACP
+  // connection to come up. The editor is always editable (RichComposer receives
+  // no `disabled`; sends are gated in `handleSend`, not editability), so the old
+  // `!disabled` gate only postponed the caret until "connected" for no real
+  // reason. Deliberately NOT keyed on `disabled`: once focus lands on open, a
+  // later connect (disabled → false) must never re-run this and yank focus back.
+  // Keyed on `composerReady` because `immediatelyRender: false` builds the
+  // editor a tick after mount (mirrors the hydration effect's gate). Ordered
+  // after that hydration effect so this rAF runs after its setContent, landing
+  // the caret at the end of a restored draft rather than before it.
+  useEffect(() => {
+    if (isActive && composerReady && !isPrompting) {
+      requestAnimationFrame(() => {
+        editorRef.current?.focus()
+      })
+    }
+  }, [isActive, composerReady, isPrompting])
+
   // Re-hydrate when the user (re)edits a *different* queue item after the
   // initial mount hydration above. Keyed on the item id (not display text) so
   // switching between two items with identical text still reloads.
@@ -1051,61 +959,6 @@ export function MessageInput({
     setComposerReady(true)
   }, [])
 
-  // ─── Consume pending initial draft (from task→conversation flow) ───
-  // Keyed by tabId (attachmentTabId), not conversationId, to prevent badge
-  // drafts from leaking into other tab's editors. Only the tab whose id
-  // matches the draft key will consume and insert the badges.
-  useEffect(() => {
-    if (!composerReady || !attachmentTabId) return
-    const pending = pendingInitialDrafts.get(attachmentTabId)
-    if (!pending) return
-    // One-time ref guard prevents duplicate insertions: when insertReference
-    // triggers a synchronous flushSync re-render (NodeViewRenderer), this
-    // effect re-runs. The ref already contains this tabId, so the re-run
-    // skips — breaking the cascade that caused triple duplication.
-    if (draftConsumedRef.current.has(attachmentTabId)) return
-    draftConsumedRef.current.add(attachmentTabId)
-
-    // Parse refs now (synchronous) — data is captured in the rAF closure.
-    let refs: ReferenceAttrs[]
-    let isLegacyMarkdown = false
-    try {
-      refs = JSON.parse(pending) as ReferenceAttrs[]
-    } catch {
-      isLegacyMarkdown = true
-    }
-
-    // Defer editor mutations to the next animation frame to avoid flushSync
-    // warnings during the commit phase. Same rAF pattern used by the
-    // hydration and inject effects elsewhere in this component.
-    const raf = requestAnimationFrame(() => {
-      const editor = editorRef.current?.getEditor()
-      if (!editor) {
-        // Editor unavailable — remove the guard so a future effect run
-        // (when the editor is ready) can retry.
-        draftConsumedRef.current.delete(attachmentTabId)
-        return
-      }
-      if (isLegacyMarkdown) {
-        editorRef.current?.insertTextAtCursor(pending)
-      } else {
-        for (const ref of refs) {
-          editor.chain().insertReference(ref).insertContent(" ").run()
-        }
-      }
-      // Clear the draft after successful insertion. This triggers a state
-      // update, but the ref guard already prevents any re-trigger, and the
-      // rAF has completed so cancelAnimationFrame cleanup is a no-op.
-      clearPendingInitialDraft(attachmentTabId)
-    })
-    return () => cancelAnimationFrame(raf)
-  }, [
-    composerReady,
-    attachmentTabId,
-    pendingInitialDrafts,
-    clearPendingInitialDraft,
-  ])
-
   const availableModes = useMemo(() => modes ?? [], [modes])
   const availableConfigOptions = useMemo(
     () => configOptions ?? [],
@@ -1175,20 +1028,16 @@ export function MessageInput({
   const [slashDropdownOpen, setSlashDropdownOpen] = useState(false)
   const [slashDropdownSearch, setSlashDropdownSearch] = useState("")
   const slashDropdownInputRef = useRef<HTMLInputElement>(null)
-  const filteredSlashDropdownCommands = useMemo(() => {
-    const q = slashDropdownSearch.toLowerCase().trim()
-    if (!q) return slashCommands
-    const nameMatches: typeof slashCommands = []
-    const descOnlyMatches: typeof slashCommands = []
-    for (const cmd of slashCommands) {
-      if (cmd.name.toLowerCase().includes(q)) {
-        nameMatches.push(cmd)
-      } else if (cmd.description?.toLowerCase().includes(q)) {
-        descOnlyMatches.push(cmd)
-      }
-    }
-    return [...nameMatches, ...descOnlyMatches]
-  }, [slashCommands, slashDropdownSearch])
+  const filteredSlashDropdownCommands = useMemo(
+    () =>
+      rankByTextMatch(
+        slashDropdownSearch,
+        slashCommands,
+        (cmd) => cmd.name,
+        (cmd) => cmd.description
+      ),
+    [slashCommands, slashDropdownSearch]
+  )
   const handleSlashDropdownOpenChange = useCallback((open: boolean) => {
     setSlashDropdownOpen(open)
     if (!open) setSlashDropdownSearch("")
@@ -1207,28 +1056,19 @@ export function MessageInput({
   const filteredSlashCommands = useMemo(() => {
     if (!slashMenuOpen || slashCommands.length === 0) return []
     if (slashTriggerChar !== "/") return []
-    const filter = slashFilter.toLowerCase()
-    return slashCommands.filter((cmd) =>
-      cmd.name.toLowerCase().includes(filter)
-    )
+    return rankByTextMatch(slashFilter, slashCommands, (cmd) => cmd.name)
   }, [slashMenuOpen, slashCommands, slashTriggerChar, slashFilter])
   const filteredSlashSkills = useMemo(() => {
     // Skills autocomplete is Codex-only and triggered by `$`.
     if (agentType !== "codex") return []
     if (!slashMenuOpen || availableSkills.length === 0) return []
     if (slashTriggerChar !== "$") return []
-    const filter = slashFilter.toLowerCase()
-    if (!filter) return availableSkills
-    const nameMatches: typeof availableSkills = []
-    const idOnlyMatches: typeof availableSkills = []
-    for (const skill of availableSkills) {
-      if (skill.name.toLowerCase().includes(filter)) {
-        nameMatches.push(skill)
-      } else if (skill.id.toLowerCase().includes(filter)) {
-        idOnlyMatches.push(skill)
-      }
-    }
-    return [...nameMatches, ...idOnlyMatches]
+    return rankByTextMatch(
+      slashFilter,
+      availableSkills,
+      (skill) => skill.name,
+      (skill) => skill.id
+    )
   }, [slashMenuOpen, availableSkills, agentType, slashTriggerChar, slashFilter])
   const slashAutocompleteCount =
     filteredSlashCommands.length + filteredSlashSkills.length
@@ -1656,27 +1496,134 @@ export function MessageInput({
     ]
   )
 
-  const appendImageAttachments = useCallback(async (files: File[]) => {
-    if (files.length === 0) return
-    const parsed = await Promise.all(
-      files.map(async (file, index) => {
-        const mimeType =
-          file.type && file.type.startsWith("image/")
-            ? file.type
-            : (mimeTypeFromPath(file.name) ?? "image/png")
-        const base64Data = await blobToBase64(file)
-        return {
-          id: `image:${Date.now()}:${index}:${randomUUID()}`,
-          type: "image" as const,
-          data: base64Data,
-          uri: null,
-          name: file.name || `image-${Date.now()}-${index + 1}`,
-          mimeType,
+  const appendImageAttachments = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0) return
+      // Web / remote-workspace mode: the prompt request runs through the
+      // HTTP API, whose body must stay small (axum's 2 MiB default limit —
+      // a couple of inline base64 screenshots would 413 the send). Stream
+      // the bytes through the upload endpoint instead; the base64 stays
+      // local for the thumbnail and the transport strips it from the sent
+      // block (`stripUploadedImagePayloads`), leaving the server to
+      // re-inline the bytes from the uploaded file (`prompt_hydration`).
+      // Desktop-local mode keeps the inline path — Tauri IPC has no body
+      // limit and the workspace has no uploads dir.
+      const uploadImages = !showNativePaperclip
+
+      const oversized = uploadImages
+        ? files.filter((f) => f.size > UPLOAD_MAX_BYTES)
+        : []
+      if (oversized.length > 0) {
+        toast.error(
+          tAttach("attachUploadTooLarge", {
+            limit: Math.round(UPLOAD_MAX_BYTES / (1024 * 1024)),
+            names: oversized.map((f) => f.name).join(", "),
+          })
+        )
+      }
+      const accepted = files.filter((file) => {
+        if (uploadImages && file.size > UPLOAD_MAX_BYTES) return false
+        if (uploadImages && file.size === 0) {
+          // Matches `uploadAttachment`'s EmptyAttachmentError semantics:
+          // dropped silently, no toast, no broken thumbnail.
+          console.warn(
+            `[MessageInput] skipping empty image attachment: ${file.name}`
+          )
+          return false
         }
+        return true
       })
-    )
-    setAttachments((prev) => [...prev, ...parsed])
-  }, [])
+      if (accepted.length === 0) return
+
+      const parsed = await Promise.all(
+        accepted.map(async (file, index) => {
+          const mimeType =
+            file.type && file.type.startsWith("image/")
+              ? file.type
+              : (mimeTypeFromPath(file.name) ?? "image/png")
+          const base64Data = await blobToBase64(file)
+          return {
+            attachment: {
+              id: `image:${Date.now()}:${index}:${randomUUID()}`,
+              type: "image" as const,
+              data: base64Data,
+              uri: null,
+              name: file.name || `image-${Date.now()}-${index + 1}`,
+              mimeType,
+              ...(uploadImages ? { uploading: true } : {}),
+            },
+            file,
+          }
+        })
+      )
+      // Thumbnails appear immediately; uploads settle in the background and
+      // flip `uploading` off (send is gated on that in `handleSend`).
+      setAttachments((prev) => [...prev, ...parsed.map((p) => p.attachment)])
+      if (!uploadImages) return
+
+      const failed: Array<{ name: string; reason: unknown }> = []
+      const quotaRejected: string[] = []
+      const CONCURRENCY = 3
+      let cursor = 0
+      const workers = Array.from(
+        { length: Math.min(CONCURRENCY, parsed.length) },
+        async () => {
+          while (cursor < parsed.length) {
+            const idx = cursor++
+            const { attachment, file } = parsed[idx]
+            try {
+              const r = await uploadAttachment(file, attachmentTabId ?? null)
+              const uri = buildFileUri(r.path)
+              setAttachments((prev) =>
+                prev.map((a) =>
+                  a.id === attachment.id ? { ...a, uri, uploading: false } : a
+                )
+              )
+            } catch (error) {
+              setAttachments((prev) =>
+                prev.filter((a) => a.id !== attachment.id)
+              )
+              if (isEmptyAttachmentError(error)) {
+                console.warn(
+                  `[MessageInput] skipping empty image attachment: ${attachment.name}`
+                )
+                continue
+              }
+              const appError = extractAppCommandError(error)
+              if (appError?.i18n_key === UPLOAD_I18N_KEY_QUOTA_EXCEEDED) {
+                quotaRejected.push(attachment.name)
+                continue
+              }
+              failed.push({ name: attachment.name, reason: error })
+            }
+          }
+        }
+      )
+      await Promise.all(workers)
+
+      if (quotaRejected.length > 0) {
+        toast.error(
+          tAttach("attachUploadQuotaExceeded", {
+            names: quotaRejected.join(", "),
+          })
+        )
+      }
+      if (failed.length > 0) {
+        for (const f of failed) {
+          console.error(
+            `[MessageInput] image upload failed (${f.name}):`,
+            f.reason
+          )
+        }
+        toast.error(
+          tAttach("attachUploadFailed", {
+            names: failed.map((r) => r.name).join(", "),
+          })
+        )
+      }
+    },
+    [showNativePaperclip, attachmentTabId, tAttach]
+  )
 
   const appendImagePathAttachments = useCallback(
     async (paths: string[]) => {
@@ -1764,6 +1711,7 @@ export function MessageInput({
       const oversize: string[] = []
       const directories: string[] = []
       const quotaRejected: string[] = []
+      const imageAttachmentsToAdd: ImageInputAttachment[] = []
 
       const CONCURRENCY = 3
       let cursor = 0
@@ -1779,6 +1727,28 @@ export function MessageInput({
                 path,
                 attachmentTabId ?? null
               )
+              // A dropped image keeps its image-ness: attach it as a
+              // thumbnail whose uri is the uploaded server-side file, so the
+              // agent receives a real image block (hydrated server-side)
+              // instead of a ResourceLink it may never open. The local path
+              // is only readable on THIS desktop — the thumbnail preview
+              // reads it via local IPC; the remote agent reads the upload.
+              const mimeType = r.mimeType ?? mimeTypeFromPath(name) ?? ""
+              if (canAttachImages && mimeType.startsWith("image/")) {
+                const previewData = await readLocalFileBase64(
+                  path,
+                  UPLOAD_MAX_BYTES
+                )
+                imageAttachmentsToAdd.push({
+                  id: `image:${Date.now()}:${idx}:${randomUUID()}`,
+                  type: "image",
+                  data: previewData,
+                  uri: buildFileUri(r.path),
+                  name,
+                  mimeType,
+                })
+                continue
+              }
               succeeded.push(r.path)
             } catch (error) {
               if (isEmptyAttachmentError(error)) {
@@ -1849,11 +1819,14 @@ export function MessageInput({
           })
         )
       }
+      if (imageAttachmentsToAdd.length > 0) {
+        setAttachments((prev) => [...prev, ...imageAttachmentsToAdd])
+      }
       if (succeeded.length > 0) {
         appendResourceAttachments(succeeded)
       }
     },
-    [appendResourceAttachments, attachmentTabId, tAttach]
+    [appendResourceAttachments, attachmentTabId, canAttachImages, tAttach]
   )
 
   const uploadPathsToRemoteRef = useRef(uploadPathsToRemote)
@@ -1925,6 +1898,42 @@ export function MessageInput({
       return false
     },
     [appendFilesFromInput, disabled]
+  )
+
+  // Insert an inline file reference for a file-tree entry dropped onto the
+  // composer, placing the caret at the drop point first so the badge lands where
+  // the user released (native-textarea feel). Shared by the editor-level drop
+  // (`onDropFiles`) and the container-chrome drop (`handleContainerDrop`).
+  const insertTreeDropAtPoint = useCallback(
+    (absPath: string, clientX: number, clientY: number) => {
+      editorRef.current?.focusAtCoords(clientX, clientY)
+      appendResourceAttachments([absPath], { atCaret: true })
+    },
+    [appendResourceAttachments]
+  )
+
+  // Routed from RichComposer's `onDropFiles` (ProseMirror's `handleDrop`).
+  // Consumes a file-tree drag so PM does not insert the drag's `text/plain`
+  // absolute-path fallback as literal text, and stops propagation so the
+  // container's own drop handler doesn't double-insert. Returns false for every
+  // other drop (OS files, editor text moves) so existing behavior is untouched.
+  const handleEditorDrop = useCallback(
+    (event: DragEvent): boolean => {
+      if (disabled) return false
+      if (!hasFileTreeDragType(event.dataTransfer)) return false
+      const payload = readFileTreeDragPayload(event.dataTransfer)
+      if (!payload) return false
+      event.preventDefault()
+      event.stopPropagation()
+      // `stopPropagation` keeps the container's `onDrop` from double-inserting,
+      // but that handler is also what clears the drag overlay — and a completed
+      // drop doesn't reliably emit `dragleave`. Clear it here so the overlay
+      // can't get stuck covering the composer.
+      setDragActiveIfChanged(false)
+      insertTreeDropAtPoint(payload.absPath, event.clientX, event.clientY)
+      return true
+    },
+    [disabled, insertTreeDropAtPoint, setDragActiveIfChanged]
   )
 
   useEffect(() => {
@@ -2026,62 +2035,6 @@ export function MessageInput({
     chain.insertReference(commandToReference(cmd)).insertContent(" ").run()
   }, [])
 
-  // ─── Task context: inject badges into editor ───
-  // Skips options whose badge already exists in the editor (deduped by id),
-  // preventing duplicate context badges when the user injects a second time.
-  const handleTaskInject = useCallback((payload: ContextInjectPayload) => {
-    const editor = editorRef.current?.getEditor()
-    if (!editor) {
-      setTaskPopoverOpen(false)
-      return
-    }
-    let chain = editor.chain().focus("end")
-    let inserted = 0
-    for (const option of payload.options) {
-      const ref = optionToReferenceAttrs(option)
-      // Skip if a context badge with this id already exists in the editor
-      if (editorHasContextReference(editor, String(option.id))) continue
-      chain = chain.insertReference(ref).insertContent(" ")
-      inserted++
-    }
-    if (inserted > 0) chain.run()
-    setTaskPopoverOpen(false)
-  }, [])
-
-  const handleTaskLink = useCallback(
-    async (
-      taskId: number,
-      role: string,
-      taskInfo?: { title: string; taskType: string }
-    ) => {
-      if (hasPersistedConversation) {
-        // Persisted conversation — link immediately
-        await linkConversation({
-          taskId,
-          conversationId: ownConversationId,
-          role,
-        })
-        refreshLinkedTask()
-      } else if (attachmentTabId && taskInfo) {
-        // New (unpersisted) conversation — store intent for later
-        setPendingTaskLink(
-          attachmentTabId,
-          taskId,
-          role,
-          taskInfo.title,
-          taskInfo.taskType
-        )
-      }
-    },
-    [
-      hasPersistedConversation,
-      ownConversationId,
-      refreshLinkedTask,
-      setPendingTaskLink,
-      attachmentTabId,
-    ]
-  )
-
   // ── "+" menu skill shortcuts (experts / daily office / research) ──
   //
   // Surface the welcome-page skill families inside an active conversation. Each
@@ -2116,7 +2069,7 @@ export function MessageInput({
 
   const notifySkillNotEnabled = useCallback(
     (skillLabel: string, section: SettingsSection) => {
-      const agentLabel = agentType ? AGENT_LABELS[agentType] : ""
+      const agentLabel = agentType ? getAgentLabel(agentType) : ""
       toast.warning(
         tQa("notEnabled.title", { skill: skillLabel, agent: agentLabel }),
         {
@@ -2239,10 +2192,14 @@ export function MessageInput({
     input.multiple = true
     input.onchange = async () => {
       const all = input.files ? Array.from(input.files) : []
-      await uploadAndAppendFiles(all)
+      // Route through the shared classifier so images become thumbnail
+      // attachments (uploaded, then re-inlined server-side) instead of
+      // degrading to plain ResourceLinks; non-images keep the existing
+      // upload → ResourceLink path via `appendFilesAsResources`.
+      await appendFilesFromInput(all)
     }
     input.click()
-  }, [disabled, uploadAndAppendFiles])
+  }, [disabled, appendFilesFromInput])
 
   const handleServerFilesSelected = useCallback(
     (paths: string[]) => {
@@ -2464,6 +2421,61 @@ export function MessageInput({
     }
   }, [attachmentTabId])
 
+  // ─── Consume pending initial draft (from task→conversation flow) ───
+  // Keyed by tabId (attachmentTabId), not conversationId, to prevent badge
+  // drafts from leaking into other tab's editors. Only the tab whose id
+  // matches the draft key will consume and insert the badges.
+  useEffect(() => {
+    if (!composerReady || !attachmentTabId) return
+    const pending = pendingInitialDrafts.get(attachmentTabId)
+    if (!pending) return
+    // One-time ref guard prevents duplicate insertions: when insertReference
+    // triggers a synchronous flushSync re-render (NodeViewRenderer), this
+    // effect re-runs. The ref already contains this tabId, so the re-run
+    // skips — breaking the cascade that caused triple duplication.
+    if (draftConsumedRef.current.has(attachmentTabId)) return
+    draftConsumedRef.current.add(attachmentTabId)
+
+    // Parse refs now (synchronous) — data is captured in the rAF closure.
+    let refs: ReferenceAttrs[]
+    let isLegacyMarkdown = false
+    try {
+      refs = JSON.parse(pending) as ReferenceAttrs[]
+    } catch {
+      isLegacyMarkdown = true
+    }
+
+    // Defer editor mutations to the next animation frame to avoid flushSync
+    // warnings during the commit phase. Same rAF pattern used by the
+    // hydration and inject effects elsewhere in this component.
+    const raf = requestAnimationFrame(() => {
+      const editor = editorRef.current?.getEditor()
+      if (!editor) {
+        // Editor unavailable — remove the guard so a future effect run
+        // (when the editor is ready) can retry.
+        draftConsumedRef.current.delete(attachmentTabId)
+        return
+      }
+      if (isLegacyMarkdown) {
+        editorRef.current?.insertTextAtCursor(pending)
+      } else {
+        for (const ref of refs) {
+          editor.chain().insertReference(ref).insertContent(" ").run()
+        }
+      }
+      // Clear the draft after successful insertion. This triggers a state
+      // update, but the ref guard already prevents any re-trigger, and the
+      // rAF has completed so cancelAnimationFrame cleanup is a no-op.
+      clearPendingInitialDraft(attachmentTabId)
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [
+    composerReady,
+    attachmentTabId,
+    pendingInitialDrafts,
+    clearPendingInitialDraft,
+  ])
+
   useEffect(() => {
     let cancelled = false
     const unlisteners: Array<() => void | Promise<void>> = []
@@ -2634,14 +2646,14 @@ export function MessageInput({
     if (blocks.length === 0 && attachments.length === 0) return null
 
     // `attachments` holds only images now — files live inline as badges above.
+    // The wire encoding is capability-driven (native `image` block vs embedded
+    // `resource` blob) so an agent that advertises `image: false` but
+    // `embedded_context: true` (e.g. Grok) still receives the bytes it accepts.
     for (const attachment of attachments) {
       if (attachment.type === "image") {
-        blocks.push({
-          type: "image",
-          data: attachment.data,
-          mime_type: attachment.mimeType,
-          uri: attachment.uri,
-        })
+        blocks.push(
+          imageAttachmentToPromptBlock(attachment, promptCapabilities)
+        )
       }
     }
 
@@ -2649,7 +2661,7 @@ export function MessageInput({
       displayProse ||
       `Attached ${attachments.length} attachment${attachments.length > 1 ? "s" : ""}`
     return { blocks, displayText }
-  }, [attachments, skillPrefix])
+  }, [attachments, skillPrefix, promptCapabilities])
 
   // Clear the editor + attachments after a send / enqueue / save.
   const resetComposer = useCallback(() => {
@@ -2665,6 +2677,15 @@ export function MessageInput({
     // can keep typing, but a plain send is blocked — only enqueue / queue-edit
     // save go through. Mirrors the legacy textarea's keydown guard.
     if (disabled && !isPrompting && !isEditingQueueItem) return
+    // An image whose web/remote upload hasn't settled has no server-side uri
+    // yet — the transport would strip its base64 and the backend would have
+    // nothing to hydrate. Block ALL three branches below (send / enqueue /
+    // queue-edit save; a queued block is sent verbatim later) until uploads
+    // finish. The draft stays intact, so this is a "wait a moment", not a loss.
+    if (attachments.some((a) => a.type === "image" && a.uploading)) {
+      toast.error(tAttach("attachUploadInProgress"))
+      return
+    }
     const draft = buildDraft()
     if (!draft) return
 
@@ -2689,6 +2710,8 @@ export function MessageInput({
     resetComposer()
   }, [
     disabled,
+    attachments,
+    tAttach,
     buildDraft,
     isEditingQueueItem,
     isPrompting,
@@ -2703,6 +2726,13 @@ export function MessageInput({
 
   const handleForkSendClick = useCallback(() => {
     if (!onForkSend) return
+    // Same uploading gate as `handleSend`: a fork-send consumes the draft
+    // (and its blocks) immediately, so an unsettled upload would strip to
+    // nothing on the wire.
+    if (attachments.some((a) => a.type === "image" && a.uploading)) {
+      toast.error(tAttach("attachUploadInProgress"))
+      return
+    }
     const draft = buildDraft()
     if (!draft) return
     // Fork-send consumes the draft synchronously, exactly like a normal send:
@@ -2716,11 +2746,61 @@ export function MessageInput({
     resetComposer()
   }, [
     onForkSend,
+    attachments,
+    tAttach,
     buildDraft,
     effectiveModeId,
     showModeSelector,
     effectiveDraftStorageKey,
     resetComposer,
+  ])
+
+  // Mid-turn insert into current turn (native steering). Draft-only path: the
+  // text of a draft with non-text blocks (file badges) can't be reconstructed,
+  // so those drafts are queued whole instead of being silently stripped.
+  // Image attachments disable the menu entry at render.
+  const [steering, setSteering] = useState(false)
+  const handleSteerClick = useCallback(async () => {
+    if (!onSteer || steering) return
+    const draft = buildDraft()
+    if (!draft) return
+    const enqueueInstead = () => {
+      if (!onEnqueue) return
+      onEnqueue(draft, showModeSelector ? effectiveModeId : null)
+      resetComposer()
+      toast.info(t("steerQueuedInstead"))
+    }
+    if (draft.blocks.some((b) => b.type !== "text")) {
+      enqueueInstead()
+      return
+    }
+    const text = draft.blocks
+      .map((b) => (b.type === "text" ? b.text : ""))
+      .join("\n")
+      .trim()
+    if (!text) return
+    setSteering(true)
+    try {
+      await onSteer(text)
+      resetComposer()
+    } catch (err) {
+      if (isNoActiveTurnRejection(err)) {
+        enqueueInstead()
+      } else {
+        toast.error(t("steerFailed"), { description: toErrorMessage(err) })
+      }
+    } finally {
+      setSteering(false)
+    }
+  }, [
+    onSteer,
+    steering,
+    buildDraft,
+    onEnqueue,
+    showModeSelector,
+    effectiveModeId,
+    resetComposer,
+    t,
   ])
 
   // Navigation/confirm/escape keys for the `/` (commands) and `$` (Codex skills)
@@ -2817,9 +2897,12 @@ export function MessageInput({
 
   const handleContainerDragOver = useCallback(
     (event: React.DragEvent<HTMLDivElement>) => {
-      if (!hasDragFiles(event.dataTransfer)) return
+      const isTreeDrag = hasFileTreeDragType(event.dataTransfer)
+      if (!hasDragFiles(event.dataTransfer) && !isTreeDrag) return
       event.preventDefault()
       if (!disabled) {
+        // A file-tree entry is copied in as a reference, not moved.
+        if (isTreeDrag) event.dataTransfer.dropEffect = "copy"
         setDragActiveIfChanged(true)
       }
     },
@@ -2843,11 +2926,21 @@ export function MessageInput({
 
   const handleContainerDrop = useCallback(
     (event: React.DragEvent<HTMLDivElement>) => {
-      if (!hasDragFiles(event.dataTransfer)) return
+      const treePayload = hasFileTreeDragType(event.dataTransfer)
+        ? readFileTreeDragPayload(event.dataTransfer)
+        : null
+      if (!hasDragFiles(event.dataTransfer) && !treePayload) return
       event.preventDefault()
       lastDomDropAtRef.current = Date.now()
       setDragActiveIfChanged(false)
       if (disabled) return
+      // A file-tree entry dropped on the composer chrome (the editor's own drop
+      // surface is handled first by `handleEditorDrop`) becomes an inline file
+      // reference at the drop point.
+      if (treePayload) {
+        insertTreeDropAtPoint(treePayload.absPath, event.clientX, event.clientY)
+        return
+      }
       const files = Array.from(event.dataTransfer.files ?? [])
       if (files.length > 0) {
         void appendFilesFromInput(files).catch((error) => {
@@ -2855,7 +2948,12 @@ export function MessageInput({
         })
       }
     },
-    [appendFilesFromInput, disabled, setDragActiveIfChanged]
+    [
+      appendFilesFromInput,
+      disabled,
+      insertTreeDropAtPoint,
+      setDragActiveIfChanged,
+    ]
   )
 
   const hasImageAttachments = imageAttachments.length > 0
@@ -3010,6 +3108,18 @@ export function MessageInput({
     t,
   ])
 
+  // Platform composer toolbar callback — converts InjectOption[] selections
+  // from ProjectResourcePicker into inline reference badges in the composer.
+  const handlePlatformInject = useCallback((refs: ReferenceAttrs[]) => {
+    const editor = editorRef.current?.getEditor()
+    if (!editor) return
+    let chain = editor.chain().focus("end")
+    for (const ref of refs) {
+      chain = chain.insertReference(ref).insertContent(" ")
+    }
+    chain.run()
+  }, [])
+
   const actionButtons = isEditingQueueItem ? (
     <div className="flex items-center gap-1">
       <Button
@@ -3032,15 +3142,71 @@ export function MessageInput({
       </Button>
     </div>
   ) : isPrompting && onCancel ? (
-    <Button
-      onClick={onCancel}
-      variant="destructive"
-      size="icon"
-      className="h-8 w-8"
-      title={t("cancel")}
-    >
-      <Square className="size-4" />
-    </Button>
+    // Native-steering sessions surface the mid-turn actions that already exist
+    // but were keyboard-only/invisible: the primary half of the split queues the
+    // draft (what Enter has always done here), the dropdown injects it into the
+    // RUNNING turn. Without `onSteer` this branch stays pixel-identical to the
+    // historical Stop-only form below.
+    onSteer && onEnqueue && hasSendableContent ? (
+      <div className="flex items-center gap-1">
+        <Button
+          onClick={onCancel}
+          variant="destructive"
+          size="icon"
+          className="h-8 w-8"
+          title={t("cancel")}
+        >
+          <Square className="size-4" />
+        </Button>
+        <div className="flex items-center">
+          <Button
+            onClick={handleSend}
+            disabled={steering}
+            size="icon"
+            className="h-8 w-8 rounded-r-none"
+            title={t("queueMessage")}
+          >
+            <Send className="size-4" />
+          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                disabled={steering}
+                size="icon"
+                className="h-8 w-5 rounded-l-none border-l border-primary-foreground/20"
+                aria-label={t("steerIntoTurn")}
+              >
+                <ChevronUp className="size-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" side="top">
+              <DropdownMenuItem
+                onSelect={() => void handleSteerClick()}
+                disabled={steering || attachments.length > 0}
+                title={
+                  attachments.length > 0
+                    ? t("steerAttachmentsUnsupported")
+                    : undefined
+                }
+              >
+                <Zap className="h-4 w-4" />
+                {t("steerIntoTurn")}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      </div>
+    ) : (
+      <Button
+        onClick={onCancel}
+        variant="destructive"
+        size="icon"
+        className="h-8 w-8"
+        title={t("cancel")}
+      >
+        <Square className="size-4" />
+      </Button>
+    )
   ) : onForkSend ? (
     <div className="flex items-center">
       <Button
@@ -3087,6 +3253,12 @@ export function MessageInput({
     <div
       ref={containerRef}
       className="relative"
+      // Marks this composer as a file-tree drop zone. On desktop Tauri's webview
+      // swallows the HTML5 `drop`, so a dragged entry is committed from Tauri's
+      // native drag-drop event by hit-testing the drop point; this attribute
+      // lets that hit-test route the drop to this session's input (see the tree
+      // tab's desktop commit). Absent when there's no tab to attach to.
+      data-tree-drop-composer={attachmentTabId ?? undefined}
       onKeyDown={handleContainerKeyDown}
       onDragOver={handleContainerDragOver}
       onDragLeave={handleContainerDragLeave}
@@ -3113,7 +3285,7 @@ export function MessageInput({
                 }}
               >
                 <span className="shrink-0 font-mono text-primary">
-                  /{cmd.name}
+                  {commandInvocationToken(cmd.name)}
                 </span>
                 <span className="truncate text-xs text-muted-foreground">
                   {cmd.description}
@@ -3153,6 +3325,10 @@ export function MessageInput({
           </div>
         </div>
       )}
+      {/* When the folder/branch row is attached below the composer, this group
+          clips both into one rounded box (`overflow-hidden rounded-xl`); the
+          drag-active ring rides the wrapper so it isn't clipped. Standalone
+          (no row) it's layout-neutral (`display:contents`). */}
       <div
         className={cn(
           folderBranchPickerAttached
@@ -3175,11 +3351,24 @@ export function MessageInput({
                 // blank areas (padding, the dead space below a short message, the
                 // action-bar gaps) so the whole input reads as clickable-to-type;
                 // interactive controls re-assert their own cursor (see globals.css).
-                "codeg-composer-chrome @container relative flex flex-col rounded-xl border border-input bg-transparent transition-colors",
+                // Resting border uses `border-foreground/20` (a touch darker than
+                // the default `border-input`, which is near-invisible at rest and
+                // vanishes over a workspace background image); it adapts per theme
+                // (dark ink in light mode, light ink in dark) and stays legible.
+                // Focus still swaps to `border-ring` below.
+                "codeg-composer-chrome @container relative flex flex-col rounded-xl border border-foreground/20 bg-transparent transition-colors",
                 // Standard focus ring — always shown when the composer is
-                // focused (the plain default input style).
+                // focused (the plain default input style). `bg-background
+                // ws-transparent-bg`: opaque surface normally, but with a
+                // workspace-bg image the composer goes transparent to reveal the
+                // real image like the rest of the canvas (no frosted treatment) —
+                // the border stays. Off (no image) it's the plain background,
+                // unchanged. When the folder/branch row is attached below, the
+                // solid surface + an INSET focus ring live here so the shared
+                // rounded box (clipped by the wrapper) reads as one control and
+                // the ring isn't clipped away.
                 folderBranchPickerAttached
-                  ? "bg-background focus-within:border-ring focus-within:ring-[3px] focus-within:ring-inset focus-within:ring-ring/50"
+                  ? "bg-background ws-transparent-bg focus-within:border-ring focus-within:ring-[3px] focus-within:ring-inset focus-within:ring-ring/50"
                   : "focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/50",
                 // Active session, tiled across multiple sessions: a gradient
                 // flows around the border to mark which tile is active — but ONLY
@@ -3218,6 +3407,13 @@ export function MessageInput({
                             className="h-14 w-14 object-cover"
                           />
                         </button>
+                        {attachment.uploading ? (
+                          // Web/remote upload still in flight — sends are
+                          // gated on this settling (see `handleSend`).
+                          <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-background/50">
+                            <Loader2 className="h-4 w-4 animate-spin text-foreground/80" />
+                          </div>
+                        ) : null}
                         <button
                           type="button"
                           onClick={() => removeAttachment(attachment.id)}
@@ -3246,6 +3442,7 @@ export function MessageInput({
                 onSubmit={handleSend}
                 onFocus={onFocus}
                 onPasteFiles={handlePasteFiles}
+                onDropFiles={handleEditorDrop}
                 onPlainPaste={handlePlainPasteShortcut}
                 submitShortcut={shortcuts.send_message}
                 newlineShortcut={shortcuts.newline_in_message}
@@ -3451,7 +3648,7 @@ export function MessageInput({
                                   className="hover:bg-accent hover:text-accent-foreground"
                                 >
                                   <DropdownRadioItemContent
-                                    label={`/${cmd.name}`}
+                                    label={commandInvocationToken(cmd.name)}
                                     description={cmd.description}
                                   />
                                 </DropdownMenuItem>
@@ -3583,41 +3780,9 @@ export function MessageInput({
                       )}
                     </DropdownMenuContent>
                   </DropdownMenu>
-                  <Popover
-                    modal
-                    open={taskPopoverOpen}
-                    onOpenChange={setTaskPopoverOpen}
-                  >
-                    <PopoverTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        size="icon-xs"
-                        className="shrink-0 text-muted-foreground"
-                        title="Task context"
-                        aria-label="Task context"
-                      >
-                        <ClipboardList className="size-4" />
-                      </Button>
-                    </PopoverTrigger>
-                    <PopoverContent
-                      side="top"
-                      align="start"
-                      className="w-[22rem] max-w-[calc(100vw-1rem)] p-0"
-                    >
-                      <ProjectResourcePicker
-                        conversationId={ownConversationId}
-                        linkedTaskInfo={linkedTaskInfo}
-                        linkedTask={linkedTask}
-                        onInject={handleTaskInject}
-                        onLink={handleTaskLink}
-                        activeProjectId={activeProject?.id ?? null}
-                        kbDocs={popoverKbDocs}
-                        attachments={popoverAttachments}
-                        kbLoading={popoverKbLoading}
-                        kbDirPrefix={kbDirPrefix}
-                      />
-                    </PopoverContent>
-                  </Popover>
+                  <PlatformComposerToolbar
+                    onInjectReferences={handlePlatformInject}
+                  />
                   {hasInlineSelectors && (
                     <div className="hidden min-w-0 items-end gap-1 @[30rem]:flex">
                       {inlineSelectorItems}
@@ -3768,18 +3933,27 @@ export function MessageInput({
           </ContextMenuContent>
         </ContextMenu>
         {hasFolderBranchPicker && (
-          // `pl-2` mirrors the action bar's `px-2` so this row lines up with the
-          // composer above. Kept on the rem scale (no px literals) so it tracks
-          // UI zoom; the folder icon then aligns with the centered "+" icon
-          // because both buttons add the same 1px transparent border (paired
-          // with the picker buttons' `px-1.5`).
-          <div
-            className={cn(
-              "flex items-center gap-1 pl-2 text-xs text-muted-foreground",
-              folderBranchPickerAttached ? "rounded-b-xl pt-1 pr-2" : "mt-1.5"
-            )}
-          >
-            <ConversationFolderBranchPicker tabId={attachmentTabId} />
+          // `px-2` mirrors the action bar so this row lines up with the composer
+          // above; the folder icon then aligns with the centered "+" icon (both
+          // add the same 1px transparent border, paired with the picker buttons'
+          // `px-1.5`). The row only renders while attached below the composer, so
+          // it always takes the rounded-bottom box treatment. Pickers sit at the
+          // left edge; the context-usage circle + agent connection status
+          // right-align at the trailing edge.
+          <div className="flex items-center justify-between gap-2 rounded-b-xl px-2 pt-1 text-xs text-muted-foreground">
+            <div className="flex min-w-0 items-center gap-1">
+              <ConversationFolderBranchPicker tabId={attachmentTabId} />
+            </div>
+            {/* `pr-px` offsets the composer chrome's 1px border: the send button
+                sits INSIDE that border while this status row sits outside it, so
+                without the 1px nudge the trailing icon hangs 1px past the button.
+                With it, the connection icon's RIGHT edge is flush (0px) with the
+                send button's right edge in the action bar above — no centring
+                slot, which would inset the narrow icon and break the alignment. */}
+            <div className="flex shrink-0 items-center gap-3 pr-px">
+              <ComposerContextUsage tabId={attachmentTabId ?? null} />
+              <ComposerConnectionStatus tabId={attachmentTabId ?? null} />
+            </div>
           </div>
         )}
       </div>

@@ -39,7 +39,7 @@ pub async fn get_project_core(
         .map_err(AppCommandError::from)?;
 
     // Count tasks by status
-    let tasks = crate::db::service::platform_task_service::list_by_project(conn, id, None, None, None)
+    let tasks = crate::db::service::platform_task_service::list_by_project(conn, id, None, None, None, None)
         .await
         .map_err(AppCommandError::from)?;
 
@@ -402,9 +402,14 @@ async fn find_or_create_platform_repo_folder(
     conn: &sea_orm::DatabaseConnection,
     abs_dir: &str,
 ) -> Result<Option<i32>, AppCommandError> {
-    let existing = folder_service::add_platform_repo_folder(conn, abs_dir)
-        .await
-        .map_err(AppCommandError::from)?;
+    // ⛔ Replaced call from `folder_service` → `platform_folder_kind`:
+    //    the platform_repo add helper moved to a standalone module per D32,
+    //    so `folder_service` stays untouched by the platform surface.
+    let existing = crate::db::service::platform_folder_kind::add_platform_repo_folder(
+        conn, abs_dir,
+    )
+    .await
+    .map_err(AppCommandError::from)?;
 
     Ok(Some(existing.id))
 }

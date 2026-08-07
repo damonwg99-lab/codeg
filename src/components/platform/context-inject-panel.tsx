@@ -4,7 +4,7 @@ import { useMemo, useState } from "react"
 import { ClipboardList } from "lucide-react"
 import { useTranslations } from "next-intl"
 import type { AgentType } from "@/lib/types"
-import { AGENT_LABELS } from "@/lib/types"
+import { getAgentLabel } from "@/lib/custom-agents"
 import { useAcpAgents } from "@/hooks/use-acp-agents"
 import { AgentIcon } from "@/components/agent-icon"
 import type {
@@ -211,7 +211,7 @@ export function ContextInjectPanel({
                           agentType={agent.agent_type}
                           className="w-3.5 h-3.5 shrink-0"
                         />
-                        {AGENT_LABELS[agent.agent_type]}
+                        {getAgentLabel(agent.agent_type)}
                       </span>
                     </SelectItem>
                   ))}

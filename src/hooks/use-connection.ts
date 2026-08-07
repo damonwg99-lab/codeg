@@ -16,6 +16,7 @@ import type {
   AvailableCommandInfo,
   ConfigStaleKind,
   ConnectionStatus,
+  PendingPlanApprovalState,
   PendingQuestionState,
   PromptCapabilitiesInfo,
   QuestionAnswer,
@@ -32,6 +33,12 @@ const DEFAULT_PROMPT_CAPABILITIES: PromptCapabilitiesInfo = {
 
 export interface UseConnectionReturn {
   connectionId: string | null
+  /** The agent type of the live connection at this contextKey (null when no
+   *  connection exists yet). Lets callers detect a connection still bound to a
+   *  PREVIOUS agent — e.g. a draft mid-switch, or a switch the not-installed
+   *  preflight blocked before it could tear the old one down — so they can
+   *  avoid rendering the previous agent's selectors as the selected one's. */
+  agentType: AgentType | null
   /**
    * True when this context attached to a connection another client owns
    * (cross-client viewing). Viewers detach but never `acpDisconnect`, so the
@@ -56,6 +63,7 @@ export interface UseConnectionReturn {
   pendingUserMessage: PendingUserMessage | null
   pendingQuestion: PendingQuestion | null
   pendingAskQuestion: PendingQuestionState | null
+  pendingPlanApproval: PendingPlanApprovalState | null
   claudeApiRetry: ClaudeApiRetryState | null
   error: string | null
   loadError: string | null
@@ -191,6 +199,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const connection = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
 
   const connectionId = connection?.connectionId ?? null
+  const agentType = connection?.agentType ?? null
   const isViewer = connection?.isViewer ?? false
   const status = connection?.status ?? null
   const promptCapabilities =
@@ -211,6 +220,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const pendingUserMessage = connection?.pendingUserMessage ?? null
   const pendingQuestion = connection?.pendingQuestion ?? null
   const pendingAskQuestion = connection?.pendingAskQuestion ?? null
+  const pendingPlanApproval = connection?.pendingPlanApproval ?? null
   const claudeApiRetry = connection?.claudeApiRetry ?? null
   const error = connection?.error ?? null
   const loadError = connection?.loadError ?? null
@@ -297,6 +307,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   return useMemo(
     () => ({
       connectionId,
+      agentType,
       isViewer,
       status,
       promptCapabilities,
@@ -312,6 +323,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       pendingUserMessage,
       pendingQuestion,
       pendingAskQuestion,
+      pendingPlanApproval,
       claudeApiRetry,
       error,
       loadError,
@@ -334,6 +346,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
     }),
     [
       connectionId,
+      agentType,
       isViewer,
       status,
       promptCapabilities,
@@ -349,6 +362,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       pendingUserMessage,
       pendingQuestion,
       pendingAskQuestion,
+      pendingPlanApproval,
       claudeApiRetry,
       error,
       loadError,

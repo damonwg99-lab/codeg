@@ -1,6 +1,6 @@
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, Condition, DatabaseConnection,
+    ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, Condition, ConnectionTrait,
     EntityTrait, QueryFilter, QueryOrder, Set, IntoActiveModel,
 };
 use sea_orm::entity::prelude::DateTimeUtc;
@@ -29,18 +29,24 @@ fn to_info(m: platform_task::Model) -> TaskInfo {
         zentao_module: m.zentao_module,
         kb_refs_json: m.kb_refs_json,
         affected_repos_json: m.affected_repos_json,
+        related_db_scripts_json: m.related_db_scripts_json,
+        branch_count: 0,
+        db_script_count: 0,
+        branch_statuses: Vec::new(),
+        archived_release_code: None,
         delegation_config: m.delegation_config,
         created_at: m.created_at,
         updated_at: m.updated_at,
     }
 }
 
-pub async fn list_by_project(
-    conn: &DatabaseConnection,
+pub async fn list_by_project<C: ConnectionTrait>(
+    conn: &C,
     project_id: i32,
     keyword: Option<&str>,
     task_type: Option<&str>,
     priority: Option<&str>,
+    status: Option<&str>,
 ) -> Result<Vec<TaskInfo>, DbError> {
     let mut query = platform_task::Entity::find()
         .filter(platform_task::Column::ProjectId.eq(project_id))
@@ -67,6 +73,12 @@ pub async fn list_by_project(
         }
     }
 
+    if let Some(st) = status {
+        if !st.is_empty() && st != "all" {
+            query = query.filter(platform_task::Column::Status.eq(st));
+        }
+    }
+
     let rows = query
         .order_by_asc(platform_task::Column::Status)
         .order_by_desc(platform_task::Column::Priority)
@@ -75,8 +87,8 @@ pub async fn list_by_project(
     Ok(rows.into_iter().map(to_info).collect())
 }
 
-pub async fn get_by_id(
-    conn: &DatabaseConnection,
+pub async fn get_by_id<C: ConnectionTrait>(
+    conn: &C,
     id: i32,
 ) -> Result<Option<TaskInfo>, DbError> {
     let row = platform_task::Entity::find_by_id(id)
@@ -87,8 +99,8 @@ pub async fn get_by_id(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn create(
-    conn: &DatabaseConnection,
+pub async fn create<C: ConnectionTrait>(
+    conn: &C,
     project_id: i32,
     title: &str,
     task_type: &str,
@@ -117,6 +129,7 @@ pub async fn create(
         zentao_module: Set(None),
         kb_refs_json: Set(None),
         affected_repos_json: Set(None),
+        related_db_scripts_json: Set(None),
         delegation_config: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
@@ -127,8 +140,8 @@ pub async fn create(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn update(
-    conn: &DatabaseConnection,
+pub async fn update<C: ConnectionTrait>(
+    conn: &C,
     id: i32,
     title: Option<String>,
     description: Option<String>,
@@ -211,7 +224,7 @@ pub async fn update(
     Ok(to_info(result))
 }
 
-pub async fn delete(conn: &DatabaseConnection, id: i32) -> Result<(), DbError> {
+pub async fn delete<C: ConnectionTrait>(conn: &C, id: i32) -> Result<(), DbError> {
     let row = platform_task::Entity::find_by_id(id)
         .filter(platform_task::Column::DeletedAt.is_null())
         .one(conn)
@@ -225,8 +238,8 @@ pub async fn delete(conn: &DatabaseConnection, id: i32) -> Result<(), DbError> {
     Ok(())
 }
 
-pub async fn list_by_status(
-    conn: &DatabaseConnection,
+pub async fn list_by_status<C: ConnectionTrait>(
+    conn: &C,
     project_id: i32,
     status: &str,
 ) -> Result<Vec<TaskInfo>, DbError> {
@@ -239,8 +252,8 @@ pub async fn list_by_status(
     Ok(rows.into_iter().map(to_info).collect())
 }
 
-pub async fn list_sub_tasks(
-    conn: &DatabaseConnection,
+pub async fn list_sub_tasks<C: ConnectionTrait>(
+    conn: &C,
     parent_task_id: i32,
 ) -> Result<Vec<TaskInfo>, DbError> {
     let rows = platform_task::Entity::find()
@@ -251,8 +264,8 @@ pub async fn list_sub_tasks(
     Ok(rows.into_iter().map(to_info).collect())
 }
 
-pub async fn list_by_zentao_sync_status(
-    conn: &DatabaseConnection,
+pub async fn list_by_zentao_sync_status<C: ConnectionTrait>(
+    conn: &C,
     status: &str,
 ) -> Result<Vec<TaskInfo>, DbError> {
     let rows = platform_task::Entity::find()
@@ -263,8 +276,8 @@ pub async fn list_by_zentao_sync_status(
     Ok(rows.into_iter().map(to_info).collect())
 }
 
-pub async fn update_status(
-    conn: &DatabaseConnection,
+pub async fn update_status<C: ConnectionTrait>(
+    conn: &C,
     id: i32,
     status: &str,
 ) -> Result<TaskInfo, DbError> {
@@ -279,4 +292,21 @@ pub async fn update_status(
     active.updated_at = Set(Utc::now());
     let result = active.update(conn).await?;
     Ok(to_info(result))
+}
+
+pub async fn update_related_db_scripts<C: ConnectionTrait>(
+    conn: &C,
+    task_id: i32,
+    scripts_json: &str,
+) -> Result<platform_task::Model, DbError> {
+    let row = platform_task::Entity::find_by_id(task_id)
+        .filter(platform_task::Column::DeletedAt.is_null())
+        .one(conn)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("Task not found: {task_id}")))?;
+
+    let mut active = row.into_active_model();
+    active.related_db_scripts_json = Set(Some(scripts_json.to_string()));
+    active.updated_at = Set(Utc::now());
+    active.update(conn).await.map_err(DbError::from)
 }

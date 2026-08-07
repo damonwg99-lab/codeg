@@ -2,24 +2,42 @@ import { describe, expect, it } from "vitest"
 
 import {
   applyClaudeProviderToConfigText,
+  buildCodexSandboxConfig,
+  codexSandboxBaselineOf,
+  codexSandboxSaveConfig,
   buildGrokSaveOptions,
   buildGrokStructuredConfig,
+  buildMergeConfigPayload,
+  buildAcpAdapterCheck,
   buildVersionCheck,
   configTextForClaudeSave,
   getAgentChecks,
+  inferGrokMode,
+  materializeClaudeHardeningFlags,
+  patchCodexConfigTomlText,
   patchImportantConfigText,
+  setClaudeEnvFlagInConfigText,
 } from "./acp-agent-settings"
-import type { AcpAgentInfo, AgentType, PreflightResult } from "@/lib/types"
+import { parse as parseTomlDocument } from "smol-toml"
+import type {
+  AcpAgentInfo,
+  AdapterInfo,
+  AgentType,
+  PreflightResult,
+} from "@/lib/types"
 
 function makeAgent(overrides: Partial<AcpAgentInfo>): AcpAgentInfo {
   return {
     agent_type: "hermes" as AgentType,
+    skills_capable: true,
     registry_id: "hermes",
     registry_version: "0.16.0",
     name: "Hermes Agent",
     description: "",
     available: true,
     distribution_type: "uvx",
+    is_acp_adapter: false,
+    custom_source: null,
     enabled: true,
     sort_order: 0,
     installed_version: null,
@@ -30,10 +48,15 @@ function makeAgent(overrides: Partial<AcpAgentInfo>): AcpAgentInfo {
     codex_auth_json: null,
     cline_secrets_json: null,
     codex_config_toml: null,
+    codex_model_catalog: null,
+    codex_sandbox_settings: null,
     grok_config_toml: null,
     grok_settings: null,
     hermes_config_yaml: null,
+    cursor_cli_config_json: null,
+    cursor_settings: null,
     model_provider_id: null,
+    icon_url: null,
     ...overrides,
   }
 }
@@ -51,10 +74,13 @@ function fixDisabled(fix: unknown): boolean {
 
 // A full Grok draft, custom-model + compaction fields defaulted empty. Typed
 // from the function's own parameter so it stays in sync with the panel shape.
+// Defaults to the `custom` auth method so the custom-model save cases below
+// exercise the [model.<id>] path; non-custom gating is covered separately.
 type GrokDraftInput = Parameters<typeof buildGrokStructuredConfig>[0]
 const grokDraft = (
   overrides: Partial<GrokDraftInput> = {}
 ): GrokDraftInput => ({
+  grokAuthMode: "custom",
   grokPermissionMode: "",
   grokReasoningEffort: "",
   grokCustomModelId: "",
@@ -75,6 +101,225 @@ const emptyCustoms = {
   autoCompactThresholdPercent: null,
 }
 
+type CodexSandboxDraft = Parameters<typeof buildCodexSandboxConfig>[0]
+
+const CODEX_GRANULAR_SEED = {
+  sandbox_approval: true,
+  rules: true,
+  skill_approval: false,
+  request_permissions: false,
+  mcp_elicitations: true,
+}
+
+/** A draft whose baseline equals its current values — i.e. "nothing touched
+ * yet", exactly what `buildAgentDraft` produces from a freshly-read config. */
+function codexSandboxDraft(
+  disk: Partial<CodexSandboxDraft> = {},
+  edits: Partial<CodexSandboxDraft> = {}
+): CodexSandboxDraft {
+  const seeded = {
+    codexApprovalPolicy: "" as CodexSandboxDraft["codexApprovalPolicy"],
+    codexGranular: CODEX_GRANULAR_SEED,
+    codexSandboxMode: "" as CodexSandboxDraft["codexSandboxMode"],
+    codexWritableRootsText: "",
+    codexNetworkAccess: false,
+    codexExcludeTmpdirEnvVar: false,
+    codexExcludeSlashTmp: false,
+    ...disk,
+  }
+  return {
+    ...seeded,
+    ...edits,
+    codexSandboxBaseline: codexSandboxBaselineOf(seeded),
+  }
+}
+
+describe("buildCodexSandboxConfig — Codex sandbox/approval save patch", () => {
+  // The core contract. The panel also sends the raw config.toml text and the
+  // backend applies this patch last, so a field the user did not move must not
+  // appear at all — otherwise a hand-edit in the raw editor gets reverted by
+  // the panel's stale value for that key.
+  it("sends nothing when no control moved", () => {
+    expect(
+      buildCodexSandboxConfig(
+        codexSandboxDraft({
+          codexApprovalPolicy: "never",
+          codexSandboxMode: "workspace-write",
+          codexWritableRootsText: "/srv/one",
+          codexNetworkAccess: true,
+        })
+      )
+    ).toEqual({})
+  })
+
+  it("sends only the field that moved", () => {
+    expect(
+      buildCodexSandboxConfig(
+        codexSandboxDraft(
+          { codexApprovalPolicy: "never", codexSandboxMode: "read-only" },
+          { codexSandboxMode: "danger-full-access" }
+        )
+      )
+    ).toEqual({ sandboxMode: "danger-full-access" })
+  })
+
+  // Clearing a control back to "not set" must reach the backend as an explicit
+  // null (remove the key), not as an absent field (leave it alone).
+  it("clears a control with an explicit null", () => {
+    expect(
+      buildCodexSandboxConfig(
+        codexSandboxDraft(
+          { codexSandboxMode: "never" as never },
+          {
+            codexSandboxMode: "",
+          }
+        )
+      )
+    ).toEqual({ sandboxMode: null })
+  })
+
+  // Approval is one externally tagged key upstream, so both representations
+  // travel together whenever either side changes.
+  it("moves the approval preset and granular table as a pair", () => {
+    const toGranular = buildCodexSandboxConfig(
+      codexSandboxDraft(
+        { codexApprovalPolicy: "never" },
+        { codexApprovalPolicy: "granular" }
+      )
+    )
+    expect(toGranular).toEqual({
+      approvalPolicy: null,
+      granular: CODEX_GRANULAR_SEED,
+    })
+
+    const toPreset = buildCodexSandboxConfig(
+      codexSandboxDraft(
+        { codexApprovalPolicy: "granular" },
+        { codexApprovalPolicy: "on-request" }
+      )
+    )
+    expect(toPreset).toEqual({ approvalPolicy: "on-request", granular: null })
+  })
+
+  it("detects a flipped granular switch while staying on granular", () => {
+    const patch = buildCodexSandboxConfig(
+      codexSandboxDraft(
+        { codexApprovalPolicy: "granular" },
+        {
+          codexApprovalPolicy: "granular",
+          codexGranular: { ...CODEX_GRANULAR_SEED, rules: false },
+        }
+      )
+    )
+    expect(patch.granular).toEqual({ ...CODEX_GRANULAR_SEED, rules: false })
+    expect(patch.approvalPolicy).toBeNull()
+  })
+
+  // codex only reads the workspace-write group under `workspace-write`, so
+  // dormant values are inert — clearing them would destroy the user's roots on
+  // a round-trip through read-only or full-access.
+  it("does not touch dormant workspace-write values when the mode changes", () => {
+    expect(
+      buildCodexSandboxConfig(
+        codexSandboxDraft(
+          {
+            codexSandboxMode: "workspace-write",
+            codexWritableRootsText: "/srv/one",
+            codexNetworkAccess: true,
+          },
+          { codexSandboxMode: "danger-full-access" }
+        )
+      )
+    ).toEqual({ sandboxMode: "danger-full-access" })
+  })
+
+  it("sends a flag toggle without disturbing its siblings", () => {
+    expect(
+      buildCodexSandboxConfig(
+        codexSandboxDraft(
+          { codexWritableRootsText: "/srv/one", codexNetworkAccess: true },
+          { codexExcludeSlashTmp: true }
+        )
+      )
+    ).toEqual({ excludeSlashTmp: true })
+  })
+
+  it("normalizes the roots box and ignores cosmetic whitespace", () => {
+    expect(
+      buildCodexSandboxConfig(
+        codexSandboxDraft(
+          { codexWritableRootsText: "/srv/one" },
+          { codexWritableRootsText: "  /srv/one  \n\n" }
+        )
+      )
+    ).toEqual({})
+    expect(
+      buildCodexSandboxConfig(
+        codexSandboxDraft(
+          {},
+          { codexWritableRootsText: " /srv/one \n\n/srv/two\n" }
+        )
+      )
+    ).toEqual({ writableRoots: ["/srv/one", "/srv/two"] })
+  })
+
+  // codex does NOT reject a relative writable_roots entry — it resolves it
+  // against CODEX_HOME, so "docs" would silently grant write access to
+  // ~/.codex/docs. The save must fail loudly instead.
+  it("refuses relative writable roots the user just typed", () => {
+    expect(() =>
+      buildCodexSandboxConfig(
+        codexSandboxDraft({}, { codexWritableRootsText: "/srv/ok\ndocs/rel" })
+      )
+    ).toThrow(/docs\/rel/)
+  })
+
+  // A relative root already on disk is not this save's problem: the field is
+  // untouched, so it is not in the patch and must not block the save.
+  it("tolerates a pre-existing relative root while it stays untouched", () => {
+    expect(
+      buildCodexSandboxConfig(
+        codexSandboxDraft(
+          { codexWritableRootsText: "rel/dir" },
+          { codexNetworkAccess: true }
+        )
+      )
+    ).toEqual({ networkAccess: true })
+  })
+
+  it("accepts POSIX and Windows absolute roots", () => {
+    expect(
+      buildCodexSandboxConfig(
+        codexSandboxDraft(
+          {},
+          {
+            codexWritableRootsText:
+              "/srv/one\nC:\\work\\repo\n\\\\server\\share",
+          }
+        )
+      ).writableRoots
+    ).toHaveLength(3)
+  })
+})
+
+describe("codexSandboxSaveConfig — omit the field when nothing moved", () => {
+  it("returns undefined for an untouched group", () => {
+    expect(
+      codexSandboxSaveConfig(
+        codexSandboxDraft({ codexApprovalPolicy: "never" })
+      )
+    ).toBeUndefined()
+  })
+
+  it("returns the patch once a control moves", () => {
+    expect(
+      codexSandboxSaveConfig(
+        codexSandboxDraft({}, { codexSandboxMode: "read-only" })
+      )
+    ).toEqual({ sandboxMode: "read-only" })
+  })
+})
+
 describe("buildGrokStructuredConfig — Grok panel save payload", () => {
   // A chosen dropdown value passes through. These become [ui].permission_mode /
   // [models].default_reasoning_effort on save.
@@ -82,12 +327,12 @@ describe("buildGrokStructuredConfig — Grok panel save payload", () => {
     expect(
       buildGrokStructuredConfig(
         grokDraft({
-          grokPermissionMode: "always-approve",
+          grokPermissionMode: "bypassPermissions",
           grokReasoningEffort: "high",
         })
       )
     ).toEqual({
-      permissionMode: "always-approve",
+      permissionMode: "bypassPermissions",
       defaultReasoningEffort: "high",
       ...emptyCustoms,
     })
@@ -172,6 +417,35 @@ describe("buildGrokStructuredConfig — Grok panel save payload", () => {
       autoCompactThresholdPercent: 100,
     })
   })
+
+  // The custom-model group is written ONLY in the `custom` auth method. In
+  // subscription / api_key mode the [model.<id>] block is dropped even if the
+  // (now-hidden) custom fields still hold values — so switching away removes it,
+  // while method-independent fields (reasoning effort) still pass through.
+  it("drops the custom model when the auth method isn't custom", () => {
+    const filled = {
+      grokCustomModelId: "my-grok",
+      grokCustomBaseUrl: "https://gw/v1",
+      grokCustomApiKey: "xai-123",
+      grokCustomApiBackend: "chat_completions",
+      grokCustomContextWindow: "131072",
+    }
+    for (const mode of ["subscription", "api_key"] as const) {
+      expect(
+        buildGrokStructuredConfig(
+          grokDraft({
+            ...filled,
+            grokAuthMode: mode,
+            grokReasoningEffort: "high",
+          })
+        )
+      ).toEqual({
+        permissionMode: null,
+        defaultReasoningEffort: "high",
+        ...emptyCustoms,
+      })
+    }
+  })
 })
 
 describe("buildGrokSaveOptions — one save persists both surfaces", () => {
@@ -220,7 +494,240 @@ describe("buildGrokSaveOptions — one save persists both surfaces", () => {
   })
 })
 
+describe("inferGrokMode — Grok auth-method recognition", () => {
+  // An explicit knob always wins, even against a present/absent key.
+  it("honors an explicit GROK_AUTH_MODE knob", () => {
+    expect(inferGrokMode({ GROK_AUTH_MODE: "subscription" })).toBe(
+      "subscription"
+    )
+    expect(inferGrokMode({ GROK_AUTH_MODE: "api_key", XAI_API_KEY: "" })).toBe(
+      "api_key"
+    )
+    // Subscription wins even if a stale key lingers in env.
+    expect(
+      inferGrokMode({ GROK_AUTH_MODE: "subscription", XAI_API_KEY: "xai-1" })
+    ).toBe("subscription")
+  })
+
+  // Legacy rows (no knob): a saved key implies api_key, else subscription.
+  it("falls back to XAI_API_KEY presence for legacy rows", () => {
+    expect(inferGrokMode({ XAI_API_KEY: "xai-abc" })).toBe("api_key")
+    expect(inferGrokMode({ XAI_API_KEY: "   " })).toBe("subscription")
+    expect(inferGrokMode({})).toBe("subscription")
+  })
+
+  // An unrecognized knob value is ignored, falling through to key presence.
+  it("ignores an unknown knob value", () => {
+    expect(inferGrokMode({ GROK_AUTH_MODE: "bogus" })).toBe("subscription")
+    expect(
+      inferGrokMode({ GROK_AUTH_MODE: "bogus", XAI_API_KEY: "xai-1" })
+    ).toBe("api_key")
+  })
+
+  // The custom-endpoint method: an explicit knob wins; else a configured custom
+  // model (in config.toml, surfaced via the hasCustomModel flag) implies it and
+  // outranks a lingering key.
+  it("recognizes the custom endpoint method", () => {
+    expect(inferGrokMode({ GROK_AUTH_MODE: "custom" })).toBe("custom")
+    expect(inferGrokMode({}, true)).toBe("custom")
+    expect(inferGrokMode({ XAI_API_KEY: "xai-1" }, true)).toBe("custom")
+    // An explicit knob still wins over the custom-model flag.
+    expect(inferGrokMode({ GROK_AUTH_MODE: "api_key" }, true)).toBe("api_key")
+  })
+})
+
+describe("buildAcpAdapterCheck", () => {
+  function makeAdapter(overrides: Partial<AdapterInfo> = {}): AdapterInfo {
+    return {
+      adapter_package: "@agentclientprotocol/claude-agent-acp@0.63.0",
+      adapter_cmd: "claude-agent-acp",
+      adapter_installed: false,
+      native_cmd: "claude",
+      native_label: "Claude Code CLI",
+      native_path: "/opt/homebrew/bin/claude",
+      shared_config_dir: "~/.claude",
+      docs_url: "https://docs.codeg.app/guide/supported-agents#acp-adapters",
+      ...overrides,
+    }
+  }
+
+  // Nothing for the ten agents whose registry command IS the vendor CLI, and
+  // nothing before preflight resolves — the card must never appear speculatively.
+  it("produces nothing for non-adapter agents or before preflight resolves", () => {
+    expect(buildAcpAdapterCheck(null)).toBeNull()
+    expect(buildAcpAdapterCheck(undefined)).toBeNull()
+  })
+
+  // The whole point of the card: the user has `claude`, we say so by path, and
+  // name the different thing we actually need.
+  it("names the detected CLI, the adapter package and the shared config dir", () => {
+    const check = buildAcpAdapterCheck(makeAdapter())
+    expect(check?.check_id).toBe("acp_adapter")
+    // warn, not fail: Version Status below already fails: this one explains.
+    expect(check?.status).toBe("warn")
+    expect(check?.message).toContain("/opt/homebrew/bin/claude")
+    expect(check?.message).toContain(
+      "@agentclientprotocol/claude-agent-acp@0.63.0"
+    )
+    expect(check?.message).toContain("~/.claude")
+  })
+
+  // Undetected vendor CLI is not a dead end — the explanation still stands, it
+  // just can't point at a path.
+  it("still explains the split when no vendor CLI was found", () => {
+    const check = buildAcpAdapterCheck(makeAdapter({ native_path: null }))
+    expect(check?.status).toBe("warn")
+    expect(check?.message).toContain(
+      "@agentclientprotocol/claude-agent-acp@0.63.0"
+    )
+    expect(check?.message).not.toContain("/opt/homebrew/bin/claude")
+  })
+
+  // Installed → pass, so renderCheck collapses it and a working setup isn't
+  // nagged by an explainer it no longer needs.
+  it("passes once the adapter is installed", () => {
+    const check = buildAcpAdapterCheck(makeAdapter({ adapter_installed: true }))
+    expect(check?.status).toBe("pass")
+    expect(check?.message).toContain("claude-agent-acp")
+  })
+
+  // Exactly one action, and it never duplicates the Install button that lives
+  // on the Version Status card directly below.
+  it("offers only a docs link, never a second install button", () => {
+    const check = buildAcpAdapterCheck(makeAdapter())
+    expect(check?.fixes).toHaveLength(1)
+    expect(check?.fixes[0].kind).toBe("open_url")
+    expect(check?.fixes[0].payload).toContain("#acp-adapters")
+  })
+})
+
+describe("getAgentChecks adapter ordering", () => {
+  // The explainer answers "why does this say not installed?" and must be read
+  // BEFORE the Version Status card that offers the fix.
+  it("puts the adapter card first, then version, then backend checks", () => {
+    const checks = getAgentChecks(
+      makeAgent({
+        agent_type: "claude_code" as AgentType,
+        distribution_type: "npx",
+        is_acp_adapter: true,
+        registry_version: "0.63.0",
+        installed_version: null,
+      }),
+      {
+        result: {
+          agent_type: "claude_code" as AgentType,
+          agent_name: "Claude Code",
+          passed: true,
+          checks: [
+            {
+              check_id: "node_available",
+              label: "Node.js",
+              status: "pass",
+              message: "Node.js v22.0.0 available",
+              fixes: [],
+            },
+          ],
+          adapter: {
+            adapter_package: "@agentclientprotocol/claude-agent-acp@0.63.0",
+            adapter_cmd: "claude-agent-acp",
+            adapter_installed: false,
+            native_cmd: "claude",
+            native_label: "Claude Code CLI",
+            native_path: "/usr/local/bin/claude",
+            shared_config_dir: "~/.claude",
+            docs_url:
+              "https://docs.codeg.app/guide/supported-agents#acp-adapters",
+          },
+        },
+      }
+    )
+
+    expect(checks.map((c) => c.check_id)).toEqual([
+      "acp_adapter",
+      "version_status",
+      "node_available",
+    ])
+  })
+
+  // A plain agent's list is byte-for-byte what it was before this feature.
+  it("adds nothing for an agent with no adapter relation", () => {
+    const checks = getAgentChecks(
+      makeAgent({ distribution_type: "npx", installed_version: "1.0.0" }),
+      {
+        result: {
+          agent_type: "gemini" as AgentType,
+          agent_name: "Gemini CLI",
+          passed: true,
+          checks: [],
+          adapter: null,
+        },
+      }
+    )
+    expect(checks.some((c) => c.check_id === "acp_adapter")).toBe(false)
+  })
+})
+
 describe("buildVersionCheck", () => {
+  // A manually written definition has no registry behind it — its stored
+  // version is user-typed — so the check must show the local side alone and
+  // never manufacture an "upgrade available" against that noise.
+  it("shows only the local version for a manually added custom agent", () => {
+    const installed = buildVersionCheck(
+      makeAgent({
+        agent_type: "custom:goose" as AgentType,
+        distribution_type: "npx",
+        custom_source: "manual",
+        registry_version: "0.0.0",
+        installed_version: "1.44.0",
+      })
+    )
+    expect(installed?.status).toBe("pass")
+    // The manual pass message, not the generic "Already latest" (there is no
+    // "latest" to be at). The mocked translator returns raw templates, so
+    // assertions stay at the template level.
+    expect(installed?.message).toContain("Installed")
+    expect(installed?.message).not.toContain("Already latest")
+    // The registry-comparison flow would have produced an upgrade hint here
+    // (0.0.0 < 1.44.0 is "not latest" in the generic flow's terms).
+    expect(installed?.fixes.some((fix) => fix.kind === "upgrade_npx")).toBe(
+      false
+    )
+    expect(installed?.fixes.some((fix) => fix.kind === "uninstall_npx")).toBe(
+      true
+    )
+  })
+
+  it("still demands an install for a manual custom agent with no local version", () => {
+    const check = buildVersionCheck(
+      makeAgent({
+        agent_type: "custom:goose" as AgentType,
+        distribution_type: "npx",
+        custom_source: "manual",
+        registry_version: "0.0.0",
+        installed_version: null,
+      })
+    )
+    expect(check?.status).toBe("fail")
+    expect(check?.fixes.some((fix) => fix.kind === "install_npx")).toBe(true)
+  })
+
+  // A registry-added custom agent keeps the full remote/local comparison — its
+  // stored version is a real registry snapshot.
+  it("keeps the remote comparison for a registry-added custom agent", () => {
+    const check = buildVersionCheck(
+      makeAgent({
+        agent_type: "custom:goose" as AgentType,
+        distribution_type: "npx",
+        custom_source: "registry",
+        registry_version: "2.0.0",
+        installed_version: "1.0.0",
+      })
+    )
+    expect(check?.status).toBe("warn")
+    expect(check?.message).toContain("Upgrade available")
+    expect(check?.fixes.some((fix) => fix.kind === "upgrade_npx")).toBe(true)
+  })
+
   // uv runtime not ready: a uvx agent (Hermes) must surface a blocked
   // version-status with the agent-install action DISABLED — the actual install
   // happens via the separate "Install uv" preflight action, not here.
@@ -325,6 +832,7 @@ describe("getAgentChecks uv gating", () => {
           fixes: [{ label: "Install uv", kind: "install_uv", payload: "" }],
         },
       ],
+      adapter: null,
     },
   }
 
@@ -494,6 +1002,25 @@ describe("applyClaudeProviderToConfigText — provider-bound stale config", () =
     expect(env.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME).toBe("GW Opus")
     expect(env.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION).toBe("via gateway")
   })
+
+  // The hardening toggles are not provider-controlled, so a provider-authoritative
+  // rewrite must leave them intact while it overwrites the model keys.
+  it("preserves a hardening env flag through the provider rewrite", () => {
+    const withFlag = JSON.stringify({
+      env: {
+        CLAUDE_CODE_ATTRIBUTION_HEADER: "0",
+        ANTHROPIC_MODEL: "old-main",
+      },
+    })
+    const next = applyClaudeProviderToConfigText(withFlag, {
+      api_url: "https://gw.example/v1",
+      api_key: "sk-x",
+      model: JSON.stringify({ main: "prov-main" }),
+    })
+    const env = envOf(next)
+    expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe("0")
+    expect(env.ANTHROPIC_MODEL).toBe("prov-main")
+  })
 })
 
 describe("configTextForClaudeSave — bound-Claude save payload", () => {
@@ -543,5 +1070,329 @@ describe("configTextForClaudeSave — bound-Claude save payload", () => {
     expect(
       configTextForClaudeSave(cfg, "codex" as AgentType, 7, provider)
     ).toBe(cfg)
+  })
+})
+
+describe("setClaudeEnvFlagInConfigText — Claude hardening toggles", () => {
+  const KEY = "CLAUDE_CODE_ATTRIBUTION_HEADER"
+
+  function envOf(configText: string): Record<string, string> {
+    const parsed = JSON.parse(configText) as { env?: Record<string, string> }
+    return parsed.env ?? {}
+  }
+
+  it("sets the flag value while preserving other env + root keys", () => {
+    const base = JSON.stringify({
+      model: "opus",
+      env: { ANTHROPIC_BASE_URL: "https://gw" },
+    })
+    const next = setClaudeEnvFlagInConfigText(base, KEY, "1")
+    expect(next.recoveredFromInvalid).toBe(false)
+    const parsed = JSON.parse(next.configText) as {
+      model?: string
+      env?: Record<string, string>
+    }
+    expect(parsed.model).toBe("opus")
+    expect(parsed.env?.[KEY]).toBe("1")
+    expect(parsed.env?.ANTHROPIC_BASE_URL).toBe("https://gw")
+  })
+
+  it("creates the env when the config has none", () => {
+    const next = setClaudeEnvFlagInConfigText("", KEY, "0")
+    expect(next.recoveredFromInvalid).toBe(false)
+    expect(envOf(next.configText)[KEY]).toBe("0")
+  })
+
+  it("overwrites an existing value (off → on) and keeps siblings", () => {
+    const base = JSON.stringify({
+      env: { [KEY]: "0", ANTHROPIC_MODEL: "keep" },
+    })
+    const next = setClaudeEnvFlagInConfigText(base, KEY, "1")
+    const env = envOf(next.configText)
+    expect(env[KEY]).toBe("1")
+    expect(env.ANTHROPIC_MODEL).toBe("keep")
+  })
+
+  it("recovers from invalid JSON and writes a fresh config", () => {
+    const next = setClaudeEnvFlagInConfigText("{ not json", KEY, "1")
+    expect(next.recoveredFromInvalid).toBe(true)
+    expect(envOf(next.configText)[KEY]).toBe("1")
+  })
+})
+
+describe("buildMergeConfigPayload — merge-strategy save diff", () => {
+  const KEY = "CLAUDE_CODE_ATTRIBUTION_HEADER"
+
+  // Toggling off the only flag empties configText; the diff against the original
+  // must still emit env: null so the backend merge deletes it from disk.
+  it("nulls a removed env key when the config emptied out", () => {
+    const original = JSON.stringify({ env: { [KEY]: "0" } })
+    const payload = buildMergeConfigPayload("", original)
+    expect(payload).not.toBeNull()
+    expect(JSON.parse(payload as string)).toEqual({ env: null })
+  })
+
+  it("returns null when both current and original are empty", () => {
+    expect(buildMergeConfigPayload("", null)).toBeNull()
+    expect(buildMergeConfigPayload("", "")).toBeNull()
+  })
+
+  it("nulls only the removed key when siblings remain", () => {
+    const original = JSON.stringify({ env: { [KEY]: "0", OTHER: "x" } })
+    const current = JSON.stringify({ env: { OTHER: "x" } })
+    const payload = buildMergeConfigPayload(current, original)
+    expect(JSON.parse(payload as string)).toEqual({
+      env: { OTHER: "x", [KEY]: null },
+    })
+  })
+
+  it("passes a fresh config through with no null patches", () => {
+    const current = JSON.stringify({ env: { [KEY]: "0" } })
+    const payload = buildMergeConfigPayload(current, null)
+    expect(JSON.parse(payload as string)).toEqual({ env: { [KEY]: "0" } })
+  })
+})
+
+describe("materializeClaudeHardeningFlags — save-time toggle defaults", () => {
+  const ATTR = "CLAUDE_CODE_ATTRIBUTION_HEADER"
+  const TRAFFIC = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+
+  function envOf(configText: string): Record<string, string> {
+    const parsed = JSON.parse(configText) as { env?: Record<string, string> }
+    return parsed.env ?? {}
+  }
+
+  // Fresh config + the intended defaults: don't send the header ("0"), disable
+  // telemetry ("1") — written into BOTH the native config env and envText.
+  it("writes both flags per the defaults into config env and envText", () => {
+    const { configText, envText } = materializeClaudeHardeningFlags("", "", {
+      sendAttributionHeader: false,
+      disableNonessentialTraffic: true,
+    })
+    const env = envOf(configText)
+    expect(env[ATTR]).toBe("0")
+    expect(env[TRAFFIC]).toBe("1")
+    expect(envText).toContain(`${ATTR}=0`)
+    expect(envText).toContain(`${TRAFFIC}=1`)
+  })
+
+  it("writes both on when both toggles are enabled, preserving other keys", () => {
+    const base = JSON.stringify({ model: "opus", env: { KEEP: "y" } })
+    const { configText, envText } = materializeClaudeHardeningFlags(
+      base,
+      "KEEP=y",
+      { sendAttributionHeader: true, disableNonessentialTraffic: true }
+    )
+    const parsed = JSON.parse(configText) as {
+      model?: string
+      env?: Record<string, string>
+    }
+    expect(parsed.model).toBe("opus")
+    expect(parsed.env?.[ATTR]).toBe("1")
+    expect(parsed.env?.[TRAFFIC]).toBe("1")
+    expect(parsed.env?.KEEP).toBe("y")
+    expect(envText).toContain("KEEP=y")
+    expect(envText).toContain(`${ATTR}=1`)
+  })
+
+  // Regression: invalid JSON must be returned UNCHANGED (never recovered to a
+  // minimal {env}), so persistConfig rejects it instead of the merge diff
+  // deleting every other on-disk key.
+  it("leaves invalid config JSON untouched (no recovery, no data loss)", () => {
+    const invalid = "{ not valid json"
+    const { configText, envText } = materializeClaudeHardeningFlags(
+      invalid,
+      "EXISTING=1",
+      { sendAttributionHeader: false, disableNonessentialTraffic: true }
+    )
+    expect(configText).toBe(invalid)
+    expect(envText).toBe("EXISTING=1")
+  })
+})
+
+describe("patchCodexConfigTomlText — codeg's requires_openai_auth default", () => {
+  /** Read `model_providers.codeg.requires_openai_auth` back out of a result. */
+  function authFlagOf(configTomlText: string): boolean | undefined {
+    const parsed = parseTomlDocument(configTomlText) as {
+      model_providers?: Record<string, { requires_openai_auth?: unknown }>
+    }
+    const value = parsed.model_providers?.codeg?.requires_openai_auth
+    return typeof value === "boolean" ? value : undefined
+  }
+
+  // The three structured controls that reach ensureCodexProviderDefaults. Each
+  // must behave identically — the bug in issue #406 fired through all of them.
+  const ENTRY_POINTS: Array<{
+    label: string
+    patch: Parameters<typeof patchCodexConfigTomlText>[1]
+  }> = [
+    { label: "API base URL", patch: { apiBaseUrl: "https://new.example/v1" } },
+    { label: "WebSocket toggle", patch: { supportsWebsockets: true } },
+    { label: "model provider", patch: { modelProvider: "codeg" } },
+  ]
+
+  const BOUND_PROVIDER = [
+    'model_provider = "codeg"',
+    "",
+    "[model_providers.codeg]",
+    'base_url = "https://old.example/v1"',
+    'name = "codeg"',
+    'wire_api = "responses"',
+  ].join("\n")
+
+  for (const { label, patch } of ENTRY_POINTS) {
+    describe(`via the ${label} control`, () => {
+      it("keeps an explicit false", () => {
+        const toml = `${BOUND_PROVIDER}\nrequires_openai_auth = false\n`
+        expect(authFlagOf(patchCodexConfigTomlText(toml, patch))).toBe(false)
+      })
+
+      it("keeps an explicit true", () => {
+        const toml = `${BOUND_PROVIDER}\nrequires_openai_auth = true\n`
+        expect(authFlagOf(patchCodexConfigTomlText(toml, patch))).toBe(true)
+      })
+
+      it("supplies the default when the field is absent", () => {
+        expect(
+          authFlagOf(patchCodexConfigTomlText(BOUND_PROVIDER, patch))
+        ).toBe(true)
+      })
+
+      it("seeds a brand-new provider from an empty config", () => {
+        expect(authFlagOf(patchCodexConfigTomlText("", patch))).toBe(true)
+      })
+
+      it("stands down for a provider using actor authorization", () => {
+        const toml = [
+          BOUND_PROVIDER,
+          "",
+          "[model_providers.codeg.http_headers]",
+          'x-openai-actor-authorization = "local-image-extension"',
+        ].join("\n")
+        expect(
+          authFlagOf(patchCodexConfigTomlText(toml, patch))
+        ).toBeUndefined()
+      })
+    })
+  }
+
+  const ENTRY = ENTRY_POINTS[0].patch
+
+  it("preserves user comments around the managed provider", () => {
+    const toml = [
+      "# my hand-written codex config",
+      'model_provider = "codeg"',
+      "",
+      "[model_providers.codeg]",
+      'base_url = "https://old.example/v1"',
+      "# keep the actor-authorization arrangement intact",
+      "requires_openai_auth = false",
+    ].join("\n")
+    const result = patchCodexConfigTomlText(toml, ENTRY)
+    expect(result).toContain("# my hand-written codex config")
+    expect(result).toContain(
+      "# keep the actor-authorization arrangement intact"
+    )
+    expect(authFlagOf(result)).toBe(false)
+  })
+
+  it("matches the actor-authorization header case-insensitively", () => {
+    const toml = [
+      BOUND_PROVIDER,
+      "",
+      "[model_providers.codeg.http_headers]",
+      'X-OpenAI-Actor-Authorization = "local-image-extension"',
+    ].join("\n")
+    expect(authFlagOf(patchCodexConfigTomlText(toml, ENTRY))).toBeUndefined()
+  })
+
+  it("reads the header out of an inline table too", () => {
+    const toml = [
+      'model_provider = "codeg"',
+      "",
+      "[model_providers.codeg]",
+      'base_url = "https://old.example/v1"',
+      'http_headers = { "x-openai-actor-authorization" = "local-image-extension" }',
+    ].join("\n")
+    expect(authFlagOf(patchCodexConfigTomlText(toml, ENTRY))).toBeUndefined()
+  })
+
+  // Asserted on the text, not the parse: the text writers predate this change
+  // and cannot patch a provider spelled with root-level dotted keys — they
+  // append a `[model_providers.codeg]` section that redefines the same table.
+  // That limitation is pre-existing and out of scope here; what matters is
+  // that the header is still recognized, so no auth default is added.
+  it("reads the header out of a root-level dotted key too", () => {
+    const toml = [
+      'model_provider = "codeg"',
+      'model_providers.codeg.base_url = "https://old.example/v1"',
+      'model_providers.codeg.http_headers."x-openai-actor-authorization" = "local-image-extension"',
+    ].join("\n")
+    expect(patchCodexConfigTomlText(toml, ENTRY)).not.toContain(
+      "requires_openai_auth"
+    )
+  })
+
+  // Upstream's predicate is `!value.trim().is_empty()`, so a blank header does
+  // NOT enable actor authorization and the default still applies.
+  it("ignores an actor-authorization header with a blank value", () => {
+    const toml = [
+      BOUND_PROVIDER,
+      "",
+      "[model_providers.codeg.http_headers]",
+      'x-openai-actor-authorization = "   "',
+    ].join("\n")
+    expect(authFlagOf(patchCodexConfigTomlText(toml, ENTRY))).toBe(true)
+  })
+
+  it("never rewrites an explicit true that sits beside the header", () => {
+    const toml = [
+      BOUND_PROVIDER,
+      "requires_openai_auth = true",
+      "",
+      "[model_providers.codeg.http_headers]",
+      'x-openai-actor-authorization = "local-image-extension"',
+    ].join("\n")
+    expect(authFlagOf(patchCodexConfigTomlText(toml, ENTRY))).toBe(true)
+  })
+
+  it("ignores another provider's actor-authorization header", () => {
+    const toml = [
+      BOUND_PROVIDER,
+      "",
+      "[model_providers.other.http_headers]",
+      'x-openai-actor-authorization = "local-image-extension"',
+    ].join("\n")
+    expect(authFlagOf(patchCodexConfigTomlText(toml, ENTRY))).toBe(true)
+  })
+
+  // Regression (review round 1): `"http_headers.x-..." = "v"` is ONE literal
+  // key, not an http_headers sub-table. Mistaking it for the nested path would
+  // suppress the default and break codeg's own auth.json-based auth.
+  it("does not mistake a quoted dotted key for the header table", () => {
+    const toml = [
+      BOUND_PROVIDER,
+      '"http_headers.x-openai-actor-authorization" = "local-image-extension"',
+    ].join("\n")
+    expect(authFlagOf(patchCodexConfigTomlText(toml, ENTRY))).toBe(true)
+  })
+
+  // Regression (review round 2): an escaped key still declares the field, so
+  // writing the default would produce a duplicate-key TOML the backend rejects.
+  it("recognizes a field declared through an escaped quoted key", () => {
+    const toml = [BOUND_PROVIDER, '"requires\\u005fopenai_auth" = false'].join(
+      "\n"
+    )
+    const result = patchCodexConfigTomlText(toml, ENTRY)
+    expect(authFlagOf(result)).toBe(false)
+    expect(() => parseTomlDocument(result)).not.toThrow()
+  })
+
+  // A draft can be mid-edit in the raw editor. We cannot tell what is declared,
+  // so we touch nothing — the backend refuses to persist invalid TOML anyway.
+  it("leaves an unparsable draft's auth field alone", () => {
+    const toml = [BOUND_PROVIDER, 'base_url = "unterminated'].join("\n")
+    const result = patchCodexConfigTomlText(toml, ENTRY)
+    expect(result).not.toContain("requires_openai_auth")
   })
 })

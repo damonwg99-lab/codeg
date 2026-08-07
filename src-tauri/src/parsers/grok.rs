@@ -11,9 +11,10 @@ use crate::models::{
     TurnUsage,
 };
 use crate::parsers::{
-    compute_session_stats, folder_name_from_path, infer_context_window_max_tokens,
-    latest_turn_total_usage_tokens, merge_context_window_stats, relocate_orphaned_tool_results,
-    structurize_read_tool_output, title_from_user_text, truncate_str, AgentParser, ParseError,
+    backfill_turn_durations, compute_session_stats, folder_name_from_path,
+    infer_context_window_max_tokens, latest_turn_total_usage_tokens, merge_context_window_stats,
+    relocate_orphaned_tool_results, structurize_read_tool_output, title_from_user_text,
+    truncate_str, AgentParser, ParseError,
 };
 
 /// Cap for a single tool result / tool input preview stored on a turn. Grok's
@@ -22,6 +23,19 @@ use crate::parsers::{
 /// a single noisy command can't bloat a conversation detail payload.
 const GROK_TOOL_OUTPUT_CAP: usize = 100_000;
 const GROK_TOOL_INPUT_CAP: usize = 8_000;
+
+/// Budget for a serialized `TaskOutput` envelope (see `grok_task_output_envelope`).
+/// Deliberately below the live path's `MAX_SINGLE_EMIT_BYTES` (64 KiB, see
+/// `acp::connection`): the envelope is JSON the frontend parses, and the live
+/// emitter truncates from the head with a marker — which would corrupt it. Both
+/// paths share this function, so a background command's output is capped here
+/// rather than shredded downstream.
+const GROK_TASK_OUTPUT_CAP: usize = 48 * 1024;
+
+/// Tool name the parser assigns to grok's native `ask_user_question` (from its
+/// `_meta["x.ai/tool"].name`). Used to find the ask ToolResults whose answer must
+/// be recovered from `chat_history.jsonl` (see `inject_grok_ask_answers`).
+const GROK_ASK_TOOL_NAME: &str = "ask_user_question";
 
 /// Resolve Grok's data home, honoring `GROK_HOME`, else `~/.grok` (mirrors the
 /// CLI's own `GROK_HOME` override). The transcript store lives under the
@@ -76,8 +90,10 @@ fn resolve_grok_home_from(grok_home_env: Option<OsString>, home_dir: Option<Path
 ///   `status` ∈ {in_progress, completed, failed}, `content[]`, `rawOutput`).
 ///   The last update per `toolCallId` holds the full output.
 /// - `task_backgrounded` / `task_completed` — a command that was moved to the
-///   background; `task_completed.task_snapshot` carries the authoritative final
-///   `output` + `exit_code` (preferred over the streamed `tool_call_update`s).
+///   background. Both are ignored here (the launch call and the polls already
+///   carry everything rendered); note `task_backgrounded` is the ONLY event
+///   pairing `tool_call_id` with `task_id`, since `task_completed.task_snapshot`
+///   is keyed by `task_id` alone.
 /// - `turn_completed` — closes the current assistant turn (`stop_reason`).
 ///
 /// Turn model: one user turn per `user_message_chunk`, then a single assistant
@@ -152,6 +168,14 @@ impl GrokParser {
         relocate_orphaned_tool_results(&mut parsed.turns);
         structurize_read_tool_output(&mut parsed.turns);
 
+        // Grok resolves its native `ask_user_question` over the `_x.ai/ask_user_question`
+        // ext round-trip and never writes the answer into `updates.jsonl`, so the
+        // parsed ToolResult is empty and the `AskQuestionResultCard` shows "未选择".
+        // Recover the user's picks from `chat_history.jsonl` (the model-facing
+        // transcript, which DOES record the answer as a `tool_result`) and inject
+        // them as the tool output. No-op when the file is absent or there's no ask.
+        inject_grok_ask_answers(&mut parsed.turns, &session_dir.join("chat_history.jsonl"));
+
         // Fill assistant turns that carried no in-stream `modelId` with the
         // session model (summary `current_model_id`, else the first in-stream
         // model) so the message footer shows the model even for older/sparse
@@ -163,6 +187,10 @@ impl GrokParser {
                 }
             }
         }
+
+        // Grok times a turn from its own update spans; this reaches only the
+        // turns whose updates carried no usable timestamps.
+        backfill_turn_durations(&mut parsed.turns, &[]);
 
         // Grok sends no ACP `usage_update`, so the live meter stays empty; derive
         // the context ring here instead. Grok reports a cumulative per-turn token
@@ -329,15 +357,14 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
     let mut assistant: Option<MessageTurn> = None;
     let mut tool_result_idx: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    // toolCallIds whose result `task_completed` already finalized. A backgrounded
-    // command can emit a trailing (stale/cumulative) `tool_call_update` *after*
-    // its `task_completed` — those must not clobber the authoritative snapshot
-    // output. toolCallIds are unique within a session, so this is never cleared.
-    let mut finalized_tools: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
     // Stats for the in-flight turn (tokens/timing/model), applied to the
     // assistant turn when it is finalized. Reset at each turn boundary.
     let mut turn_meta = GrokTurnMeta::default();
+    // `promptIndex` of the currently-open user turn. Grok splits one prompt into
+    // several `user_message_chunk`s (prose, image, …) sharing a `promptIndex`;
+    // this lets consecutive same-prompt chunks merge into a single user turn
+    // instead of each opening a new (often empty) one.
+    let mut open_user_prompt_index: Option<i64> = None;
 
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else { continue };
@@ -368,13 +395,45 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
             .and_then(Value::as_str)
             .unwrap_or("");
 
+        // Grok injects its own reminders (a background task finishing, …) as
+        // `user_message_chunk`s and marks them `_meta.hideFromScrollback` — its
+        // TUI never shows them. Honor the flag: rendered as a user bubble, such a
+        // chunk splits one reply into two turns with a raw `<system-reminder>`
+        // block wedged between them. Skipped BEFORE the turn-boundary logic below,
+        // so a reminder injected mid-turn doesn't cut the open assistant turn
+        // either.
+        if kind == "user_message_chunk"
+            && update
+                .pointer("/_meta/hideFromScrollback")
+                .and_then(Value::as_bool)
+                == Some(true)
+        {
+            continue;
+        }
+
         // Grok's per-turn stats live in the OUTER `params._meta` (token total +
         // timing) plus `update._meta.modelId`. Accumulate them into `turn_meta`
-        // and apply at the turn boundary. A `user_message_chunk` opens a new
-        // turn, so close+reset the prior turn's accumulator before observing it.
+        // and apply at the turn boundary. A `user_message_chunk` that opens a NEW
+        // prompt closes+resets the prior turn's accumulator; a continuation chunk
+        // of the SAME prompt (see below) keeps accumulating.
         let params_meta = v.pointer("/params/_meta");
         let update_meta = update.get("_meta");
-        if kind == "user_message_chunk" {
+        // Grok emits each content piece of one prompt (prose, image, …) as its
+        // own `user_message_chunk` sharing a `promptIndex`. Merge consecutive
+        // user chunks of the same prompt into ONE user turn so a "text + image"
+        // prompt renders as a single bubble (matching the live path) rather than
+        // a trailing empty/image-only turn. A chunk continues the open user turn
+        // when no assistant content has intervened and the `promptIndex` matches
+        // (or is absent on either side).
+        let user_chunk_continues = kind == "user_message_chunk"
+            && assistant.is_none()
+            && matches!(out.turns.last(), Some(t) if matches!(t.role, TurnRole::User))
+            && update
+                .pointer("/_meta/promptIndex")
+                .and_then(Value::as_i64)
+                .zip(open_user_prompt_index)
+                .is_none_or(|(a, b)| a == b);
+        if kind == "user_message_chunk" && !user_chunk_continues {
             if let Some(prev) = assistant.as_mut() {
                 turn_meta.apply(prev);
             }
@@ -385,10 +444,14 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
 
         match kind {
             "user_message_chunk" => {
-                let text = update_text(update);
+                let block = user_chunk_to_block(update);
                 out.content_events += 1;
-                if out.first_user_text.is_none() && !text.trim().is_empty() {
-                    out.first_user_text = Some(text.clone());
+                // Title/first-prompt text comes only from prose chunks; an image
+                // chunk carries no text and must not overwrite it.
+                if let Some(ContentBlock::Text { text }) = &block {
+                    if out.first_user_text.is_none() && !text.trim().is_empty() {
+                        out.first_user_text = Some(text.clone());
+                    }
                 }
                 if out.model.is_none() {
                     out.model = update
@@ -396,16 +459,26 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
                         .and_then(Value::as_str)
                         .map(str::to_string);
                 }
-                out.turns.push(MessageTurn {
-                    id: String::new(), // assigned in a final pass
-                    role: TurnRole::User,
-                    blocks: vec![ContentBlock::Text { text }],
-                    timestamp: now,
-                    usage: None,
-                    duration_ms: None,
-                    model: None,
-                    completed_at: None,
-                });
+                if user_chunk_continues {
+                    // Same prompt: append the block to the open user turn.
+                    if let (Some(b), Some(turn)) = (block, out.turns.last_mut()) {
+                        turn.blocks.push(b);
+                    }
+                } else {
+                    open_user_prompt_index = update
+                        .pointer("/_meta/promptIndex")
+                        .and_then(Value::as_i64);
+                    out.turns.push(MessageTurn {
+                        id: String::new(), // assigned in a final pass
+                        role: TurnRole::User,
+                        blocks: block.into_iter().collect(),
+                        timestamp: now,
+                        usage: None,
+                        duration_ms: None,
+                        model: None,
+                        completed_at: None,
+                    });
+                }
             }
             "agent_message_chunk" => {
                 out.content_events += 1;
@@ -463,32 +536,9 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
             }
             "tool_call_update" => {
                 let id = str_field(update, "toolCallId");
-                // A trailing update after task_completed must not overwrite the
-                // authoritative snapshot output.
-                if !finalized_tools.contains(&id) {
-                    let output = update_tool_output(update);
-                    let failed = update.get("status").and_then(Value::as_str) == Some("failed");
-                    apply_tool_result(assistant.as_mut(), &tool_result_idx, &id, output, failed);
-                }
-            }
-            "task_completed" => {
-                let snap = update.get("task_snapshot");
-                let id = snap.map(|s| str_field(s, "task_id")).unwrap_or_default();
-                let output = snap
-                    .and_then(|s| s.get("output"))
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| truncate_str(s, GROK_TOOL_OUTPUT_CAP));
-                let failed = snap
-                    .and_then(|s| s.get("exit_code"))
-                    .and_then(Value::as_i64)
-                    .is_some_and(|code| code != 0);
-                // task_completed is authoritative for a backgrounded command;
-                // finalize the id so a trailing tool_call_update can't clobber it.
+                let output = update_tool_output(update);
+                let failed = update.get("status").and_then(Value::as_str) == Some("failed");
                 apply_tool_result(assistant.as_mut(), &tool_result_idx, &id, output, failed);
-                if !id.is_empty() {
-                    finalized_tools.insert(id);
-                }
             }
             "turn_completed" => {
                 if let Some(mut turn) = assistant.take() {
@@ -499,8 +549,64 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
                 turn_meta = GrokTurnMeta::default();
                 tool_result_idx.clear();
             }
-            // task_backgrounded / plan / other extension updates carry no
-            // distinct rendered content beyond what the tool stream already has.
+            // Grok's auto-compaction (`/compact` or threshold-triggered) lands in
+            // updates.jsonl on the namespaced `_x.ai/session/update` method as
+            // `auto_compact_completed` {tokens_before, tokens_after}. Mirror the
+            // live synthesis (connection.rs::map_grok_ext_notification): a completed
+            // ToolUse tagged `meta.contextCompaction` so the history path renders the
+            // shared ContextCompactionCard with the token delta instead of dropping
+            // it. The paired ToolResult keeps the block well-formed (no orphan
+            // tool_use). The `/compact` command itself is not recoverable — Grok
+            // never persists slash commands as `user_message_chunk`s — so only the
+            // compaction OUTCOME shows, not a "/compact" user bubble.
+            "auto_compact_completed" => {
+                out.content_events += 1;
+                let mut meta = serde_json::Map::new();
+                meta.insert("contextCompaction".to_string(), Value::Bool(true));
+                if let Some(before) = update.get("tokens_before").and_then(Value::as_u64) {
+                    meta.insert("tokensBefore".to_string(), before.into());
+                }
+                if let Some(after) = update.get("tokens_after").and_then(Value::as_u64) {
+                    meta.insert("tokensAfter".to_string(), after.into());
+                }
+                // A stable id from the event id (deterministic across re-parses);
+                // the paired blocks are self-contained, so no `tool_result_idx`
+                // registration or later update is needed.
+                let id = params_meta
+                    .and_then(|m| m.get("eventId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("grok-compaction-{}", out.content_events));
+                let turn = ensure_assistant(&mut assistant, now);
+                turn.blocks.push(ContentBlock::ToolUse {
+                    tool_use_id: Some(id.clone()),
+                    tool_name: "context_compaction".to_string(),
+                    input_preview: None,
+                    meta: Some(Value::Object(meta)),
+                });
+                turn.blocks.push(ContentBlock::ToolResult {
+                    tool_use_id: Some(id),
+                    output_preview: None,
+                    is_error: false,
+                    agent_stats: None,
+                    images: Vec::new(),
+                });
+            }
+            // `task_backgrounded` / `task_completed` / plan / other extension
+            // updates carry no distinct rendered content beyond what the tool
+            // stream already has.
+            //
+            // In particular `task_completed`'s snapshot is deliberately NOT
+            // applied to the launching tool call: Grok reports that CALL as
+            // `completed` on the wire (it did start the task), the live path
+            // never receives this ext notification at all, and the task's real
+            // outcome — command, exit code, output — renders from the
+            // `get_command_or_subagent_output` polls (see
+            // `grok_task_output_envelope`). Writing the snapshot here would make
+            // history contradict live for the same conversation.
+            //
+            // Known gap: a task the model never polls has its output ONLY in
+            // this snapshot, so neither path surfaces it.
             _ => {}
         }
     }
@@ -526,6 +632,215 @@ fn update_text(update: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
+}
+
+/// Classify a `user_message_chunk`'s `content` into a display block.
+///
+/// Grok sends prose as `{type:"text"}` and a pasted image as an embedded
+/// `{type:"resource", resource:{blob, mimeType, uri}}` — it advertises
+/// `image:false`, so images ride as embedded resources. An image-mime resource
+/// is promoted to [`ContentBlock::Image`] (bytes: `blob → data`) so it renders
+/// as a thumbnail, matching the live path and every other agent's images; a
+/// non-image embedded resource folds to a `[uri](uri)` link (same as the live
+/// [`crate::acp::user_blocks_from_prompt`]) so the attachment is still visible
+/// instead of a blank turn. Anything else falls back to a (possibly empty) text
+/// block, preserving prior behavior for plain prompts.
+fn user_chunk_to_block(update: &Value) -> Option<ContentBlock> {
+    let content = update.get("content")?;
+    match content.get("type").and_then(Value::as_str).unwrap_or("") {
+        "resource" => {
+            let resource = content.get("resource")?;
+            let mime = resource.get("mimeType").and_then(Value::as_str);
+            let blob = resource.get("blob").and_then(Value::as_str);
+            match (mime, blob) {
+                (Some(mime), Some(blob)) if mime.starts_with("image/") => {
+                    Some(ContentBlock::Image {
+                        data: blob.to_string(),
+                        mime_type: mime.to_string(),
+                        uri: resource
+                            .get("uri")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    })
+                }
+                _ => {
+                    let uri = resource.get("uri").and_then(Value::as_str).unwrap_or("");
+                    Some(ContentBlock::Text {
+                        text: format!("[{uri}]({uri})"),
+                    })
+                }
+            }
+        }
+        // Defensive: native ACP image content. Grok uses the `resource` shape
+        // above, but stay robust to a future/native image chunk.
+        "image" => {
+            let data = content.get("data").and_then(Value::as_str)?;
+            Some(ContentBlock::Image {
+                data: data.to_string(),
+                mime_type: content
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/png")
+                    .to_string(),
+                uri: content
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        }
+        // "text" and unknown kinds: existing behavior (reads `/content/text`).
+        _ => Some(ContentBlock::Text {
+            text: update_text(update),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// chat_history.jsonl — grok native ask_user_question answers
+// ---------------------------------------------------------------------------
+
+/// Inject the user's `ask_user_question` picks — recorded only in
+/// `chat_history.jsonl`, never in `updates.jsonl` — into the matching ToolResult
+/// so the `AskQuestionResultCard` renders the answer instead of "未选择". Mirrors
+/// the live path (`connection.rs::handle_grok_ask_user_question`): both feed the
+/// card the same `{answers, declined}` envelope with an empty `header`, so a
+/// conversation renders identically live and after reload. No-op when there is no
+/// ask or `chat_history.jsonl` is absent.
+fn inject_grok_ask_answers(turns: &mut [MessageTurn], chat_history: &Path) {
+    // The native ask carries meta `x.ai/tool.kind == "ask_user"`, which the
+    // tool_call arm mapped to this tool name; collect those call ids.
+    let ask_ids: std::collections::HashSet<String> = turns
+        .iter()
+        .flat_map(|t| t.blocks.iter())
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse {
+                tool_use_id: Some(id),
+                tool_name,
+                ..
+            } if tool_name == GROK_ASK_TOOL_NAME => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    if ask_ids.is_empty() {
+        return;
+    }
+    let answers = read_grok_ask_answers(chat_history, &ask_ids);
+    if answers.is_empty() {
+        return;
+    }
+    for turn in turns.iter_mut() {
+        for block in turn.blocks.iter_mut() {
+            if let ContentBlock::ToolResult {
+                tool_use_id: Some(id),
+                output_preview,
+                is_error,
+                ..
+            } = block
+            {
+                if let Some(env) = answers.get(id) {
+                    *output_preview = Some(env.clone());
+                    *is_error = false;
+                }
+            }
+        }
+    }
+}
+
+/// Read `chat_history.jsonl` and, for each `tool_result` whose `tool_call_id` is a
+/// known ask id, parse its content into the `{answers, declined}` envelope JSON.
+/// `chat_history.jsonl` is grok's model-facing transcript; an ask result there is
+/// `{type:"tool_result", tool_call_id, content}` and its id matches the
+/// `updates.jsonl` call id verbatim. Empty map when the file is missing.
+fn read_grok_ask_answers(
+    chat_history: &Path,
+    ask_ids: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(file) = fs::File::open(chat_history) else {
+        return out;
+    };
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        let Some(id) = v.get("tool_call_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !ask_ids.contains(id) {
+            continue;
+        }
+        let content = v.get("content").and_then(Value::as_str).unwrap_or("");
+        if let Some(envelope) = grok_history_answer_to_envelope(content) {
+            out.insert(id.to_string(), envelope.to_string());
+        }
+    }
+    out
+}
+
+/// Parse a grok `ask_user_question` `tool_result` content string into the codeg
+/// `{answers, declined}` envelope (the shape `parseAskQuestionOutcome` reads).
+///
+/// Verified against grok-0.2.101. The accepted template is `User has answered
+/// your questions: "Q"="A", "Q2"="B, C". You can now …` (a multi-select value is
+/// joined with `, `); the declined / skip_interview template is `The user has
+/// indicated they have provided enough answers …` / `(No answer provided)`.
+///
+/// `header` is emitted empty to match the header-less card input (grok's questions
+/// carry no header). Returns `None` for anything that is not one of these shapes,
+/// leaving the ToolResult untouched (today's behavior) — safe by construction.
+fn grok_history_answer_to_envelope(content: &str) -> Option<Value> {
+    let content = content.trim();
+    // Declined / skip_interview: distinct template, no per-question picks to show.
+    if content.starts_with("The user has indicated they have provided enough answers")
+        || content.contains("(No answer provided)")
+    {
+        return Some(serde_json::json!({ "answers": [], "declined": true }));
+    }
+    // Accepted: only this exact prefix (English — grok's internal template, not
+    // localized) carries `"Q"="A"` pairs.
+    if !content.starts_with("User has answered your questions:") {
+        return None;
+    }
+    // Split on the `"` delimiter. For `"Q1"="A1", "Q2"="A2". You can now …` the
+    // tokens are ["…: ", Q1, "=", A1, ", ", Q2, "=", A2, ". You can now …"], so a
+    // pair is (toks[i], toks[i+2]) with toks[i+1] == "=", advancing by 4. Trailing
+    // prose after the last quote is ignored. Lossy only if a question or label
+    // contains a literal `"` (then that pair's `=` guard fails and we stop) —
+    // questions rarely do, matching the existing text-fallback's tolerance.
+    let toks: Vec<&str> = content.split('"').collect();
+    let mut answers: Vec<Value> = Vec::new();
+    let mut i = 1;
+    while i + 2 < toks.len() {
+        if toks[i + 1] != "=" {
+            break;
+        }
+        let question = toks[i];
+        // Multi-select values are joined with ", "; split them back into the label
+        // array the card partitions against the offered options.
+        let selected: Vec<String> = toks[i + 2]
+            .split(", ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        answers.push(serde_json::json!({
+            "header": "",
+            "question": question,
+            "selected": selected,
+        }));
+        i += 4;
+    }
+    if answers.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({ "answers": answers, "declined": false }))
 }
 
 fn str_field(v: &Value, key: &str) -> String {
@@ -572,9 +887,10 @@ fn grok_mcp_output_text(raw_output: &Value) -> Option<String> {
 
 /// Extract the tool output text from a `tool_call_update`. Prefers the ACP
 /// `content[]` array (`{type:"content", content:{type:"text", text}}`), then
-/// `rawOutput.output_for_prompt` (Bash/terminal), then an MCP `rawOutput`'s
-/// `output` text (`use_tool`). All are cumulative, so the last update per call
-/// carries the full output.
+/// `rawOutput.output_for_prompt` (Bash/terminal), then a `TaskOutput` envelope
+/// (background-task polls — see `grok_task_output_envelope`), then an MCP
+/// `rawOutput`'s `output` text (`use_tool`). All are cumulative, so the last
+/// update per call carries the full output.
 fn update_tool_output(update: &Value) -> Option<String> {
     if let Some(items) = update.get("content").and_then(Value::as_array) {
         let mut buf = String::new();
@@ -601,6 +917,9 @@ fn update_tool_output(update: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
     {
         return Some(truncate_str(text, GROK_TOOL_OUTPUT_CAP));
+    }
+    if let Some(envelope) = update.get("rawOutput").and_then(grok_task_output_envelope) {
+        return Some(envelope);
     }
     update
         .get("rawOutput")
@@ -631,14 +950,47 @@ fn grok_mcp_input_preview(input: &Value) -> Option<String> {
     if input.is_null() {
         return None;
     }
-    let mut per_string = GROK_TOOL_INPUT_CAP;
+    cap_json_to_budget(input, GROK_TOOL_INPUT_CAP)
+}
+
+/// Serialize `value` as JSON that stays VALID within `budget` bytes: cap every
+/// string value, halving the per-string cap until the WHOLE serialized form
+/// fits. Checking the actual serialized length each pass is what bounds every
+/// bloat vector (many strings, long arrays, JSON/UTF-8 escaping that expands
+/// bytes) — a single per-field cap could not. Converges in O(log budget) passes;
+/// an already-small value returns on the first pass unchanged.
+fn cap_json_to_budget(value: &Value, budget: usize) -> Option<String> {
+    let mut per_string = budget;
     loop {
-        let serialized = serde_json::to_string(&cap_json_string_values(input, per_string)).ok()?;
-        if serialized.len() <= GROK_TOOL_INPUT_CAP || per_string == 0 {
+        let serialized = serde_json::to_string(&cap_json_string_values(value, per_string)).ok()?;
+        if serialized.len() <= budget || per_string == 0 {
             return Some(serialized);
         }
         per_string /= 2;
     }
+}
+
+/// Serialize a Grok `TaskOutput` `rawOutput` — the result of a
+/// `get_command_or_subagent_output` poll — for the frontend, which parses it
+/// into a background-task card (`@/lib/background-task`). Returns `None` for
+/// every other `rawOutput`, so the caller falls through to its normal paths.
+///
+/// The WHOLE envelope is passed through verbatim (bounded by
+/// [`GROK_TASK_OUTPUT_CAP`]): its `type` discriminator is what lets the frontend
+/// claim it without hijacking other JSON tool output, and passing it whole means
+/// the variants Grok can put beside it (`Result`, `MultiResult`, `TaskNotFound`)
+/// need no per-variant handling here. Without this the readable output — the
+/// command, exit code and shell text all live under `Result` — is dropped
+/// entirely: `content[]` is absent on these updates, and the `output_for_prompt`
+/// / MCP paths don't match.
+///
+/// Shared with the live path (`acp::connection::grok_live_tool_output`) so both
+/// hand the frontend a byte-identical string.
+pub(crate) fn grok_task_output_envelope(raw_output: &Value) -> Option<String> {
+    if raw_output.get("type").and_then(Value::as_str) != Some("TaskOutput") {
+        return None;
+    }
+    cap_json_to_budget(raw_output, GROK_TASK_OUTPUT_CAP)
 }
 
 /// Truncate every string value in a JSON value to `cap` chars, preserving
@@ -874,11 +1226,16 @@ mod tests {
         r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p0","stop_reason":"end_turn"}},"timestamp":1783584024}"#, "\n",
         r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"执行 pnpm build"},"_meta":{"promptIndex":1}}},"timestamp":1783584029}"#, "\n",
         r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"正在执行"}}},"timestamp":1783584029}"#, "\n",
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"run_terminal_command","rawInput":{"command":"pnpm build"},"_meta":{"x.ai/tool":{"name":"run_terminal_command","kind":"execute"}}}},"timestamp":1783584029}"#, "\n",
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"partial output"}}]}},"timestamp":1783584033}"#, "\n",
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_completed","task_snapshot":{"task_id":"call-1","output":"build ok","exit_code":0}}},"timestamp":1783584122}"#, "\n",
-        // Trailing (stale) update AFTER task_completed — must NOT clobber "build ok".
-        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"STALE trailing output"}}]}},"timestamp":1783584123}"#, "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"run_terminal_command","rawInput":{"command":"pnpm build","background":true},"_meta":{"x.ai/tool":{"name":"run_terminal_command","kind":"execute"}}}},"timestamp":1783584029}"#, "\n",
+        // The only event pairing the task id with the launching tool call.
+        r#"{"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_backgrounded","tool_call_id":"call-1","task_id":"term_x","command":"pnpm build"}},"timestamp":1783584029}"#, "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed","title":"[bg] pnpm build (term_x)","content":[{"type":"content","content":{"type":"text","text":"Background task term_x started"}}]}},"timestamp":1783584033}"#, "\n",
+        // Snapshot keyed by `task_id` — deliberately ignored, so the launch call
+        // stays exactly as the wire (and the live path) reports it.
+        r#"{"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_completed","task_snapshot":{"task_id":"term_x","command":"/bin/bash -lc 'pnpm build'","output":"boom","exit_code":1}}},"timestamp":1783584122}"#, "\n",
+        // The model polls the task; its whole result lives in `rawOutput`.
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-2","title":"get_command_or_subagent_output","rawInput":{"task_ids":["term_x"],"timeout_ms":15000},"_meta":{"x.ai/tool":{"name":"get_command_or_subagent_output","kind":"background_task_action"}}}},"timestamp":1783584123}"#, "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-2","status":"completed","title":"/bin/bash -lc 'pnpm build' (term_x)","rawOutput":{"type":"TaskOutput","Result":{"task_id":"term_x","command":"/bin/bash -lc 'pnpm build'","status":"failed","exit_code":1,"output":"boom"}}}},"timestamp":1783584124}"#, "\n",
         r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p1","stop_reason":"end_turn"}},"timestamp":1783584129}"#, "\n",
     );
 
@@ -927,8 +1284,11 @@ mod tests {
         assert!(
             matches!(tool_use, ContentBlock::ToolUse { tool_name, .. } if tool_name == "run_terminal_command")
         );
-        // task_completed output ("build ok") is authoritative over the streamed
-        // "partial output", and exit_code 0 → not an error.
+        // The launch keeps its own "started" text and its wire status: Grok
+        // reports the CALL as completed (it did start the task), and the failing
+        // `task_completed` snapshot is not applied — otherwise history would
+        // contradict the live path, which never sees that ext notification. The
+        // task's failure surfaces on the poll below.
         let tool_result = last
             .blocks
             .iter()
@@ -937,8 +1297,175 @@ mod tests {
         assert!(matches!(
             tool_result,
             ContentBlock::ToolResult { output_preview, is_error, .. }
-                if output_preview.as_deref() == Some("build ok") && !*is_error
+                if output_preview.as_deref() == Some("Background task term_x started") && !*is_error
         ));
+    }
+
+    /// A `get_command_or_subagent_output` poll carries its whole result in
+    /// `rawOutput` (no `content[]`, no `output_for_prompt`), which used to be
+    /// dropped — leaving the card empty. It must reach the frontend verbatim so
+    /// the background-task card can render command/status/exit code/output.
+    #[test]
+    fn background_task_poll_surfaces_task_output_envelope() {
+        let (_tmp, sessions) = fixture(SUMMARY, UPDATES);
+        let detail = GrokParser::with_base_dir(sessions)
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+        let blocks = &detail.turns[3].blocks;
+
+        let poll = blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse {
+                    tool_name,
+                    tool_use_id,
+                    ..
+                } => Some((tool_name, tool_use_id)),
+                _ => None,
+            })
+            .find(|(name, _)| name.as_str() == "get_command_or_subagent_output")
+            .expect("poll tool use");
+        assert_eq!(poll.1.as_deref(), Some("call-2"));
+
+        let output = blocks
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    output_preview,
+                    ..
+                } if tool_use_id.as_deref() == Some("call-2") => output_preview.clone(),
+                _ => None,
+            })
+            .expect("poll ToolResult output");
+        let env: Value = serde_json::from_str(&output).expect("envelope is valid JSON");
+        assert_eq!(env["type"], "TaskOutput");
+        assert_eq!(env["Result"]["exit_code"], 1);
+        assert_eq!(env["Result"]["status"], "failed");
+        assert_eq!(env["Result"]["output"], "boom");
+    }
+
+    /// Grok injects reminders as `user_message_chunk`s flagged
+    /// `_meta.hideFromScrollback`. Rendering them as user bubbles split one reply
+    /// into two turns with a raw `<system-reminder>` wedged between.
+    #[test]
+    fn hidden_user_chunk_does_not_split_the_reply() {
+        let updates = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"启动服务"},"_meta":{"modelId":"grok-4.5","promptIndex":0}}},"timestamp":1783584019}"#, "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"已启动"}}},"timestamp":1783584020}"#, "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p0","stop_reason":"end_turn"}},"timestamp":1783584021}"#, "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"<system-reminder>\nBackground task \"term_x\" completed (exit code: 1).\n</system-reminder>"},"_meta":{"modelId":"grok-4.5","promptIndex":1,"hideFromScrollback":true}}},"timestamp":1783584022}"#, "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"那次失败可以忽略"}}},"timestamp":1783584023}"#, "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p1","stop_reason":"end_turn"}},"timestamp":1783584024}"#, "\n",
+        );
+        let (_tmp, sessions) = fixture(SUMMARY, updates);
+        let detail = GrokParser::with_base_dir(sessions)
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+
+        // One real prompt + the two assistant replies; no reminder bubble.
+        assert_eq!(
+            detail
+                .turns
+                .iter()
+                .filter(|t| matches!(t.role, TurnRole::User))
+                .count(),
+            1
+        );
+        assert!(!detail.turns.iter().any(|t| t
+            .blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("system-reminder")))));
+        assert!(matches!(&detail.turns[2].blocks[0], ContentBlock::Text { text } if text == "那次失败可以忽略"));
+    }
+
+    #[test]
+    fn history_renders_auto_compaction_as_context_compaction_tool() {
+        // Grok's auto-compaction lands on the namespaced `_x.ai/session/update`
+        // method as `auto_compact_completed` (real capture, session 019f9432:
+        // 51777 → 4616 tokens), preceded by a `compaction_checkpoint` (ignored).
+        // History must surface the outcome as a completed ToolUse tagged
+        // `meta.contextCompaction` with the token delta — mirroring the live path —
+        // rather than dropping it.
+        let updates = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"plan a page"},"_meta":{"promptIndex":0}}},"timestamp":1783584019}"#, "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ok"}}},"timestamp":1783584020}"#, "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":1783584021}"#, "\n",
+            r#"{"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"compaction_checkpoint","checkpoint_id":"c1","prompt_index_at_compaction":0},"_meta":{"eventId":"ev-compact-1"}},"timestamp":1783584030}"#, "\n",
+            r#"{"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"auto_compact_completed","tokens_before":51777,"tokens_after":4616,"summary_preview":null},"_meta":{"eventId":"ev-compact-2"}},"timestamp":1783584030}"#, "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"},"_meta":{"promptIndex":1}}},"timestamp":1783584031}"#, "\n",
+        );
+        let (_tmp, sessions) = fixture(SUMMARY, updates);
+        let parser = GrokParser::with_base_dir(sessions);
+        let detail = parser
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+        // The compaction ToolUse carries the shared card's meta anywhere in the
+        // timeline (rendered between the prior turn and the next "hi" prompt).
+        let compaction = detail
+            .turns
+            .iter()
+            .flat_map(|t| &t.blocks)
+            .find_map(|b| match b {
+                ContentBlock::ToolUse { meta: Some(m), .. }
+                    if m.get("contextCompaction").and_then(|v| v.as_bool()) == Some(true) =>
+                {
+                    Some(m.clone())
+                }
+                _ => None,
+            })
+            .expect("compaction tool_use present in history");
+        assert_eq!(
+            compaction.get("tokensBefore").and_then(|v| v.as_u64()),
+            Some(51777)
+        );
+        assert_eq!(
+            compaction.get("tokensAfter").and_then(|v| v.as_u64()),
+            Some(4616)
+        );
+        // The paired ToolResult keeps the block well-formed (no orphan tool_use).
+        let has_result = detail
+            .turns
+            .iter()
+            .flat_map(|t| &t.blocks)
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+        assert!(has_result, "compaction tool_result present");
+    }
+
+    #[test]
+    fn merges_prompt_text_and_image_resource_into_one_user_turn() {
+        // Grok (`image:false` + `embedded_context:true`) sends a pasted image as
+        // a separate `user_message_chunk` carrying an embedded resource blob,
+        // right after the prose chunk of the SAME prompt (same `promptIndex`).
+        // Both must land in ONE user turn as [Text, Image] — not a text turn
+        // plus a trailing empty/image-only turn (the bug this fixes).
+        let updates = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"这是什么"},"_meta":{"modelId":"grok-4.5","promptIndex":0}}},"timestamp":1783584019}"#, "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"resource","resource":{"blob":"QUJD","mimeType":"image/png","uri":"clipboard://image.png-abc"}},"_meta":{"promptIndex":0}}},"timestamp":1783584019}"#, "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"一张截图"}}},"timestamp":1783584024}"#, "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":1783584024}"#, "\n",
+        );
+        let (_tmp, sessions) = fixture(SUMMARY, updates);
+        let parser = GrokParser::with_base_dir(sessions);
+        let detail = parser
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+        let turns = &detail.turns;
+        // One user turn + one assistant turn — NOT two user turns.
+        assert_eq!(turns.len(), 2);
+        assert!(matches!(turns[0].role, TurnRole::User));
+        assert_eq!(turns[0].blocks.len(), 2);
+        assert!(
+            matches!(&turns[0].blocks[0], ContentBlock::Text { text } if text == "这是什么")
+        );
+        assert!(matches!(
+            &turns[0].blocks[1],
+            ContentBlock::Image { data, mime_type, uri }
+                if data == "QUJD"
+                    && mime_type == "image/png"
+                    && uri.as_deref() == Some("clipboard://image.png-abc")
+        ));
+        assert!(matches!(turns[1].role, TurnRole::Assistant));
     }
 
     #[test]
@@ -987,7 +1514,9 @@ mod tests {
     fn assistant_turn_model_falls_back_to_summary() {
         // No in-stream modelId anywhere → the assistant turn's model is filled
         // from summary.json `current_model_id`, and without `params._meta` no
-        // token/duration stats are fabricated.
+        // token stats are fabricated. The elapsed time is not a fabrication
+        // though — the records are timestamped, so `backfill_turn_durations`
+        // reads the reply's span straight off the prompt→reply clock.
         let updates = concat!(
             r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"},"_meta":{"promptIndex":0}}},"timestamp":1783584019}"#, "\n",
             r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}},"timestamp":1783584024}"#, "\n",
@@ -1001,7 +1530,11 @@ mod tests {
         let assistant = detail.turns.last().expect("assistant turn");
         assert_eq!(assistant.model.as_deref(), Some("grok-4.5"));
         assert!(assistant.usage.is_none());
-        assert!(assistant.duration_ms.is_none());
+        assert_eq!(
+            assistant.duration_ms,
+            Some(5_000),
+            "1783584024 - 1783584019"
+        );
     }
 
     #[test]
@@ -1159,5 +1692,147 @@ mod tests {
         assert_eq!(home, PathBuf::from("/custom/grok"));
         let fallback = resolve_grok_home_from(None, Some("/home/me".into()));
         assert_eq!(fallback, PathBuf::from("/home/me/.grok"));
+    }
+
+    // --- grok native ask_user_question answer recovery (chat_history.jsonl) ---
+
+    #[test]
+    fn history_answer_single_select() {
+        let env = grok_history_answer_to_envelope(
+            "User has answered your questions: \"你更喜欢哪种演示方式？\"=\"随便看看\". \
+             You can now continue with the user's answers in mind.",
+        )
+        .unwrap();
+        assert_eq!(env["declined"], false);
+        assert_eq!(env["answers"][0]["header"], "");
+        assert_eq!(env["answers"][0]["question"], "你更喜欢哪种演示方式？");
+        assert_eq!(env["answers"][0]["selected"], serde_json::json!(["随便看看"]));
+    }
+
+    #[test]
+    fn history_answer_multi_select_splits_on_comma() {
+        // Grok joins a multi-select array with ", " inside the answer quotes.
+        let env = grok_history_answer_to_envelope(
+            "User has answered your questions: \"Which colors do you like?\"=\"Red, Green\". \
+             You can now continue with the user's answers in mind.",
+        )
+        .unwrap();
+        assert_eq!(
+            env["answers"][0]["selected"],
+            serde_json::json!(["Red", "Green"])
+        );
+    }
+
+    #[test]
+    fn history_answer_two_questions() {
+        let env = grok_history_answer_to_envelope(
+            "User has answered your questions: \"Q1\"=\"A1\", \"Q2\"=\"A2\". \
+             You can now continue with the user's answers in mind.",
+        )
+        .unwrap();
+        assert_eq!(env["answers"].as_array().unwrap().len(), 2);
+        assert_eq!(env["answers"][0]["question"], "Q1");
+        assert_eq!(env["answers"][0]["selected"], serde_json::json!(["A1"]));
+        assert_eq!(env["answers"][1]["question"], "Q2");
+        assert_eq!(env["answers"][1]["selected"], serde_json::json!(["A2"]));
+    }
+
+    #[test]
+    fn history_answer_declined() {
+        let env = grok_history_answer_to_envelope(
+            "The user has indicated they have provided enough answers for the plan interview.\n\
+             Stop asking clarifying questions and proceed to finish the plan.\n\n\
+             Questions asked and answers provided:\n- \"Pick a size\"\n  (No answer provided)",
+        )
+        .unwrap();
+        assert_eq!(env["declined"], true);
+        assert_eq!(env["answers"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn history_answer_non_ask_is_none() {
+        // A normal (non-ask) tool_result must never be mistaken for an answer.
+        assert!(grok_history_answer_to_envelope("build ok\nexit code 0").is_none());
+        assert!(grok_history_answer_to_envelope("").is_none());
+        // Accepted prefix but no parseable pairs → None (leaves ToolResult as-is).
+        assert!(grok_history_answer_to_envelope("User has answered your questions: none.").is_none());
+    }
+
+    // Updates carrying grok's native ask_user_question (meta kind "ask_user"),
+    // whose answer never lands in updates.jsonl — only in chat_history.jsonl.
+    const ASK_UPDATES: &str = concat!(
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"给我看看提问工具"},"_meta":{"promptIndex":0}}},"timestamp":1784334515}"#, "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-ask-0","title":"ask_user_question","rawInput":{"questions":[{"question":"你更喜欢哪种演示方式？","options":[{"label":"单选示例","description":"a"},{"label":"多选示例","description":"b"},{"label":"随便看看","description":"c"}]}]},"_meta":{"x.ai/tool":{"name":"ask_user_question","kind":"ask_user","namespace":"grok_build","label":"Ask User","read_only":true}}}},"timestamp":1784334520}"#, "\n",
+        r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p0","stop_reason":"end_turn"}},"timestamp":1784334532}"#, "\n",
+    );
+
+    fn ask_session_dir(sessions: &Path) -> PathBuf {
+        sessions
+            .join("%2FUsers%2Fme%2Fproj")
+            .join("019f45e3-e1ef-7690-a29f-fe2554382b49")
+    }
+
+    fn ask_detail(sessions: PathBuf) -> ConversationDetail {
+        GrokParser::with_base_dir(sessions)
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap()
+    }
+
+    fn ask_result_output(detail: &ConversationDetail) -> Option<String> {
+        detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .find_map(|b| match b {
+                ContentBlock::ToolResult { output_preview, .. } => Some(output_preview.clone()),
+                _ => None,
+            })
+            .flatten()
+    }
+
+    #[test]
+    fn injects_ask_answer_from_chat_history() {
+        let (_tmp, sessions) = fixture(SUMMARY, ASK_UPDATES);
+        write(
+            &ask_session_dir(&sessions),
+            "chat_history.jsonl",
+            concat!(
+                r#"{"type":"assistant","content":"演示","tool_calls":[{"id":"call-ask-0","name":"ask_user_question","arguments":"{}"}]}"#, "\n",
+                r#"{"type":"tool_result","tool_call_id":"call-ask-0","content":"User has answered your questions: \"你更喜欢哪种演示方式？\"=\"随便看看\". You can now continue with the user's answers in mind."}"#, "\n",
+            ),
+        );
+        let detail = ask_detail(sessions);
+        let output = ask_result_output(&detail).expect("ask ToolResult output injected");
+        let env: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(env["declined"], false);
+        assert_eq!(env["answers"][0]["question"], "你更喜欢哪种演示方式？");
+        assert_eq!(env["answers"][0]["selected"], serde_json::json!(["随便看看"]));
+        assert_eq!(env["answers"][0]["header"], "");
+    }
+
+    #[test]
+    fn injects_declined_ask_from_chat_history() {
+        let (_tmp, sessions) = fixture(SUMMARY, ASK_UPDATES);
+        write(
+            &ask_session_dir(&sessions),
+            "chat_history.jsonl",
+            concat!(
+                r#"{"type":"tool_result","tool_call_id":"call-ask-0","content":"The user has indicated they have provided enough answers for the plan interview.\n\nQuestions asked and answers provided:\n- \"你更喜欢哪种演示方式？\"\n  (No answer provided)"}"#, "\n",
+            ),
+        );
+        let detail = ask_detail(sessions);
+        let output = ask_result_output(&detail).expect("declined ask ToolResult output injected");
+        let env: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(env["declined"], true);
+        assert_eq!(env["answers"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn ask_without_chat_history_leaves_output_empty() {
+        // No chat_history.jsonl → injection is a no-op; the ask ToolResult output
+        // stays None (the pre-fix "未选择", never a crash).
+        let (_tmp, sessions) = fixture(SUMMARY, ASK_UPDATES);
+        let detail = ask_detail(sessions);
+        assert!(ask_result_output(&detail).is_none());
     }
 }

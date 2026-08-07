@@ -11,7 +11,6 @@ import type {
 } from "@/lib/platform/types"
 import { KB_SKIP_FILENAMES } from "@/lib/platform/types"
 import type { ReferenceAttrs } from "@/components/chat/composer/types"
-
 /** Check whether a KB doc's filePath ends with a filename that should be skipped
  *  (e.g. README.md, .gitignore). These files are project-level metadata, not
  *  meaningful knowledge docs. */
@@ -135,25 +134,6 @@ export type InjectI18nFn = (
   key: string,
   params?: Record<string, unknown>
 ) => string
-
-/**
- * Convert an InjectOption to a ReferenceAttrs for insertion as a context badge
- * in the TipTap composer. Each option becomes an inline `refType: "context"` atom.
- */
-export function optionToReferenceAttrs(option: InjectOption): ReferenceAttrs {
-  return {
-    refType: "context",
-    id: String(option.id),
-    label: option.label,
-    uri: null,
-    meta: {
-      injectGroup: option.group,
-      injectPrefix: option.prefixLine ?? undefined,
-      injectDocPath: option.docPath ?? undefined,
-      injectDocId: option.kbDocId ?? undefined,
-    },
-  }
-}
 
 /**
  * Build task-related options (description only).
@@ -312,5 +292,27 @@ export function buildPayloadFromOptions(
   return {
     options: selected,
     injectedDocsJson: JSON.stringify(docs),
+  }
+}
+
+/**
+ * Convert an InjectOption to a ProseMirror ReferenceAttrs for badge rendering.
+ * All inject options use `refType: "context"` so they render as platform badges;
+ * docPath/kbDocId/prefixLine are carried in `meta` for serialization.
+ */
+export function optionToReferenceAttrs(
+  option: InjectOption
+): ReferenceAttrs {
+  return {
+    refType: "context",
+    id: String(option.id),
+    label: option.label,
+    uri: null,
+    meta: {
+      injectGroup: option.group,
+      injectPrefix: option.prefixLine ?? undefined,
+      injectDocPath: option.docPath ?? undefined,
+      injectDocId: option.kbDocId ?? undefined,
+    },
   }
 }

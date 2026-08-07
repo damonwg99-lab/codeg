@@ -9,6 +9,12 @@ use regex::Regex;
 use walkdir::WalkDir;
 
 use crate::models::*;
+use crate::parsers::codex_code_mode::{
+    extract_chunk_ids, extract_shell_session_ids, is_code_mode_call, parse_code_mode_script,
+    script_card_input,
+    split_code_mode_output, with_note, CodeModeCall, CodeModeOutput, CodeModeScript, ScriptStatus,
+    Separator, CODEX_SCRIPT_TOOL_NAME,
+};
 use crate::parsers::{
     folder_name_from_path, title_from_user_text, truncate_str, AgentParser, ParseError,
 };
@@ -361,7 +367,42 @@ fn parse_codex_json_output(payload: &serde_json::Value) -> Option<serde_json::Va
     }
 }
 
-fn clean_codex_exec_output(text: &str) -> String {
+/// A `tools.exec_command()` result the script printed verbatim
+/// (`text(JSON.stringify(r))`) — the object form of the very envelope the
+/// string path spells out as `Chunk ID: …` / `Wall time: …` / `Output:`.
+/// Reduce it to the output it wraps so the card reads like the terminal it is:
+/// 9% of code-mode chunks are this shape, and the ones announcing a background
+/// session carry an empty `output`, so today those cards show nothing but the
+/// envelope. Callers must read whatever they need from the raw text (the
+/// session announcement lives in `session_id`) before cleaning.
+fn unwrap_exec_chunk_envelope(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let obj = value.as_object()?;
+    // The whole shape, not just `chunk_id`: a command whose own stdout is JSON
+    // carrying those two keys would otherwise be truncated to its `output`
+    // field, silently dropping the rest. Every envelope in real transcripts
+    // carries all four.
+    if !ENVELOPE_KEYS.iter().all(|key| obj.contains_key(*key)) {
+        return None;
+    }
+    Some(obj.get("output")?.as_str()?.to_string())
+}
+
+/// Keys every `tools.exec_command()` result object carries, in both the
+/// `exit_code` (finished) and `session_id` (still running) variants.
+const ENVELOPE_KEYS: [&str; 4] = [
+    "chunk_id",
+    "wall_time_seconds",
+    "original_token_count",
+    "output",
+];
+
+/// The command line and body of a codex exec envelope, or `None` when the text
+/// carries neither — i.e. when there is no envelope to strip. Distinct from
+/// `clean_codex_exec_output` in exactly one case that matters to a background
+/// session: an envelope whose body is empty answers `Some("")` (that poll
+/// collected nothing) rather than falling back to the header text.
+fn split_codex_exec_output(text: &str) -> Option<String> {
     let mut cmd_line: Option<&str> = None;
     let mut in_output = false;
     let mut output_lines = Vec::new();
@@ -371,13 +412,17 @@ fn clean_codex_exec_output(text: &str) -> String {
             cmd_line = Some(line);
             continue;
         }
-        if line == "Output:" || line == "Output: " {
+        if line.trim_end() == "Output:" {
             in_output = true;
             continue;
         }
         if in_output {
             output_lines.push(line);
         }
+    }
+
+    if cmd_line.is_none() && !in_output {
+        return None;
     }
 
     let mut result = String::new();
@@ -390,12 +435,908 @@ fn clean_codex_exec_output(text: &str) -> String {
         }
         result.push_str(&output_lines.join("\n"));
     }
+    Some(result)
+}
 
-    if result.is_empty() {
-        text.to_string()
-    } else {
-        result
+fn clean_codex_exec_output(text: &str) -> String {
+    split_codex_exec_output(text)
+        .filter(|cleaned| !cleaned.is_empty())
+        .unwrap_or_else(|| text.to_string())
+}
+
+/// Strip whichever exec envelope `text` is wrapped in — the object form or the
+/// `Chunk ID:` / `Wall time:` / `Output:` header — or `None` when it is wrapped
+/// in neither. The header form is only stripped when the FIRST line announces
+/// it: an `Output:` line in the middle of a build log is a build log, not an
+/// envelope, and stripping on that alone would swallow everything above it.
+fn strip_exec_envelope(text: &str) -> Option<String> {
+    if let Some(unwrapped) = unwrap_exec_chunk_envelope(text) {
+        return Some(unwrapped);
     }
+    let first = text.lines().next()?.trim_start().to_ascii_lowercase();
+    let announced = ["chunk id:", "wall time", "process ", "script "]
+        .iter()
+        .any(|prefix| first.starts_with(prefix));
+    if !announced {
+        return None;
+    }
+    split_codex_exec_output(text)
+}
+
+/// Banner codex puts in front of a script's `text()` stream when it re-rendered
+/// the whole stream as one blob instead of passing the parts through.
+const TRUNCATION_WARNING: &str = "Warning: truncated output";
+const TOTAL_OUTPUT_LINES: &str = "Total output lines: ";
+
+/// The per-`text()` chunks hiding inside a collapsed output blob, or `None` when
+/// recovering them is not provable.
+///
+/// Codex re-renders a long script's whole `text()` stream as ONE chunk behind a
+/// `Warning: truncated output (original token count: N)` / `Total output lines:
+/// M` banner. The boundaries survive in it — one physical line per `text()` —
+/// so the per-call split is still there to be had, and without it a
+/// `Promise.all` of four commands shows up as a single card whose body is four
+/// lines of raw envelope JSON.
+///
+/// Recovering it is only sound while all M lines are present: past the cap codex
+/// drops whole lines, and it drops them from the MIDDLE, so the survivors'
+/// positions stop naming their calls. Measured over the newest 400 rollouts: with
+/// every line present, line *i* is call *i* in 36 of 36 checkable cases; with
+/// lines dropped, 13 of 57 land on the wrong command. So all three counts have to
+/// agree — declared, present, and calls — and every line has to be a complete
+/// exec envelope, which is also what tells this blob apart from a single
+/// command's stdout that merely got truncated (the far more common banner).
+fn uncollapse_truncated_chunks(blob: Option<&TruncatedBlob>, calls: usize) -> Option<Vec<String>> {
+    if calls == 0 {
+        return None;
+    }
+    let blob = blob?;
+    if blob.body.len() != blob.declared || blob.declared != calls {
+        return None;
+    }
+    blob.body
+        .iter()
+        .all(|line| unwrap_exec_chunk_envelope(line).is_some())
+        .then(|| blob.body.iter().map(|line| line.to_string()).collect())
+}
+
+/// The line count a collapsed blob declares, and the lines it actually kept.
+///
+/// Reading it costs a pass over the whole blob, and three of the paths below
+/// want it, so `unwrap_code_mode_script` reads it once and hands it down.
+struct TruncatedBlob<'a> {
+    declared: usize,
+    body: Vec<&'a str>,
+}
+
+impl TruncatedBlob<'_> {
+    /// Codex dropped lines from the middle to fit the cap.
+    fn truncated(&self) -> bool {
+        self.declared > self.body.len()
+    }
+}
+
+fn truncated_blob(parsed: &CodeModeOutput) -> Option<TruncatedBlob<'_>> {
+    let [collapsed] = parsed.chunks.as_slice() else {
+        return None;
+    };
+    let mut lines = collapsed.lines();
+    if !lines.next()?.starts_with(TRUNCATION_WARNING) {
+        return None;
+    }
+    let declared: usize = lines
+        .next()?
+        .strip_prefix(TOTAL_OUTPUT_LINES)?
+        .trim()
+        .parse()
+        .ok()?;
+    if !lines.next()?.is_empty() {
+        return None;
+    }
+    Some(TruncatedBlob {
+        declared,
+        body: lines.collect(),
+    })
+}
+
+/// One call's share of a collapsed blob that was split on the separator lines
+/// the script printed.
+struct SeparatorSlot {
+    /// The lines this call owns. `None` means it printed nothing between its
+    /// separator and the next — which is not the same as having no separator,
+    /// hence `placed`.
+    text: Option<String>,
+    /// Whether a span of the blob could be attributed to this call at all. False
+    /// when truncation removed its separator, leaving nothing to cut on.
+    placed: bool,
+    /// Calls whose separators were truncated away, leaving their output inside
+    /// this slot with no boundary to cut on. Empty in the normal case.
+    shares_with: Vec<usize>,
+}
+
+/// At least this many separators have to be found, so a split rests on at least
+/// one proven boundary. One anchor divides nothing — it would hand the whole
+/// blob to the first call and leave the rest empty.
+const MIN_ANCHORS: usize = 2;
+
+/// The blob split on the separator lines the script printed before each result,
+/// or `None` when it cannot be read that way.
+///
+/// This is the only handle left once codex re-renders a long `text()` stream as
+/// one truncated blob: 89% of collapsed blobs are missing lines, so the counts
+/// `uncollapse_truncated_chunks` compares never agree. But scripts of this shape
+/// label their results — ``text(`===== ${k} =====\n${r.output}`)`` — and the
+/// labels come from the same literal table the commands do. So the separator
+/// each call printed can be *predicted* from the source and then looked up in
+/// the output, which is a far stronger check than counting: a wrong prediction
+/// does not match and the split is simply refused.
+///
+/// Truncation cannot reorder — it only deletes — so lines between two surviving
+/// separators belong to the earlier one and nothing else. When the separator
+/// *between* them was dropped, the span covers several calls with no way to
+/// tell where each begins; that span stays whole, attributed to the call it
+/// provably starts with, and the calls sharing it are named in `shares_with`
+/// rather than silently given someone else's output.
+///
+/// One residual, deliberately accepted: a matched line is only *probably* the
+/// separator the script printed. A command whose own stdout contains a line
+/// identical to another row's separator — printing this very transcript, say —
+/// would be cut there, and the tail of its output would be filed under that
+/// row. Uniqueness makes this impossible whenever every separator survived (a
+/// look-alike would be a second match and reject the candidate), so the risk
+/// only exists in the truncated case, and only when the look-alike stands in
+/// for a separator that is genuinely gone. Refusing truncated blobs would avoid
+/// it at the cost of the case this exists for — 89% of collapsed blobs are
+/// missing lines — so the split is kept and the labels are what it rests on.
+fn split_by_separators(
+    blob: Option<&TruncatedBlob>,
+    calls: &[CodeModeCall],
+    separators: &[Separator],
+) -> Option<Vec<SeparatorSlot>> {
+    if calls.len() < 2 || separators.is_empty() {
+        return None;
+    }
+    let body = &blob?.body;
+
+    let labels: Option<Vec<&str>> = calls.iter().map(|c| c.label.as_deref()).collect();
+    let by_index = |offset: usize| (0..calls.len()).map(|i| (i + offset).to_string()).collect();
+    // `---RESULT ${i+1}---` is as common as a label in this corpus, and costs
+    // nothing to try: the output either contains the line or it does not.
+    let candidates: Vec<Vec<String>> = labels
+        .map(|names| names.iter().map(|n| n.to_string()).collect())
+        .into_iter()
+        .chain([by_index(0), by_index(1)])
+        .collect();
+
+    let index = index_body_lines(body);
+    let mut best: Option<Vec<Option<usize>>> = None;
+    for separator in separators {
+        for values in &candidates {
+            let Some(found) = locate_anchors(&index, separator, values) else {
+                continue;
+            };
+            let hits = found.iter().flatten().count();
+            if hits < MIN_ANCHORS {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|b| hits > b.iter().flatten().count())
+            {
+                best = Some(found);
+            }
+        }
+    }
+
+    Some(slots_from_anchors(body, &best?))
+}
+
+/// Every line of the blob, trimmed of trailing whitespace, mapped to where it
+/// sits — or to `None` when it occurs more than once.
+///
+/// Built once and read by every candidate, which is what keeps the split from
+/// costing a pass over the blob per command: a run of separators is looked up,
+/// not searched for.
+fn index_body_lines<'a>(body: &[&'a str]) -> HashMap<&'a str, Option<usize>> {
+    let mut index = HashMap::with_capacity(body.len());
+    for (at, line) in body.iter().enumerate() {
+        index
+            .entry(line.trim_end())
+            .and_modify(|seen| *seen = None)
+            .or_insert(Some(at));
+    }
+    index
+}
+
+/// Where each value's separator line sits in the blob, or `None` for the ones
+/// truncation removed. Refuses the whole candidate when a line repeats or the
+/// lines run backwards — either means the match is not the separator run.
+fn locate_anchors(
+    index: &HashMap<&str, Option<usize>>,
+    separator: &Separator,
+    values: &[String],
+) -> Option<Vec<Option<usize>>> {
+    let mut found = Vec::with_capacity(values.len());
+    let mut previous = None;
+
+    for value in values {
+        let anchor = separator.anchor(value);
+        let hit = match index.get(anchor.trim_end()) {
+            // The line occurs twice, so it is not a boundary to cut on. Only a
+            // line some value actually predicts can refuse a candidate; an
+            // ordinary output line repeating is nobody's separator.
+            Some(None) => return None,
+            Some(Some(at)) => Some(*at),
+            None => None,
+        };
+        if let Some(at) = hit {
+            if previous.is_some_and(|before| at <= before) {
+                return None;
+            }
+            previous = Some(at);
+        }
+        found.push(hit);
+    }
+
+    Some(found)
+}
+
+fn slots_from_anchors(body: &[&str], found: &[Option<usize>]) -> Vec<SeparatorSlot> {
+    // A call whose separator survived owns the lines after it. The first call
+    // owns the head of the blob even without one: deletion never moves a line,
+    // so nothing can precede the first call's output.
+    let mut owners: Vec<(usize, Option<usize>)> = Vec::new();
+    if found.first().is_some_and(Option::is_none) {
+        owners.push((0, None));
+    }
+    owners.extend(
+        found
+            .iter()
+            .enumerate()
+            .filter_map(|(call, at)| at.map(|at| (call, Some(at)))),
+    );
+
+    let mut slots: Vec<SeparatorSlot> = (0..found.len())
+        .map(|_| SeparatorSlot {
+            text: None,
+            placed: false,
+            shares_with: Vec::new(),
+        })
+        .collect();
+
+    for (position, (call, anchor)) in owners.iter().enumerate() {
+        let start = anchor.map_or(0, |at| at + 1);
+        let (end, next_call) = match owners.get(position + 1) {
+            // The next owner's separator line is not part of this slot.
+            Some((next_call, Some(at))) => (*at, *next_call),
+            _ => (body.len(), found.len()),
+        };
+        let mut text = body.get(start..end).unwrap_or_default().join("\n");
+        let kept = text.trim_end().len();
+        text.truncate(kept);
+        slots[*call] = SeparatorSlot {
+            text: (!text.is_empty()).then_some(text),
+            placed: true,
+            shares_with: (call + 1..next_call).collect(),
+        };
+    }
+
+    slots
+}
+
+/// `text` trimmed with every run of digits collapsed to `#`, so `---RESULT 1---`
+/// and `---RESULT 2---` compare equal while `--- dto diff ---` and
+/// `--- handler diff ---` do not.
+fn digit_blind(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut digits = false;
+    for ch in text.trim().chars() {
+        if ch.is_ascii_digit() {
+            if !digits {
+                out.push('#');
+                digits = true;
+            }
+        } else {
+            digits = false;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// How many `text()` chunks each call contributed — 1 for the plain
+/// `results.forEach(r => text(r.output))` shape — or `None` when the chunks do
+/// not provably divide into one group per call.
+///
+/// Scripts routinely print more than one chunk per call: a `---RESULT n---`
+/// header before the output, an `exit_code=0` after it. 268 of the 1297
+/// multi-call scripts that fail the 1:1 count in the newest 400 rollouts are
+/// exactly this, and they render as one undecomposable script card today.
+///
+/// The count alone proves nothing — a script that prints every output first and
+/// every exit code after hands over the same chunks in the wrong order, and
+/// slicing those into pairs would pin each command's output to the previous
+/// command's card. The proof is `text_run` (see `CodeModeScript`): exactly
+/// `stride` `text()` calls with no loop between the first and the last, so that
+/// run emitted its chunks together, `calls` times over. A repeating slot is kept
+/// as corroboration — it is only evidence, since a command's own stdout can be
+/// `exit_code=0` — and costs 13 of 256 candidates, which stay script cards.
+///
+/// Measured with commands whose output names its own call (`nl -ba F | sed -n
+/// 'A,Bp'` must start at line A): 152 of 153 groups land on the right command,
+/// and the one exception is the check's own blind spot — that `nl` failed and
+/// printed a usage error, so there was no line number to match.
+fn call_chunk_stride(chunks: &[String], calls: usize, text_run: Option<usize>) -> Option<usize> {
+    if calls == 0 || chunks.is_empty() || !chunks.len().is_multiple_of(calls) {
+        return None;
+    }
+    let stride = chunks.len() / calls;
+    if stride == 1 {
+        return Some(1);
+    }
+    if text_run != Some(stride) {
+        return None;
+    }
+    (0..stride)
+        .any(|slot| {
+            let marker = digit_blind(&chunks[slot]);
+            !marker.is_empty()
+                && (1..calls).all(|index| digit_blind(&chunks[index * stride + slot]) == marker)
+        })
+        .then_some(stride)
+}
+
+/// Turn one code-mode script + its output envelope into the tool blocks the
+/// pre-code-mode history path produced.
+///
+/// Returns `(replacement tool_use blocks, tool_result blocks)`. The first is
+/// `None` when the script could not be decomposed — the placeholder script card
+/// stays and simply receives the whole output.
+///
+/// Splitting per call needs the chunks to divide into one group per call, in
+/// order — see `call_chunk_stride` for what counts as proof. Anything less falls
+/// back to the script card rather than misattributing output, including the
+/// collapsed blob codex renders in place of the chunks when the stream is long,
+/// unless `uncollapse_truncated_chunks` can prove the chunks back out of it.
+fn unwrap_code_mode_script(
+    call_id: &str,
+    script: &CodeModeScript,
+    parsed: &CodeModeOutput,
+    payload: &serde_json::Value,
+    sessions: &mut HashMap<String, ShellSession>,
+    poll_origins: &mut HashMap<String, String>,
+) -> (Option<Vec<ContentBlock>>, Vec<ContentBlock>) {
+    let calls = script.calls.as_deref().unwrap_or_default();
+
+    let result_block = |tool_use_id: Option<String>, text: Option<String>, note: Option<&str>| {
+        let output_preview = with_note(text, note);
+        let is_error = parsed.is_error()
+            || infer_tool_call_output_is_error(payload, None, output_preview.as_deref());
+        ContentBlock::ToolResult {
+            tool_use_id,
+            output_preview,
+            is_error,
+            agent_stats: None,
+            images: Vec::new(),
+        }
+    };
+
+    let non_empty = |text: String| {
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    };
+
+    // NB: the envelope note (`Script running with cell ID N`) is deliberately
+    // NOT registered as a shell session here. That cell is the SCRIPT — it has
+    // not finished — so the `wait` collecting it carries this very script's
+    // return value and is folded back onto these cards by the caller
+    // (`DeferredScript`), never rendered as a session of its own.
+
+    // A collapsed blob stands in for the chunks it was rendered from, when the
+    // counts prove which is which. Nothing changes when it does not: the
+    // fallback is `parsed.chunks` itself, banner and all.
+    // Every path that reads it bails on the call count first, so a script that
+    // recovered nothing does not pay to have its blob split into lines.
+    let blob = (!calls.is_empty())
+        .then(|| truncated_blob(parsed))
+        .flatten();
+    let uncollapsed = uncollapse_truncated_chunks(blob.as_ref(), calls.len());
+    let chunks: &[String] = uncollapsed.as_deref().unwrap_or(&parsed.chunks);
+
+    if calls.len() == 1 {
+        let call = &calls[0];
+        let joined = chunks.join("\n");
+        let uses = vec![ContentBlock::ToolUse {
+            tool_use_id: Some(call_id.to_string()),
+            tool_name: call.tool_name.clone(),
+            input_preview: Some(shell_session_input_preview(
+                call,
+                call_id,
+                sessions,
+                poll_origins,
+            )),
+            meta: codex_script_meta(call.label.as_deref(), false, &[], false),
+        }];
+        register_shell_sessions(call, call_id, &joined, sessions);
+        let results = vec![result_block(
+            Some(call_id.to_string()),
+            non_empty(exec_chunk_display(call, joined)),
+            parsed.note.as_deref(),
+        )];
+        return (Some(uses), results);
+    }
+
+    if let Some(stride) = (calls.len() > 1)
+        .then(|| call_chunk_stride(chunks, calls.len(), script.text_run))
+        .flatten()
+    {
+        let last = calls.len() - 1;
+        let mut uses = Vec::with_capacity(calls.len());
+        let mut results = Vec::with_capacity(calls.len());
+        for (index, call) in calls.iter().enumerate() {
+            let id = format!("{call_id}#{index}");
+            let note = if index == last {
+                parsed.note.as_deref()
+            } else {
+                None
+            };
+            let group = &chunks[index * stride..(index + 1) * stride];
+            uses.push(ContentBlock::ToolUse {
+                tool_use_id: Some(id.clone()),
+                tool_name: call.tool_name.clone(),
+                input_preview: Some(shell_session_input_preview(
+                    call,
+                    &id,
+                    sessions,
+                    poll_origins,
+                )),
+                meta: codex_script_meta(call.label.as_deref(), false, &[], false),
+            });
+            // Announcements are read from the chunks as written: unwrapping an
+            // envelope drops the `session_id` that names the session.
+            register_shell_sessions(call, &id, &group.join("\n"), sessions);
+            let shown = group
+                .iter()
+                .map(|chunk| exec_chunk_display(call, chunk.clone()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            results.push(result_block(Some(id), non_empty(shown), note));
+        }
+        return (Some(uses), results);
+    }
+
+    // The chunks did not divide, but the script may have labelled its results
+    // on their way out. Only reachable for a collapsed blob — anything with real
+    // chunks was already handled above.
+    if let Some(slots) = split_by_separators(blob.as_ref(), calls, &script.separators) {
+        let truncated = blob.as_ref().is_some_and(TruncatedBlob::truncated);
+        let last = calls.len() - 1;
+        let mut uses = Vec::with_capacity(calls.len());
+        let mut results = Vec::with_capacity(calls.len());
+        for (index, (call, slot)) in calls.iter().zip(&slots).enumerate() {
+            let id = format!("{call_id}#{index}");
+            let note = if index == last {
+                parsed.note.as_deref()
+            } else {
+                None
+            };
+            let shared: Vec<String> = slot
+                .shares_with
+                .iter()
+                .filter_map(|other| calls.get(*other))
+                .map(call_display_name)
+                .collect();
+            uses.push(ContentBlock::ToolUse {
+                tool_use_id: Some(id.clone()),
+                tool_name: call.tool_name.clone(),
+                input_preview: Some(shell_session_input_preview(
+                    call,
+                    &id,
+                    sessions,
+                    poll_origins,
+                )),
+                meta: codex_script_meta(
+                    call.label.as_deref(),
+                    // A command that ran and printed nothing is not a command
+                    // whose output went missing; only the second is worth a
+                    // notice, and saying it of the first would be false.
+                    !slot.placed,
+                    &shared,
+                    truncated,
+                ),
+            });
+            if let Some(text) = &slot.text {
+                register_shell_sessions(call, &id, text, sessions);
+            }
+            let shown = slot
+                .text
+                .clone()
+                .and_then(|text| non_empty(exec_chunk_display(call, text)));
+            results.push(result_block(Some(id), shown, note));
+        }
+        return (Some(uses), results);
+    }
+
+    // Undecomposable script: the card stays a script card, and no session it
+    // announced is attributed. There is no way to tell which of its calls
+    // started one — that is exactly why it did not decompose.
+    let joined = chunks.join("\n");
+    (
+        None,
+        vec![result_block(
+            Some(call_id.to_string()),
+            non_empty(joined),
+            parsed.note.as_deref(),
+        )],
+    )
+}
+
+/// What the renderer needs to know about a call recovered from a code-mode
+/// script, as facts rather than prose: the backend states them, the frontend
+/// words them in the reader's language.
+fn codex_script_meta(
+    label: Option<&str>,
+    output_missing: bool,
+    shares_with: &[String],
+    truncated: bool,
+) -> Option<serde_json::Value> {
+    let mut marks = serde_json::Map::new();
+    if let Some(label) = label {
+        marks.insert("label".to_string(), label.into());
+    }
+    if output_missing {
+        marks.insert("outputMissing".to_string(), true.into());
+    }
+    if !shares_with.is_empty() {
+        marks.insert("sharedWith".to_string(), shares_with.into());
+    }
+    if truncated {
+        marks.insert("truncated".to_string(), true.into());
+    }
+    (!marks.is_empty()).then(|| serde_json::json!({ "codeg.codexScript": marks }))
+}
+
+/// How to name a call when telling the reader whose output shares a card.
+fn call_display_name(call: &CodeModeCall) -> String {
+    call.label.clone().unwrap_or_else(|| {
+        truncate_str(
+            call.input_preview.lines().next().unwrap_or_default().trim(),
+            60,
+        )
+    })
+}
+
+/// A code-mode script whose output was `Script running with cell ID N`: the
+/// script itself has not finished. Remembers where its cards were written so
+/// the `wait` that collects cell N — its real return value, arriving any number
+/// of turns later — can be folded back onto them instead of rendering as a
+/// separate card. Indices are stable because the parse loop only appends.
+#[derive(Clone)]
+struct DeferredScript {
+    call_id: String,
+    /// Index of the message holding the script's ToolUse block(s).
+    use_index: usize,
+    /// Index of the message holding its ToolResult block(s).
+    result_index: usize,
+    script: CodeModeScript,
+    /// Everything the script has printed so far. A `wait` answers with what has
+    /// been printed SINCE — measured on real transcripts, the collected answer
+    /// shares nothing with the one that parked the script — so the chunks have
+    /// to be accumulated and re-decomposed as one sequence. Replacing the cards
+    /// from the `wait` alone would drop whatever the script had already printed,
+    /// and would decompose against a chunk count that is missing its front.
+    chunks: Vec<String>,
+}
+
+/// codex's unified-exec session tools. Neither carries a command of its own:
+/// both address a background shell started by an earlier `exec_command`, by the
+/// id that command's output announced (`wait` calls it `cell_id`,
+/// `write_stdin` calls it `session_id`).
+const SHELL_SESSION_TOOLS: [&str; 2] = ["wait", "write_stdin"];
+
+/// Key added to a `wait` / `write_stdin` `input_preview` carrying the command
+/// that started the session it addresses.
+///
+/// Deliberately NOT `command`: `inferFromInput` (`tool-call-normalization.ts`)
+/// classifies any live input carrying `command`/`cmd`/… as a terminal call, so
+/// that spelling would hijack the live classification of these tools.
+const SESSION_COMMAND_KEY: &str = "session_command";
+
+/// A background shell an `exec_command` left running: unified-exec answers that
+/// command with whatever it printed so far plus `Process running with session
+/// ID N`, and the rest of the output has to be collected by later `wait` /
+/// `write_stdin` calls addressing N.
+#[derive(Clone)]
+struct ShellSession {
+    /// The command that started it. Titles the calls that address it.
+    command: String,
+    /// `tool_use_id` of the card holding that command's output, while more of
+    /// it may still be appended there. `None` once the session got a card of
+    /// its own (keystrokes, termination): output arriving after that card
+    /// belongs below it, not folded back above it.
+    origin: Option<String>,
+}
+
+fn is_shell_session_tool(tool_name: &str) -> bool {
+    SHELL_SESSION_TOOLS.contains(&tool_name)
+}
+
+/// The text a recovered call's card shows. Only the exec family answers with
+/// the chunk envelope, and only there is unwrapping it provably right — another
+/// tool returning an object that happens to carry `chunk_id` would be showing
+/// its own result, not a terminal's.
+fn exec_chunk_display(call: &CodeModeCall, chunk: String) -> String {
+    if call.tool_name != "exec_command" && !is_shell_session_tool(&call.tool_name) {
+        return chunk;
+    }
+    strip_exec_envelope(&chunk).unwrap_or(chunk)
+}
+
+/// Whether a `wait` / `write_stdin` only collects output — no keystrokes to
+/// show, no termination to report. Such a call *is* the earlier command still
+/// running, so it gets no card and its output is appended to that command's.
+fn is_pure_poll(args: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let sends_input = args
+        .get("chars")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    let terminates = args
+        .get("terminate")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    !sends_input && !terminates
+}
+
+/// The session id a `wait` / `write_stdin` argument object addresses, as a
+/// string — `wait` sends `"cell_id":"7106"`, `write_stdin` sends
+/// `"session_id":33067`.
+fn shell_session_id(args: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let value = args.get("cell_id").or_else(|| args.get("session_id"))?;
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Annotate a `wait` / `write_stdin` argument JSON with the command that
+/// started the session it addresses, so the card can be titled by that command
+/// instead of a bare `wait`. Returns `None` when the arguments aren't an
+/// object, carry no session id, or the id was never announced — the caller then
+/// keeps the arguments untouched rather than inventing a command.
+fn annotate_shell_session_args(
+    args: &serde_json::Value,
+    sessions: &HashMap<String, ShellSession>,
+) -> Option<String> {
+    let obj = args.as_object()?;
+    let session = sessions.get(&shell_session_id(obj)?)?;
+    let mut annotated = obj.clone();
+    annotated.insert(
+        SESSION_COMMAND_KEY.to_string(),
+        serde_json::Value::String(session.command.clone()),
+    );
+    Some(serde_json::Value::Object(annotated).to_string())
+}
+
+/// Same annotation for a session tool recovered from a code-mode script, whose
+/// `input_preview` is already the argument object's JSON.
+fn shell_session_input_preview(
+    call: &CodeModeCall,
+    tool_use_id: &str,
+    sessions: &mut HashMap<String, ShellSession>,
+    poll_origins: &mut HashMap<String, String>,
+) -> String {
+    if !is_shell_session_tool(&call.tool_name) {
+        return call.input_preview.clone();
+    }
+    let args = serde_json::from_str::<serde_json::Value>(&call.input_preview).ok();
+    note_shell_session_call(Some(tool_use_id), args.as_ref(), sessions, poll_origins);
+    args.and_then(|args| annotate_shell_session_args(&args, sessions))
+        .unwrap_or_else(|| call.input_preview.clone())
+}
+
+/// Record `session id → command` for every background session this call's
+/// output announced. Only `exec_command` starts sessions, and only its own
+/// output can name them, so nothing else is registered — a wrong mapping would
+/// put someone else's command in a `wait` card's title.
+fn register_shell_sessions(
+    call: &CodeModeCall,
+    origin: &str,
+    output: &str,
+    sessions: &mut HashMap<String, ShellSession>,
+) {
+    // `args_inline` is the proof that this command is what actually ran: one
+    // call site executes any number of times, and arguments reached through a
+    // variable can be reassigned between iterations, leaving the recovered
+    // command a guess. Titling — and now folding — a session under a guess is
+    // exactly the failure this parser must not have.
+    if call.tool_name != "exec_command" || !call.args_inline {
+        return;
+    }
+    // `input_preview` of a recovered `exec_command` is the bare command string.
+    register_announced_sessions(&call.input_preview, origin, output, sessions);
+}
+
+/// `origin` is the `tool_use_id` of the card this output is being written to —
+/// where the session's remaining output gets appended once a later poll
+/// collects it.
+fn register_announced_sessions(
+    command: &str,
+    origin: &str,
+    output: &str,
+    sessions: &mut HashMap<String, ShellSession>,
+) {
+    if command.trim().is_empty() {
+        return;
+    }
+    let announced = extract_shell_session_ids(output);
+    if announced.is_empty() {
+        return;
+    }
+    // The chunk ids of the same output are aliases for the cells it announced —
+    // codex addresses them either way. Registered only alongside a real
+    // announcement, so a chunk id from a command that already exited stays
+    // meaningless.
+    for id in announced.into_iter().chain(extract_chunk_ids(output)) {
+        sessions.insert(
+            id,
+            ShellSession {
+                command: command.to_string(),
+                origin: Some(origin.to_string()),
+            },
+        );
+    }
+}
+
+/// Classify a `wait` / `write_stdin` against the session it addresses: either
+/// it only collects more of that session's output — in which case it is marked
+/// for folding into the card of the command producing it — or it is an action
+/// (keystrokes, termination) that earns a card, and everything the session
+/// prints from then on belongs below that card rather than folded back above
+/// it. Sessions nobody announced fall through both: nothing to fold into.
+fn note_shell_session_call(
+    tool_use_id: Option<&str>,
+    args: Option<&serde_json::Value>,
+    sessions: &mut HashMap<String, ShellSession>,
+    poll_origins: &mut HashMap<String, String>,
+) {
+    let Some(args) = args.and_then(|a| a.as_object()) else {
+        return;
+    };
+    let Some(session_id) = shell_session_id(args) else {
+        return;
+    };
+    let Some(origin) = sessions.get(&session_id).and_then(|s| s.origin.clone()) else {
+        return;
+    };
+    if is_pure_poll(args) {
+        if let Some(call_id) = tool_use_id {
+            poll_origins.insert(call_id.to_string(), origin);
+        }
+        return;
+    }
+    // End the folding for every id naming this cell, not just the one this call
+    // addressed: the numeric session id and the hex chunk id are aliases, and a
+    // poll arriving through the other spelling would otherwise still be folded
+    // in above the card that caused it.
+    for session in sessions.values_mut() {
+        if session.origin.as_deref() == Some(origin.as_str()) {
+            session.origin = None;
+        }
+    }
+}
+
+/// Drop every card that only collects more of an earlier command's output,
+/// moving what it collected onto that command's card. Runs on the finished
+/// message list so a poll codex called directly and one a code-mode script
+/// wrote are folded the same way — the script path builds its cards inside
+/// `unwrap_code_mode_script`, long after the call itself was read.
+fn fold_shell_session_polls(
+    messages: &mut Vec<UnifiedMessage>,
+    poll_origins: &HashMap<String, String>,
+) {
+    if poll_origins.is_empty() {
+        return;
+    }
+
+    // Where every tool block lives, and — in transcript order — the polls to
+    // fold. Collected up front: a poll's origin always sits earlier, so folding
+    // as we walk would need the map anyway, and both blocks of a poll have to be
+    // located before either can be dropped.
+    let mut result_at: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut use_at: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut folds: Vec<(String, String, usize, usize)> = Vec::new();
+    for (mi, message) in messages.iter().enumerate() {
+        for (bi, block) in message.content.iter().enumerate() {
+            match block {
+                ContentBlock::ToolUse {
+                    tool_use_id: Some(id),
+                    ..
+                } => {
+                    use_at.insert(id.clone(), (mi, bi));
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id: Some(id),
+                    ..
+                } => match poll_origins.get(id) {
+                    Some(origin) => folds.push((id.clone(), origin.clone(), mi, bi)),
+                    None => {
+                        result_at.insert(id.clone(), (mi, bi));
+                    }
+                },
+                _ => {}
+            }
+        }
+    }
+
+    let mut drop_at: Vec<(usize, usize)> = Vec::new();
+    for (poll_id, origin, mi, bi) in folds {
+        // No origin block left — a code-mode script re-decomposed under it, say.
+        // Leave the poll's own card alone rather than dropping what it collected.
+        let Some(&(omi, obi)) = result_at.get(&origin) else {
+            continue;
+        };
+        let ContentBlock::ToolResult {
+            output_preview,
+            is_error,
+            ..
+        } = &messages[mi].content[bi]
+        else {
+            continue;
+        };
+        let collected = output_preview.clone().unwrap_or_default();
+        let collected = collected.trim_end().to_string();
+        let collected_error = *is_error;
+
+        let ContentBlock::ToolResult {
+            output_preview,
+            is_error,
+            ..
+        } = &mut messages[omi].content[obi]
+        else {
+            continue;
+        };
+        if !collected.is_empty() {
+            match output_preview {
+                Some(existing) if !existing.trim().is_empty() => {
+                    while existing.ends_with('\n') {
+                        existing.pop();
+                    }
+                    existing.push('\n');
+                    existing.push_str(&collected);
+                }
+                _ => *output_preview = Some(collected),
+            }
+        }
+        *is_error = *is_error || collected_error;
+
+        drop_at.push((mi, bi));
+        if let Some(&at) = use_at.get(&poll_id) {
+            drop_at.push(at);
+        }
+    }
+
+    if drop_at.is_empty() {
+        return;
+    }
+    let emptied: HashSet<usize> = drop_at.iter().map(|(mi, _)| *mi).collect();
+    drop_at.sort_unstable();
+    // Two polls sharing a `tool_use_id` would name the same use block twice, and
+    // removing a block index twice panics. Ids are unique in practice; a broken
+    // transcript must not take the whole conversation down with it.
+    drop_at.dedup();
+    for (mi, bi) in drop_at.into_iter().rev() {
+        messages[mi].content.remove(bi);
+    }
+    let mut index = 0;
+    messages.retain(|m| {
+        let keep = !m.content.is_empty() || !emptied.contains(&index);
+        index += 1;
+        keep
+    });
 }
 
 fn value_to_preview(value: Option<&serde_json::Value>) -> Option<String> {
@@ -702,7 +1643,9 @@ fn parse_codex_subagent_stats(
     let reader = BufReader::new(file);
 
     let mut tool_calls = Vec::new();
-    let mut pending_calls: HashMap<String, AgentToolCall> = HashMap::new();
+    // A code-mode `exec` call expands to one entry per inner `tools.*` call, so
+    // the sub-agent stats count real tools instead of a pile of `exec`.
+    let mut pending_calls: HashMap<String, Vec<AgentToolCall>> = HashMap::new();
     let mut first_ts: Option<DateTime<Utc>> = None;
     let mut last_ts: Option<DateTime<Utc>> = None;
 
@@ -746,28 +1689,60 @@ fn parse_codex_subagent_stats(
                     .unwrap_or("unknown")
                     .to_string();
 
-                let input_preview = if tool_name == "exec_command" {
-                    parse_codex_json_arg(payload)
-                        .and_then(|a| a.get("cmd").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                        .or_else(|| {
-                            value_to_preview(
-                                payload.get("arguments").or_else(|| payload.get("input")),
-                            )
-                        })
+                let entries = if is_code_mode_call(&tool_name) {
+                    let source = payload
+                        .get("input")
+                        .or_else(|| payload.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let script = parse_code_mode_script(source);
+                    match script.calls {
+                        Some(calls) if !calls.is_empty() => calls
+                            .into_iter()
+                            .map(|call| AgentToolCall {
+                                tool_name: call.tool_name,
+                                input_preview: Some(truncate_str(&call.input_preview, 500)),
+                                output_preview: None,
+                                is_error: false,
+                            })
+                            .collect(),
+                        _ => vec![AgentToolCall {
+                            tool_name: CODEX_SCRIPT_TOOL_NAME.to_string(),
+                            input_preview: script
+                                .summary
+                                .or_else(|| Some(source.to_string()))
+                                .map(|s| truncate_str(&s, 500)),
+                            output_preview: None,
+                            is_error: false,
+                        }],
+                    }
                 } else {
-                    value_to_preview(payload.get("arguments").or_else(|| payload.get("input")))
+                    let input_preview = if tool_name == "exec_command" {
+                        parse_codex_json_arg(payload)
+                            .and_then(|a| {
+                                a.get("cmd").and_then(|v| v.as_str()).map(|s| s.to_string())
+                            })
+                            .or_else(|| {
+                                value_to_preview(
+                                    payload.get("arguments").or_else(|| payload.get("input")),
+                                )
+                            })
+                    } else {
+                        value_to_preview(payload.get("arguments").or_else(|| payload.get("input")))
+                    };
+
+                    vec![AgentToolCall {
+                        tool_name,
+                        input_preview: input_preview.map(|s| truncate_str(&s, 500)),
+                        output_preview: None,
+                        is_error: false,
+                    }]
                 };
 
-                let tc = AgentToolCall {
-                    tool_name,
-                    input_preview: input_preview.map(|s| truncate_str(&s, 500)),
-                    output_preview: None,
-                    is_error: false,
-                };
                 if let Some(id) = call_id {
-                    pending_calls.insert(id, tc);
+                    pending_calls.insert(id, entries);
                 } else {
-                    tool_calls.push(tc);
+                    tool_calls.extend(entries);
                 }
             }
             "function_call_output" | "custom_tool_call_output" => {
@@ -778,21 +1753,40 @@ fn parse_codex_subagent_stats(
                     .and_then(|id| id.as_str());
 
                 if let Some(id) = call_id {
-                    if let Some(mut tc) = pending_calls.remove(id) {
+                    if let Some(entries) = pending_calls.remove(id) {
                         let output_value = payload.get("output");
-                        let raw_output = value_to_preview(output_value);
-                        if tc.tool_name == "exec_command" {
-                            tc.output_preview =
-                                raw_output.map(|s| truncate_str(&clean_codex_exec_output(&s), 500));
+                        let envelope = split_code_mode_output(output_value);
+                        let per_call = entries.len() > 1 && envelope.chunks.len() == entries.len();
+                        let joined = if envelope.status != ScriptStatus::Unknown
+                            || output_value.is_some_and(|v| v.is_array())
+                        {
+                            Some(envelope.joined())
                         } else {
-                            tc.output_preview = raw_output.map(|s| truncate_str(&s, 500));
+                            value_to_preview(output_value)
+                        };
+
+                        for (index, mut tc) in entries.into_iter().enumerate() {
+                            let raw_output = if per_call {
+                                Some(envelope.chunks[index].clone())
+                            } else if index == 0 {
+                                joined.clone()
+                            } else {
+                                None
+                            };
+                            if tc.tool_name == "exec_command" {
+                                tc.output_preview = raw_output
+                                    .map(|s| truncate_str(&clean_codex_exec_output(&s), 500));
+                            } else {
+                                tc.output_preview = raw_output.map(|s| truncate_str(&s, 500));
+                            }
+                            tc.is_error = envelope.is_error()
+                                || infer_tool_call_output_is_error(
+                                    payload,
+                                    output_value,
+                                    tc.output_preview.as_deref(),
+                                );
+                            tool_calls.push(tc);
                         }
-                        tc.is_error = infer_tool_call_output_is_error(
-                            payload,
-                            output_value,
-                            tc.output_preview.as_deref(),
-                        );
-                        tool_calls.push(tc);
                     }
                 }
             }
@@ -800,7 +1794,7 @@ fn parse_codex_subagent_stats(
         }
     }
 
-    tool_calls.extend(pending_calls.into_values());
+    tool_calls.extend(pending_calls.into_values().flatten());
 
     let total_duration_ms = match (first_ts, last_ts) {
         (Some(f), Some(l)) => {
@@ -871,11 +1865,38 @@ impl CodexParser {
         // persisted the `/goal` text as the opening `user_message`, which arrives
         // BEFORE the goal — there the flag stays false and nothing is synthesized.
         let mut goal_opens_session = false;
-        let mut last_turn_context_ts: Option<DateTime<Utc>> = None;
+        // Start-of-turn markers, chronological, fed to
+        // `backfill_turn_durations` so the first reply of a turn is measured
+        // from when codex began working — not from the previous turn's end,
+        // which would charge it the user's thinking time.
+        //
+        // Two lists because the two events are not equally trustworthy.
+        // `task_started` fires exactly once per turn. `turn_context` normally
+        // follows it within milliseconds, but newer codex re-emits it MID-turn
+        // (it carries a `turn_id` and is rewritten when the turn's config
+        // changes) — 6 of 495 records across the local rollout corpus. Since a
+        // marker only ever moves the boundary forward, a mid-turn one would
+        // truncate the reply that follows it and silently drop that slice from
+        // the turn's total. So `turn_context` is used only as a fallback, for
+        // rollouts old enough to predate `task_started`.
+        let mut task_start_markers: Vec<DateTime<Utc>> = Vec::new();
+        let mut turn_context_markers: Vec<DateTime<Utc>> = Vec::new();
         let mut context_window_used_tokens: Option<u64> = None;
         let mut context_window_max_tokens: Option<u64> = None;
         let mut latest_total_usage: Option<TurnUsage> = None;
         let mut latest_total_tokens: Option<u64> = None;
+        // Cumulative `total_token_usage` as of the previous `token_count`, so
+        // each event can be reduced to what its own round-trip added.
+        let mut previous_total_usage: Option<TurnUsage> = None;
+        // Previous `last_token_usage`, used only by the no-total fallback to
+        // recognize a restated event.
+        let mut previous_last_usage: Option<TurnUsage> = None;
+        // Round-trip spend recorded before any assistant message existed to
+        // carry it; flushed onto the first one that appears.
+        let mut pending_round_usage: Option<TurnUsage> = None;
+        // Everything every round-trip reported, kept independently of which
+        // message ended up carrying it — see `reconcile_turn_usage`.
+        let mut recorded_round_usage = TurnUsage::default();
 
         let mut first_timestamp: Option<DateTime<Utc>> = None;
         let mut last_timestamp: Option<DateTime<Utc>> = None;
@@ -894,10 +1915,13 @@ impl CodexParser {
         //   - close_agent → folded into the execution capsule (no own capsule);
         //     its result is only a fallback for agents never waited on.
         // codex-acp 1.0.1 (#223) maps `collabAgentToolCall` onto live ACP
-        // `tool_call`s and still drops `subAgentActivity`, so the nested
-        // `agent-<id>.jsonl` stats only exist on history reload. Live and
-        // reconstructed capsules never double-render (live during streaming,
-        // this on reload).
+        // `tool_call`s; 1.1.3+ (#304) additionally emits `subAgentActivity` as a
+        // SEPARATE live `tool_call` (`_meta.codex.subagent`), but codeg
+        // suppresses it (redundant with the collab capsule — see
+        // `is_codex_subagent_activity`) and it carries no transcript content, so
+        // the nested `agent-<id>.jsonl` stats still only exist on history reload.
+        // Live and reconstructed capsules never double-render (live during
+        // streaming, this on reload).
         let mut spawn_agent_call_ids: HashSet<String> = HashSet::new();
         let mut agent_id_to_spawn_call_id: HashMap<String, String> = HashMap::new();
         // Result text used to FILL the execution capsule only as a fallback for
@@ -916,6 +1940,31 @@ impl CodexParser {
         let mut close_agent_targets: HashMap<String, String> = HashMap::new();
         let mut active_agent_count: u32 = 0;
         let mut call_id_tool_names: HashMap<String, String> = HashMap::new();
+        // Code-mode scripts (`custom_tool_call` named `exec`) awaiting their
+        // output. A placeholder script card is pushed when the call is read, so
+        // an interrupted turn still shows it in place; the output arm rewrites
+        // that message's blocks once it knows how many `text()` chunks came
+        // back. See `parsers/codex_code_mode.rs`.
+        let mut pending_exec_scripts: HashMap<String, (usize, CodeModeScript)> = HashMap::new();
+        // `exec_command` call_id → the command it ran, and the background shell
+        // sessions that command's output announced (`session id → command`).
+        // A later `wait` / `write_stdin` carries only the session id, so this is
+        // what lets its card be titled by the command it is waiting on instead
+        // of a bare `wait`. See `extract_shell_session_ids`.
+        let mut call_id_commands: HashMap<String, String> = HashMap::new();
+        let mut shell_sessions: HashMap<String, ShellSession> = HashMap::new();
+        // Calls that only collect more of an earlier command's output: poll
+        // `tool_use_id` → `tool_use_id` of the card holding that command. The
+        // fold happens once parsing is done (`fold_shell_session_polls`), which
+        // is what lets a poll written inside a code-mode script be folded on the
+        // same footing as one codex called directly.
+        let mut poll_origins: HashMap<String, String> = HashMap::new();
+        // Scripts that answered `Script running with cell ID N` — they have NOT
+        // finished, and the `wait` that later collects cell N carries their own
+        // return value. Keyed by cell id so a parallel batch of waits each folds
+        // into the right script no matter what order the records interleave in.
+        let mut deferred_scripts: HashMap<String, DeferredScript> = HashMap::new();
+        let mut deferred_waits: HashMap<String, String> = HashMap::new();
         // Codex 0.129+ writes a generated image both as `event_msg.image_generation_end`
         // and as `response_item.image_generation_call`, sharing the same call_id/id.
         // Emit at most one ContentBlock::Image per id to avoid duplicate display.
@@ -980,7 +2029,9 @@ impl CodexParser {
                             .and_then(|m| m.as_str())
                             .map(|s| s.to_string());
                     }
-                    last_turn_context_ts = parse_codex_timestamp(&value);
+                    if let Some(ts) = parse_codex_timestamp(&value) {
+                        push_turn_start(&mut turn_context_markers, ts);
+                    }
                 }
                 "event_msg" => {
                     if let Some(payload) = value.get("payload") {
@@ -1003,9 +2054,18 @@ impl CodexParser {
                         }
 
                         match payload_type {
-                            "task_started" if context_window_max_tokens.is_none() => {
-                                context_window_max_tokens =
-                                    payload.get("model_context_window").and_then(|v| v.as_u64());
+                            "task_started" => {
+                                if context_window_max_tokens.is_none() {
+                                    context_window_max_tokens = payload
+                                        .get("model_context_window")
+                                        .and_then(|v| v.as_u64());
+                                }
+                                // The one marker codex writes exactly once per
+                                // turn; it precedes `turn_context` and the
+                                // prompt.
+                                if let Some(ts) = parse_codex_timestamp(&value) {
+                                    push_turn_start(&mut task_start_markers, ts);
+                                }
                             }
                             "user_message" => {
                                 active_agent_count = 0;
@@ -1291,40 +2351,103 @@ impl CodexParser {
                                     }
 
                                     if !info.is_null() {
-                                        if let Some(usage) = info
-                                            .get("last_token_usage")
-                                            .and_then(extract_turn_usage_from_codex_usage)
-                                        {
-                                            // Attach to the last assistant message
-                                            if let Some(last_msg) = messages
+                                        // What this round-trip spent. Preferred
+                                        // as the rise in the session's own
+                                        // cumulative counter; `last_token_usage`
+                                        // is the fallback for transcripts that
+                                        // report no total, and there a repeat of
+                                        // the previous event is dropped since it
+                                        // restates one call rather than adding
+                                        // another.
+                                        let round = match info.get("total_token_usage") {
+                                            Some(total_payload) => {
+                                                let total = codex_usage_counters(total_payload);
+                                                let round = codex_round_usage(
+                                                    previous_total_usage.as_ref(),
+                                                    &total,
+                                                );
+                                                previous_total_usage = Some(total);
+                                                round
+                                            }
+                                            None => match info.get("last_token_usage") {
+                                                Some(last_payload) => {
+                                                    let last = codex_usage_counters(last_payload);
+                                                    let repeated = previous_last_usage
+                                                        .as_ref()
+                                                        .is_some_and(|prev| prev == &last);
+                                                    previous_last_usage = Some(last.clone());
+                                                    if repeated {
+                                                        TurnUsage::default()
+                                                    } else {
+                                                        // Carry this round into the
+                                                        // cumulative baseline too.
+                                                        // A transcript that mixes
+                                                        // both shapes would
+                                                        // otherwise count it twice:
+                                                        // once here, and again
+                                                        // inside the next
+                                                        // total-bearing event's
+                                                        // delta, which is measured
+                                                        // from a baseline that
+                                                        // never learned about it.
+                                                        let base = previous_total_usage
+                                                            .clone()
+                                                            .unwrap_or_default();
+                                                        previous_total_usage =
+                                                            Some(codex_usage_add(&base, &last));
+                                                        last
+                                                    }
+                                                }
+                                                None => TurnUsage::default(),
+                                            },
+                                        };
+
+                                        if !codex_usage_is_zero(&round) {
+                                            recorded_round_usage =
+                                                codex_usage_add(&recorded_round_usage, &round);
+                                            // Every round of a turn belongs to
+                                            // the assistant message it worked
+                                            // for, so they accumulate onto it
+                                            // rather than the first one winning
+                                            // and the rest being dropped. A
+                                            // round that ran before any
+                                            // assistant message (the model went
+                                            // straight to a tool call) waits
+                                            // here for one to arrive — 3 % of
+                                            // all recorded spend, previously
+                                            // discarded outright.
+                                            pending_round_usage = Some(match pending_round_usage {
+                                                Some(ref pending) => {
+                                                    codex_usage_add(pending, &round)
+                                                }
+                                                None => round,
+                                            });
+                                        }
+                                        if let (Some(pending), Some(last_msg)) = (
+                                            pending_round_usage.clone(),
+                                            messages
                                                 .iter_mut()
                                                 .rev()
-                                                .find(|m| matches!(m.role, MessageRole::Assistant))
-                                            {
-                                                if last_msg.usage.is_none() {
-                                                    last_msg.usage = Some(usage);
+                                                .find(|m| matches!(m.role, MessageRole::Assistant)),
+                                        ) {
+                                            last_msg.usage = Some(match last_msg.usage {
+                                                Some(ref existing) => {
+                                                    codex_usage_add(existing, &pending)
                                                 }
-                                            }
+                                                None => pending,
+                                            });
+                                            pending_round_usage = None;
                                         }
                                     }
                                 }
-                                // Compute duration from turn_context to token_count
-                                if let (Some(start_ts), Some(end_ts)) =
-                                    (last_turn_context_ts, parse_codex_timestamp(&value))
-                                {
-                                    let duration = (end_ts - start_ts).num_milliseconds();
-                                    if duration > 0 {
-                                        if let Some(last_msg) = messages
-                                            .iter_mut()
-                                            .rev()
-                                            .find(|m| matches!(m.role, MessageRole::Assistant))
-                                        {
-                                            if last_msg.duration_ms.is_none() {
-                                                last_msg.duration_ms = Some(duration as u64);
-                                            }
-                                        }
-                                    }
-                                }
+                                // Durations are NOT derived here. `token_count`
+                                // fires once per model request, so measuring
+                                // turn_context → token_count restated the whole
+                                // elapsed turn on every sub-turn; the UI sums
+                                // sub-turns into one card, which multiplied a
+                                // reply's reported time several-fold. See
+                                // `backfill_turn_durations`, applied after
+                                // grouping, which partitions the turn instead.
                             }
                             _ => {}
                         }
@@ -1408,7 +2531,30 @@ impl CodexParser {
                                     .and_then(|n| n.as_str())
                                     .unwrap_or("unknown");
 
+                                // A `wait` collecting a code-mode script that
+                                // has not finished. Matched by cell id, never by
+                                // adjacency — parallel calls interleave freely.
+                                let deferred_cell = if raw_tool_name == "wait" {
+                                    parse_codex_json_arg(payload)
+                                        .as_ref()
+                                        .and_then(|a| a.as_object())
+                                        .and_then(shell_session_id)
+                                        .filter(|cell| deferred_scripts.contains_key(cell))
+                                } else {
+                                    None
+                                };
+
                                 match raw_tool_name {
+                                    // No card of its own: the output it is about
+                                    // to collect IS the parked script's return
+                                    // value, and the output arm writes it back
+                                    // onto that script's cards.
+                                    _ if deferred_cell.is_some() => {
+                                        if let (Some(id), Some(cell)) = (tool_use_id, deferred_cell)
+                                        {
+                                            deferred_waits.insert(id, cell);
+                                        }
+                                    }
                                     "spawn_agent" => {
                                         let args = parse_codex_json_arg(payload);
                                         let agent_type = args
@@ -1470,31 +2616,92 @@ impl CodexParser {
                                             }
                                         }
                                     }
+                                    // Code mode: the whole turn's tool calls are
+                                    // wrapped in one JS script. Park a script
+                                    // card here and let the output arm replace
+                                    // it with the real per-call cards — the
+                                    // split depends on how many `text()` chunks
+                                    // came back, which is only known then. An
+                                    // interrupted turn never gets an output, so
+                                    // the placeholder must be pushed now to keep
+                                    // its position.
+                                    _ if is_code_mode_call(raw_tool_name) => {
+                                        let source = payload
+                                            .get("input")
+                                            .or_else(|| payload.get("arguments"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let script = parse_code_mode_script(source);
+                                        if let Some(ref id) = tool_use_id {
+                                            pending_exec_scripts.insert(
+                                                id.clone(),
+                                                (messages.len(), script.clone()),
+                                            );
+                                        }
+                                        messages.push(UnifiedMessage {
+                                            id: format!("tool-{}", messages.len()),
+                                            role: MessageRole::Assistant,
+                                            content: vec![ContentBlock::ToolUse {
+                                                tool_use_id,
+                                                tool_name: CODEX_SCRIPT_TOOL_NAME.to_string(),
+                                                input_preview: Some(script_card_input(
+                                                    source,
+                                                    script.summary.as_deref(),
+                                                    script.call_sites,
+                                                )),
+                                                meta: None,
+                                            }],
+                                            timestamp,
+                                            usage: None,
+                                            duration_ms: None,
+                                            model: None,
+                                            completed_at: Some(timestamp),
+                                        });
+                                    }
                                     _ => {
                                         if let Some(ref id) = tool_use_id {
                                             call_id_tool_names
                                                 .insert(id.clone(), raw_tool_name.to_string());
                                         }
-                                        let input_preview = if raw_tool_name == "exec_command" {
-                                            parse_codex_json_arg(payload)
-                                                .and_then(|a| {
-                                                    a.get("cmd")
-                                                        .and_then(|v| v.as_str())
-                                                        .map(|s| s.to_string())
-                                                })
-                                                .or_else(|| {
-                                                    value_to_preview(
-                                                        payload
-                                                            .get("arguments")
-                                                            .or_else(|| payload.get("input")),
-                                                    )
-                                                })
-                                        } else {
+                                        let raw_args = || {
                                             value_to_preview(
                                                 payload
                                                     .get("arguments")
                                                     .or_else(|| payload.get("input")),
                                             )
+                                        };
+                                        let input_preview = if raw_tool_name == "exec_command" {
+                                            let cmd = parse_codex_json_arg(payload).and_then(|a| {
+                                                a.get("cmd")
+                                                    .and_then(|v| v.as_str())
+                                                    .map(|s| s.to_string())
+                                            });
+                                            // Remembered so this command can be
+                                            // attached to whatever background
+                                            // session its output announces.
+                                            if let (Some(id), Some(cmd)) =
+                                                (tool_use_id.as_ref(), cmd.as_ref())
+                                            {
+                                                call_id_commands.insert(id.clone(), cmd.clone());
+                                            }
+                                            cmd.or_else(raw_args)
+                                        } else if is_shell_session_tool(raw_tool_name) {
+                                            // `wait` / `write_stdin`: carry the
+                                            // command that started the session
+                                            // they address, when it is known.
+                                            let args = parse_codex_json_arg(payload);
+                                            note_shell_session_call(
+                                                tool_use_id.as_deref(),
+                                                args.as_ref(),
+                                                &mut shell_sessions,
+                                                &mut poll_origins,
+                                            );
+                                            args.and_then(|args| {
+                                                annotate_shell_session_args(&args, &shell_sessions)
+                                            })
+                                            .or_else(raw_args)
+                                        } else {
+                                            raw_args()
                                         };
                                         messages.push(UnifiedMessage {
                                             id: format!("tool-{}", messages.len()),
@@ -1531,8 +2738,96 @@ impl CodexParser {
                                 let is_close = tool_use_id
                                     .as_ref()
                                     .is_some_and(|id| close_agent_call_ids.contains(id));
+                                let pending_script = tool_use_id
+                                    .as_ref()
+                                    .and_then(|id| pending_exec_scripts.remove(id));
+                                let deferred = tool_use_id
+                                    .as_ref()
+                                    .and_then(|id| deferred_waits.remove(id))
+                                    .and_then(|cell| deferred_scripts.remove(&cell));
 
-                                if is_spawn {
+                                if let Some(deferred) = deferred {
+                                    // The parked script's real return value, at
+                                    // last. Re-decompose it against that script
+                                    // and rewrite the cards it already owns —
+                                    // this `wait` contributes no card of its own.
+                                    let collected = split_code_mode_output(payload.get("output"));
+                                    // The whole run, not just this instalment:
+                                    // see `DeferredScript::chunks`.
+                                    let parsed = CodeModeOutput {
+                                        status: collected.status,
+                                        chunks: deferred
+                                            .chunks
+                                            .iter()
+                                            .cloned()
+                                            .chain(collected.chunks)
+                                            .collect(),
+                                        note: collected.note,
+                                    };
+                                    let (uses, results) = unwrap_code_mode_script(
+                                        &deferred.call_id,
+                                        &deferred.script,
+                                        &parsed,
+                                        payload,
+                                        &mut shell_sessions,
+                                        &mut poll_origins,
+                                    );
+                                    if let Some(uses) = uses {
+                                        messages[deferred.use_index].content = uses;
+                                    }
+                                    messages[deferred.result_index].content = results;
+                                    // Still not done: whatever cell it reports
+                                    // now is what the next `wait` collects.
+                                    if parsed.status == ScriptStatus::Running {
+                                        let deferred = DeferredScript {
+                                            chunks: parsed.chunks,
+                                            ..deferred
+                                        };
+                                        for cell in extract_shell_session_ids(
+                                            parsed.note.as_deref().unwrap_or_default(),
+                                        ) {
+                                            deferred_scripts.insert(cell, deferred.clone());
+                                        }
+                                    }
+                                } else if let Some((message_index, script)) = pending_script {
+                                    let call_id = tool_use_id.unwrap_or_default();
+                                    let parsed = split_code_mode_output(payload.get("output"));
+                                    let (uses, results) = unwrap_code_mode_script(
+                                        &call_id,
+                                        &script,
+                                        &parsed,
+                                        payload,
+                                        &mut shell_sessions,
+                                        &mut poll_origins,
+                                    );
+                                    if let Some(uses) = uses {
+                                        messages[message_index].content = uses;
+                                    }
+                                    if parsed.status == ScriptStatus::Running {
+                                        let deferred = DeferredScript {
+                                            call_id: call_id.clone(),
+                                            use_index: message_index,
+                                            result_index: messages.len(),
+                                            script: script.clone(),
+                                            chunks: parsed.chunks.clone(),
+                                        };
+                                        for cell in extract_shell_session_ids(
+                                            parsed.note.as_deref().unwrap_or_default(),
+                                        ) {
+                                            deferred_scripts.insert(cell, deferred.clone());
+                                        }
+                                    }
+                                    messages.push(UnifiedMessage {
+                                        id: format!("tool-result-{}", messages.len()),
+                                        role: MessageRole::Tool,
+                                        content: results,
+                                        timestamp,
+                                        usage: None,
+                                        duration_ms: None,
+                                        model: None,
+                                        completed_at: Some(timestamp),
+                                    });
+                                } else if is_spawn {
                                     if let Some(output_obj) = parse_codex_json_output(payload) {
                                         if let (Some(agent_id), Some(call_id)) = (
                                             output_obj.get("agent_id").and_then(|v| v.as_str()),
@@ -1653,17 +2948,76 @@ impl CodexParser {
                                             .is_some_and(|n| n == "exec_command")
                                     });
                                     let output_value = payload.get("output");
-                                    let raw_output = value_to_preview(output_value);
-                                    let output = if is_exec {
+                                    // Unified-exec tools (`wait`, …) share the
+                                    // code-mode output shape: an ARRAY of
+                                    // `{type:"input_text", text}` parts behind a
+                                    // `Script …/Wall time …/Output:` header.
+                                    // `value_to_preview` would dump that array as
+                                    // raw JSON into the result panel.
+                                    let envelope = split_code_mode_output(output_value);
+                                    // An `exec_command` that left a background
+                                    // shell running announces its id here; bind
+                                    // it to the command so the `wait` /
+                                    // `write_stdin` calls that address it later
+                                    // can be titled by that command. Read before
+                                    // `clean_codex_exec_output`, which drops
+                                    // everything above the `Output:` line — the
+                                    // announcement included.
+                                    if let Some((origin, command)) =
+                                        tool_use_id.as_ref().and_then(|id| {
+                                            call_id_commands.get(id).map(|cmd| (id.clone(), cmd))
+                                        })
+                                    {
+                                        let mut announced = envelope.joined();
+                                        if let Some(note) = envelope.note.as_deref() {
+                                            announced.push('\n');
+                                            announced.push_str(note);
+                                        }
+                                        register_announced_sessions(
+                                            command,
+                                            &origin,
+                                            &announced,
+                                            &mut shell_sessions,
+                                        );
+                                    }
+                                    let (raw_output, envelope_error) =
+                                        if envelope.status != ScriptStatus::Unknown
+                                            || output_value.is_some_and(|v| v.is_array())
+                                        {
+                                            (
+                                                with_note(
+                                                    Some(envelope.joined()),
+                                                    envelope.note.as_deref(),
+                                                )
+                                                .filter(|s| !s.is_empty()),
+                                                envelope.is_error(),
+                                            )
+                                        } else {
+                                            (value_to_preview(output_value), false)
+                                        };
+                                    // A poll about to be folded into the card of
+                                    // the command it is collecting for: its
+                                    // envelope has to go, and an envelope that
+                                    // wrapped nothing has to end up empty rather
+                                    // than falling back to its own header.
+                                    let is_folded_poll = tool_use_id
+                                        .as_ref()
+                                        .is_some_and(|id| poll_origins.contains_key(id));
+                                    let output = if is_folded_poll {
+                                        raw_output
+                                            .map(|s| strip_exec_envelope(&s).unwrap_or(s))
+                                            .filter(|s| !s.is_empty())
+                                    } else if is_exec {
                                         raw_output.map(|s| clean_codex_exec_output(&s))
                                     } else {
                                         raw_output
                                     };
-                                    let is_error = infer_tool_call_output_is_error(
-                                        payload,
-                                        output_value,
-                                        output.as_deref(),
-                                    );
+                                    let is_error = envelope_error
+                                        || infer_tool_call_output_is_error(
+                                            payload,
+                                            output_value,
+                                            output.as_deref(),
+                                        );
                                     messages.push(UnifiedMessage {
                                         id: format!("tool-result-{}", messages.len()),
                                         role: MessageRole::Tool,
@@ -1891,10 +3245,20 @@ impl CodexParser {
         let folder_path = cwd.clone();
         let folder_name = folder_path.as_ref().map(|p| folder_name_from_path(p));
 
+        fold_shell_session_polls(&mut messages, &poll_origins);
         let mut turns = group_into_turns(messages);
+        reconcile_turn_usage(&mut turns, &recorded_round_usage);
         super::relocate_orphaned_tool_results(&mut turns);
         super::structurize_read_tool_output(&mut turns);
         super::resolve_patch_line_numbers(&mut turns, cwd.as_deref());
+        // After relocation every turn's `completed_at` is final — tile the
+        // timeline into per-reply durations before stats aggregate them.
+        let turn_starts = if task_start_markers.is_empty() {
+            &turn_context_markers
+        } else {
+            &task_start_markers
+        };
+        super::backfill_turn_durations(&mut turns, turn_starts);
         let mut session_stats = super::compute_session_stats(&turns);
         session_stats =
             merge_codex_total_usage_stats(session_stats, latest_total_usage, latest_total_tokens);
@@ -1991,6 +3355,142 @@ fn extract_turn_usage_from_codex_usage(usage: &serde_json::Value) -> Option<Turn
     })
 }
 
+/// A codex usage payload read as raw counters, keeping zeros.
+///
+/// [`extract_turn_usage_from_codex_usage`] answers "is there anything to show",
+/// so it collapses an all-zero payload to `None`. The running-total arithmetic
+/// below needs the opposite: a cumulative counter that legitimately still reads
+/// zero is a real datapoint, not an absent one.
+fn codex_usage_counters(usage: &serde_json::Value) -> TurnUsage {
+    let field = |name: &str| usage.get(name).and_then(|v| v.as_u64()).unwrap_or(0);
+    let cache_read = field("cached_input_tokens");
+    TurnUsage {
+        // Codex reports `input_tokens` *inclusive* of the cached prefix, so the
+        // cached part is split out rather than counted twice.
+        input_tokens: field("input_tokens").saturating_sub(cache_read),
+        output_tokens: field("output_tokens"),
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: cache_read,
+    }
+}
+
+fn codex_usage_is_zero(usage: &TurnUsage) -> bool {
+    usage.input_tokens == 0
+        && usage.output_tokens == 0
+        && usage.cache_creation_input_tokens == 0
+        && usage.cache_read_input_tokens == 0
+}
+
+fn codex_usage_add(base: &TurnUsage, extra: &TurnUsage) -> TurnUsage {
+    TurnUsage {
+        input_tokens: base.input_tokens.saturating_add(extra.input_tokens),
+        output_tokens: base.output_tokens.saturating_add(extra.output_tokens),
+        cache_creation_input_tokens: base
+            .cache_creation_input_tokens
+            .saturating_add(extra.cache_creation_input_tokens),
+        cache_read_input_tokens: base
+            .cache_read_input_tokens
+            .saturating_add(extra.cache_read_input_tokens),
+    }
+}
+
+/// What one model round-trip added, as the rise in the session's cumulative
+/// counter.
+///
+/// Codex emits a `token_count` event after **every** model call — including the
+/// tool-calling rounds inside a turn — and each one restates
+/// `total_token_usage` for the whole session. Differencing that counter is what
+/// makes the accounting exact: it cannot double-count a `token_count` that is
+/// emitted twice for the same call (7 380 of 31 846 events in a real session
+/// tree are such repeats), and it cannot lose a round whose event went
+/// unrecorded, because the next event's total absorbs it.
+///
+/// A total that moves *backwards* means the counter restarted (a fresh context
+/// after compaction), so the new value is the round's own spend.
+fn codex_round_usage(previous_total: Option<&TurnUsage>, total: &TurnUsage) -> TurnUsage {
+    let grand = |u: &TurnUsage| {
+        u.input_tokens
+            .saturating_add(u.output_tokens)
+            .saturating_add(u.cache_creation_input_tokens)
+            .saturating_add(u.cache_read_input_tokens)
+    };
+    // No baseline, or the counter restarted below it: the whole figure is this
+    // round's own spend. Differencing per field instead would clamp every field
+    // to zero and silently drop the rest of the session.
+    let Some(previous) = previous_total.filter(|prev| grand(prev) <= grand(total)) else {
+        return total.clone();
+    };
+    TurnUsage {
+        input_tokens: total.input_tokens.saturating_sub(previous.input_tokens),
+        output_tokens: total.output_tokens.saturating_sub(previous.output_tokens),
+        cache_creation_input_tokens: total
+            .cache_creation_input_tokens
+            .saturating_sub(previous.cache_creation_input_tokens),
+        cache_read_input_tokens: total
+            .cache_read_input_tokens
+            .saturating_sub(previous.cache_read_input_tokens),
+    }
+}
+
+/// Make the turns account for every token the transcript reported.
+///
+/// Round-trip usage is attached to the assistant message that was current when
+/// the `token_count` arrived, which is right whenever that message survives —
+/// but presentation is allowed to drop or fold messages (a tool call absorbed
+/// into a capsule, a duplicate agent message collapsed away), and a message
+/// that disappears takes its usage with it. Across a real session tree that
+/// silently lost 7 % of Codex spend, concentrated in exactly the sessions that
+/// worked hardest.
+///
+/// So the recorded rounds are also summed independently, and any shortfall is
+/// put back on the last turn that can hold it. The invariant this establishes
+/// is worth stating plainly: **the per-turn usage of a Codex session always
+/// sums to what its own counter reported**, whatever the renderer did to the
+/// turns in between.
+///
+/// A surplus is left alone. It would mean the turns claim more than the
+/// transcript ever reported, which no path here can produce, and inventing a
+/// correction for an impossible state would only hide the bug that caused it.
+fn reconcile_turn_usage(turns: &mut [MessageTurn], recorded: &TurnUsage) {
+    if codex_usage_is_zero(recorded) {
+        return;
+    }
+    let attributed = turns
+        .iter()
+        .filter_map(|t| t.usage.as_ref())
+        .fold(TurnUsage::default(), |acc, u| codex_usage_add(&acc, u));
+
+    let missing = TurnUsage {
+        input_tokens: recorded.input_tokens.saturating_sub(attributed.input_tokens),
+        output_tokens: recorded
+            .output_tokens
+            .saturating_sub(attributed.output_tokens),
+        cache_creation_input_tokens: recorded
+            .cache_creation_input_tokens
+            .saturating_sub(attributed.cache_creation_input_tokens),
+        cache_read_input_tokens: recorded
+            .cache_read_input_tokens
+            .saturating_sub(attributed.cache_read_input_tokens),
+    };
+    if codex_usage_is_zero(&missing) {
+        return;
+    }
+
+    // Prefer a turn that already reports usage — it is one the transcript
+    // itself tied to a model call, so the recovered tokens land beside spend
+    // that really happened rather than on an unrelated bubble.
+    let target = turns
+        .iter()
+        .rposition(|t| t.usage.is_some())
+        .or_else(|| turns.iter().rposition(|t| matches!(t.role, TurnRole::Assistant)));
+    if let Some(turn) = target.and_then(|i| turns.get_mut(i)) {
+        turn.usage = Some(match turn.usage {
+            Some(ref existing) => codex_usage_add(existing, &missing),
+            None => missing,
+        });
+    }
+}
+
 fn extract_context_window_used_tokens_from_token_count_info(
     info: &serde_json::Value,
 ) -> Option<u64> {
@@ -2070,6 +3570,18 @@ fn parse_codex_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
         .get("timestamp")
         .and_then(|t| t.as_str())
         .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+}
+
+/// Append a start-of-turn marker to one of the two marker lists (see their
+/// declaration for why `task_started` and `turn_context` are kept apart).
+///
+/// An out-of-order arrival (skewed clocks in a rollout) is dropped rather than
+/// inserted: the backfill scans the list once, in order.
+fn push_turn_start(turn_starts: &mut Vec<DateTime<Utc>>, ts: DateTime<Utc>) {
+    match turn_starts.last() {
+        Some(last) if ts <= *last => {}
+        _ => turn_starts.push(ts),
+    }
 }
 
 /// Emit any buffered streaming `agent_reasoning` sections as a single Thinking
@@ -2412,6 +3924,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
 
 #[cfg(test)]
 mod tests {
+
     use std::collections::HashMap;
 
     use super::extract_codex_title_candidate;
@@ -2424,6 +3937,7 @@ mod tests {
     use super::should_skip_duplicate_user_message;
     use super::strip_blocked_resource_mentions;
     use super::CodexParser;
+    use super::CODEX_SCRIPT_TOOL_NAME;
     use crate::models::{
         ContentBlock, MessageRole, MessageTurn, SessionStats, TurnRole, TurnUsage, UnifiedMessage,
     };
@@ -2711,13 +4225,290 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    /// Sum the per-turn usage a parse produced — what the usage dashboard
+    /// materializes and what the session panel adds up.
+    fn turn_usage_total(detail: &crate::models::ConversationDetail) -> u64 {
+        detail
+            .turns
+            .iter()
+            .filter_map(|t| t.usage.as_ref())
+            .map(|u| {
+                u.input_tokens + u.output_tokens + u.cache_creation_input_tokens
+                    + u.cache_read_input_tokens
+            })
+            .sum()
+    }
+
+    fn parse_rollout(label: &str, content: &str, session_id: &str) -> crate::models::ConversationDetail {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time ok")
+            .as_nanos();
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-{label}-{nanos}.jsonl"));
+        fs::write(&path, content).expect("write test jsonl");
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, session_id)
+            .expect("parse detail ok");
+        let _ = fs::remove_file(path);
+        detail
+    }
+
+    #[test]
+    fn every_model_round_trip_of_a_turn_is_counted() {
+        // Codex emits a `token_count` after each model call, so one turn that
+        // calls tools four times reports four times. Only the first was kept
+        // (`if last_msg.usage.is_none()`), which lost most of a working turn's
+        // spend — measured at 61 % of all Codex tokens in a real session tree.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"rounds-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5-codex\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"working\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:03Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":20224,\"cached_input_tokens\":0,\"output_tokens\":458},\"last_token_usage\":{\"input_tokens\":20224,\"cached_input_tokens\":0,\"output_tokens\":458}}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:13Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":51186,\"cached_input_tokens\":18000,\"output_tokens\":886},\"last_token_usage\":{\"input_tokens\":30962,\"cached_input_tokens\":18000,\"output_tokens\":428}}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:29Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":92652,\"cached_input_tokens\":45000,\"output_tokens\":1420},\"last_token_usage\":{\"input_tokens\":41466,\"cached_input_tokens\":27000,\"output_tokens\":534}}}}\n"
+        );
+        let detail = parse_rollout("rounds", content, "rounds-1");
+
+        // The session's own cumulative counter is the ground truth, and the
+        // per-turn rows now reconstruct it exactly.
+        assert_eq!(turn_usage_total(&detail), 92_652 + 1_420);
+        let stats = detail.session_stats.expect("session stats");
+        let total = stats.total_usage.expect("total usage");
+        assert_eq!(
+            total.input_tokens + total.output_tokens + total.cache_read_input_tokens,
+            92_652 + 1_420
+        );
+    }
+
+    #[test]
+    fn a_restated_token_count_is_not_counted_twice() {
+        // Codex sometimes reports the same call twice (7 380 of 31 846 events
+        // in a real tree). Differencing the cumulative counter makes the repeat
+        // contribute nothing, where summing `last_token_usage` would inflate it.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"repeat-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"hi\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":1000,\"cached_input_tokens\":0,\"output_tokens\":50},\"last_token_usage\":{\"input_tokens\":1000,\"cached_input_tokens\":0,\"output_tokens\":50}}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:03Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":1000,\"cached_input_tokens\":0,\"output_tokens\":50},\"last_token_usage\":{\"input_tokens\":1000,\"cached_input_tokens\":0,\"output_tokens\":50}}}}\n"
+        );
+        let detail = parse_rollout("repeat", content, "repeat-1");
+        assert_eq!(turn_usage_total(&detail), 1_050);
+    }
+
+    #[test]
+    fn a_round_that_ran_before_any_assistant_message_is_not_lost() {
+        // When the model opens a turn by calling a tool, its first round-trips
+        // finish before it ever speaks. Those had no assistant message to
+        // attach to and were dropped outright — 3 % of all recorded spend.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"early-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"go\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":800,\"cached_input_tokens\":0,\"output_tokens\":40},\"last_token_usage\":{\"input_tokens\":800,\"cached_input_tokens\":0,\"output_tokens\":40}}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:03Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"done\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:04Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":1900,\"cached_input_tokens\":0,\"output_tokens\":110},\"last_token_usage\":{\"input_tokens\":1100,\"cached_input_tokens\":0,\"output_tokens\":70}}}}\n"
+        );
+        let detail = parse_rollout("early", content, "early-1");
+        assert_eq!(turn_usage_total(&detail), 1_900 + 110);
+    }
+
+    #[test]
+    fn a_transcript_without_cumulative_totals_still_counts_each_call_once() {
+        // Fallback path: no `total_token_usage` to difference, so a `token_count`
+        // that merely restates the previous one is recognized by its payload.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"nototal-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"hi\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":500,\"cached_input_tokens\":100,\"output_tokens\":25}}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:03Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":500,\"cached_input_tokens\":100,\"output_tokens\":25}}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:04Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":700,\"cached_input_tokens\":200,\"output_tokens\":30}}}}\n"
+        );
+        let detail = parse_rollout("nototal", content, "nototal-1");
+        assert_eq!(turn_usage_total(&detail), 525 + 730);
+    }
+
+    #[test]
+    fn a_transcript_that_mixes_both_shapes_counts_each_round_exactly_once() {
+        // A no-total event contributes its own `last_token_usage`, so the
+        // cumulative baseline has to learn about it. Otherwise the next
+        // total-bearing event differences against a stale figure and bills that
+        // round a second time.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"mixed-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"hi\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":0,\"output_tokens\":0},\"last_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":0,\"output_tokens\":0}}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:03Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":50,\"cached_input_tokens\":0,\"output_tokens\":0}}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:04Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":180,\"cached_input_tokens\":0,\"output_tokens\":0},\"last_token_usage\":{\"input_tokens\":30,\"cached_input_tokens\":0,\"output_tokens\":0}}}}\n"
+        );
+        let detail = parse_rollout("mixed", content, "mixed-1");
+        // 100 + 50 + (180 - 150) — the session's own counter says 180 total.
+        assert_eq!(turn_usage_total(&detail), 180);
+    }
+
+    #[test]
+    fn a_rollout_with_no_assistant_message_still_reports_its_spend() {
+        // A turn that only ran tools and was interrupted leaves `token_count`
+        // events with no assistant turn to carry them, so `reconcile_turn_usage`
+        // has no target. The tokens are not lost: the session-level total is
+        // populated, and that is the fallback `facts_from_detail` records as a
+        // single fact row (covered by `a_session_level_total_is_recorded_when_
+        // no_turn_reports_usage` in commands::token_usage).
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"toolonly-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"go\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":900,\"cached_input_tokens\":100,\"output_tokens\":40},\"last_token_usage\":{\"input_tokens\":900,\"cached_input_tokens\":100,\"output_tokens\":40}}}}\n"
+        );
+        let detail = parse_rollout("toolonly", content, "toolonly-1");
+        assert!(
+            !detail.turns.iter().any(|t| matches!(t.role, TurnRole::Assistant)),
+            "precondition: this rollout has no assistant turn"
+        );
+        let total = detail
+            .session_stats
+            .as_ref()
+            .and_then(|s| s.total_usage.as_ref())
+            .expect("session-level total must survive as the fallback fact source");
+        assert_eq!(
+            total.input_tokens + total.output_tokens + total.cache_read_input_tokens,
+            940
+        );
+    }
+
+    #[test]
+    fn a_counter_that_restarts_after_compaction_does_not_wrap_to_zero() {
+        // A cumulative counter that moves backwards means a fresh context, so
+        // the new value is that round's own spend rather than a negative delta
+        // silently clamped away.
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"compact-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"hi\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":90000,\"cached_input_tokens\":0,\"output_tokens\":2000}}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:03Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":5000,\"cached_input_tokens\":0,\"output_tokens\":100}}}}\n"
+        );
+        let detail = parse_rollout("compact", content, "compact-1");
+        assert_eq!(turn_usage_total(&detail), 92_000 + 5_100);
+    }
+
+    #[test]
+    fn parse_detail_durations_partition_a_multi_message_turn() {
+        // Regression: durations came from `turn_context → token_count`, and
+        // codex fires `token_count` once per model request — so every reply in
+        // a turn restated the elapsed time SINCE THE PROMPT. The UI merges a
+        // turn's replies into one card by summing their durations, so a 30s
+        // turn reported 10+22+30 = 62s (on a real 4-prompt rollout: 26 minutes
+        // of work shown as 109). Each reply must instead carry only its own
+        // slice, and the slices must add up to the turn.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time ok")
+            .as_nanos();
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-spans-{nanos}.jsonl"));
+
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"spans-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:00.100Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:00.200Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5-codex\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:00.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"go\"}}\n",
+            // Reply 1 at +10s, then two more model requests inside the SAME turn.
+            "{\"timestamp\":\"2026-03-01T10:00:10.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"one\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:11.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":10,\"cached_input_tokens\":0,\"output_tokens\":2,\"total_tokens\":12}}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:22.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"two\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:23.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":10,\"cached_input_tokens\":0,\"output_tokens\":2,\"total_tokens\":12}}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:30.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"three\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:30.400Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":10,\"cached_input_tokens\":0,\"output_tokens\":2,\"total_tokens\":12}}}}\n",
+            // A second prompt arrives 10 minutes later; that idle gap belongs
+            // to nobody, so its reply must report 4s and not 10m4s.
+            "{\"timestamp\":\"2026-03-01T10:10:30.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:10:30.100Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5-codex\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:10:30.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"again\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:10:34.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"four\"}}\n"
+        );
+        fs::write(&path, content).expect("write test jsonl");
+
+        let parser = CodexParser::new();
+        let detail = parser
+            .parse_conversation_detail(&path, "spans-1")
+            .expect("parse detail ok");
+
+        let assistant_durations: Vec<Option<u64>> = detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::Assistant))
+            .map(|t| t.duration_ms)
+            .collect();
+        assert_eq!(
+            assistant_durations,
+            vec![
+                Some(10_000), // prompt → "one"
+                Some(12_000), // "one" → "two"
+                Some(8_000),  // "two" → "three"
+                Some(4_000),  // second prompt → "four"
+            ]
+        );
+
+        // Turn 1's replies sum to its wall clock, and the session total is the
+        // two turns' work — never the idle stretch between them.
+        let turn_one: u64 = assistant_durations[..3].iter().flatten().sum();
+        assert_eq!(turn_one, 30_000);
+        let stats = detail.session_stats.expect("session stats");
+        assert_eq!(stats.total_duration_ms, 34_000);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_mid_turn_turn_context_does_not_truncate_the_reply_after_it() {
+        // Newer codex re-emits `turn_context` in the MIDDLE of a turn — it
+        // carries a `turn_id` and is rewritten when the turn's config changes
+        // (6 of 495 records across the local rollout corpus). A start marker
+        // only ever moves the boundary forward, so treating that one as a turn
+        // start would charge the following reply just the time since it and
+        // silently drop the rest of the span from the turn's total. Only
+        // `task_started` — exactly one per turn — anchors the measurement;
+        // `turn_context` is a fallback for rollouts that predate it.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time ok")
+            .as_nanos();
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-midctx-{nanos}.jsonl"));
+
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"midctx-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:00.100Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:00.200Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5-codex\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:00.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"go\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:10.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"one\"}}\n",
+            // Re-emitted mid-turn, 1s before the next reply. If this counted as
+            // a turn start, "two" would report 1s instead of its real 20s.
+            "{\"timestamp\":\"2026-03-01T10:00:29.300Z\",\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t-1\",\"model\":\"gpt-5-codex\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:30.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"two\"}}\n"
+        );
+        fs::write(&path, content).expect("write test jsonl");
+
+        let parser = CodexParser::new();
+        let detail = parser
+            .parse_conversation_detail(&path, "midctx-1")
+            .expect("parse detail ok");
+
+        let assistant_durations: Vec<Option<u64>> = detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::Assistant))
+            .map(|t| t.duration_ms)
+            .collect();
+        assert_eq!(assistant_durations, vec![Some(10_000), Some(20_000)]);
+        // Still tiles: 10s + 20s is the whole prompt→last-reply span.
+        let total: u64 = assistant_durations.iter().flatten().sum();
+        assert_eq!(total, 30_000);
+
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     fn parse_detail_completion_time_uses_agent_message_timestamp_not_added_turn_span() {
-        // Regression: in Codex `duration_ms` is computed from the
-        // turn_context → token_count span, while `timestamp` on the
-        // assistant `UnifiedMessage` is the agent_message event time
-        // (already near turn end). Adding them double-counts the entire
-        // turn span. completed_at must reflect the agent_message arrival.
+        // Regression: `duration_ms` is a *span* and `timestamp` on the
+        // assistant `UnifiedMessage` is the agent_message event time (already
+        // at the end of that span, not its start), so adding the two
+        // double-counts. completed_at must reflect the agent_message arrival.
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
@@ -4443,5 +6234,1547 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    // ── codex code mode ──────────────────────────────────────────────────
+    //
+    // Newer codex wraps EVERY tool call in a JS script persisted as one
+    // `custom_tool_call` named `exec`. Without unwrapping, the whole history
+    // renders as `const r = await tools.…` shell cards (see
+    // `parsers/codex_code_mode.rs`).
+
+    fn tool_uses(
+        detail: &crate::models::ConversationDetail,
+    ) -> Vec<(String, String, Option<String>)> {
+        detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse {
+                    tool_use_id,
+                    tool_name,
+                    input_preview,
+                    ..
+                } => Some((
+                    tool_use_id.clone().unwrap_or_default(),
+                    tool_name.clone(),
+                    input_preview.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_results(
+        detail: &crate::models::ConversationDetail,
+    ) -> Vec<(String, Option<String>, bool)> {
+        detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    output_preview,
+                    is_error,
+                    ..
+                } => Some((
+                    tool_use_id.clone().unwrap_or_default(),
+                    output_preview.clone(),
+                    *is_error,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn code_mode_rollout(script: &str, output: serde_json::Value) -> Vec<String> {
+        vec![
+            rollout_line(
+                "2026-07-20T08:40:00Z",
+                "event_msg",
+                serde_json::json!({"type": "user_message", "message": "go"}),
+            ),
+            rollout_line(
+                "2026-07-20T08:40:01Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "call_id": "call_1",
+                    "input": script,
+                }),
+            ),
+            rollout_line(
+                "2026-07-20T08:40:02Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_1",
+                    "output": output,
+                }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn code_mode_single_call_renders_as_the_inner_tool() {
+        let lines = code_mode_rollout(
+            "const r = await tools.exec_command({\n  cmd: \"git status --short\",\n  workdir: \"/repo\"\n});\ntext(r.output);\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 0.5 seconds\nOutput:\n"},
+                {"type": "input_text", "text": " M src/main.rs"},
+            ]),
+        );
+        let path = write_temp_rollout("code-mode-single", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "code-mode-single")
+            .expect("parse ok");
+
+        assert_eq!(
+            tool_uses(&detail),
+            vec![(
+                "call_1".to_string(),
+                "exec_command".to_string(),
+                Some("git status --short".to_string())
+            )]
+        );
+        assert_eq!(
+            tool_results(&detail),
+            vec![(
+                "call_1".to_string(),
+                Some(" M src/main.rs".to_string()),
+                false
+            )]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn code_mode_parallel_calls_split_output_per_card() {
+        let lines = code_mode_rollout(
+            "const rs = await Promise.all([\n  tools.exec_command({cmd:\"one\"}),\n  tools.exec_command({cmd:\"two\"}),\n  tools.exec_command({cmd:\"three\"})\n]);\nrs.forEach(r => text(r.output));\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                {"type": "input_text", "text": "out-one"},
+                {"type": "input_text", "text": "out-two"},
+                {"type": "input_text", "text": "out-three"},
+            ]),
+        );
+        let path = write_temp_rollout("code-mode-split", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "code-mode-split")
+            .expect("parse ok");
+
+        assert_eq!(
+            tool_uses(&detail),
+            vec![
+                (
+                    "call_1#0".to_string(),
+                    "exec_command".to_string(),
+                    Some("one".to_string())
+                ),
+                (
+                    "call_1#1".to_string(),
+                    "exec_command".to_string(),
+                    Some("two".to_string())
+                ),
+                (
+                    "call_1#2".to_string(),
+                    "exec_command".to_string(),
+                    Some("three".to_string())
+                ),
+            ]
+        );
+        assert_eq!(
+            tool_results(&detail),
+            vec![
+                ("call_1#0".to_string(), Some("out-one".to_string()), false),
+                ("call_1#1".to_string(), Some("out-two".to_string()), false),
+                ("call_1#2".to_string(), Some("out-three".to_string()), false),
+            ]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    const THREE_CALLS: &str = "const r = await Promise.all([\n  tools.exec_command({cmd:\"one\"}),\n  tools.exec_command({cmd:\"two\"}),\n  tools.exec_command({cmd:\"three\"})\n]);\nfor (const x of r) { text(x.output); text(`exit_code=${x.exit_code}`); }\n";
+
+    /// `text(x.output); text(\`exit_code=…\`)` — two chunks per call, so the 1:1
+    /// count fails and the whole thing used to stay one script card.
+    #[test]
+    fn a_trailing_chunk_per_call_still_splits_per_call() {
+        let lines = code_mode_rollout(
+            THREE_CALLS,
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                {"type": "input_text", "text": "out-one"},
+                {"type": "input_text", "text": "exit_code=0"},
+                {"type": "input_text", "text": "out-two"},
+                {"type": "input_text", "text": "exit_code=1"},
+                {"type": "input_text", "text": "out-three"},
+                {"type": "input_text", "text": "exit_code=0"},
+            ]),
+        );
+        let path = write_temp_rollout("code-mode-stride-tail", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "code-mode-stride-tail")
+            .expect("parse ok");
+
+        assert_eq!(
+            tool_uses(&detail),
+            vec![
+                (
+                    "call_1#0".to_string(),
+                    "exec_command".to_string(),
+                    Some("one".to_string())
+                ),
+                (
+                    "call_1#1".to_string(),
+                    "exec_command".to_string(),
+                    Some("two".to_string())
+                ),
+                (
+                    "call_1#2".to_string(),
+                    "exec_command".to_string(),
+                    Some("three".to_string())
+                ),
+            ]
+        );
+        assert_eq!(
+            tool_results(&detail),
+            vec![
+                (
+                    "call_1#0".to_string(),
+                    Some("out-one\nexit_code=0".to_string()),
+                    false
+                ),
+                (
+                    "call_1#1".to_string(),
+                    Some("out-two\nexit_code=1".to_string()),
+                    false
+                ),
+                (
+                    "call_1#2".to_string(),
+                    Some("out-three\nexit_code=0".to_string()),
+                    false
+                ),
+            ]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// The other half of the shape: a `---RESULT n---` header ahead of each
+    /// output. The counter differs per call, so the repeat is only visible with
+    /// digits blinded — and each chunk of the group is unwrapped on its own, so
+    /// an envelope behind a header still reads as a terminal.
+    #[test]
+    fn a_numbered_header_per_call_still_splits_per_call() {
+        let envelope = |out: &str| {
+            serde_json::json!({
+                "chunk_id": "abc123",
+                "wall_time_seconds": 0.5,
+                "exit_code": 0,
+                "original_token_count": 9,
+                "output": out,
+            })
+            .to_string()
+        };
+        let lines = code_mode_rollout(
+            "const r = await Promise.all([\n  tools.exec_command({cmd:\"one\"}),\n  tools.exec_command({cmd:\"two\"})\n]);\nr.forEach((x, i) => { text(`---RESULT ${i + 1}---`); text(JSON.stringify(x)); });\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                {"type": "input_text", "text": "---RESULT 1---"},
+                {"type": "input_text", "text": envelope("out-one")},
+                {"type": "input_text", "text": "---RESULT 2---"},
+                {"type": "input_text", "text": envelope("out-two")},
+            ]),
+        );
+        let path = write_temp_rollout("code-mode-stride-head", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "code-mode-stride-head")
+            .expect("parse ok");
+
+        assert_eq!(
+            tool_results(&detail),
+            vec![
+                (
+                    "call_1#0".to_string(),
+                    Some("---RESULT 1---\nout-one".to_string()),
+                    false
+                ),
+                (
+                    "call_1#1".to_string(),
+                    Some("---RESULT 2---\nout-two".to_string()),
+                    false
+                ),
+            ]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// The adversarial version of the shape above: the second command's own
+    /// stdout IS `exit_code=0`, so slot 1 of every assumed pair repeats and the
+    /// chunk content alone stops telling the two loops apart. Only the script
+    /// says which it is — two loops, so no grouping.
+    #[test]
+    fn a_command_whose_output_mimics_the_marker_does_not_force_a_grouping() {
+        let lines = code_mode_rollout(
+            "const r = await Promise.all([\n  tools.exec_command({cmd:\"printf one\"}),\n  tools.exec_command({cmd:\"printf 'exit_code=0'\"}),\n  tools.exec_command({cmd:\"printf three\"})\n]);\nfor (const x of r) text(x.output);\nfor (const x of r) text(`exit_code=${x.exit_code}`);\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                {"type": "input_text", "text": "one"},
+                {"type": "input_text", "text": "exit_code=0"},
+                {"type": "input_text", "text": "three"},
+                {"type": "input_text", "text": "exit_code=0"},
+                {"type": "input_text", "text": "exit_code=0"},
+                {"type": "input_text", "text": "exit_code=0"},
+            ]),
+        );
+        let path = write_temp_rollout("code-mode-stride-mimic", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "code-mode-stride-mimic")
+            .expect("parse ok");
+
+        let uses = tool_uses(&detail);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].1, CODEX_SCRIPT_TOOL_NAME);
+        let results = tool_results(&detail);
+        assert_eq!(results.len(), 1);
+        assert!(results[0]
+            .1
+            .as_deref()
+            .expect("script output")
+            .starts_with("one\nexit_code=0\nthree"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// Dividing evenly is NOT the proof. This script prints every output and
+    /// then every exit code — the same 6 chunks for 3 calls as the interleaved
+    /// shape above, in an order where grouping them in pairs would pin call 2's
+    /// output to call 1's card. Only the script says which shape it is.
+    #[test]
+    fn chunks_that_merely_divide_evenly_are_not_grouped() {
+        let lines = code_mode_rollout(
+            "const r = await Promise.all([\n  tools.exec_command({cmd:\"one\"}),\n  tools.exec_command({cmd:\"two\"}),\n  tools.exec_command({cmd:\"three\"})\n]);\nfor (const x of r) text(x.output);\nfor (const x of r) text(`exit_code=${x.exit_code}`);\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                {"type": "input_text", "text": "out-one"},
+                {"type": "input_text", "text": "out-two"},
+                {"type": "input_text", "text": "out-three"},
+                {"type": "input_text", "text": "exit_code=0"},
+                {"type": "input_text", "text": "exit_code=0"},
+                {"type": "input_text", "text": "exit_code=0"},
+            ]),
+        );
+        let path = write_temp_rollout("code-mode-stride-interleaved", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "code-mode-stride-interleaved")
+            .expect("parse ok");
+
+        let uses = tool_uses(&detail);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].1, CODEX_SCRIPT_TOOL_NAME);
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// What codex sends instead of the chunks when a script's `text()` stream is
+    /// too long: the whole stream re-rendered as one blob, one line per `text()`,
+    /// behind a banner declaring how many lines it started with.
+    fn collapsed_blob(declared: usize, outputs: &[&str]) -> String {
+        let lines: Vec<String> = outputs
+            .iter()
+            .enumerate()
+            .map(|(index, out)| {
+                serde_json::json!({
+                    "chunk_id": format!("chunk{index}"),
+                    "wall_time_seconds": 0.5,
+                    "exit_code": 0,
+                    "original_token_count": 9,
+                    "output": out,
+                })
+                .to_string()
+            })
+            .collect();
+        format!(
+            "Warning: truncated output (original token count: 10644)\nTotal output lines: {declared}\n\n{}",
+            lines.join("\n")
+        )
+    }
+
+    #[test]
+    fn a_collapsed_output_blob_splits_back_into_one_card_per_call() {
+        let lines = code_mode_rollout(
+            "const r = await Promise.all([\n  tools.exec_command({cmd:\"one\"}),\n  tools.exec_command({cmd:\"two\"}),\n  tools.exec_command({cmd:\"three\"})\n]);\nfor (const x of r) text(x);\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                {"type": "input_text", "text": collapsed_blob(3, &["out-one", "out-two", "out-three"])},
+            ]),
+        );
+        let path = write_temp_rollout("code-mode-collapsed", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "code-mode-collapsed")
+            .expect("parse ok");
+
+        assert_eq!(
+            tool_uses(&detail),
+            vec![
+                (
+                    "call_1#0".to_string(),
+                    "exec_command".to_string(),
+                    Some("one".to_string())
+                ),
+                (
+                    "call_1#1".to_string(),
+                    "exec_command".to_string(),
+                    Some("two".to_string())
+                ),
+                (
+                    "call_1#2".to_string(),
+                    "exec_command".to_string(),
+                    Some("three".to_string())
+                ),
+            ]
+        );
+        assert_eq!(
+            tool_results(&detail),
+            vec![
+                ("call_1#0".to_string(), Some("out-one".to_string()), false),
+                ("call_1#1".to_string(), Some("out-two".to_string()), false),
+                ("call_1#2".to_string(), Some("out-three".to_string()), false),
+            ]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// One call, one line, and the line is the raw result object — the shape
+    /// that used to leave a card whose entire body was `{"chunk_id":…}`.
+    #[test]
+    fn a_collapsed_single_call_blob_still_shows_its_output() {
+        let lines = code_mode_rollout(
+            "const r = await tools.exec_command({cmd:\"cargo test\"});\ntext(r);\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 9.0 seconds\nOutput:\n"},
+                {"type": "input_text", "text": collapsed_blob(1, &["test result: ok. 42 passed"])},
+            ]),
+        );
+        let path = write_temp_rollout("code-mode-collapsed-single", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "code-mode-collapsed-single")
+            .expect("parse ok");
+
+        assert_eq!(
+            tool_results(&detail),
+            vec![(
+                "call_1".to_string(),
+                Some("test result: ok. 42 passed".to_string()),
+                false
+            )]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// Past the cap codex drops whole lines — and it drops them from the middle,
+    /// so a survivor's position no longer names its call. Measured: with a line
+    /// missing, 13 of 57 checkable lines belong to a different command than
+    /// their position claims. Splitting anyway would put a command's output
+    /// under another command's title, so the script card stays.
+    #[test]
+    fn a_collapsed_blob_missing_a_line_keeps_the_script_card() {
+        let lines = code_mode_rollout(
+            "const r = await Promise.all([\n  tools.exec_command({cmd:\"one\"}),\n  tools.exec_command({cmd:\"two\"}),\n  tools.exec_command({cmd:\"three\"})\n]);\nfor (const x of r) text(x);\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                {"type": "input_text", "text": collapsed_blob(3, &["out-one", "out-three"])},
+            ]),
+        );
+        let path = write_temp_rollout("code-mode-collapsed-lossy", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "code-mode-collapsed-lossy")
+            .expect("parse ok");
+
+        let uses = tool_uses(&detail);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].1, CODEX_SCRIPT_TOOL_NAME);
+        let results = tool_results(&detail);
+        assert_eq!(results.len(), 1);
+        assert!(results[0]
+            .1
+            .as_deref()
+            .expect("script output")
+            .starts_with("Warning: truncated output"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// The same banner fronts the far more common case: ONE command whose own
+    /// stdout was too long. Its lines are stdout, not `text()` results, and
+    /// splitting them would shred one command's output across every card.
+    #[test]
+    fn a_truncated_command_output_is_not_read_as_one_line_per_call() {
+        let lines = code_mode_rollout(
+            "const r = await Promise.all([\n  tools.exec_command({cmd:\"one\"}),\n  tools.exec_command({cmd:\"two\"})\n]);\ntext(r[0].output);\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                {"type": "input_text", "text": "Warning: truncated output (original token count: 900)\nTotal output lines: 2\n\nfirst line of stdout\nsecond line of stdout"},
+            ]),
+        );
+        let path = write_temp_rollout("code-mode-collapsed-stdout", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "code-mode-collapsed-stdout")
+            .expect("parse ok");
+
+        let uses = tool_uses(&detail);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].1, CODEX_SCRIPT_TOOL_NAME);
+        let results = tool_results(&detail);
+        assert_eq!(results.len(), 1);
+        assert!(results[0]
+            .1
+            .as_deref()
+            .expect("script output")
+            .contains("first line of stdout\nsecond line of stdout"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// Fewer `text()` chunks than calls means chunk *i* is NOT provably call
+    /// *i*'s output — keep one script card rather than misattribute.
+    #[test]
+    fn code_mode_mismatched_chunks_keep_the_script_card() {
+        let lines = code_mode_rollout(
+            "const rs = await Promise.all([\n  tools.exec_command({cmd:\"one\"}),\n  tools.exec_command({cmd:\"two\"})\n]);\ntext(JSON.stringify(rs));\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                {"type": "input_text", "text": "[{\"output\":\"a\"},{\"output\":\"b\"}]"},
+            ]),
+        );
+        let path = write_temp_rollout("code-mode-mismatch", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "code-mode-mismatch")
+            .expect("parse ok");
+
+        let uses = tool_uses(&detail);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].1, CODEX_SCRIPT_TOOL_NAME);
+        let card: serde_json::Value =
+            serde_json::from_str(uses[0].2.as_deref().expect("script card input"))
+                .expect("script card input is JSON");
+        assert_eq!(card["title"], "one");
+        assert_eq!(card["call_count"], 2);
+        assert!(card["source"]
+            .as_str()
+            .expect("source")
+            .contains("Promise.all"));
+
+        let results = tool_results(&detail);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].1.as_deref(),
+            Some("[{\"output\":\"a\"},{\"output\":\"b\"}]")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn code_mode_apply_patch_renders_as_a_patch_card() {
+        let lines = code_mode_rollout(
+            "const patch = \"*** Begin Patch\\n*** Update File: a.rs\\n@@\\n-old\\n+new\\n*** End Patch\";\nconst result = await tools.apply_patch(patch);\ntext(result);\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 0.2 seconds\nOutput:\n"},
+                {"type": "input_text", "text": "Success. Updated the following files:\nM a.rs"},
+            ]),
+        );
+        let path = write_temp_rollout("code-mode-patch", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "code-mode-patch")
+            .expect("parse ok");
+
+        let uses = tool_uses(&detail);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].1, "apply_patch");
+        assert!(uses[0]
+            .2
+            .as_deref()
+            .expect("patch text")
+            .starts_with("*** Begin Patch"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn code_mode_script_failure_marks_the_result_as_an_error() {
+        let lines = code_mode_rollout(
+            "const r = await tools.exec_command({cmd: \"rm -rf /tmp/x\"});\ntext(r.output);\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script failed\nWall time 0.0 seconds\nOutput:\n"},
+                {"type": "input_text", "text": "Script error:\nexec_command failed for `rm -rf /tmp/x`"},
+            ]),
+        );
+        let path = write_temp_rollout("code-mode-failed", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "code-mode-failed")
+            .expect("parse ok");
+
+        let results = tool_results(&detail);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].2, "a failed script must render as an error");
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// An interrupted turn never writes the output record; the script card must
+    /// stay where it was rather than vanish or jump to the end.
+    #[test]
+    fn code_mode_call_without_output_keeps_its_script_card() {
+        let lines = vec![
+            rollout_line(
+                "2026-07-20T08:40:00Z",
+                "event_msg",
+                serde_json::json!({"type": "user_message", "message": "go"}),
+            ),
+            rollout_line(
+                "2026-07-20T08:40:01Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "call_id": "call_1",
+                    "input": "const r = await tools.exec_command({cmd: \"sleep 60\"});",
+                }),
+            ),
+        ];
+        let path = write_temp_rollout("code-mode-dangling", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "code-mode-dangling")
+            .expect("parse ok");
+
+        let uses = tool_uses(&detail);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].1, CODEX_SCRIPT_TOOL_NAME);
+        assert!(tool_results(&detail).is_empty());
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// The unified-exec `wait` tool shares code mode's array output shape; it
+    /// used to render as a raw `[{"text":"Script completed…` JSON blob.
+    #[test]
+    fn wait_tool_output_is_joined_text_not_raw_json() {
+        let lines = vec![
+            rollout_line(
+                "2026-07-20T08:40:00Z",
+                "event_msg",
+                serde_json::json!({"type": "user_message", "message": "go"}),
+            ),
+            rollout_line(
+                "2026-07-20T08:40:01Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "function_call",
+                    "name": "wait",
+                    "call_id": "call_w",
+                    "arguments": "{\"cell_id\":\"55\",\"yield_time_ms\":30000}",
+                }),
+            ),
+            rollout_line(
+                "2026-07-20T08:40:09Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": "call_w",
+                    "output": [
+                        {"type": "input_text", "text": "Script completed\nWall time 5.6 seconds\nOutput:\n"},
+                        {"type": "input_text", "text": "test result: ok. 12 passed"},
+                    ],
+                }),
+            ),
+        ];
+        let path = write_temp_rollout("code-mode-wait", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "code-mode-wait")
+            .expect("parse ok");
+
+        assert_eq!(
+            tool_results(&detail),
+            vec![(
+                "call_w".to_string(),
+                Some("test result: ok. 12 passed".to_string()),
+                false
+            )]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// `wait` / `write_stdin` carry a session id, never a command — which is
+    /// why their cards used to be titled by the bare tool name. The command
+    /// that started the session is recovered from the announcement in that
+    /// command's own output.
+    fn session_tool_rollout(
+        exec_output: serde_json::Value,
+        session_call: serde_json::Value,
+    ) -> Vec<String> {
+        let mut lines = background_session_head(exec_output);
+        lines.push(rollout_line(
+            "2026-07-20T08:40:03Z",
+            "response_item",
+            session_call,
+        ));
+        lines
+    }
+
+    /// `pnpm dev`, answered with whatever it had printed when unified-exec's
+    /// yield ran out.
+    fn background_session_head(exec_output: serde_json::Value) -> Vec<String> {
+        vec![
+            rollout_line(
+                "2026-07-20T08:40:00Z",
+                "event_msg",
+                serde_json::json!({"type": "user_message", "message": "go"}),
+            ),
+            rollout_line(
+                "2026-07-20T08:40:01Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_e",
+                    "arguments": "{\"cmd\":\"pnpm dev\",\"yield_time_ms\":1000}",
+                }),
+            ),
+            rollout_line(
+                "2026-07-20T08:40:02Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": "call_e",
+                    "output": exec_output,
+                }),
+            ),
+        ]
+    }
+
+    /// One `write_stdin` collecting more of a background session's output, and
+    /// the output it collected.
+    fn poll_lines(call_id: &str, args: &str, output: serde_json::Value) -> Vec<String> {
+        vec![
+            rollout_line(
+                "2026-07-20T08:40:03Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "function_call",
+                    "name": "write_stdin",
+                    "call_id": call_id,
+                    "arguments": args,
+                }),
+            ),
+            rollout_line(
+                "2026-07-20T08:40:04Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                }),
+            ),
+        ]
+    }
+
+    fn parse_lines(lines: &[String], tag: &str) -> crate::models::ConversationDetail {
+        let path = write_temp_rollout(tag, lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, tag)
+            .expect("parse ok");
+        let _ = fs::remove_file(path);
+        detail
+    }
+
+    fn session_tool_input(lines: &[String], tag: &str) -> Option<String> {
+        tool_uses(&parse_lines(lines, tag))
+            .into_iter()
+            .find(|(id, _, _)| id == "call_s")
+            .and_then(|(_, _, input)| input)
+    }
+
+    /// A call that gets a card of its own — here a `wait` that also kills the
+    /// session — is titled by the command it is acting on, not by the bare tool
+    /// name. (A call that only collects output gets no card at all; see
+    /// `polling_a_background_session_appends_to_the_card_of_its_command`.)
+    #[test]
+    fn wait_carries_the_command_whose_session_it_polls() {
+        let lines = session_tool_rollout(
+            serde_json::json!(
+                "Chunk ID: 523e44\nWall time: 1.0 seconds\nProcess running with session ID 22068\nOutput:\nstarting…"
+            ),
+            serde_json::json!({
+                "type": "function_call",
+                "name": "wait",
+                "call_id": "call_s",
+                "arguments": "{\"cell_id\":\"22068\",\"terminate\":true,\"yield_time_ms\":30000}",
+            }),
+        );
+
+        let input: serde_json::Value =
+            serde_json::from_str(&session_tool_input(&lines, "session-wait").expect("input"))
+                .expect("json args");
+        assert_eq!(input["session_command"], "pnpm dev");
+        // The original arguments survive untouched next to it.
+        assert_eq!(input["cell_id"], "22068");
+        assert_eq!(input["yield_time_ms"], 30000);
+    }
+
+    #[test]
+    fn write_stdin_resolves_a_numeric_session_id_from_a_code_mode_result() {
+        let lines = session_tool_rollout(
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 1.0 seconds\nOutput:\n"},
+                {"type": "input_text", "text": "{\"chunk_id\":\"a74f94\",\"session_id\":7106,\"output\":\"\"}"},
+            ]),
+            serde_json::json!({
+                "type": "function_call",
+                "name": "write_stdin",
+                "call_id": "call_s",
+                "arguments": "{\"session_id\":7106,\"chars\":\"q\\n\"}",
+            }),
+        );
+
+        let input: serde_json::Value =
+            serde_json::from_str(&session_tool_input(&lines, "session-stdin").expect("input"))
+                .expect("json args");
+        assert_eq!(input["session_command"], "pnpm dev");
+    }
+
+    /// A `wait` / `write_stdin` that only collects output is the earlier command
+    /// still running — not a second command. Before this, a `cargo test` cut
+    /// short by unified-exec's yield showed as two adjacent cards with the same
+    /// title, the first holding a few lines of output and the second holding
+    /// the rest.
+    #[test]
+    fn polling_a_background_session_appends_to_the_card_of_its_command() {
+        let mut lines = background_session_head(serde_json::json!(
+            "Chunk ID: 523e44\nWall time: 30.0 seconds\nProcess running with session ID 22068\nOutput:\n   Compiling codeg"
+        ));
+        // Nothing new yet, and the session says so by naming itself again.
+        lines.extend(poll_lines(
+            "call_p1",
+            "{\"session_id\":22068,\"chars\":\"\"}",
+            serde_json::json!(
+                "Chunk ID: 9a1\nWall time: 30.0 seconds\nProcess running with session ID 22068\nOutput:\n"
+            ),
+        ));
+        lines.extend(poll_lines(
+            "call_p2",
+            "{\"session_id\":22068,\"chars\":\"\"}",
+            serde_json::json!(
+                "Chunk ID: 9a2\nWall time: 0.1 seconds\nProcess exited with code 0\nOutput:\ntest result: ok. 1 passed"
+            ),
+        ));
+
+        let detail = parse_lines(&lines, "session-fold");
+        let uses = tool_uses(&detail);
+        assert_eq!(uses.len(), 1, "polls must not add cards: {uses:?}");
+        assert_eq!(uses[0].1, "exec_command");
+
+        let results = tool_results(&detail);
+        assert_eq!(results.len(), 1, "{results:?}");
+        let output = results[0].1.clone().expect("output");
+        assert_eq!(output, "   Compiling codeg\ntest result: ok. 1 passed");
+    }
+
+    /// The chunk envelope in its object form — what a script that prints its
+    /// `exec_command` result verbatim leaves behind. Unwrapped to the output it
+    /// carries, exactly like the string form's header is stripped, so a folded
+    /// session does not read as JSON followed by terminal output.
+    #[test]
+    fn a_code_mode_exec_result_shows_its_output_not_its_envelope() {
+        let mut lines = code_mode_rollout(
+            "const r = await tools.exec_command({cmd:\"pnpm dev\"});\ntext(JSON.stringify(r));\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 1.0 seconds\nOutput:\n"},
+                {"type": "input_text", "text": "{\"chunk_id\":\"6a10a9\",\"wall_time_seconds\":1.0,\"session_id\":75100,\"original_token_count\":0,\"output\":\"\"}"},
+            ]),
+        );
+        lines.extend(poll_lines(
+            "call_p",
+            "{\"session_id\":75100,\"chars\":\"\"}",
+            serde_json::json!(
+                "Chunk ID: 9a2\nWall time: 9.0 seconds\nProcess exited with code 0\nOutput:\n[INFO] Scanning for projects..."
+            ),
+        ));
+
+        let detail = parse_lines(&lines, "session-envelope");
+        let results = tool_results(&detail);
+        assert_eq!(results.len(), 1, "{results:?}");
+        // The envelope is gone; what the command printed took its place.
+        assert_eq!(
+            results[0].1.as_deref(),
+            Some("[INFO] Scanning for projects...")
+        );
+    }
+
+    /// Keystrokes are an action, not a poll: they earn a card, and everything
+    /// the session prints afterwards belongs below that card rather than folded
+    /// back above it.
+    #[test]
+    fn keystrokes_get_a_card_and_end_the_folding() {
+        let mut lines = background_session_head(serde_json::json!(
+            "Chunk ID: 523e44\nWall time: 1.0 seconds\nProcess running with session ID 22068\nOutput:\noverwrite? [y/N]"
+        ));
+        lines.extend(poll_lines(
+            "call_k",
+            "{\"session_id\":22068,\"chars\":\"y\\n\"}",
+            serde_json::json!(
+                "Chunk ID: 9a1\nWall time: 1.0 seconds\nProcess running with session ID 22068\nOutput:\nwriting"
+            ),
+        ));
+        lines.extend(poll_lines(
+            "call_p",
+            "{\"session_id\":22068,\"chars\":\"\"}",
+            serde_json::json!(
+                "Chunk ID: 9a2\nWall time: 0.1 seconds\nProcess exited with code 0\nOutput:\ndone"
+            ),
+        ));
+
+        let detail = parse_lines(&lines, "session-keys");
+        let uses = tool_uses(&detail);
+        assert_eq!(uses.len(), 3, "{uses:?}");
+        assert_eq!(uses[1].0, "call_k");
+        assert_eq!(uses[2].0, "call_p");
+
+        let results = tool_results(&detail);
+        let origin = results
+            .iter()
+            .find(|(id, _, _)| id == "call_e")
+            .expect("origin result");
+        assert_eq!(origin.1.as_deref(), Some("overwrite? [y/N]"));
+    }
+
+    /// A command's own JSON stdout may well carry `chunk_id` and `output`.
+    /// Truncating it to the `output` field would silently drop the rest, so the
+    /// whole envelope shape has to be there before anything is unwrapped.
+    #[test]
+    fn json_stdout_that_only_resembles_an_envelope_is_left_whole() {
+        let payload =
+            r#"{"chunk_id":"artifact-7","output":"ok","checksum":"abc","files":["a.rs"]}"#;
+        let lines = code_mode_rollout(
+            "const r = await tools.exec_command({cmd: \"node build.js\"});\ntext(r.output);\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 1.0 seconds\nOutput:\n"},
+                {"type": "input_text", "text": payload},
+            ]),
+        );
+
+        let detail = parse_lines(&lines, "envelope-lookalike");
+        assert_eq!(
+            tool_results(&detail)
+                .first()
+                .and_then(|(_, out, _)| out.clone())
+                .as_deref(),
+            Some(payload)
+        );
+    }
+
+    /// One `tools.exec_command` call site driven by a loop is many commands. The
+    /// first command literal in the source is then just a guess, and a session
+    /// some later command started would be titled — and folded — under it.
+    #[test]
+    fn a_looped_call_site_attributes_no_session() {
+        let mut lines = code_mode_rollout(
+            "const cmds = [\"pnpm build\", \"pnpm dev\"];\nfor (const cmd of cmds) {\n  const r = await tools.exec_command({cmd});\n  text(JSON.stringify(r));\n}\n",
+            // Two commands ran; the second announced session 4242.
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 1.0 seconds\nOutput:\n"},
+                {"type": "input_text", "text": "{\"chunk_id\":\"a1\",\"wall_time_seconds\":1.0,\"original_token_count\":0,\"exit_code\":0,\"output\":\"built\"}"},
+                {"type": "input_text", "text": "{\"chunk_id\":\"b2\",\"wall_time_seconds\":1.0,\"original_token_count\":0,\"session_id\":4242,\"output\":\"\"}"},
+            ]),
+        );
+        lines.extend(poll_lines(
+            "call_p",
+            "{\"session_id\":4242,\"chars\":\"\"}",
+            serde_json::json!(
+                "Chunk ID: 9a2\nWall time: 1.0 seconds\nProcess exited with code 0\nOutput:\nready"
+            ),
+        ));
+
+        let detail = parse_lines(&lines, "looped-site");
+        let poll = tool_uses(&detail)
+            .into_iter()
+            .find(|(id, _, _)| id == "call_p")
+            .expect("the poll keeps its card");
+        let input = poll.2.expect("input");
+        assert!(
+            !input.contains("session_command"),
+            "session 4242 was started by one of two commands — attributing it to \
+             either is a guess: {input}"
+        );
+    }
+
+    /// The numeric session id and the hex chunk id name the same cell. Once a
+    /// keystroke earns a card, a poll arriving through the *other* spelling must
+    /// not still fold its output in above that card.
+    #[test]
+    fn an_action_ends_the_folding_for_every_alias_of_its_session() {
+        let mut lines = background_session_head(serde_json::json!(
+            "Chunk ID: 523e44\nWall time: 1.0 seconds\nProcess running with session ID 22068\nOutput:\noverwrite? [y/N]"
+        ));
+        lines.extend(poll_lines(
+            "call_k",
+            "{\"session_id\":22068,\"chars\":\"y\\n\"}",
+            serde_json::json!(
+                "Chunk ID: 9a1\nWall time: 1.0 seconds\nProcess running with session ID 22068\nOutput:\nwriting"
+            ),
+        ));
+        // Same cell, addressed by the chunk id of the announcing envelope.
+        lines.extend(poll_lines(
+            "call_p",
+            "{\"session_id\":\"523e44\",\"chars\":\"\"}",
+            serde_json::json!(
+                "Chunk ID: 9a2\nWall time: 0.1 seconds\nProcess exited with code 0\nOutput:\ndone"
+            ),
+        ));
+
+        let detail = parse_lines(&lines, "session-alias-boundary");
+        let results = tool_results(&detail);
+        let origin = results
+            .iter()
+            .find(|(id, _, _)| id == "call_e")
+            .expect("origin result");
+        assert_eq!(origin.1.as_deref(), Some("overwrite? [y/N]"));
+        let uses = tool_uses(&detail);
+        assert_eq!(uses.len(), 3, "the alias poll keeps its own card: {uses:?}");
+    }
+
+    /// codex names sessions after pids, and pids come back around. Whichever
+    /// command announced an id last owns it: its polls must land on its own
+    /// card, never on the card of the command that held the id before.
+    #[test]
+    fn a_reused_session_id_binds_to_whoever_announced_it_last() {
+        let mut lines = background_session_head(serde_json::json!(
+            "Chunk ID: 523e44\nWall time: 1.0 seconds\nProcess running with session ID 22068\nOutput:\nstarting"
+        ));
+        lines.push(rollout_line(
+            "2026-07-20T08:41:00Z",
+            "response_item",
+            serde_json::json!({
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_e2",
+                "arguments": "{\"cmd\":\"cargo watch\",\"yield_time_ms\":1000}",
+            }),
+        ));
+        lines.push(rollout_line(
+            "2026-07-20T08:41:01Z",
+            "response_item",
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call_e2",
+                "output": "Chunk ID: 7c11\nWall time: 1.0 seconds\nProcess running with session ID 22068\nOutput:\nwatching",
+            }),
+        ));
+        lines.extend(poll_lines(
+            "call_p",
+            "{\"session_id\":22068,\"chars\":\"\"}",
+            serde_json::json!(
+                "Chunk ID: 9a2\nWall time: 0.1 seconds\nProcess exited with code 0\nOutput:\nrebuilt"
+            ),
+        ));
+
+        let detail = parse_lines(&lines, "session-reused");
+        let results = tool_results(&detail);
+        let first = results
+            .iter()
+            .find(|(id, _, _)| id == "call_e")
+            .expect("first result");
+        let second = results
+            .iter()
+            .find(|(id, _, _)| id == "call_e2")
+            .expect("second result");
+        assert_eq!(first.1.as_deref(), Some("starting"));
+        assert_eq!(second.1.as_deref(), Some("watching\nrebuilt"));
+    }
+
+    #[test]
+    fn an_unannounced_session_leaves_the_arguments_alone() {
+        // The command ran to completion — it never announced a session — so
+        // there is nothing to attribute this wait to. Inventing a command here
+        // would be worse than the bare id the card falls back to.
+        let lines = session_tool_rollout(
+            serde_json::json!("Chunk ID: 523e44\nWall time: 1.0 seconds\nOutput:\ndone"),
+            serde_json::json!({
+                "type": "function_call",
+                "name": "wait",
+                "call_id": "call_s",
+                "arguments": "{\"cell_id\":\"999\",\"yield_time_ms\":30000}",
+            }),
+        );
+
+        let input = session_tool_input(&lines, "session-unknown").expect("input");
+        assert!(
+            !input.contains("session_command"),
+            "unexpected attribution: {input}"
+        );
+    }
+
+    /// A code-mode script that answers `Script running with cell ID N` has not
+    /// finished — the `wait` that later collects cell N carries that script's
+    /// own return value. It belongs on the script's card, not on a card of its
+    /// own: before this, the delegation-status card showed only "Script running
+    /// with cell ID 35" while its actual `{"tasks":[…]}` sat in a separate
+    /// terminal card further down the transcript.
+    fn deferred_script_rollout(wait_output: serde_json::Value) -> Vec<String> {
+        let mut lines = code_mode_rollout(
+            "const r = await tools.mcp__codeg_mcp__get_delegation_status({task_ids:[\"t1\"],wait_ms:60000});\ntext(JSON.stringify(r));\n",
+            serde_json::json!("Script running with cell ID 34\nWall time 11.0 seconds\nOutput:\n"),
+        );
+        lines.push(rollout_line(
+            "2026-07-20T08:40:03Z",
+            "response_item",
+            serde_json::json!({
+                "type": "function_call",
+                "name": "wait",
+                "call_id": "call_w",
+                "arguments": "{\"cell_id\":\"34\",\"yield_time_ms\":60000}",
+            }),
+        ));
+        lines.push(rollout_line(
+            "2026-07-20T08:40:48Z",
+            "response_item",
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call_w",
+                "output": wait_output,
+            }),
+        ));
+        lines
+    }
+
+    #[test]
+    fn a_deferred_scripts_result_lands_on_its_own_card() {
+        let lines = deferred_script_rollout(serde_json::json!([
+            {"type": "input_text", "text": "Script completed\nWall time 44.5 seconds\nOutput:\n"},
+            {"type": "input_text", "text": "{\"tasks\":[{\"task_id\":\"t1\",\"child_conversation_id\":2890}]}"},
+        ]));
+        let path = write_temp_rollout("deferred-script", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "deferred-script")
+            .expect("parse ok");
+
+        // One card for the call, carrying the result the `wait` collected.
+        assert_eq!(
+            tool_uses(&detail)
+                .into_iter()
+                .map(|(id, name, _)| (id, name))
+                .collect::<Vec<_>>(),
+            vec![(
+                "call_1".to_string(),
+                "mcp__codeg_mcp__get_delegation_status".to_string()
+            )]
+        );
+        assert_eq!(
+            tool_results(&detail),
+            vec![(
+                "call_1".to_string(),
+                Some(
+                    "{\"tasks\":[{\"task_id\":\"t1\",\"child_conversation_id\":2890}]}".to_string()
+                ),
+                false
+            )]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_script_still_running_after_a_wait_stays_collectable() {
+        // The wait came back with the script STILL parked: the card keeps the
+        // running note, and the next wait must still find it.
+        let lines = deferred_script_rollout(serde_json::json!(
+            "Script running with cell ID 34\nWall time 60.0 seconds\nOutput:\n"
+        ));
+        let path = write_temp_rollout("deferred-still-running", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "deferred-still-running")
+            .expect("parse ok");
+
+        assert_eq!(tool_uses(&detail).len(), 1);
+        assert_eq!(
+            tool_results(&detail),
+            vec![(
+                "call_1".to_string(),
+                Some("Script running with cell ID 34".to_string()),
+                false
+            )]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// A `wait` answers with what the script printed SINCE it parked, not with
+    /// the whole run. Rewriting the cards from that answer alone would drop
+    /// whatever the script had already printed — and decompose against a chunk
+    /// count missing its front, so a two-call script could end up undecomposable
+    /// and leave its `call_1#i` cards without results.
+    #[test]
+    fn a_deferred_script_keeps_what_it_printed_before_the_wait() {
+        let mut lines = code_mode_rollout(
+            "const a = await tools.exec_command({cmd: \"pnpm build\"});\ntext(a.output);\nconst b = await tools.exec_command({cmd: \"pnpm test\"});\ntext(b.output);\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script running with cell ID 34\nWall time 11.0 seconds\nOutput:\n"},
+                {"type": "input_text", "text": "build finished"},
+            ]),
+        );
+        lines.push(rollout_line(
+            "2026-07-20T08:40:03Z",
+            "response_item",
+            serde_json::json!({
+                "type": "function_call",
+                "name": "wait",
+                "call_id": "call_w",
+                "arguments": "{\"cell_id\":\"34\",\"yield_time_ms\":60000}",
+            }),
+        ));
+        lines.push(rollout_line(
+            "2026-07-20T08:40:48Z",
+            "response_item",
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call_w",
+                "output": [
+                    {"type": "input_text", "text": "Script completed\nWall time 45.0 seconds\nOutput:\n"},
+                    {"type": "input_text", "text": "1 passed"},
+                ],
+            }),
+        ));
+
+        let detail = parse_lines(&lines, "deferred-accumulates");
+        // Two chunks across the two answers, two calls: decomposed per call.
+        assert_eq!(
+            tool_uses(&detail)
+                .iter()
+                .map(|(id, name, _)| (id.as_str(), name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("call_1#0", "exec_command"), ("call_1#1", "exec_command")]
+        );
+        assert_eq!(
+            tool_results(&detail)
+                .iter()
+                .map(|(id, out, _)| (id.as_str(), out.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("call_1#0", Some("build finished")),
+                ("call_1#1", Some("1 passed")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_script_cell_is_never_mistaken_for_a_shell_session() {
+        // `Script running with cell ID N` names the SCRIPT, not a shell inside
+        // it — so the wait that collects it folds into the script's card and
+        // contributes no card of its own. Nothing may leak into the shell
+        // session map either: that cell is not a shell, and the long-running
+        // call here is not even a command.
+        let mut lines = code_mode_rollout(
+            "const r = await tools.mcp__codeg_mcp__ask_user_question({questions: []});\ntext(JSON.stringify(r));\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script running with cell ID 15\nWall time 11.0 seconds\nOutput:\n"},
+            ]),
+        );
+        lines.push(rollout_line(
+            "2026-07-20T08:40:03Z",
+            "response_item",
+            serde_json::json!({
+                "type": "function_call",
+                "name": "wait",
+                "call_id": "call_s",
+                "arguments": "{\"cell_id\":\"15\"}",
+            }),
+        ));
+
+        let path = write_temp_rollout("session-script-cell", &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "session-script-cell")
+            .expect("parse ok");
+        let uses = tool_uses(&detail);
+        assert_eq!(
+            uses.iter()
+                .map(|(id, name, _)| (id.as_str(), name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("call_1", "mcp__codeg_mcp__ask_user_question")]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn code_mode_session_announcements_are_attributed_per_chunk() {
+        // Two commands in one script, one `text()` chunk each: the second
+        // command's session id must resolve to the SECOND command.
+        let mut lines = code_mode_rollout(
+            "const a = await tools.exec_command({cmd: \"pnpm dev\"});\ntext(JSON.stringify(a));\nconst b = await tools.exec_command({cmd: \"cargo watch\"});\ntext(JSON.stringify(b));\n",
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 1.0 seconds\nOutput:\n"},
+                {"type": "input_text", "text": "{\"chunk_id\":\"a1\",\"session_id\":11,\"output\":\"\"}"},
+                {"type": "input_text", "text": "{\"chunk_id\":\"b2\",\"session_id\":22,\"output\":\"\"}"},
+            ]),
+        );
+        lines.push(rollout_line(
+            "2026-07-20T08:40:03Z",
+            "response_item",
+            serde_json::json!({
+                "type": "function_call",
+                "name": "wait",
+                // `terminate` keeps it a card of its own — a bare poll would be
+                // folded into the command's card and have no title to check.
+                "call_id": "call_s",
+                "arguments": "{\"cell_id\":\"22\",\"terminate\":true}",
+            }),
+        ));
+
+        let input: serde_json::Value =
+            serde_json::from_str(&session_tool_input(&lines, "session-chunked").expect("input"))
+                .expect("json args");
+        assert_eq!(input["session_command"], "cargo watch");
+    }
+
+    // ── separator split ──────────────────────────────────────────────────
+
+    /// The script from the reported session: a literal table of labelled
+    /// commands fanned out through one `tools.exec_command({cmd, …})`.
+    fn labelled_fanout(labels: &[&str]) -> String {
+        let rows: Vec<String> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| format!("  [\"{label}\", \"echo {i}\"],\n"))
+            .collect();
+        format!(
+            "const cmds = [\n{}];\nconst out = await Promise.all(cmds.map(async ([k,cmd]) => [k, await tools.exec_command({{cmd, workdir:\"/repo\", yield_time_ms:10000}})]));\nfor (const [k,r] of out) text(`===== ${{k}} =====\\n${{r.output}}`);\n",
+            rows.concat()
+        )
+    }
+
+    /// What codex renders when a labelled fan-out's `text()` stream is too
+    /// long: one blob, the separators still in it, behind a banner declaring
+    /// how many lines it started with.
+    fn labelled_blob(declared: usize, sections: &[(&str, &str)]) -> String {
+        let body: Vec<String> = sections
+            .iter()
+            .map(|(label, out)| format!("===== {label} =====\n{out}"))
+            .collect();
+        format!(
+            "Warning: truncated output (original token count: 23243)\nTotal output lines: {declared}\n\n{}",
+            body.join("\n")
+        )
+    }
+
+    fn code_mode_detail(script: &str, blob: String, id: &str) -> crate::models::ConversationDetail {
+        let lines = code_mode_rollout(
+            script,
+            serde_json::json!([
+                {"type": "input_text", "text": "Script completed\nWall time 0.3 seconds\nOutput:\n"},
+                {"type": "input_text", "text": blob},
+            ]),
+        );
+        let path = write_temp_rollout(id, &lines);
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, id)
+            .expect("parse ok");
+        let _ = fs::remove_file(path);
+        detail
+    }
+
+    fn tool_metas(detail: &crate::models::ConversationDetail) -> Vec<serde_json::Value> {
+        detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { meta, .. } => Some(
+                    meta.clone()
+                        .and_then(|m| m.get("codeg.codexScript").cloned())
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_labelled_fanout_splits_a_collapsed_blob_per_command() {
+        let detail = code_mode_detail(
+            &labelled_fanout(&["query-entry", "formula-service", "factor-full"]),
+            labelled_blob(6, &[
+                ("query-entry", "one"),
+                ("formula-service", "two"),
+                ("factor-full", "three"),
+            ]),
+            "code-mode-labelled",
+        );
+
+        assert_eq!(
+            tool_uses(&detail),
+            vec![
+                ("call_1#0".into(), "exec_command".into(), Some("echo 0".into())),
+                ("call_1#1".into(), "exec_command".into(), Some("echo 1".into())),
+                ("call_1#2".into(), "exec_command".into(), Some("echo 2".into())),
+            ]
+        );
+        assert_eq!(
+            tool_results(&detail),
+            vec![
+                ("call_1#0".into(), Some("one".into()), false),
+                ("call_1#1".into(), Some("two".into()), false),
+                ("call_1#2".into(), Some("three".into()), false),
+            ]
+        );
+        let metas = tool_metas(&detail);
+        assert_eq!(metas[0]["label"], "query-entry");
+        assert_eq!(metas[2]["label"], "factor-full");
+        assert!(metas.iter().all(|m| m.get("outputMissing").is_none()));
+    }
+
+    /// The reported card: truncation ate two separators, so the span after
+    /// `formula-service` holds three commands' output with no boundary. The
+    /// commands it provably brackets still get their own output; the ones whose
+    /// separator is gone say so instead of being handed someone else's.
+    #[test]
+    fn a_truncated_separator_leaves_its_command_without_output() {
+        let detail = code_mode_detail(
+            &labelled_fanout(&["query-entry", "formula-service", "vo", "formula-splice", "factor-full"]),
+            labelled_blob(20, &[
+                ("query-entry", "first"),
+                ("formula-service", "second\nvo-output\nsplice-output"),
+                ("factor-full", "last"),
+            ]),
+            "code-mode-labelled-partial",
+        );
+
+        assert_eq!(
+            tool_results(&detail),
+            vec![
+                ("call_1#0".into(), Some("first".into()), false),
+                ("call_1#1".into(), Some("second\nvo-output\nsplice-output".into()), false),
+                ("call_1#2".into(), None, false),
+                ("call_1#3".into(), None, false),
+                ("call_1#4".into(), Some("last".into()), false),
+            ]
+        );
+
+        let metas = tool_metas(&detail);
+        assert_eq!(metas[1]["sharedWith"], serde_json::json!(["vo", "formula-splice"]));
+        assert_eq!(metas[2]["outputMissing"], true);
+        assert_eq!(metas[3]["outputMissing"], true);
+        assert!(metas[0].get("sharedWith").is_none());
+        assert!(metas[4].get("sharedWith").is_none());
+        assert!(metas.iter().all(|m| m["truncated"] == true));
+    }
+
+    /// A command that printed the separator itself makes the line ambiguous;
+    /// the whole candidate is refused rather than cutting on the wrong one.
+    #[test]
+    fn a_repeated_separator_line_keeps_the_script_card() {
+        let detail = code_mode_detail(
+            &labelled_fanout(&["alpha", "beta"]),
+            labelled_blob(8, &[
+                ("alpha", "one\n===== beta ====="),
+                ("beta", "two"),
+            ]),
+            "code-mode-labelled-dup",
+        );
+
+        let uses = tool_uses(&detail);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].1, CODEX_SCRIPT_TOOL_NAME);
+    }
+
+    /// Only a line some separator actually predicts can make a candidate
+    /// ambiguous. Two commands printing the same ordinary line is the normal
+    /// case — `index_body_lines` marks it repeated, but nothing looks it up.
+    #[test]
+    fn a_repeated_output_line_still_splits() {
+        let detail = code_mode_detail(
+            &labelled_fanout(&["alpha", "beta", "gamma"]),
+            labelled_blob(8, &[
+                ("alpha", "shared line\none"),
+                ("beta", "shared line\ntwo"),
+                ("gamma", "three"),
+            ]),
+            "code-mode-labelled-repeat",
+        );
+
+        assert_eq!(
+            tool_results(&detail),
+            vec![
+                ("call_1#0".into(), Some("shared line\none".into()), false),
+                ("call_1#1".into(), Some("shared line\ntwo".into()), false),
+                ("call_1#2".into(), Some("three".into()), false),
+            ]
+        );
+        // Every line the banner declared is present, so nothing went missing.
+        let metas = tool_metas(&detail);
+        assert!(metas.iter().all(|m| m.get("truncated").is_none()));
+        assert!(metas.iter().all(|m| m.get("outputMissing").is_none()));
+    }
+
+    /// One separator divides nothing: it would hand the whole blob to the first
+    /// command and leave the rest blank.
+    #[test]
+    fn a_single_surviving_separator_keeps_the_script_card() {
+        let detail = code_mode_detail(
+            &labelled_fanout(&["alpha", "beta", "gamma"]),
+            labelled_blob(9, &[("beta", "two")]),
+            "code-mode-labelled-one",
+        );
+
+        let uses = tool_uses(&detail);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].1, CODEX_SCRIPT_TOOL_NAME);
+    }
+
+    /// Separators in the wrong order are not this script's separator run.
+    #[test]
+    fn separators_out_of_order_keep_the_script_card() {
+        let detail = code_mode_detail(
+            &labelled_fanout(&["alpha", "beta", "gamma"]),
+            labelled_blob(9, &[("gamma", "three"), ("beta", "two"), ("alpha", "one")]),
+            "code-mode-labelled-unordered",
+        );
+
+        let uses = tool_uses(&detail);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].1, CODEX_SCRIPT_TOOL_NAME);
+    }
+
+    /// Scripts that number their results instead of naming them split the same
+    /// way — the hole is the loop index.
+    #[test]
+    fn numbered_separators_split_a_collapsed_blob() {
+        let script = concat!(
+            "const cmds = [[\"echo one\", 20000], [\"echo two\", 20000]];\n",
+            "const rs = await Promise.all(cmds.map(([cmd,max]) => tools.exec_command({cmd, max_output_tokens:max})));\n",
+            "rs.forEach((r,i)=>text(`---RESULT ${i+1}---\\n${r.output}`));\n",
+        );
+        let blob = "Warning: truncated output (original token count: 900)\nTotal output lines: 7\n\n---RESULT 1---\none\n---RESULT 2---\ntwo".to_string();
+        let detail = code_mode_detail(script, blob, "code-mode-numbered");
+
+        assert_eq!(
+            tool_results(&detail),
+            vec![
+                ("call_1#0".into(), Some("one".into()), false),
+                ("call_1#1".into(), Some("two".into()), false),
+            ]
+        );
+        // No table label to show, so the chip has nothing to say.
+        assert!(tool_metas(&detail).iter().all(|m| m.get("label").is_none()));
     }
 }

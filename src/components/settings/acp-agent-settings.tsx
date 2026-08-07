@@ -25,17 +25,27 @@ import {
   Loader2,
   Minus,
   PackagePlus,
+  Pencil,
   Plug,
   Plus,
   RefreshCw,
   Save,
+  Stethoscope,
   Trash2,
   Wrench,
 } from "lucide-react"
+import { parse as parseTomlDocument } from "smol-toml"
 import { isDesktop, openUrl } from "@/lib/platform"
 import { getActiveRemoteConnectionId } from "@/lib/transport"
 import { toast } from "sonner"
+import {
+  customAgentId,
+  isCustomAgentType,
+  setCustomAgentDisplay,
+} from "@/lib/custom-agents"
 import { AgentIcon } from "@/components/agent-icon"
+import { AddCustomAgentDialog } from "@/components/settings/add-custom-agent-dialog"
+import { CustomAgentSkillsToggle } from "@/components/settings/custom-agent-skills-toggle"
 import {
   AlertDialog,
   AlertDialogCancel,
@@ -85,12 +95,11 @@ import {
   acpPreflight,
   acpPrepareNpxAgent,
   acpReorderAgents,
+  acpDeleteCustomAgent,
   acpUninstallAgent,
   acpUpdateAgentConfig,
   acpUpdateAgentEnv,
   acpUpdateHermesConfig,
-  acpUpdateKimiCodeConfig,
-  acpFetchKimiModels,
   acpRevealHermesHome,
   acpOpenHermesSetupTerminal,
   codexPollDeviceCode,
@@ -100,8 +109,11 @@ import {
 } from "@/lib/api"
 import type {
   AcpAgentInfo,
+  AdapterInfo,
   AgentType,
   CheckStatus,
+  CodexGranularApproval,
+  CodexSandboxStructuredConfig,
   FixAction,
   GrokStructuredConfig,
   HermesLocalConfig,
@@ -109,11 +121,19 @@ import type {
   OpenCodeCatalogProvider,
   PreflightResult,
 } from "@/lib/types"
-import { HERMES_PROVIDERS, parseClaudeProviderModel } from "@/lib/types"
+import {
+  HERMES_PROVIDERS,
+  parseClaudeProviderModel,
+  parseCodexModelConfig,
+  serializeCodexModelConfig,
+  type CodexModelConfig,
+} from "@/lib/types"
+import { CodexModelListEditor } from "@/components/settings/codex-model-list-editor"
 import {
   OpenCodeConnectDialog,
   OpenCodeCustomProviderDialog,
 } from "@/components/settings/opencode-connect-dialog"
+import { AgentDiagnosticsDialog } from "@/components/settings/agent-diagnostics-dialog"
 import {
   buildConnectedModelOptions,
   buildConnectedProviders,
@@ -129,6 +149,8 @@ import { getInstallErrorHintKey } from "@/lib/agent-install-error"
 import { useAgentInstallStream } from "@/hooks/use-agent-install-stream"
 import { OpencodePluginsModal } from "./opencode-plugins-modal"
 import { CodeBuddyConfigPanel } from "./codebuddy-config-panel"
+import { CursorConfigPanel } from "./cursor-config-panel"
+import { KimiCodeConfigPanel } from "./kimi-code-config-panel"
 import { PiConfigPanel } from "./pi-config-panel"
 
 interface AgentCheckState {
@@ -165,6 +187,26 @@ interface AgentDraft {
   codexSupportsWebsockets: boolean
   codexSkills: boolean
   codexServiceTierFast: boolean
+  /** Sandbox / approval group — the thread defaults codex applies to turns it
+   * starts itself (`/goal`, `/review`, `/compact`). Held as plain draft state
+   * (not derived from `codexConfigTomlText`) and merged into config.toml
+   * server-side on save. */
+  codexApprovalPolicy: CodexApprovalPolicyChoice
+  codexGranular: CodexGranularApproval
+  codexSandboxMode: CodexSandboxModeChoice
+  /** `writable_roots`, one absolute path per line. */
+  codexWritableRootsText: string
+  codexNetworkAccess: boolean
+  codexExcludeTmpdirEnvVar: boolean
+  codexExcludeSlashTmp: boolean
+  /** The sandbox group as it was read off disk. A save sends only the fields
+   * that differ from this, so neither the raw config.toml editor nor an
+   * untouched control can revert the other. */
+  codexSandboxBaseline: CodexSandboxBaseline
+  /** Read-only diagnostics from the backend projection: `default_permissions`
+   * makes codex ignore `sandbox_mode` entirely. */
+  codexSandboxShadowed: boolean
+  codexSandboxHasPermissionsTable: boolean
   claudeMainModel: string
   claudeReasoningModel: string
   claudeDefaultHaikuModel: string
@@ -174,9 +216,22 @@ interface AgentDraft {
   claudeCustomModelOptionName: string
   claudeCustomModelOptionDescription: string
   claudeEffortLevel: ClaudeEffortLevel
+  // Claude Code hardening toggles (native config `env`). `claudeSendAttributionHeader`
+  // → CLAUDE_CODE_ATTRIBUTION_HEADER (on="1"/off="0"), default off (don't send).
+  // `claudeDisableNonessentialTraffic` → CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
+  // default on (disabled).
+  claudeSendAttributionHeader: boolean
+  claudeDisableNonessentialTraffic: boolean
   codexAuthJsonText: string
   codexConfigTomlText: string
+  /** Structured codex custom-model list (mirrors the catalog source sidecar).
+   *  Drives the model editor + `model_catalog_json` generation on save. */
+  codexModelList: CodexModelConfig
   grokConfigTomlText: string
+  // Grok authentication method (subscription via `grok login` vs XAI_API_KEY).
+  // Recorded in env as GROK_AUTH_MODE; drives which credential body renders and
+  // whether XAI_API_KEY is stripped from env on subscription.
+  grokAuthMode: GrokAuthMethod
   // Grok structured controls (empty string = "unset / use default"). Backed by
   // ~/.grok/config.toml [ui].permission_mode / [models].default_reasoning_effort;
   // merged onto the current on-disk config server-side on save.
@@ -245,6 +300,25 @@ interface UiCheckItem {
   fixes: UiFixAction[]
 }
 
+/**
+ * Fix kinds that run a package operation. Only one of these may run at a time
+ * across ALL agents, so while any of them is busy anywhere, every button whose
+ * kind is listed here is disabled — and dimmed, so the lockout is visible on
+ * agents other than the busy one.
+ */
+const PACKAGE_ACTION_FIX_KINDS: ReadonlyArray<UiFixAction["kind"]> = [
+  "download_binary",
+  "upgrade_binary",
+  "install_npx",
+  "upgrade_npx",
+  "uninstall_binary",
+  "uninstall_npx",
+  "redownload_binary",
+  "install_opencode_plugins",
+  "custom_install",
+  "install_uv",
+]
+
 type AcpTranslator = (
   key: string,
   values?: Record<string, string | number>
@@ -259,6 +333,23 @@ function acpText(
 ): string {
   if (!acpTranslator) return fallback
   return acpTranslator(key, values)
+}
+
+/**
+ * Publish a freshly fetched agent list into the custom-agent display map
+ * (names + icons behind `getAgentLabel` / `getAgentIconUrl`). The map is
+ * normally hydrated by `useAcpAgents`, but that hook lives in the workspace
+ * surfaces — the settings window fetches its own list, so without this every
+ * custom agent here falls back to the initial-letter glyph.
+ */
+function publishAgentDisplay(list: AcpAgentInfo[]): void {
+  setCustomAgentDisplay(
+    list.map((agent) => ({
+      agentType: agent.agent_type,
+      name: agent.name,
+      iconUrl: agent.icon_url,
+    }))
+  )
 }
 
 function statusTone(status: CheckStatus): string {
@@ -328,6 +419,22 @@ const CLAUDE_MODEL_ENV_KEYS = {
   claudeCustomModelOptionDescription:
     "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION",
 } as const
+
+// Claude Code hardening flags surfaced as toggles below the reasoning settings.
+// Each maps to a boolean env var in the native config's `env` (on = "1", off =
+// "0"). Because Claude Code's own defaults are the opposite of what we want, the
+// toggle values are materialized on save (see the config-save handler) so the
+// shown default positions are actually applied — not left implicit/absent.
+const CLAUDE_ATTRIBUTION_HEADER_ENV_KEY = "CLAUDE_CODE_ATTRIBUTION_HEADER"
+const CLAUDE_NONESSENTIAL_TRAFFIC_ENV_KEY =
+  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+const CLAUDE_ENV_FLAG_ON = "1"
+const CLAUDE_ENV_FLAG_OFF = "0"
+// `CLAUDE_CODE_ATTRIBUTION_HEADER` = "send the attribution/billing header" →
+// default OFF (don't send). `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` = "disable
+// telemetry / redundant pings" → default ON (disabled).
+const CLAUDE_SEND_ATTRIBUTION_HEADER_DEFAULT = false
+const CLAUDE_DISABLE_NONESSENTIAL_TRAFFIC_DEFAULT = true
 
 const CLAUDE_EFFORT_LEVEL_CONFIG_KEY = "effortLevel"
 
@@ -417,6 +524,51 @@ const GROK_UNSET = "__grok_unset__"
  * what Grok's own build models use; a BYO OpenAI-compatible proxy would pick
  * `chat_completions`, an Anthropic-format endpoint `messages`. */
 const GROK_DEFAULT_API_BACKEND = "responses"
+
+/** Grok's real credential env var (mirrors the backend `agent_env_keys(Grok)`
+ * and `importantEnvKeysByAgent`). */
+const GROK_API_KEY_ENV = "XAI_API_KEY"
+
+/** codeg-side knob recording the chosen authentication method. Read by the
+ * launch path (`apply_grok_env_policy`): in `subscription` mode it clears any
+ * inherited XAI_API_KEY so the CLI uses the `grok login` browser credential.
+ * The Grok binary itself ignores this var. Mirrors Cursor's CURSOR_AUTH_MODE. */
+const GROK_AUTH_MODE_ENV = "GROK_AUTH_MODE"
+
+/** The subscription sign-in command shown (and copied) in the auth card. Grok's
+ * `login` is a root subcommand; a bare `grok login` matches the panel's existing
+ * hint wording (codeg doesn't resolve the managed binary path here). */
+const GROK_LOGIN_COMMAND = "grok login"
+
+/** Grok's three authentication methods:
+ *  - `subscription` — sign in with `grok login` (SuperGrok / X Premium+),
+ *    whose session lives in `~/.grok/auth.json` (untouched by codeg);
+ *  - `api_key` — a non-interactive XAI_API_KEY from the xAI console;
+ *  - `custom` — a bring-your-own endpoint: a custom `[model.<id>]` in
+ *    ~/.grok/config.toml with its own base_url/api_key (the custom-model card). */
+export type GrokAuthMethod = "subscription" | "api_key" | "custom"
+
+/** Resolve the persisted Grok authentication method, tolerant of legacy rows:
+ * an explicit `GROK_AUTH_MODE` wins; otherwise a configured custom model implies
+ * `custom`, a saved XAI_API_KEY implies `api_key`, and an empty env means the
+ * user relies on `grok login`. `hasCustomModel` reflects whether a codeg-managed
+ * `[model.<id>]` is set (it lives in config.toml, not env). Mirrors
+ * `inferCursorMode`. */
+export function inferGrokMode(
+  env: Record<string, string>,
+  hasCustomModel = false
+): GrokAuthMethod {
+  const explicit = (env[GROK_AUTH_MODE_ENV] ?? "").trim()
+  if (
+    explicit === "subscription" ||
+    explicit === "api_key" ||
+    explicit === "custom"
+  ) {
+    return explicit
+  }
+  if (hasCustomModel) return "custom"
+  return (env[GROK_API_KEY_ENV] ?? "").trim() ? "api_key" : "subscription"
+}
 
 function importantEnvKeysByAgent(agentType: AgentType): ImportantEnvKeys {
   if (agentType === "claude_code") {
@@ -604,6 +756,8 @@ function extractImportantConfigValues(
   claudeCustomModelOptionName: string
   claudeCustomModelOptionDescription: string
   claudeEffortLevel: ClaudeEffortLevel
+  claudeSendAttributionHeader: boolean
+  claudeDisableNonessentialTraffic: boolean
   configError: string | null
 } {
   const parseResult = parseConfigJsonText(configText)
@@ -652,6 +806,26 @@ function extractImportantConfigValues(
       ? normalizeClaudeEffortLevel(config[CLAUDE_EFFORT_LEVEL_CONFIG_KEY])
       : ""
 
+  // Present in env → on iff value is "1"; absent → the toggle's default.
+  const attributionRaw = findEnvValue(mergedEnv, [
+    CLAUDE_ATTRIBUTION_HEADER_ENV_KEY,
+  ])
+  const claudeSendAttributionHeader =
+    agentType === "claude_code"
+      ? attributionRaw
+        ? attributionRaw === CLAUDE_ENV_FLAG_ON
+        : CLAUDE_SEND_ATTRIBUTION_HEADER_DEFAULT
+      : false
+  const nonessentialRaw = findEnvValue(mergedEnv, [
+    CLAUDE_NONESSENTIAL_TRAFFIC_ENV_KEY,
+  ])
+  const claudeDisableNonessentialTraffic =
+    agentType === "claude_code"
+      ? nonessentialRaw
+        ? nonessentialRaw === CLAUDE_ENV_FLAG_ON
+        : CLAUDE_DISABLE_NONESSENTIAL_TRAFFIC_DEFAULT
+      : false
+
   return {
     apiBaseUrl: apiBaseUrl ?? "",
     apiKey: apiKey ?? "",
@@ -672,6 +846,8 @@ function extractImportantConfigValues(
     claudeCustomModelOptionDescription:
       agentType === "claude_code" ? claudeCustomModelOptionDescription : "",
     claudeEffortLevel,
+    claudeSendAttributionHeader,
+    claudeDisableNonessentialTraffic,
     configError: parseResult.error,
   }
 }
@@ -1061,6 +1237,36 @@ function markRemovedKeysNull(
   return result
 }
 
+/**
+ * Build the `config_json` payload for a merge-strategy agent save (Claude Code /
+ * Gemini / OpenClaw). Diffs the current config against the original so removed
+ * keys become explicit `null`s the backend merge deletes from disk — crucially
+ * even when the current config emptied to "" (e.g. the last env flag toggled
+ * off), which would otherwise serialize to a null `config_json` no-op and leave
+ * the stale key on disk. Returns `null` when both sides are empty (nothing to
+ * write, no empty file created). Pure — shared by `persistConfig` and tests.
+ */
+export function buildMergeConfigPayload(
+  currentConfigText: string,
+  originalConfigText: string | null | undefined
+): string | null {
+  const currentConfig = parseConfigJsonText(currentConfigText).config
+  const originalConfig = originalConfigText
+    ? parseConfigJsonText(originalConfigText).config
+    : {}
+  if (
+    Object.keys(currentConfig).length === 0 &&
+    Object.keys(originalConfig).length === 0
+  ) {
+    return null
+  }
+  return JSON.stringify(
+    markRemovedKeysNull(originalConfig, currentConfig),
+    null,
+    2
+  )
+}
+
 function normalizeConfigText(configText: string): string {
   const parseResult = parseConfigJsonText(configText)
   if (parseResult.error) return configText.trim()
@@ -1392,6 +1598,13 @@ interface CodexImportantValues {
 
 const CODEX_DEFAULT_MODEL_PROVIDER = "codeg"
 
+/**
+ * Header codex reads to decide whether a provider authenticates through the
+ * "actor authorization" path. Mirrors `OPENAI_ACTOR_AUTHORIZATION_HEADER` in
+ * codex's `model-provider-info` crate.
+ */
+const CODEX_ACTOR_AUTHORIZATION_HEADER = "x-openai-actor-authorization"
+
 const CODEX_AUTH_MODES = [
   "api_key",
   "chatgpt_subscription",
@@ -1429,6 +1642,203 @@ const CODEX_REASONING_EFFORT_OPTIONS: ReadonlyArray<{
 ]
 
 const CODEX_DEFAULT_REASONING_EFFORT: CodexReasoningEffort = "high"
+
+/** The draft value meaning "leave the key out of config.toml", i.e. let codex
+ * apply its own default. */
+const CODEX_SANDBOX_UNSET = ""
+
+/** Radix Select rejects "" as an item value, so the unset choice travels
+ * through the widget under this sentinel and is mapped back on change. */
+const CODEX_SANDBOX_UNSET_OPTION = "__codex_unset__"
+
+/** `approval_policy` choices. The three presets are `AskForApproval`'s plain
+ * string variants; `granular` is its table variant and reveals five switches.
+ * (`on-failure` is only a legacy serde alias of `on-request` upstream, so it is
+ * normalized away by the backend rather than offered here.) */
+const CODEX_APPROVAL_POLICY_VALUES = [
+  "on-request",
+  "untrusted",
+  "never",
+  "granular",
+] as const
+type CodexApprovalPolicyChoice =
+  | typeof CODEX_SANDBOX_UNSET
+  | (typeof CODEX_APPROVAL_POLICY_VALUES)[number]
+
+/** `SandboxMode`'s complete upstream vocabulary. */
+const CODEX_SANDBOX_MODE_VALUES = [
+  "read-only",
+  "workspace-write",
+  "danger-full-access",
+] as const
+type CodexSandboxModeChoice =
+  | typeof CODEX_SANDBOX_UNSET
+  | (typeof CODEX_SANDBOX_MODE_VALUES)[number]
+
+/** The five `granular` flags, in the order they are shown. */
+const CODEX_GRANULAR_KEYS = [
+  "sandbox_approval",
+  "rules",
+  "skill_approval",
+  "request_permissions",
+  "mcp_elicitations",
+] as const
+
+const CODEX_GRANULAR_DEFAULT: CodexGranularApproval = {
+  sandbox_approval: true,
+  rules: true,
+  skill_approval: false,
+  request_permissions: false,
+  mcp_elicitations: true,
+}
+
+/** codex resolves a RELATIVE `writable_roots` entry against `CODEX_HOME`
+ * instead of rejecting it, so `docs` would silently grant write access to
+ * `~/.codex/docs`. Absolute-only is enforced here (and again server-side).
+ * Both POSIX and Windows shapes are accepted regardless of host, since
+ * config.toml is portable. */
+function isAbsoluteWritableRoot(value: string): boolean {
+  const trimmed = value.trim()
+  if (trimmed.startsWith("/") || trimmed.startsWith("\\\\")) return true
+  return /^[A-Za-z]:[\\/]/.test(trimmed)
+}
+
+/** One path per line → trimmed, de-blanked list. */
+function parseWritableRootsText(text: string): string[] {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+}
+
+/** The first relative entry, or null when every entry is absolute. */
+function firstRelativeWritableRoot(text: string): string | null {
+  return (
+    parseWritableRootsText(text).find(
+      (root) => !isAbsoluteWritableRoot(root)
+    ) ?? null
+  )
+}
+
+/** Whether the workspace-write sub-group applies. `sandbox_mode` unset falls
+ * back to `workspace-write` for any directory carrying a `[projects]` trust
+ * decision (which codeg writes for every folder it opens), so "unset" keeps the
+ * group live rather than greying out the very knobs the fallback uses. */
+function codexWorkspaceWriteApplies(mode: CodexSandboxModeChoice): boolean {
+  return mode === "workspace-write" || mode === CODEX_SANDBOX_UNSET
+}
+
+/** The draft slice the sandbox payload is derived from. */
+export type CodexSandboxDraftFields = {
+  codexApprovalPolicy: CodexApprovalPolicyChoice
+  codexGranular: CodexGranularApproval
+  codexSandboxMode: CodexSandboxModeChoice
+  codexWritableRootsText: string
+  codexNetworkAccess: boolean
+  codexExcludeTmpdirEnvVar: boolean
+  codexExcludeSlashTmp: boolean
+}
+
+/** The sandbox controls as they were read off disk, kept on the draft so a save
+ * can send ONLY what the user actually moved. */
+export type CodexSandboxBaseline = CodexSandboxDraftFields
+
+/** Baseline snapshot to seed a fresh draft with. */
+export function codexSandboxBaselineOf(
+  fields: CodexSandboxDraftFields
+): CodexSandboxBaseline {
+  return { ...fields }
+}
+
+/** Build the save PATCH for the Codex sandbox / approval controls: only the
+ * fields whose control actually moved relative to `codexSandboxBaseline`.
+ * Exported for tests.
+ *
+ * A whole-group payload would be wrong here. The panel sends the raw
+ * config.toml text alongside this patch and the backend applies the patch LAST,
+ * so any of these keys the user hand-edited in the raw editor — a surface the
+ * panel never parses back into its controls — would be reverted by the panel's
+ * stale value for that key. A per-field patch touches nothing the user did not
+ * touch, in either surface.
+ *
+ * Throws on a relative `writable_roots` entry (only when that field moved) so
+ * the save surfaces it instead of writing a path that would silently resolve
+ * inside `~/.codex`. */
+export function buildCodexSandboxConfig(
+  draft: CodexSandboxDraftFields & {
+    codexSandboxBaseline: CodexSandboxBaseline
+  }
+): CodexSandboxStructuredConfig {
+  const base = draft.codexSandboxBaseline
+  const patch: CodexSandboxStructuredConfig = {}
+
+  // Approval is one externally tagged key upstream, so its two representations
+  // move together: send both (one nulled) whenever either side changed.
+  const granular = draft.codexApprovalPolicy === "granular"
+  const approvalChanged =
+    draft.codexApprovalPolicy !== base.codexApprovalPolicy ||
+    (granular &&
+      JSON.stringify(draft.codexGranular) !==
+        JSON.stringify(base.codexGranular))
+  if (approvalChanged) {
+    patch.approvalPolicy =
+      granular || draft.codexApprovalPolicy === CODEX_SANDBOX_UNSET
+        ? null
+        : draft.codexApprovalPolicy
+    patch.granular = granular ? draft.codexGranular : null
+  }
+
+  if (draft.codexSandboxMode !== base.codexSandboxMode) {
+    patch.sandboxMode =
+      draft.codexSandboxMode === CODEX_SANDBOX_UNSET
+        ? null
+        : draft.codexSandboxMode
+  }
+
+  // The workspace-write group is sent as-is even in the modes that ignore it:
+  // codex only reads it under `workspace-write`, so a dormant value costs
+  // nothing, while clearing it would destroy the user's roots/flags on a round
+  // trip through read-only or full-access.
+  const roots = parseWritableRootsText(draft.codexWritableRootsText)
+  const baseRoots = parseWritableRootsText(base.codexWritableRootsText)
+  if (JSON.stringify(roots) !== JSON.stringify(baseRoots)) {
+    const relative = roots.find((root) => !isAbsoluteWritableRoot(root))
+    if (relative) {
+      // `.replace` also covers the no-translator path, where acpText returns
+      // the fallback uninterpolated.
+      throw new Error(
+        acpText(
+          "codex.sandboxRootsRelativeError",
+          "Writable folders must be absolute paths: {path}",
+          { path: relative }
+        ).replace("{path}", relative)
+      )
+    }
+    patch.writableRoots = roots
+  }
+  if (draft.codexNetworkAccess !== base.codexNetworkAccess) {
+    patch.networkAccess = draft.codexNetworkAccess
+  }
+  if (draft.codexExcludeTmpdirEnvVar !== base.codexExcludeTmpdirEnvVar) {
+    patch.excludeTmpdirEnvVar = draft.codexExcludeTmpdirEnvVar
+  }
+  if (draft.codexExcludeSlashTmp !== base.codexExcludeSlashTmp) {
+    patch.excludeSlashTmp = draft.codexExcludeSlashTmp
+  }
+
+  return patch
+}
+
+/** The `codexSandbox` value a Codex save should carry, or `undefined` when no
+ * control moved (so the field is omitted from the request entirely). */
+export function codexSandboxSaveConfig(
+  draft: CodexSandboxDraftFields & {
+    codexSandboxBaseline: CodexSandboxBaseline
+  }
+): CodexSandboxStructuredConfig | undefined {
+  const patch = buildCodexSandboxConfig(draft)
+  return Object.keys(patch).length > 0 ? patch : undefined
+}
 
 function normalizeCodexReasoningEffort(
   value: string
@@ -2124,6 +2534,68 @@ function patchCodexProviderField(
   return `${appended}\n\n${sectionText}`.trim()
 }
 
+/**
+ * Result of reading `[model_providers.<provider>]` out of a config.toml draft.
+ * "table absent" and "document unparsable" are deliberately distinct: an absent
+ * table is a brand-new provider we should seed, a document we cannot parse is
+ * one we must not touch.
+ */
+type CodexProviderTableRead =
+  | { status: "ok"; table: Record<string, unknown> | null }
+  | { status: "unparsable" }
+
+/**
+ * Read-only view of one provider table. Every *write* in this file stays
+ * text-based so user comments and key order survive; only the "is this field
+ * already declared?" question goes through a real parser, because answering it
+ * from text needs full TOML semantics — quoted keys containing dots, escape
+ * decoding, dotted keys and inline tables — that a line scanner cannot supply.
+ */
+function readCodexProviderTable(
+  configTomlText: string,
+  provider: string
+): CodexProviderTableRead {
+  const name = provider.trim()
+  if (!name) return { status: "unparsable" }
+  let parsed: unknown
+  try {
+    parsed = parseTomlDocument(configTomlText)
+  } catch {
+    return { status: "unparsable" }
+  }
+  if (!parsed || typeof parsed !== "object") return { status: "unparsable" }
+  const providers = (parsed as Record<string, unknown>).model_providers
+  if (!providers || typeof providers !== "object" || Array.isArray(providers)) {
+    return { status: "ok", table: null }
+  }
+  const table = (providers as Record<string, unknown>)[name]
+  if (!table || typeof table !== "object" || Array.isArray(table)) {
+    return { status: "ok", table: null }
+  }
+  return { status: "ok", table: table as Record<string, unknown> }
+}
+
+/**
+ * Mirrors the header half of codex's
+ * `ModelProviderInfo::uses_openai_actor_authorization`. The ASCII-only fold
+ * matches its `eq_ignore_ascii_case`.
+ */
+function codexProviderUsesActorAuthorization(
+  table: Record<string, unknown> | null
+): boolean {
+  const headers = table?.http_headers
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
+    return false
+  }
+  return Object.entries(headers as Record<string, unknown>).some(
+    ([name, value]) =>
+      name.replace(/[A-Z]/g, (char) => char.toLowerCase()) ===
+        CODEX_ACTOR_AUTHORIZATION_HEADER &&
+      typeof value === "string" &&
+      value.trim() !== ""
+  )
+}
+
 function ensureCodexProviderDefaults(
   configTomlText: string,
   provider: string
@@ -2153,12 +2625,35 @@ function ensureCodexProviderDefaults(
     "wire_api",
     'wire_api = "responses"'
   )
-  next = patchCodexProviderField(
-    next,
-    CODEX_DEFAULT_MODEL_PROVIDER,
-    "requires_openai_auth",
-    "requires_openai_auth = true"
+  // `requires_openai_auth` is the one managed field a user legitimately owns:
+  // codex defaults it to false, and its `uses_openai_actor_authorization()`
+  // requires `!requires_openai_auth`, so forcing true silently disables the
+  // actor-authorization path. Supply codeg's default only when the provider
+  // does not already declare it — true is right for a provider *we* created
+  // (key in auth.json, no env_key), never for one the user configured.
+  // Read the original text: the three patches above never touch
+  // `requires_openai_auth` or `http_headers`, and the original is what the
+  // user actually authored.
+  const read = readCodexProviderTable(
+    configTomlText,
+    CODEX_DEFAULT_MODEL_PROVIDER
   )
+  const providerTable = read.status === "ok" ? read.table : null
+  const alreadyDeclared =
+    read.status !== "ok" ||
+    (providerTable !== null &&
+      Object.prototype.hasOwnProperty.call(
+        providerTable,
+        "requires_openai_auth"
+      ))
+  if (!alreadyDeclared && !codexProviderUsesActorAuthorization(providerTable)) {
+    next = patchCodexProviderField(
+      next,
+      CODEX_DEFAULT_MODEL_PROVIDER,
+      "requires_openai_auth",
+      "requires_openai_auth = true"
+    )
+  }
   return next
 }
 
@@ -2200,7 +2695,7 @@ function patchCodexAuthJsonText(
   }
 }
 
-function patchCodexConfigTomlText(
+export function patchCodexConfigTomlText(
   configTomlText: string,
   patch: {
     apiBaseUrl?: string
@@ -2334,6 +2829,7 @@ function patchCodexConfigTomlText(
  * for the two managed keys.
  */
 export function buildGrokStructuredConfig(draft: {
+  grokAuthMode: GrokAuthMethod
   grokPermissionMode: string
   grokReasoningEffort: string
   grokCustomModelId: string
@@ -2343,7 +2839,12 @@ export function buildGrokStructuredConfig(draft: {
   grokCustomContextWindow: string
   grokAutoCompactThreshold: string
 }): GrokStructuredConfig {
-  const modelId = draft.grokCustomModelId.trim()
+  // The custom-model group applies only in the `custom` auth method; the
+  // subscription / api_key methods omit the codeg-managed [model.<id>] block
+  // (an empty id → the backend removes it). Permission mode, reasoning effort
+  // and compaction below stay independent of the auth method.
+  const modelId =
+    draft.grokAuthMode === "custom" ? draft.grokCustomModelId.trim() : ""
   const positiveInt = (raw: string): number | null => {
     const n = Number.parseInt(raw.trim(), 10)
     return Number.isFinite(n) && n > 0 ? n : null
@@ -2384,6 +2885,7 @@ export function buildGrokStructuredConfig(draft: {
  */
 export function buildGrokSaveOptions(
   draft: {
+    grokAuthMode: GrokAuthMethod
     grokPermissionMode: string
     grokReasoningEffort: string
     grokCustomModelId: string
@@ -2546,6 +3048,64 @@ export function configTextForClaudeSave(
   return configText
 }
 
+/**
+ * Set a Claude Code env flag to an explicit value inside the native config's
+ * `env` (creating `env` if needed), preserving all other keys. Used by the
+ * hardening toggles and their save-time materialization so the flag is always
+ * written explicitly ("1"/"0") rather than left implicit/absent. Pure — shared
+ * by the toggle handler, the save path, and tests.
+ */
+export function setClaudeEnvFlagInConfigText(
+  configText: string,
+  envKey: string,
+  value: string
+): { configText: string; recoveredFromInvalid: boolean } {
+  const parseResult = parseConfigJsonText(configText)
+  const config: Record<string, unknown> = parseResult.error
+    ? {}
+    : { ...parseResult.config }
+  const env =
+    typeof config.env === "object" && config.env && !Array.isArray(config.env)
+      ? { ...(config.env as Record<string, unknown>) }
+      : {}
+  env[envKey] = value
+  config.env = env
+  return {
+    configText: JSON.stringify(config, null, 2),
+    recoveredFromInvalid: Boolean(parseResult.error),
+  }
+}
+
+/**
+ * Materialize both Claude hardening toggles into the native config `env` AND the
+ * DB env overlay (envText), writing the explicit "1"/"0" per toggle so the shown
+ * default positions are actually applied on save. Returns the inputs UNCHANGED
+ * when `configText` is invalid JSON — never recover it here, or the caller's
+ * merge diff would treat the recovered minimal config as authoritative and
+ * delete every other on-disk key. Pure — shared by the save handler and tests.
+ */
+export function materializeClaudeHardeningFlags(
+  configText: string,
+  envText: string,
+  flags: { sendAttributionHeader: boolean; disableNonessentialTraffic: boolean }
+): { configText: string; envText: string } {
+  if (parseConfigJsonText(configText).error) {
+    return { configText, envText }
+  }
+  const entries: Array<[string, boolean]> = [
+    [CLAUDE_ATTRIBUTION_HEADER_ENV_KEY, flags.sendAttributionHeader],
+    [CLAUDE_NONESSENTIAL_TRAFFIC_ENV_KEY, flags.disableNonessentialTraffic],
+  ]
+  let nextConfig = configText
+  let nextEnv = envText
+  for (const [key, on] of entries) {
+    const value = on ? CLAUDE_ENV_FLAG_ON : CLAUDE_ENV_FLAG_OFF
+    nextConfig = setClaudeEnvFlagInConfigText(nextConfig, key, value).configText
+    nextEnv = patchEnvText(nextEnv, { [key]: value })
+  }
+  return { configText: nextConfig, envText: nextEnv }
+}
+
 function patchEnvByImportantKey(
   agentType: AgentType,
   envText: string,
@@ -2664,6 +3224,28 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
           true
         )
       : (agent.codex_config_toml ?? "")
+  const codexSandbox = agent.codex_sandbox_settings ?? null
+  // Seeded once, then fingerprinted, so a save can tell a real control change
+  // from "untouched, still whatever config.toml says".
+  const codexSandboxFields: CodexSandboxDraftFields = {
+    // The granular table and the string presets are mutually exclusive upstream,
+    // so a present table always wins the selector.
+    codexApprovalPolicy: codexSandbox?.granular
+      ? "granular"
+      : ((codexSandbox?.approval_policy ??
+          CODEX_SANDBOX_UNSET) as CodexApprovalPolicyChoice),
+    codexGranular: codexSandbox?.granular ?? CODEX_GRANULAR_DEFAULT,
+    codexSandboxMode: (codexSandbox?.sandbox_mode ??
+      CODEX_SANDBOX_UNSET) as CodexSandboxModeChoice,
+    codexWritableRootsText: (
+      codexSandbox?.workspace_write.writable_roots ?? []
+    ).join("\n"),
+    codexNetworkAccess: codexSandbox?.workspace_write.network_access ?? false,
+    codexExcludeTmpdirEnvVar:
+      codexSandbox?.workspace_write.exclude_tmpdir_env_var ?? false,
+    codexExcludeSlashTmp:
+      codexSandbox?.workspace_write.exclude_slash_tmp ?? false,
+  }
   const grokConfigTomlText = agent.grok_config_toml ?? ""
   const grokPermissionMode = agent.grok_settings?.permission_mode ?? ""
   const grokReasoningEffort =
@@ -2693,15 +3275,30 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
       : agent.agent_type === "codex"
         ? inferCodexAuthMode(codexAuthJsonText)
         : "api_key"
+  const grokAuthMode: GrokAuthMethod =
+    agent.agent_type === "grok"
+      ? inferGrokMode(
+          agent.env,
+          Boolean(agent.grok_settings?.custom_model_id?.trim())
+        )
+      : "api_key"
   const rawEnvText = envMapToText(agent.env)
-  // When codex is in official subscription mode, clean up API keys/URLs from env
+  // When codex is in official subscription mode, clean up API keys/URLs from env.
+  // Grok mirrors this: record the auth-method knob, and in subscription mode
+  // strip XAI_API_KEY so the editable env can't override the `grok login`
+  // credential (the launch path enforces the same — see apply_grok_env_policy).
   const envText =
     agent.agent_type === "codex" && codexAuthMode === "chatgpt_subscription"
       ? patchEnvText(rawEnvText, {
           OPENAI_API_KEY: "",
           OPENAI_BASE_URL: "",
         })
-      : rawEnvText
+      : agent.agent_type === "grok"
+        ? patchEnvText(rawEnvText, {
+            GROK_AUTH_MODE: grokAuthMode,
+            ...(grokAuthMode === "subscription" ? { XAI_API_KEY: "" } : {}),
+          })
+        : rawEnvText
   return {
     enabled: agent.enabled,
     envText,
@@ -2756,6 +3353,12 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
     codexSupportsWebsockets: codexImportant.supportsWebsockets,
     codexSkills: codexImportant.skills,
     codexServiceTierFast: codexImportant.serviceTierFast,
+    ...codexSandboxFields,
+    codexSandboxBaseline: codexSandboxBaselineOf(codexSandboxFields),
+    codexSandboxShadowed:
+      codexSandbox?.shadowed_by_default_permissions ?? false,
+    codexSandboxHasPermissionsTable:
+      codexSandbox?.has_permissions_table ?? false,
     claudeMainModel: important.claudeMainModel,
     claudeReasoningModel: important.claudeReasoningModel,
     claudeDefaultHaikuModel: important.claudeDefaultHaikuModel,
@@ -2766,9 +3369,14 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
     claudeCustomModelOptionDescription:
       important.claudeCustomModelOptionDescription,
     claudeEffortLevel: important.claudeEffortLevel,
+    claudeSendAttributionHeader: important.claudeSendAttributionHeader,
+    claudeDisableNonessentialTraffic:
+      important.claudeDisableNonessentialTraffic,
     codexAuthJsonText,
     codexConfigTomlText,
+    codexModelList: parseCodexModelConfig(agent.codex_model_catalog ?? null),
     grokConfigTomlText,
+    grokAuthMode,
     grokPermissionMode,
     grokReasoningEffort,
     grokCustomModelId: agent.grok_settings?.custom_model_id ?? "",
@@ -2832,6 +3440,82 @@ function isValidCustomVersion(value: string): boolean {
   return /^[0-9][0-9A-Za-z.\-+]*$/.test(normalized) && normalized.includes(".")
 }
 
+/**
+ * The explainer card for agents whose codeg entry is a third-party ACP
+ * *adapter* rather than the vendor's own CLI — Claude Code and Codex.
+ *
+ * Ten of the twelve built-ins install the vendor CLI itself, so a user's
+ * existing global install is simply detected. These two are the exception:
+ * neither `claude` nor `codex` speaks ACP, so codeg installs `claude-agent-acp`
+ * / `codex-acp` instead, and the launch gate looks for THAT command. Without
+ * this card the user only sees "Not installed" next to an agent they demonstrably
+ * have — by far the most-reported confusion.
+ *
+ * Returns `null` for every non-adapter agent (backend decides, via
+ * `PreflightResult.adapter`), and while preflight hasn't resolved yet.
+ *
+ * Deliberately carries NO install action: the Version Status card directly below
+ * already has one, and two install buttons on adjacent cards only breeds doubt
+ * about which is the right one.
+ */
+export function buildAcpAdapterCheck(
+  adapter: AdapterInfo | null | undefined
+): UiCheckItem | null {
+  if (!adapter) return null
+
+  const values = {
+    nativeLabel: adapter.native_label,
+    nativeCmd: adapter.native_cmd,
+    nativePath: adapter.native_path ?? "",
+    adapterPackage: adapter.adapter_package,
+    adapterCmd: adapter.adapter_cmd,
+    configDir: adapter.shared_config_dir,
+  }
+
+  // Installed → `pass`, so renderCheck collapses it: the relationship stays
+  // documented for anyone who wonders later, without nagging a working setup.
+  const installed = adapter.adapter_installed
+  const sawNative = Boolean(adapter.native_path)
+  // The English fallbacks mirror the four i18n messages one-for-one (they are
+  // what renders if no translator is mounted), so each state keeps the detail
+  // that state is about — above all, the path we found the vendor CLI at.
+  const split = `Codeg drives agents over ACP and the ${adapter.native_label} does not speak ACP, so Codeg needs a separate adapter package, ${adapter.adapter_package}.`
+  const coexist = `It ships its own runtime, never modifies or replaces your ${adapter.native_cmd} command, and reads the same ${adapter.shared_config_dir} — your existing sign-in and settings carry over.`
+  const [key, fallback] = installed
+    ? sawNative
+      ? [
+          "adapter.readyWithNative",
+          `Adapter ${adapter.adapter_cmd} is installed — that is what Codeg launches, not your own ${adapter.native_cmd} at ${adapter.native_path}. They are separate packages that coexist, and both read ${adapter.shared_config_dir}.`,
+        ]
+      : [
+          "adapter.ready",
+          `Adapter ${adapter.adapter_cmd} is installed — that is what Codeg launches. It ships its own runtime, so the ${adapter.native_label} is not required.`,
+        ]
+    : sawNative
+      ? [
+          "adapter.missingWithNative",
+          `Found your own ${adapter.native_label} at ${adapter.native_path}. ${split} ${coexist} Install it below.`,
+        ]
+      : [
+          "adapter.missing",
+          `${split} It ships its own runtime, so the ${adapter.native_cmd} CLI is not required first; if you do have it, the two coexist and share the same ${adapter.shared_config_dir} sign-in and settings. Install it below.`,
+        ]
+
+  return {
+    check_id: "acp_adapter",
+    label: acpText("adapter.label", "ACP adapter"),
+    status: installed ? "pass" : "warn",
+    message: acpText(key, fallback, values),
+    fixes: [
+      {
+        label: acpText("adapter.learnMore", "Learn more"),
+        kind: "open_url",
+        payload: adapter.docs_url,
+      },
+    ],
+  }
+}
+
 // `uvReady` reports whether the uv runtime (uvx) is installed — only meaningful
 // for uvx agents (Hermes). Derived from the uv preflight check by the caller.
 // uvx agents need uv installed before their package can be prepared, so when
@@ -2851,11 +3535,17 @@ export function buildVersionCheck(
   const remoteVersion = agent.registry_version ?? "unknown"
   const localVersion =
     agent.installed_version ?? acpText("version.notInstalled", "Not installed")
-  const versionText = acpText(
-    "version.remoteLocal",
-    "Remote: {remoteVersion} · Local: {localVersion}",
-    { remoteVersion, localVersion }
-  )
+  // A manually written definition has no registry behind it — its stored
+  // version is whatever the user typed — so "Remote:" would be comparing
+  // against noise. Every message shows the local side alone.
+  const manualSource = agent.custom_source === "manual"
+  const versionText = manualSource
+    ? acpText("version.localOnly", "Local: {localVersion}", { localVersion })
+    : acpText(
+        "version.remoteLocal",
+        "Remote: {remoteVersion} · Local: {localVersion}",
+        { remoteVersion, localVersion }
+      )
   const installAction: RunningActionKind =
     agent.distribution_type === "binary" ? "download_binary" : "install_npx"
   const upgradeAction: RunningActionKind =
@@ -2947,6 +3637,27 @@ export function buildVersionCheck(
         {
           label: acpText("actions.install", "Install"),
           kind: installAction,
+          payload: agent.agent_type,
+        },
+      ]),
+    }
+  }
+
+  // Manual definitions stop here: installed is the whole story, and the
+  // registry-comparison branches below would only manufacture "upgrade
+  // available" noise against a user-typed version.
+  if (manualSource) {
+    return {
+      check_id: "version_status",
+      label: acpText("version.statusLabel", "Version Status"),
+      status: "pass",
+      message: acpText("version.localInstalled", "{versionText}. Installed.", {
+        versionText,
+      }),
+      fixes: withCustomInstall([
+        {
+          label: acpText("actions.uninstall", "Uninstall"),
+          kind: uninstallAction,
           payload: agent.agent_type,
         },
       ]),
@@ -3070,7 +3781,13 @@ export function getAgentChecks(
       fixes: [...check.fixes],
     })
   )
-  return versionCheck ? [versionCheck, ...remoteChecks] : remoteChecks
+  // The adapter explainer goes FIRST: it answers "why does this say not
+  // installed when I have the CLI?" before the Version Status card below it
+  // offers the Install that fixes it.
+  const adapterCheck = buildAcpAdapterCheck(current?.result?.adapter)
+  return [adapterCheck, versionCheck, ...remoteChecks].filter(
+    (check): check is UiCheckItem => check != null
+  )
 }
 
 interface AgentReorderItemProps {
@@ -3142,686 +3859,6 @@ function AgentReorderItem({
   )
 }
 
-const KIMI_BASE_URL_INTERNATIONAL = "https://api.moonshot.ai/v1"
-const KIMI_BASE_URL_CHINA = "https://api.moonshot.cn/v1"
-/** Placeholder model id (a real Moonshot coding model) for the model input. */
-const KIMI_MODEL_PLACEHOLDER = "kimi-k2.7-code"
-
-/**
- * Kimi credential mode. `apikey` writes a codeg-managed config.toml provider/model
- * block AND seeds a synthetic gate token, so the API key actually authenticates
- * `kimi acp` — whose session gate only checks for a stored token and rejects an
- * API key on its own. `login` clears the managed block and removes our synthetic
- * token so a real OAuth login (`kimi login`, needs a Kimi subscription) governs.
- * Exactly one is authoritative — saving clears the rest. A raw config.toml editor
- * is the escape hatch.
- */
-export type KimiAuthMode = "apikey" | "login"
-/** The six provider `type` values Kimi's config.toml `[providers]` accepts. */
-export type KimiInterfaceType =
-  | "kimi"
-  | "openai"
-  | "openai_responses"
-  | "anthropic"
-  | "google-genai"
-  | "vertexai"
-/** Native-provider credential placement: inline `api_key` vs the env sub-table. */
-export type KimiNativeAuthType = "api_key" | "env"
-/** Env-mode endpoint: the two Moonshot regions or a custom OpenAI-compatible URL. */
-export type KimiEndpointRegion = "international" | "china" | "custom"
-
-export interface KimiInterfaceTypeMeta {
-  value: KimiInterfaceType
-  /** Product label (proper noun — intentionally not localized). */
-  label: string
-  /** Base URL pre-filled when this interface is selected ("" → SDK default). */
-  defaultBaseUrl: string
-  /** vertexai authenticates via GCP ADC, so it exposes no API key field. */
-  usesApiKey: boolean
-}
-
-export const KIMI_INTERFACE_TYPES: KimiInterfaceTypeMeta[] = [
-  {
-    value: "kimi",
-    label: "Kimi / Moonshot",
-    defaultBaseUrl: KIMI_BASE_URL_INTERNATIONAL,
-    usesApiKey: true,
-  },
-  {
-    value: "openai",
-    label: "OpenAI (Chat Completions)",
-    defaultBaseUrl: "https://api.openai.com/v1",
-    usesApiKey: true,
-  },
-  {
-    value: "openai_responses",
-    label: "OpenAI (Responses)",
-    defaultBaseUrl: "https://api.openai.com/v1",
-    usesApiKey: true,
-  },
-  {
-    value: "anthropic",
-    label: "Anthropic",
-    defaultBaseUrl: "",
-    usesApiKey: true,
-  },
-  {
-    value: "google-genai",
-    label: "Google Gemini",
-    defaultBaseUrl: "",
-    usesApiKey: true,
-  },
-  {
-    value: "vertexai",
-    label: "Google Vertex AI",
-    defaultBaseUrl: "",
-    usesApiKey: false,
-  },
-]
-
-export function kimiInterfaceMeta(
-  type: KimiInterfaceType
-): KimiInterfaceTypeMeta {
-  return (
-    KIMI_INTERFACE_TYPES.find((meta) => meta.value === type) ??
-    KIMI_INTERFACE_TYPES[0]
-  )
-}
-
-/**
- * Region implied by an env-mode base URL: `.cn` → china, `.ai` or empty →
- * international, any other non-empty endpoint → custom (an OpenAI-compatible
- * third party such as DeepSeek / OpenRouter / a local server).
- */
-export function kimiEndpointRegionFromBaseUrl(
-  baseUrl: string
-): KimiEndpointRegion {
-  const raw = baseUrl.trim().toLowerCase()
-  if (!raw) return "international"
-  if (raw.includes("moonshot.cn")) return "china"
-  if (raw.includes("moonshot.ai")) return "international"
-  return "custom"
-}
-
-export function kimiBaseUrlForRegion(
-  region: KimiEndpointRegion,
-  customUrl: string
-): string {
-  if (region === "china") return KIMI_BASE_URL_CHINA
-  if (region === "custom") return customUrl.trim()
-  return KIMI_BASE_URL_INTERNATIONAL
-}
-
-/**
- * Mirror of the backend `load_kimi_code_config_json` projection. Keys are
- * deliberately NOT `apiKey` / `apiBaseUrl` / `model` / `env` so the projected
- * config.toml block never leaks back into the `KIMI_MODEL_*` runtime env.
- */
-export interface KimiManagedConfig {
-  interfaceType?: KimiInterfaceType
-  baseUrl?: string
-  key?: string
-  authType?: KimiNativeAuthType
-  modelId?: string
-  maxContextSize?: number
-  vertexProject?: string
-  vertexLocation?: string
-  hasManagedBlock?: boolean
-  /** Whether `kimi acp`'s session gate is satisfied (a token file is present). */
-  credentialPresent?: boolean
-  /** Whether that gate token is codeg's synthetic one (vs a real OAuth login). */
-  credentialSynthetic?: boolean
-  rawConfigToml?: string
-}
-
-export function parseKimiManagedConfig(
-  configJson: string | null | undefined
-): KimiManagedConfig {
-  if (!configJson || !configJson.trim()) return {}
-  try {
-    return JSON.parse(configJson) as KimiManagedConfig
-  } catch {
-    return {}
-  }
-}
-
-/**
- * Initial panel mode: the codeg-managed API-key block wins; otherwise, when a
- * real (non-synthetic) OAuth login is already present, show login; else default
- * to the API-key form.
- */
-export function kimiInitialMode(config: KimiManagedConfig): KimiAuthMode {
-  if (config.hasManagedBlock) return "apikey"
-  if (config.credentialPresent && !config.credentialSynthetic) return "login"
-  return "apikey"
-}
-
-/**
- * Settings panel for Kimi Code (Moonshot AI).
- *
- * `kimi acp` gates every session on a stored OAuth-style token and rejects API
- * keys on their own, so to support API-key users codeg manages BOTH a
- * `~/.kimi-code/config.toml` provider/model block (routing inference to the key)
- * AND a synthetic gate token under `credentials/` (so the session opens). The
- * panel keeps exactly one source authoritative (enforced server-side by
- * `acpUpdateKimiCodeConfig`):
- *   • apikey — write the codeg-managed config.toml block (any of the six
- *     interface types) + seed the gate token. The working path for a plain key.
- *   • login — clear the managed block + remove our synthetic token, so a real
- *     OAuth login (`kimi login`, needs a Kimi subscription) governs.
- * A `<details>` raw config.toml editor is the escape hatch. Initial state is
- * derived from the projected `agent.config_json`; it resets on remount when a
- * different agent is selected.
- */
-function KimiCodeConfigPanel({
-  agent,
-  onSaved,
-}: {
-  agent: AcpAgentInfo
-  onSaved: () => Promise<void>
-}) {
-  const t = useTranslations("AcpAgentSettings")
-  const config = useMemo(
-    () => parseKimiManagedConfig(agent.config_json),
-    [agent.config_json]
-  )
-
-  const [mode, setMode] = useState<KimiAuthMode>(() => kimiInitialMode(config))
-  const [saving, setSaving] = useState(false)
-  const [showKey, setShowKey] = useState(false)
-
-  // api-key mode (codeg-managed config.toml provider + model)
-  const [interfaceType, setInterfaceType] = useState<KimiInterfaceType>(
-    () => config.interfaceType ?? "kimi"
-  )
-  const [region, setRegion] = useState<KimiEndpointRegion>(() =>
-    kimiEndpointRegionFromBaseUrl(config.baseUrl ?? "")
-  )
-  // Editable base URL for kimi+custom and for non-kimi interface types.
-  const [baseUrl, setBaseUrl] = useState(
-    () =>
-      config.baseUrl ??
-      kimiInterfaceMeta(config.interfaceType ?? "kimi").defaultBaseUrl
-  )
-  const [authType, setAuthType] = useState<KimiNativeAuthType>(
-    () => config.authType ?? "api_key"
-  )
-  const [apiKey, setApiKey] = useState(() => config.key ?? "")
-  const [model, setModel] = useState(() => config.modelId ?? "")
-  const [maxContext, setMaxContext] = useState(() =>
-    config.maxContextSize ? String(config.maxContextSize) : ""
-  )
-  const [vertexProject, setVertexProject] = useState(
-    () => config.vertexProject ?? ""
-  )
-  const [vertexLocation, setVertexLocation] = useState(
-    () => config.vertexLocation ?? ""
-  )
-
-  // Models discovered via the provider's /models endpoint (doubles as a key test).
-  const [models, setModels] = useState<string[]>([])
-  const [fetchingModels, setFetchingModels] = useState(false)
-
-  // raw editor
-  const [rawConfig, setRawConfig] = useState(() => config.rawConfigToml ?? "")
-
-  const meta = kimiInterfaceMeta(interfaceType)
-  const isKimi = interfaceType === "kimi"
-  const isVertex = interfaceType === "vertexai"
-  // Resolved endpoint: kimi uses the region quick-select (custom falls back to
-  // the editable field); other interfaces use the editable field directly.
-  const effectiveBaseUrl = isKimi
-    ? kimiBaseUrlForRegion(region, baseUrl)
-    : baseUrl.trim()
-
-  const handleInterfaceChange = useCallback((value: string) => {
-    const next = value as KimiInterfaceType
-    setInterfaceType(next)
-    setModels([])
-    if (next === "kimi") {
-      setRegion("international")
-      setBaseUrl("")
-    } else {
-      // Pre-fill the documented default base URL for the new interface.
-      setBaseUrl(kimiInterfaceMeta(next).defaultBaseUrl)
-    }
-  }, [])
-
-  const runSave = useCallback(
-    async (params: Parameters<typeof acpUpdateKimiCodeConfig>[0]) => {
-      setSaving(true)
-      try {
-        await acpUpdateKimiCodeConfig(params)
-        await onSaved()
-        toast.success(t("toasts.kimiCodeSaved"))
-      } catch (error) {
-        console.error("[KimiCode] save config failed", error)
-        toast.error(t("toasts.saveKimiCodeFailed"))
-      } finally {
-        setSaving(false)
-      }
-    },
-    [onSaved, t]
-  )
-
-  const handleSave = useCallback(() => {
-    if (mode === "login") {
-      void runSave({ mode: "login" })
-      return
-    }
-    void runSave({
-      mode: "apikey",
-      interfaceType,
-      authType: meta.usesApiKey ? authType : null,
-      baseUrl: effectiveBaseUrl,
-      apiKey: meta.usesApiKey ? apiKey : null,
-      model,
-      maxContextSize: maxContext.trim() ? Number(maxContext) : null,
-      vertexProject: isVertex ? vertexProject : null,
-      vertexLocation: isVertex ? vertexLocation : null,
-    })
-  }, [
-    mode,
-    interfaceType,
-    meta,
-    authType,
-    effectiveBaseUrl,
-    apiKey,
-    model,
-    maxContext,
-    isVertex,
-    vertexProject,
-    vertexLocation,
-    runSave,
-  ])
-
-  const handleSaveRaw = useCallback(() => {
-    void runSave({ mode: "raw", rawConfigToml: rawConfig })
-  }, [rawConfig, runSave])
-
-  const handleFetchModels = useCallback(async () => {
-    const url = effectiveBaseUrl
-    const key = apiKey.trim()
-    if (!url || !key) {
-      toast.error(t("kimiCode.fetchModelsNeedsKey"))
-      return
-    }
-    setFetchingModels(true)
-    try {
-      const list = await acpFetchKimiModels({ baseUrl: url, apiKey: key })
-      setModels(list)
-      toast.success(
-        list.length
-          ? t("kimiCode.fetchModelsOk", { count: list.length })
-          : t("kimiCode.fetchModelsEmpty")
-      )
-    } catch (error) {
-      console.error("[KimiCode] fetch models failed", error)
-      toast.error(t("kimiCode.fetchModelsFailed"))
-    } finally {
-      setFetchingModels(false)
-    }
-  }, [effectiveBaseUrl, apiKey, t])
-
-  const keyToggle = (
-    <Button
-      type="button"
-      variant="outline"
-      size="sm"
-      onClick={() => setShowKey((prev) => !prev)}
-      title={showKey ? t("actions.hideApiKey") : t("actions.showApiKey")}
-    >
-      {showKey ? (
-        <EyeOff className="h-3.5 w-3.5" />
-      ) : (
-        <Eye className="h-3.5 w-3.5" />
-      )}
-    </Button>
-  )
-
-  return (
-    <div className="space-y-3 rounded-md border bg-muted/10 p-3">
-      <div>
-        <label className="text-xs font-medium">
-          {t("kimiCode.configManagement")}
-        </label>
-        <p className="mt-1 text-[11px] text-muted-foreground">
-          {t("kimiCode.configDescription")}
-        </p>
-      </div>
-
-      <div
-        className={cn(
-          "rounded-md border px-2.5 py-1.5 text-[11px]",
-          config.credentialPresent
-            ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-            : "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-        )}
-      >
-        {config.credentialPresent
-          ? mode === "login"
-            ? t("kimiCode.gateReadyLogin")
-            : t("kimiCode.gateReadyApiKey")
-          : t("kimiCode.gateNotReady")}
-      </div>
-
-      <div className="space-y-1.5">
-        <label className="text-[11px] text-muted-foreground">
-          {t("kimiCode.authModeLabel")}
-        </label>
-        <Select
-          value={mode}
-          onValueChange={(value) => setMode(value as KimiAuthMode)}
-          disabled={saving}
-        >
-          <SelectTrigger className="w-full">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent align="start">
-            <SelectItem value="apikey">
-              {t("kimiCode.authModeApiKey")}
-            </SelectItem>
-            <SelectItem value="login">{t("kimiCode.authModeLogin")}</SelectItem>
-          </SelectContent>
-        </Select>
-        <p className="text-[11px] text-muted-foreground">
-          {t("kimiCode.authModeHint")}
-        </p>
-      </div>
-
-      {mode === "apikey" && (
-        <>
-          <div className="space-y-1.5">
-            <label className="text-[11px] text-muted-foreground">
-              {t("kimiCode.interfaceTypeLabel")}
-            </label>
-            <Select
-              value={interfaceType}
-              onValueChange={handleInterfaceChange}
-              disabled={saving}
-            >
-              <SelectTrigger className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent align="start">
-                {KIMI_INTERFACE_TYPES.map((it) => (
-                  <SelectItem key={it.value} value={it.value}>
-                    {it.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p className="text-[11px] text-muted-foreground">
-              {t("kimiCode.interfaceTypeHint")}
-            </p>
-          </div>
-
-          {isKimi ? (
-            <div className="space-y-1.5">
-              <label className="text-[11px] text-muted-foreground">
-                {t("kimiCode.endpointLabel")}
-              </label>
-              <Select
-                value={region}
-                onValueChange={(value) =>
-                  setRegion(value as KimiEndpointRegion)
-                }
-                disabled={saving}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent align="start">
-                  <SelectItem value="international">
-                    {t("kimiCode.regionInternational")}
-                  </SelectItem>
-                  <SelectItem value="china">
-                    {t("kimiCode.regionChina")}
-                  </SelectItem>
-                  <SelectItem value="custom">
-                    {t("kimiCode.endpointCustom")}
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-              {region === "custom" && (
-                <Input
-                  value={baseUrl}
-                  onChange={(event) => setBaseUrl(event.target.value)}
-                  placeholder="https://api.example.com/v1"
-                  disabled={saving}
-                />
-              )}
-              <p className="text-[11px] text-muted-foreground">
-                {t("kimiCode.endpointHint")}
-              </p>
-            </div>
-          ) : (
-            <div className="space-y-1.5">
-              <label className="text-[11px] text-muted-foreground">
-                {t("kimiCode.baseUrlLabel")}
-              </label>
-              <Input
-                value={baseUrl}
-                onChange={(event) => setBaseUrl(event.target.value)}
-                placeholder="https://api.example.com/v1"
-                disabled={saving}
-              />
-              <p className="text-[11px] text-muted-foreground">
-                {t("kimiCode.baseUrlHint")}
-              </p>
-            </div>
-          )}
-
-          {meta.usesApiKey ? (
-            <>
-              <div className="space-y-1.5">
-                <label className="text-[11px] text-muted-foreground">
-                  {t("kimiCode.apiKeyLabel")}
-                </label>
-                <div className="flex items-center gap-2">
-                  <Input
-                    type={showKey ? "text" : "password"}
-                    value={apiKey}
-                    onChange={(event) => setApiKey(event.target.value)}
-                    placeholder="sk-..."
-                    disabled={saving}
-                  />
-                  {keyToggle}
-                </div>
-                <p className="text-[11px] text-muted-foreground">
-                  {t("kimiCode.apiKeyHint")}
-                </p>
-              </div>
-
-              <details className="rounded-md border bg-background/40 p-2">
-                <summary className="cursor-pointer text-[11px] font-medium text-muted-foreground">
-                  {t("kimiCode.authTypeLabel")}
-                </summary>
-                <div className="mt-2 space-y-1.5">
-                  <Select
-                    value={authType}
-                    onValueChange={(value) =>
-                      setAuthType(value as KimiNativeAuthType)
-                    }
-                    disabled={saving}
-                  >
-                    <SelectTrigger className="w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent align="start">
-                      <SelectItem value="api_key">
-                        {t("kimiCode.authTypeApiKey")}
-                      </SelectItem>
-                      <SelectItem value="env">
-                        {t("kimiCode.authTypeEnv")}
-                      </SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <p className="text-[11px] text-muted-foreground">
-                    {t("kimiCode.authTypeHint")}
-                  </p>
-                </div>
-              </details>
-            </>
-          ) : (
-            <>
-              <div className="space-y-1.5">
-                <label className="text-[11px] text-muted-foreground">
-                  {t("kimiCode.vertexProjectLabel")}
-                </label>
-                <Input
-                  value={vertexProject}
-                  onChange={(event) => setVertexProject(event.target.value)}
-                  placeholder="my-gcp-project"
-                  disabled={saving}
-                />
-              </div>
-              <div className="space-y-1.5">
-                <label className="text-[11px] text-muted-foreground">
-                  {t("kimiCode.vertexLocationLabel")}
-                </label>
-                <Input
-                  value={vertexLocation}
-                  onChange={(event) => setVertexLocation(event.target.value)}
-                  placeholder="us-central1"
-                  disabled={saving}
-                />
-                <p className="text-[11px] text-muted-foreground">
-                  {t("kimiCode.vertexHint")}
-                </p>
-              </div>
-            </>
-          )}
-
-          <div className="space-y-1.5">
-            <label className="text-[11px] text-muted-foreground">
-              {t("kimiCode.modelLabel")}
-            </label>
-            <div className="flex items-center gap-2">
-              <Input
-                list="kimi-model-options"
-                value={model}
-                onChange={(event) => setModel(event.target.value)}
-                placeholder={KIMI_MODEL_PLACEHOLDER}
-                disabled={saving}
-              />
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => void handleFetchModels()}
-                disabled={saving || fetchingModels}
-                className="shrink-0 gap-1.5"
-              >
-                {fetchingModels ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <RefreshCw className="h-3.5 w-3.5" />
-                )}
-                {t("kimiCode.fetchModels")}
-              </Button>
-            </div>
-            {models.length > 0 && (
-              <datalist id="kimi-model-options">
-                {models.map((m) => (
-                  <option key={m} value={m} />
-                ))}
-              </datalist>
-            )}
-            <p className="text-[11px] text-muted-foreground">
-              {t("kimiCode.modelHint")}
-            </p>
-          </div>
-
-          <div className="space-y-1.5">
-            <label className="text-[11px] text-muted-foreground">
-              {t("kimiCode.maxContextLabel")}
-            </label>
-            <Input
-              type="number"
-              value={maxContext}
-              onChange={(event) => setMaxContext(event.target.value)}
-              placeholder="262144"
-              disabled={saving}
-            />
-            <p className="text-[11px] text-muted-foreground">
-              {t("kimiCode.maxContextHint")}
-            </p>
-          </div>
-        </>
-      )}
-
-      {mode === "login" && (
-        <p className="text-[11px] text-muted-foreground">
-          {t("kimiCode.loginHint")}
-        </p>
-      )}
-
-      <div className="flex justify-end">
-        <Button
-          type="button"
-          size="sm"
-          onClick={handleSave}
-          disabled={saving}
-          className="gap-1.5"
-        >
-          {saving ? (
-            <>
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              {t("actions.saving")}
-            </>
-          ) : (
-            <>
-              <Save className="h-3.5 w-3.5" />
-              {t("actions.saveKimiCodeConfig")}
-            </>
-          )}
-        </Button>
-      </div>
-
-      <details className="rounded-md border bg-background/40 p-2">
-        <summary className="cursor-pointer text-[11px] font-medium text-muted-foreground">
-          {t("kimiCode.rawEditorLabel")}
-        </summary>
-        <div className="mt-2 space-y-1.5">
-          <Textarea
-            value={rawConfig}
-            onChange={(event) => setRawConfig(event.target.value)}
-            placeholder={t("kimiCode.rawEditorPlaceholder")}
-            className="min-h-[140px] font-mono text-[11px]"
-            disabled={saving}
-          />
-          <p className="text-[11px] text-muted-foreground">
-            {t("kimiCode.rawEditorHint")}
-          </p>
-          <div className="flex justify-end">
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              onClick={handleSaveRaw}
-              disabled={saving}
-              className="gap-1.5"
-            >
-              {saving ? (
-                <>
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  {t("actions.saving")}
-                </>
-              ) : (
-                <>
-                  <Save className="h-3.5 w-3.5" />
-                  {t("actions.saveKimiCodeRawConfig")}
-                </>
-              )}
-            </Button>
-          </div>
-        </div>
-      </details>
-    </div>
-  )
-}
-
 export function AcpAgentSettings() {
   const locale = useLocale()
   const t = useTranslations("AcpAgentSettings")
@@ -3830,6 +3867,14 @@ export function AcpAgentSettings() {
   const searchParams = useSearchParams()
   const [agents, setAgents] = useState<AcpAgentInfo[]>([])
   const [loadingAgents, setLoadingAgents] = useState(true)
+  const [addCustomOpen, setAddCustomOpen] = useState(false)
+  // Registry id of the custom agent being edited; non-null renders the edit
+  // instance of the add dialog (its own instance so the two flows never share
+  // form state).
+  const [editCustomAgentId, setEditCustomAgentId] = useState<string | null>(
+    null
+  )
+  const [removingCustomAgent, setRemovingCustomAgent] = useState(false)
   const [loadingError, setLoadingError] = useState<string | null>(null)
   const [checkState, setCheckState] = useState<
     Partial<Record<AgentType, AgentCheckState>>
@@ -3851,6 +3896,8 @@ export function AcpAgentSettings() {
   >({})
   const [modelProviders, setModelProviders] = useState<ModelProviderInfo[]>([])
   const [uninstallConfirmAgent, setUninstallConfirmAgent] =
+    useState<AcpAgentInfo | null>(null)
+  const [removeConfirmAgent, setRemoveConfirmAgent] =
     useState<AcpAgentInfo | null>(null)
   const [customInstallAgent, setCustomInstallAgent] =
     useState<AcpAgentInfo | null>(null)
@@ -3908,6 +3955,7 @@ export function AcpAgentSettings() {
   // effect deps (which would re-run the effect and self-cancel the request).
   const openCodeCatalogRequestedRef = useRef(false)
   const [openCodeConnectOpen, setOpenCodeConnectOpen] = useState(false)
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false)
   // Add-a-custom-provider dialog (separate from the catalog connect dialog).
   const [openCodeCustomOpen, setOpenCodeCustomOpen] = useState(false)
   // When set, the connect dialog opens in edit mode for this connected provider.
@@ -3967,6 +4015,7 @@ export function AcpAgentSettings() {
         listModelProviders().catch(() => [] as ModelProviderInfo[]),
       ])
       setAgents(next)
+      publishAgentDisplay(next)
       setModelProviders(providers)
       setDrafts((prev) => {
         const updated = { ...prev }
@@ -4229,6 +4278,8 @@ export function AcpAgentSettings() {
         openCodeAuthJsonText?: string
         codexAuthJsonText?: string
         codexConfigTomlText?: string
+        codexModelCatalog?: string
+        codexSandbox?: CodexSandboxStructuredConfig
         grokConfigTomlText?: string
         grokStructured?: GrokStructuredConfig
       }
@@ -4256,17 +4307,13 @@ export function AcpAgentSettings() {
         agentType === "claude_code" ||
         agentType === "gemini" ||
         agentType === "open_claw"
-      if (usesMerge && configForPersist) {
+      if (usesMerge) {
         const originalAgent = agents.find((a) => a.agent_type === agentType)
-        const originalConfig = originalAgent?.config_json
-          ? parseConfigJsonText(originalAgent.config_json).config
-          : {}
-        const currentConfig = parsedConfig.config
-        configForPersist = JSON.stringify(
-          markRemovedKeysNull(originalConfig, currentConfig),
-          null,
-          2
-        )
+        // Diff even when the current config emptied to "" so removed keys still
+        // produce null-deletion patches (`configForPersist` would otherwise be
+        // "" → a null config_json no-op that leaves the stale key on disk).
+        configForPersist =
+          buildMergeConfigPayload(configText, originalAgent?.config_json) ?? ""
       }
       setSavingConfig((prev) => ({ ...prev, [agentType]: true }))
       try {
@@ -4282,6 +4329,11 @@ export function AcpAgentSettings() {
             typeof options?.codexConfigTomlText === "string"
               ? options.codexConfigTomlText
               : null,
+          codex_model_catalog:
+            typeof options?.codexModelCatalog === "string"
+              ? options.codexModelCatalog
+              : null,
+          codex_sandbox: options?.codexSandbox ?? null,
           grok_config_toml:
             typeof options?.grokConfigTomlText === "string"
               ? options.grokConfigTomlText
@@ -4350,6 +4402,7 @@ export function AcpAgentSettings() {
     try {
       const fresh = await acpListAgents()
       setAgents(fresh)
+      publishAgentDisplay(fresh)
       const grok = fresh.find((a) => a.agent_type === "grok")
       if (grok) {
         setDrafts((prev) => ({ ...prev, grok: buildAgentDraft(grok) }))
@@ -4576,6 +4629,34 @@ export function AcpAgentSettings() {
     [runPreflight, t, installStream.start]
   )
 
+  /**
+   * Remove a custom agent's definition. Recorded transcripts are kept — the
+   * conversations that reference this agent are still readable afterwards,
+   * they just cannot be resumed. Deleting them is a separate, explicit action.
+   *
+   * Confirmation happens in the `removeConfirmAgent` AlertDialog, never via
+   * `window.confirm`: the Tauri webview does not reliably block on the native
+   * prompt, so the deletion used to run before the user answered.
+   */
+  const handleRemoveCustomAgent = useCallback(
+    async (agent: AcpAgentInfo) => {
+      const id = customAgentId(agent.agent_type)
+      if (!id) return
+      setRemovingCustomAgent(true)
+      try {
+        await acpDeleteCustomAgent(id, false)
+        toast.success(t("customAgentRemoved", { name: agent.name }))
+        setSelectedAgentType(null)
+        await refreshAgents()
+      } catch (err) {
+        toast.error(toErrorMessage(err))
+      } finally {
+        setRemovingCustomAgent(false)
+      }
+    },
+    [refreshAgents, t]
+  )
+
   const runUninstallAction = useCallback(
     async (agent: AcpAgentInfo) => {
       if (busyActionRef.current.has(agent.agent_type)) return
@@ -4719,6 +4800,18 @@ export function AcpAgentSettings() {
     await runPreflight(agent.agent_type)
   }
 
+  const confirmRemoveCustomAgent = useCallback(() => {
+    if (!removeConfirmAgent) return
+    const target = removeConfirmAgent
+    handleRemoveCustomAgent(target)
+      .catch((err) => {
+        console.error("[Settings] remove custom agent failed:", err)
+      })
+      .finally(() => {
+        setRemoveConfirmAgent(null)
+      })
+  }, [handleRemoveCustomAgent, removeConfirmAgent])
+
   const confirmUninstall = useCallback(() => {
     if (!uninstallConfirmAgent) return
     const target = uninstallConfirmAgent
@@ -4777,6 +4870,13 @@ export function AcpAgentSettings() {
     pendingOrderRef.current = reordered.map((agent) => agent.agent_type)
   }, [])
 
+  // One package operation at a time across ALL agents: while any
+  // install/upgrade/uninstall runs, every agent's package-action buttons are
+  // disabled — the busy flag is keyed per agent, so without this, selecting
+  // another agent in the list offers a second, concurrent install. The
+  // spinner stays precise via the per-agent `runningActionKind`.
+  const anyBinaryActionBusy = Object.values(busyBinaryAction).some(Boolean)
+
   const renderCheck = (agent: AcpAgentInfo, check: UiCheckItem) => {
     const checkKey = `${agent.agent_type}:${check.check_id}`
     const expanded = expandedChecks[checkKey] ?? check.status !== "pass"
@@ -4818,55 +4918,62 @@ export function AcpAgentSettings() {
             </div>
             {check.fixes.length > 0 && (
               <div className="flex flex-wrap gap-1.5 justify-end max-w-[220px] shrink-0">
-                {check.fixes.map((fix, index) => (
-                  <Button
-                    key={`${fix.label}-${index}`}
-                    size="xs"
-                    variant="outline"
-                    className="h-6 bg-muted/30 hover:bg-muted/50 disabled:bg-muted/30 disabled:opacity-100"
-                    disabled={
-                      ("disabled" in fix && fix.disabled === true) ||
-                      (Boolean(busyBinaryAction[agent.agent_type]) &&
-                        [
-                          "download_binary",
-                          "upgrade_binary",
-                          "install_npx",
-                          "upgrade_npx",
-                          "uninstall_binary",
-                          "uninstall_npx",
-                          "redownload_binary",
-                          "install_opencode_plugins",
-                          "custom_install",
-                          "install_uv",
-                        ].includes(fix.kind))
-                    }
-                    onClick={() => {
-                      handleFixAction(agent, fix).catch((err) => {
-                        console.error("[Settings] fix action failed:", err)
-                      })
-                    }}
-                  >
-                    {runningActionKind[agent.agent_type] === fix.kind ? (
-                      <Loader2 className="h-3 w-3 animate-spin" />
-                    ) : fix.kind === "download_binary" ||
-                      fix.kind === "install_npx" ||
-                      fix.kind === "install_uv" ? (
-                      <Download className="h-3 w-3" />
-                    ) : fix.kind === "upgrade_binary" ||
-                      fix.kind === "upgrade_npx" ||
-                      fix.kind === "redownload_binary" ? (
-                      <Wrench className="h-3 w-3" />
-                    ) : fix.kind === "uninstall_binary" ||
-                      fix.kind === "uninstall_npx" ? (
-                      <Trash2 className="h-3 w-3" />
-                    ) : fix.kind === "install_opencode_plugins" ? (
-                      <Download className="h-3 w-3" />
-                    ) : fix.kind === "custom_install" ? (
-                      <PackagePlus className="h-3 w-3" />
-                    ) : null}
-                    {fix.label}
-                  </Button>
-                ))}
+                {check.fixes.map((fix, index) => {
+                  const busyGated =
+                    anyBinaryActionBusy &&
+                    PACKAGE_ACTION_FIX_KINDS.includes(fix.kind)
+                  const running =
+                    runningActionKind[agent.agent_type] === fix.kind
+                  return (
+                    <Button
+                      key={`${fix.label}-${index}`}
+                      size="xs"
+                      variant="outline"
+                      className={cn(
+                        "h-6 bg-muted/30 hover:bg-muted/50",
+                        // Two disabled looks: while the global one-package-op-
+                        // at-a-time gate is busy, every parked package action
+                        // dims (backend-disabled or not) so the lockout shows
+                        // on agents other than the busy one; only the button
+                        // showing the spinner, and — when the gate is idle — a
+                        // backend-declared inapplicable fix, keep the full-
+                        // opacity chip look.
+                        busyGated && !running
+                          ? "disabled:opacity-50"
+                          : "disabled:bg-muted/30 disabled:opacity-100"
+                      )}
+                      disabled={
+                        ("disabled" in fix && fix.disabled === true) ||
+                        busyGated
+                      }
+                      onClick={() => {
+                        handleFixAction(agent, fix).catch((err) => {
+                          console.error("[Settings] fix action failed:", err)
+                        })
+                      }}
+                    >
+                      {runningActionKind[agent.agent_type] === fix.kind ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : fix.kind === "download_binary" ||
+                        fix.kind === "install_npx" ||
+                        fix.kind === "install_uv" ? (
+                        <Download className="h-3 w-3" />
+                      ) : fix.kind === "upgrade_binary" ||
+                        fix.kind === "upgrade_npx" ||
+                        fix.kind === "redownload_binary" ? (
+                        <Wrench className="h-3 w-3" />
+                      ) : fix.kind === "uninstall_binary" ||
+                        fix.kind === "uninstall_npx" ? (
+                        <Trash2 className="h-3 w-3" />
+                      ) : fix.kind === "install_opencode_plugins" ? (
+                        <Download className="h-3 w-3" />
+                      ) : fix.kind === "custom_install" ? (
+                        <PackagePlus className="h-3 w-3" />
+                      ) : null}
+                      {fix.label}
+                    </Button>
+                  )
+                })}
               </div>
             )}
           </div>
@@ -4932,6 +5039,12 @@ export function AcpAgentSettings() {
       ? (CODEX_REASONING_EFFORT_OPTIONS.find(
           (option) => option.value === selectedDraft.codexReasoningEffort
         ) ?? null)
+      : null
+  // Inline validation for `writable_roots`: codex would accept a relative entry
+  // and resolve it against CODEX_HOME, so it is surfaced before the save throws.
+  const codexRelativeWritableRoot =
+    selectedAgent?.agent_type === "codex" && selectedDraft
+      ? firstRelativeWritableRoot(selectedDraft.codexWritableRootsText)
       : null
   const selectedHermesProviderOption =
     selectedAgent?.agent_type === "hermes" && selectedDraft
@@ -5171,6 +5284,9 @@ export function AcpAgentSettings() {
         claudeCustomModelOptionDescription:
           important.claudeCustomModelOptionDescription,
         claudeEffortLevel: important.claudeEffortLevel,
+        claudeSendAttributionHeader: important.claudeSendAttributionHeader,
+        claudeDisableNonessentialTraffic:
+          important.claudeDisableNonessentialTraffic,
       }))
     },
     [selectedAgent, selectedDraft, updateSelectedDraft]
@@ -5242,6 +5358,72 @@ export function AcpAgentSettings() {
       }))
     },
     [selectedAgent, selectedDraft, t, updateSelectedDraft]
+  )
+
+  // Toggle a Claude Code hardening flag: write the explicit "1"/"0" value into
+  // the native config's `env` (and the DB env overlay in lockstep).
+  const handleClaudeEnvFlagChange = useCallback(
+    (
+      field: "claudeSendAttributionHeader" | "claudeDisableNonessentialTraffic",
+      envKey: string,
+      enabled: boolean
+    ) => {
+      if (
+        !selectedAgent ||
+        !selectedDraft ||
+        selectedAgent.agent_type !== "claude_code"
+      )
+        return
+      const value = enabled ? CLAUDE_ENV_FLAG_ON : CLAUDE_ENV_FLAG_OFF
+      const next = setClaudeEnvFlagInConfigText(
+        selectedDraft.configText,
+        envKey,
+        value
+      )
+      if (next.recoveredFromInvalid) {
+        toast.warning(t("warnings.nativeJsonRecoveredStructured"))
+      }
+      setConfigErrors((prev) => ({
+        ...prev,
+        [selectedAgent.agent_type]: null,
+      }))
+      updateSelectedDraft((current) => ({
+        ...current,
+        [field]: enabled,
+        // The backend folds native `config.env` into `agent.env`, so keep the
+        // DB env overlay (envText) in lockstep — otherwise persistEnv would
+        // re-persist a stale value from the overlay. Mirrors
+        // handleImportantConfigChange's dual configText + envText write.
+        envText: patchEnvText(current.envText, { [envKey]: value }),
+        configText: next.configText,
+      }))
+    },
+    [selectedAgent, selectedDraft, t, updateSelectedDraft]
+  )
+
+  const handleGrokAuthModeChange = useCallback(
+    (nextMode: GrokAuthMethod) => {
+      if (
+        !selectedAgent ||
+        !selectedDraft ||
+        selectedAgent.agent_type !== "grok"
+      )
+        return
+      // Record the method knob in env; on subscription strip XAI_API_KEY so the
+      // editable env can't override the `grok login` credential (the launch path
+      // enforces the same via apply_grok_env_policy). Clearing the draft apiKey
+      // keeps the now-hidden key input from resurrecting a stale value.
+      updateSelectedDraft((current) => ({
+        ...current,
+        grokAuthMode: nextMode,
+        apiKey: nextMode === "subscription" ? "" : current.apiKey,
+        envText: patchEnvText(current.envText, {
+          GROK_AUTH_MODE: nextMode,
+          ...(nextMode === "subscription" ? { XAI_API_KEY: "" } : {}),
+        }),
+      }))
+    },
+    [selectedAgent, selectedDraft, updateSelectedDraft]
   )
 
   const handleClaudeAuthModeChange = useCallback(
@@ -5432,20 +5614,31 @@ export function AcpAgentSettings() {
           }
         })
       } else if (agentType === "codex") {
-        const codexModel = provider?.model?.trim() ?? ""
+        // The provider stores a structured model config; root `model` is its
+        // default slug and we reference the catalog the bind path generates.
+        const codexList = parseCodexModelConfig(provider?.model ?? null)
+        const codexHasConfig =
+          codexList.customs.length > 0 ||
+          (codexList.excludedOfficials?.length ?? 0) > 0
+        const codexModel = codexList.default ?? codexList.customs[0]?.slug ?? ""
         const nextAuthPatch = patchCodexAuthJsonText(
           selectedDraft.codexAuthJsonText,
           { apiKey, authMode: null }
         )
         const nextAuthJsonText = nextAuthPatch.authJsonText
         // Always pass the provider's model (empty string clears it from the toml).
-        const nextConfigTomlText = patchCodexConfigTomlText(
+        let nextConfigTomlText = patchCodexConfigTomlText(
           selectedDraft.codexConfigTomlText,
           {
             modelProvider: CODEX_DEFAULT_MODEL_PROVIDER,
             apiBaseUrl: apiUrl,
             model: codexModel,
           }
+        )
+        nextConfigTomlText = updateTomlRootStringKey(
+          nextConfigTomlText,
+          "model_catalog_json",
+          codexHasConfig ? "codeg-model-catalog.json" : ""
         )
         const synced = extractCodexImportantValues(
           nextAuthJsonText,
@@ -5457,6 +5650,7 @@ export function AcpAgentSettings() {
           apiBaseUrl: apiUrl,
           apiKey,
           model: codexModel,
+          codexModelList: codexList,
           codexAuthJsonText: nextAuthJsonText,
           codexConfigTomlText: nextConfigTomlText,
           codexModelProvider: CODEX_DEFAULT_MODEL_PROVIDER,
@@ -6632,6 +6826,33 @@ export function AcpAgentSettings() {
     [selectedAgent, selectedDraft, updateSelectedDraft]
   )
 
+  const handleCodexModelListChange = useCallback(
+    (next: CodexModelConfig) => {
+      const defaultSlug = next.default ?? next.customs[0]?.slug ?? ""
+      const hasCatalog =
+        next.customs.length > 0 || (next.excludedOfficials?.length ?? 0) > 0
+      updateSelectedDraft((current) => {
+        let toml = updateTomlRootStringKey(
+          current.codexConfigTomlText,
+          "model",
+          defaultSlug
+        )
+        toml = updateTomlRootStringKey(
+          toml,
+          "model_catalog_json",
+          hasCatalog ? "codeg-model-catalog.json" : ""
+        )
+        return {
+          ...current,
+          codexModelList: next,
+          model: defaultSlug,
+          codexConfigTomlText: toml,
+        }
+      })
+    },
+    [updateSelectedDraft]
+  )
+
   const handleCodexImportantConfigChange = useCallback(
     (
       key: "apiBaseUrl" | "apiKey" | "model" | "reasoningEffort",
@@ -6896,6 +7117,9 @@ export function AcpAgentSettings() {
               await persistConfig("codex", draft.configText, {
                 codexAuthJsonText: authJson,
                 codexConfigTomlText: draft.codexConfigTomlText,
+                codexModelCatalog:
+                  serializeCodexModelConfig(draft.codexModelList) ?? "",
+                codexSandbox: codexSandboxSaveConfig(draft),
               })
             } catch (err) {
               const msg = toErrorMessage(err)
@@ -6958,7 +7182,35 @@ export function AcpAgentSettings() {
             {t("description")}
           </p>
         </div>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 text-xs shrink-0"
+          onClick={() => setAddCustomOpen(true)}
+        >
+          <Plus className="h-3.5 w-3.5 mr-1" />
+          {t("addCustomAgent")}
+        </Button>
       </div>
+
+      <AddCustomAgentDialog
+        open={addCustomOpen}
+        onOpenChange={setAddCustomOpen}
+        onAdded={() => void refreshAgents()}
+      />
+
+      {/* Keyed by the id so switching agents never leaks a previous form. */}
+      {editCustomAgentId !== null && (
+        <AddCustomAgentDialog
+          key={editCustomAgentId}
+          open
+          editRegistryId={editCustomAgentId}
+          onOpenChange={(next) => {
+            if (!next) setEditCustomAgentId(null)
+          }}
+          onAdded={() => void refreshAgents()}
+        />
+      )}
 
       {loadingError && (
         <div className="mb-3 rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-400">
@@ -7126,8 +7378,29 @@ export function AcpAgentSettings() {
                     <Badge variant="outline" className="shrink-0">
                       {selectedAgent.distribution_type}
                     </Badge>
+                    {/* Names the thing codeg actually installs, right next to
+                        the vendor's name — so the split is visible even before
+                        anyone reads the preflight card below. */}
+                    {selectedAgent.is_acp_adapter && (
+                      <Badge
+                        variant="secondary"
+                        className="shrink-0"
+                        title={t("adapter.badgeHint")}
+                      >
+                        {t("adapter.badge")}
+                      </Badge>
+                    )}
+                    {isCustomAgentType(selectedAgent.agent_type) && (
+                      <Badge variant="secondary" className="shrink-0">
+                        {t("customAgentBadge")}
+                      </Badge>
+                    )}
                   </div>
-                  <div className="flex items-center shrink-0">
+                  {/* Removing a custom agent lives in the danger row at the
+                      bottom of the panel, not here: this line already carries
+                      the name, the distribution badge, the Custom badge and
+                      the enable switch. */}
+                  <div className="flex items-center gap-2 shrink-0">
                     <button
                       type="button"
                       role="switch"
@@ -7195,6 +7468,12 @@ export function AcpAgentSettings() {
                 </p>
               </div>
 
+              <AgentDiagnosticsDialog
+                open={diagnosticsOpen}
+                onOpenChange={setDiagnosticsOpen}
+                agentType={selectedAgent.agent_type}
+              />
+
               <div className="flex-1 overflow-y-auto p-4 space-y-4">
                 <div className="space-y-2">
                   {selectedCurrent?.error && (
@@ -7203,9 +7482,20 @@ export function AcpAgentSettings() {
                       <span className="break-all">{selectedCurrent.error}</span>
                     </div>
                   )}
-                  <div className="text-[11px] text-muted-foreground flex items-center gap-1">
-                    <CheckCircle2 className="h-3 w-3" />
-                    {t("preflight.count", { count: selectedChecks.length })}
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-[11px] text-muted-foreground flex items-center gap-1">
+                      <CheckCircle2 className="h-3 w-3" />
+                      {t("preflight.count", { count: selectedChecks.length })}
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="xs"
+                      onClick={() => setDiagnosticsOpen(true)}
+                    >
+                      <Stethoscope className="h-3.5 w-3.5" />
+                      {t("actions.diagnose")}
+                    </Button>
                   </div>
                   {selectedChecks.length > 0 ? (
                     selectedChecks.map((check) =>
@@ -7561,21 +7851,12 @@ export function AcpAgentSettings() {
                     {(selectedDraft.codexAuthMode === "api_key" ||
                       selectedDraft.codexAuthMode === "model_provider") && (
                       <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
-                          {t("codex.modelName")}
-                        </label>
-                        <Input
-                          value={selectedDraft.model}
+                        <CodexModelListEditor
+                          value={selectedDraft.codexModelList}
+                          onChange={handleCodexModelListChange}
                           readOnly={
                             selectedDraft.codexAuthMode === "model_provider"
                           }
-                          onChange={(event) => {
-                            handleCodexImportantConfigChange(
-                              "model",
-                              event.target.value
-                            )
-                          }}
-                          placeholder="gpt-5.6-sol / gpt-5.5"
                         />
                       </div>
                     )}
@@ -7651,6 +7932,219 @@ export function AcpAgentSettings() {
                       </div>
                     </div>
 
+                    {/* ---- Sandbox & approvals (config.toml thread defaults) ----
+                        These govern the turns codex starts by itself: /goal,
+                        /review, /compact. Ordinary prompts carry the composer
+                        preset's own policy per turn and ignore these keys. */}
+                    <div className="space-y-2 rounded-md border px-3 py-2.5">
+                      <div className="space-y-1">
+                        <p className="text-[11px] font-medium">
+                          {t("codex.sandboxGroupTitle")}
+                        </p>
+                        <p className="text-[10px] text-muted-foreground">
+                          {t("codex.sandboxGroupHint")}
+                        </p>
+                      </div>
+
+                      {selectedDraft.codexSandboxShadowed ? (
+                        <p className="text-[10px] text-yellow-500">
+                          {t("codex.sandboxShadowedWarning")}
+                        </p>
+                      ) : null}
+                      {selectedDraft.codexSandboxHasPermissionsTable &&
+                      !selectedDraft.codexSandboxShadowed ? (
+                        <p className="text-[10px] text-yellow-500">
+                          {t("codex.sandboxPermissionsTableWarning")}
+                        </p>
+                      ) : null}
+
+                      <div className="space-y-1.5">
+                        <label className="text-[11px] text-muted-foreground">
+                          {t("codex.approvalPolicyLabel")}
+                        </label>
+                        <Select
+                          value={
+                            selectedDraft.codexApprovalPolicy ||
+                            CODEX_SANDBOX_UNSET_OPTION
+                          }
+                          onValueChange={(value) => {
+                            updateSelectedDraft((current) => ({
+                              ...current,
+                              codexApprovalPolicy:
+                                value === CODEX_SANDBOX_UNSET_OPTION
+                                  ? CODEX_SANDBOX_UNSET
+                                  : (value as CodexApprovalPolicyChoice),
+                            }))
+                          }}
+                        >
+                          <SelectTrigger className="h-8 text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent align="start">
+                            <SelectItem value={CODEX_SANDBOX_UNSET_OPTION}>
+                              {t("codex.approvalPolicyUnset")}
+                            </SelectItem>
+                            {CODEX_APPROVAL_POLICY_VALUES.map((value) => (
+                              <SelectItem key={value} value={value}>
+                                {t(`codex.approvalPolicy_${value}`)}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+
+                      {selectedDraft.codexApprovalPolicy === "granular" ? (
+                        <div className="space-y-1 rounded-md border border-dashed px-2.5 py-2">
+                          <p className="text-[10px] text-muted-foreground">
+                            {t("codex.granularHint")}
+                          </p>
+                          {CODEX_GRANULAR_KEYS.map((key) => (
+                            <div
+                              className="flex items-center justify-between gap-2 py-0.5"
+                              key={key}
+                            >
+                              <label className="text-[11px] text-muted-foreground">
+                                {t(`codex.granular_${key}`)}
+                              </label>
+                              <Switch
+                                checked={selectedDraft.codexGranular[key]}
+                                onCheckedChange={(checked) => {
+                                  updateSelectedDraft((current) => ({
+                                    ...current,
+                                    codexGranular: {
+                                      ...current.codexGranular,
+                                      [key]: checked,
+                                    },
+                                  }))
+                                }}
+                                aria-label={t(`codex.granular_${key}`)}
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      <div className="space-y-1.5">
+                        <label className="text-[11px] text-muted-foreground">
+                          {t("codex.sandboxModeLabel")}
+                        </label>
+                        <Select
+                          disabled={selectedDraft.codexSandboxShadowed}
+                          value={
+                            selectedDraft.codexSandboxMode ||
+                            CODEX_SANDBOX_UNSET_OPTION
+                          }
+                          onValueChange={(value) => {
+                            updateSelectedDraft((current) => ({
+                              ...current,
+                              codexSandboxMode:
+                                value === CODEX_SANDBOX_UNSET_OPTION
+                                  ? CODEX_SANDBOX_UNSET
+                                  : (value as CodexSandboxModeChoice),
+                            }))
+                          }}
+                        >
+                          <SelectTrigger className="h-8 text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent align="start">
+                            <SelectItem value={CODEX_SANDBOX_UNSET_OPTION}>
+                              {t("codex.sandboxModeUnset")}
+                            </SelectItem>
+                            {CODEX_SANDBOX_MODE_VALUES.map((value) => (
+                              <SelectItem key={value} value={value}>
+                                {t(`codex.sandboxMode_${value}`)}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <p className="text-[10px] text-muted-foreground">
+                          {t("codex.sandboxModeHint")}
+                        </p>
+                      </div>
+
+                      {codexWorkspaceWriteApplies(
+                        selectedDraft.codexSandboxMode
+                      ) && !selectedDraft.codexSandboxShadowed ? (
+                        <div className="space-y-2 rounded-md border border-dashed px-2.5 py-2">
+                          <div className="space-y-1">
+                            <label className="text-[11px] text-muted-foreground">
+                              {t("codex.writableRootsLabel")}
+                            </label>
+                            <Textarea
+                              className="min-h-16 font-mono text-[11px]"
+                              spellCheck={false}
+                              value={selectedDraft.codexWritableRootsText}
+                              onChange={(event) => {
+                                const next = event.target.value
+                                updateSelectedDraft((current) => ({
+                                  ...current,
+                                  codexWritableRootsText: next,
+                                }))
+                              }}
+                              placeholder={"/Users/me/shared\n/srv/cache"}
+                            />
+                            {codexRelativeWritableRoot ? (
+                              <p className="text-[10px] text-red-500">
+                                {t("codex.sandboxRootsRelativeError", {
+                                  path: codexRelativeWritableRoot,
+                                })}
+                              </p>
+                            ) : (
+                              <p className="text-[10px] text-muted-foreground">
+                                {t("codex.writableRootsHint")}
+                              </p>
+                            )}
+                          </div>
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[11px] text-muted-foreground">
+                              {t("codex.networkAccessLabel")}
+                            </label>
+                            <Switch
+                              checked={selectedDraft.codexNetworkAccess}
+                              onCheckedChange={(checked) => {
+                                updateSelectedDraft((current) => ({
+                                  ...current,
+                                  codexNetworkAccess: checked,
+                                }))
+                              }}
+                              aria-label={t("codex.networkAccessLabel")}
+                            />
+                          </div>
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[11px] text-muted-foreground">
+                              {t("codex.excludeTmpdirLabel")}
+                            </label>
+                            <Switch
+                              checked={selectedDraft.codexExcludeTmpdirEnvVar}
+                              onCheckedChange={(checked) => {
+                                updateSelectedDraft((current) => ({
+                                  ...current,
+                                  codexExcludeTmpdirEnvVar: checked,
+                                }))
+                              }}
+                              aria-label={t("codex.excludeTmpdirLabel")}
+                            />
+                          </div>
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="text-[11px] text-muted-foreground">
+                              {t("codex.excludeSlashTmpLabel")}
+                            </label>
+                            <Switch
+                              checked={selectedDraft.codexExcludeSlashTmp}
+                              onCheckedChange={(checked) => {
+                                updateSelectedDraft((current) => ({
+                                  ...current,
+                                  codexExcludeSlashTmp: checked,
+                                }))
+                              }}
+                              aria-label={t("codex.excludeSlashTmpLabel")}
+                            />
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+
                     <div className="space-y-1.5">
                       <label className="text-[11px] text-muted-foreground">
                         {t("codex.configTomlNative")}
@@ -7716,6 +8210,12 @@ supports_websockets = true`}
                                     selectedDraft.codexAuthJsonText,
                                   codexConfigTomlText:
                                     selectedDraft.codexConfigTomlText,
+                                  codexModelCatalog:
+                                    serializeCodexModelConfig(
+                                      selectedDraft.codexModelList
+                                    ) ?? "",
+                                  codexSandbox:
+                                    codexSandboxSaveConfig(selectedDraft),
                                 }
                               )
                             )
@@ -9556,6 +10056,21 @@ supports_websockets = true`}
                     }
                     onSaved={refreshAgents}
                   />
+                ) : selectedAgent.agent_type === "cursor" ? (
+                  <CursorConfigPanel
+                    agent={selectedAgent}
+                    saving={Boolean(savingEnv[selectedAgent.agent_type])}
+                    onSaveEnv={(env, enabled) =>
+                      persistEnv(
+                        selectedAgent.agent_type,
+                        enabled,
+                        envMapToText(env),
+                        selectedAgent.model_provider_id
+                      )
+                    }
+                    onSaved={refreshAgents}
+                    onAffectedSessions={reportAffectedSessions}
+                  />
                 ) : selectedAgent.agent_type === "grok" ? (
                   <div className="space-y-3 rounded-md border bg-muted/10 p-3">
                     <div>
@@ -9594,10 +10109,16 @@ supports_websockets = true`}
                             <SelectItem value={GROK_UNSET}>
                               {t("grok.optionDefault")}
                             </SelectItem>
-                            <SelectItem value="ask">
-                              {t("grok.permissionAsk")}
+                            <SelectItem value="default">
+                              {t("grok.permissionDefault")}
                             </SelectItem>
-                            <SelectItem value="always-approve">
+                            <SelectItem value="acceptEdits">
+                              {t("grok.permissionAcceptEdits")}
+                            </SelectItem>
+                            <SelectItem value="auto">
+                              {t("grok.permissionAuto")}
+                            </SelectItem>
+                            <SelectItem value="bypassPermissions">
                               {t("grok.permissionAlwaysApprove")}
                             </SelectItem>
                           </SelectContent>
@@ -9648,248 +10169,316 @@ supports_websockets = true`}
                       </div>
                     </div>
 
-                    {/* Authentication — status + inline XAI_API_KEY */}
-                    <div className="space-y-2 rounded-md border p-2.5">
-                      <div>
+                    {/* Authentication — method selector + method-specific body.
+                        Mirrors the Cursor panel: an explicit choice between the
+                        `grok login` subscription and an XAI_API_KEY, recognized
+                        on load via inferGrokMode and recorded as GROK_AUTH_MODE. */}
+                    <div className="space-y-2.5 rounded-md border p-2.5">
+                      <div className="space-y-1.5">
                         <label className="text-[11px] font-medium">
                           {t("grok.authTitle")}
                         </label>
-                        <p className="mt-1 text-[11px] text-muted-foreground">
-                          {selectedDraft.apiKey.trim()
-                            ? t("grok.authKeyConfigured")
-                            : t("grok.authKeyMissing")}
+                        <Select
+                          value={selectedDraft.grokAuthMode}
+                          disabled={grokSaving}
+                          onValueChange={(value) =>
+                            handleGrokAuthModeChange(value as GrokAuthMethod)
+                          }
+                        >
+                          <SelectTrigger
+                            className="w-full"
+                            aria-label={t("grok.authMode")}
+                          >
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="subscription">
+                              {t("authModeOfficialSubscription")}
+                            </SelectItem>
+                            <SelectItem value="api_key">
+                              {t("grok.authModeApiKey")}
+                            </SelectItem>
+                            <SelectItem value="custom">
+                              {t("grok.authModeCustom")}
+                            </SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <p className="text-[11px] text-muted-foreground">
+                          {selectedDraft.grokAuthMode === "subscription"
+                            ? t("grok.subscriptionHint")
+                            : selectedDraft.grokAuthMode === "custom"
+                              ? t("grok.authModeCustomHint")
+                              : t("grok.authModeApiKeyHint")}
                         </p>
                       </div>
-                      <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
-                          XAI_API_KEY
-                        </label>
-                        <div className="flex items-center gap-2">
-                          <Input
-                            type={
-                              showApiKeys[selectedAgent.agent_type]
-                                ? "text"
-                                : "password"
-                            }
-                            value={selectedDraft.apiKey}
-                            onChange={(event) =>
-                              handleImportantConfigChange(
-                                "apiKey",
-                                event.target.value
-                              )
-                            }
-                            placeholder="xai-..."
-                            aria-label="XAI_API_KEY"
-                            name="grok-xai-api-key"
-                            autoComplete="off"
-                            spellCheck={false}
-                            disabled={grokSaving}
-                          />
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            disabled={grokSaving}
-                            onClick={() =>
-                              setShowApiKeys((prev) => ({
-                                ...prev,
-                                [selectedAgent.agent_type]:
-                                  !prev[selectedAgent.agent_type],
-                              }))
-                            }
-                            aria-label={
-                              showApiKeys[selectedAgent.agent_type]
-                                ? t("actions.hideApiKey")
-                                : t("actions.showApiKey")
-                            }
-                            title={
-                              showApiKeys[selectedAgent.agent_type]
-                                ? t("actions.hideApiKey")
-                                : t("actions.showApiKey")
-                            }
-                          >
-                            {showApiKeys[selectedAgent.agent_type] ? (
-                              <EyeOff className="h-3.5 w-3.5" />
-                            ) : (
-                              <Eye className="h-3.5 w-3.5" />
-                            )}
-                          </Button>
+
+                      {selectedDraft.grokAuthMode === "subscription" ? (
+                        // Subscription: a copyable `grok login` command. Its
+                        // session lives in ~/.grok/auth.json (untouched here); the
+                        // launch path strips any inherited XAI_API_KEY.
+                        <div className="space-y-1.5">
+                          <p className="text-[11px] text-muted-foreground">
+                            {t("grok.loginHint")}
+                          </p>
+                          <div className="flex items-center gap-2">
+                            <code className="flex-1 overflow-x-auto rounded bg-muted px-2 py-1 text-[11px] font-mono whitespace-nowrap">
+                              {GROK_LOGIN_COMMAND}
+                            </code>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 w-7 shrink-0 p-0"
+                              onClick={async () => {
+                                const ok =
+                                  await copyTextToClipboard(GROK_LOGIN_COMMAND)
+                                if (ok) toast.success(t("grok.commandCopied"))
+                              }}
+                              title={t("grok.copyCommand")}
+                              aria-label={t("grok.copyCommand")}
+                            >
+                              <Copy className="h-3 w-3" />
+                            </Button>
+                          </div>
                         </div>
-                      </div>
-                      <p className="text-[11px] text-muted-foreground">
-                        {t("grok.authLoginHint")}
-                      </p>
+                      ) : selectedDraft.grokAuthMode === "api_key" ? (
+                        // API key: the non-interactive XAI_API_KEY credential.
+                        <div className="space-y-1.5">
+                          <label className="text-[11px] text-muted-foreground">
+                            XAI_API_KEY
+                          </label>
+                          <div className="flex items-center gap-2">
+                            <Input
+                              type={
+                                showApiKeys[selectedAgent.agent_type]
+                                  ? "text"
+                                  : "password"
+                              }
+                              value={selectedDraft.apiKey}
+                              onChange={(event) =>
+                                handleImportantConfigChange(
+                                  "apiKey",
+                                  event.target.value
+                                )
+                              }
+                              placeholder="xai-..."
+                              aria-label="XAI_API_KEY"
+                              name="grok-xai-api-key"
+                              autoComplete="off"
+                              spellCheck={false}
+                              disabled={grokSaving}
+                            />
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              disabled={grokSaving}
+                              onClick={() =>
+                                setShowApiKeys((prev) => ({
+                                  ...prev,
+                                  [selectedAgent.agent_type]:
+                                    !prev[selectedAgent.agent_type],
+                                }))
+                              }
+                              aria-label={
+                                showApiKeys[selectedAgent.agent_type]
+                                  ? t("actions.hideApiKey")
+                                  : t("actions.showApiKey")
+                              }
+                              title={
+                                showApiKeys[selectedAgent.agent_type]
+                                  ? t("actions.hideApiKey")
+                                  : t("actions.showApiKey")
+                              }
+                            >
+                              {showApiKeys[selectedAgent.agent_type] ? (
+                                <EyeOff className="h-3.5 w-3.5" />
+                              ) : (
+                                <Eye className="h-3.5 w-3.5" />
+                              )}
+                            </Button>
+                          </div>
+                          <p className="text-[11px] text-muted-foreground">
+                            {selectedDraft.apiKey.trim()
+                              ? t("grok.authKeyConfigured")
+                              : t("grok.authKeyMissing")}
+                          </p>
+                        </div>
+                      ) : null}
                     </div>
 
                     {/* Custom model (BYO endpoint) → [model.<id>] + [models].default.
-                        A model id here registers a custom Grok model and makes it
-                        the default; empty id removes the codeg-managed block. */}
-                    <div className="space-y-2.5 rounded-md border p-2.5">
-                      <div>
-                        <label className="text-[11px] font-medium">
-                          {t("grok.customModelTitle")}
-                        </label>
-                        <p className="mt-1 text-[11px] text-muted-foreground">
-                          {t("grok.customModelHint")}
-                        </p>
-                      </div>
+                        Only shown (and saved) in the `custom` auth method: a model
+                        id registers a custom Grok model as the default; the other
+                        methods omit the codeg-managed block. */}
+                    {selectedDraft.grokAuthMode === "custom" ? (
+                      <div className="space-y-2.5 rounded-md border p-2.5">
+                        <div>
+                          <label className="text-[11px] font-medium">
+                            {t("grok.customModelTitle")}
+                          </label>
+                          <p className="mt-1 text-[11px] text-muted-foreground">
+                            {t("grok.customModelHint")}
+                          </p>
+                        </div>
 
-                      <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
-                          {t("grok.customModelIdLabel")}
-                        </label>
-                        <Input
-                          value={selectedDraft.grokCustomModelId}
-                          onChange={(event) =>
-                            updateSelectedDraft((current) => ({
-                              ...current,
-                              grokCustomModelId: event.target.value,
-                            }))
-                          }
-                          placeholder={t("grok.customModelIdPlaceholder")}
-                          aria-label={t("grok.customModelIdLabel")}
-                          autoComplete="off"
-                          spellCheck={false}
-                          disabled={grokSaving}
-                        />
-                        <p className="text-[11px] text-muted-foreground">
-                          {t("grok.customModelIdHint")}
-                        </p>
-                      </div>
-
-                      <div className="grid gap-3 md:grid-cols-2">
                         <div className="space-y-1.5">
                           <label className="text-[11px] text-muted-foreground">
-                            {t("grok.customBaseUrlLabel")}
+                            {t("grok.customModelIdLabel")}
                           </label>
                           <Input
-                            value={selectedDraft.grokCustomBaseUrl}
+                            value={selectedDraft.grokCustomModelId}
                             onChange={(event) =>
                               updateSelectedDraft((current) => ({
                                 ...current,
-                                grokCustomBaseUrl: event.target.value,
+                                grokCustomModelId: event.target.value,
                               }))
                             }
-                            placeholder={t("grok.customBaseUrlPlaceholder")}
-                            aria-label={t("grok.customBaseUrlLabel")}
+                            placeholder={t("grok.customModelIdPlaceholder")}
+                            aria-label={t("grok.customModelIdLabel")}
                             autoComplete="off"
                             spellCheck={false}
                             disabled={grokSaving}
                           />
+                          <p className="text-[11px] text-muted-foreground">
+                            {t("grok.customModelIdHint")}
+                          </p>
                         </div>
-                        <div className="space-y-1.5">
-                          <label className="text-[11px] text-muted-foreground">
-                            {t("grok.customApiBackendLabel")}
-                          </label>
-                          <Select
-                            value={
-                              selectedDraft.grokCustomApiBackend ||
-                              GROK_DEFAULT_API_BACKEND
-                            }
-                            disabled={grokSaving}
-                            onValueChange={(value) =>
-                              updateSelectedDraft((current) => ({
-                                ...current,
-                                grokCustomApiBackend: value,
-                              }))
-                            }
-                          >
-                            <SelectTrigger
-                              className="w-full"
-                              aria-label={t("grok.customApiBackendLabel")}
+
+                        <div className="grid gap-3 md:grid-cols-2">
+                          <div className="space-y-1.5">
+                            <label className="text-[11px] text-muted-foreground">
+                              {t("grok.customBaseUrlLabel")}
+                            </label>
+                            <Input
+                              value={selectedDraft.grokCustomBaseUrl}
+                              onChange={(event) =>
+                                updateSelectedDraft((current) => ({
+                                  ...current,
+                                  grokCustomBaseUrl: event.target.value,
+                                }))
+                              }
+                              placeholder={t("grok.customBaseUrlPlaceholder")}
+                              aria-label={t("grok.customBaseUrlLabel")}
+                              autoComplete="off"
+                              spellCheck={false}
+                              disabled={grokSaving}
+                            />
+                          </div>
+                          <div className="space-y-1.5">
+                            <label className="text-[11px] text-muted-foreground">
+                              {t("grok.customApiBackendLabel")}
+                            </label>
+                            <Select
+                              value={
+                                selectedDraft.grokCustomApiBackend ||
+                                GROK_DEFAULT_API_BACKEND
+                              }
+                              disabled={grokSaving}
+                              onValueChange={(value) =>
+                                updateSelectedDraft((current) => ({
+                                  ...current,
+                                  grokCustomApiBackend: value,
+                                }))
+                              }
                             >
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="responses">
-                                {t("grok.backendResponses")}
-                              </SelectItem>
-                              <SelectItem value="chat_completions">
-                                {t("grok.backendChatCompletions")}
-                              </SelectItem>
-                              <SelectItem value="messages">
-                                {t("grok.backendMessages")}
-                              </SelectItem>
-                            </SelectContent>
-                          </Select>
+                              <SelectTrigger
+                                className="w-full"
+                                aria-label={t("grok.customApiBackendLabel")}
+                              >
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="responses">
+                                  {t("grok.backendResponses")}
+                                </SelectItem>
+                                <SelectItem value="chat_completions">
+                                  {t("grok.backendChatCompletions")}
+                                </SelectItem>
+                                <SelectItem value="messages">
+                                  {t("grok.backendMessages")}
+                                </SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
                         </div>
-                      </div>
 
-                      <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
-                          {t("grok.customApiKeyLabel")}
-                        </label>
-                        <div className="flex items-center gap-2">
+                        <div className="space-y-1.5">
+                          <label className="text-[11px] text-muted-foreground">
+                            {t("grok.customApiKeyLabel")}
+                          </label>
+                          <div className="flex items-center gap-2">
+                            <Input
+                              type={showGrokCustomKey ? "text" : "password"}
+                              value={selectedDraft.grokCustomApiKey}
+                              onChange={(event) =>
+                                updateSelectedDraft((current) => ({
+                                  ...current,
+                                  grokCustomApiKey: event.target.value,
+                                }))
+                              }
+                              placeholder="xai-..."
+                              aria-label={t("grok.customApiKeyLabel")}
+                              name="grok-custom-api-key"
+                              autoComplete="off"
+                              spellCheck={false}
+                              disabled={grokSaving}
+                            />
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              disabled={grokSaving}
+                              onClick={() =>
+                                setShowGrokCustomKey((prev) => !prev)
+                              }
+                              aria-label={
+                                showGrokCustomKey
+                                  ? t("actions.hideApiKey")
+                                  : t("actions.showApiKey")
+                              }
+                              title={
+                                showGrokCustomKey
+                                  ? t("actions.hideApiKey")
+                                  : t("actions.showApiKey")
+                              }
+                            >
+                              {showGrokCustomKey ? (
+                                <EyeOff className="h-3.5 w-3.5" />
+                              ) : (
+                                <Eye className="h-3.5 w-3.5" />
+                              )}
+                            </Button>
+                          </div>
+                          <p className="text-[11px] text-muted-foreground">
+                            {t("grok.customApiKeyHint")}
+                          </p>
+                        </div>
+
+                        <div className="space-y-1.5">
+                          <label className="text-[11px] text-muted-foreground">
+                            {t("grok.customContextWindowLabel")}
+                          </label>
                           <Input
-                            type={showGrokCustomKey ? "text" : "password"}
-                            value={selectedDraft.grokCustomApiKey}
+                            type="number"
+                            inputMode="numeric"
+                            value={selectedDraft.grokCustomContextWindow}
                             onChange={(event) =>
                               updateSelectedDraft((current) => ({
                                 ...current,
-                                grokCustomApiKey: event.target.value,
+                                grokCustomContextWindow: event.target.value,
                               }))
                             }
-                            placeholder="xai-..."
-                            aria-label={t("grok.customApiKeyLabel")}
-                            name="grok-custom-api-key"
-                            autoComplete="off"
-                            spellCheck={false}
+                            placeholder="500000"
+                            aria-label={t("grok.customContextWindowLabel")}
                             disabled={grokSaving}
                           />
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            disabled={grokSaving}
-                            onClick={() =>
-                              setShowGrokCustomKey((prev) => !prev)
-                            }
-                            aria-label={
-                              showGrokCustomKey
-                                ? t("actions.hideApiKey")
-                                : t("actions.showApiKey")
-                            }
-                            title={
-                              showGrokCustomKey
-                                ? t("actions.hideApiKey")
-                                : t("actions.showApiKey")
-                            }
-                          >
-                            {showGrokCustomKey ? (
-                              <EyeOff className="h-3.5 w-3.5" />
-                            ) : (
-                              <Eye className="h-3.5 w-3.5" />
-                            )}
-                          </Button>
+                          <p className="text-[11px] text-muted-foreground">
+                            {t("grok.customContextWindowHint")}
+                          </p>
                         </div>
-                        <p className="text-[11px] text-muted-foreground">
-                          {t("grok.customApiKeyHint")}
-                        </p>
                       </div>
-
-                      <div className="space-y-1.5">
-                        <label className="text-[11px] text-muted-foreground">
-                          {t("grok.customContextWindowLabel")}
-                        </label>
-                        <Input
-                          type="number"
-                          inputMode="numeric"
-                          value={selectedDraft.grokCustomContextWindow}
-                          onChange={(event) =>
-                            updateSelectedDraft((current) => ({
-                              ...current,
-                              grokCustomContextWindow: event.target.value,
-                            }))
-                          }
-                          placeholder="500000"
-                          aria-label={t("grok.customContextWindowLabel")}
-                          disabled={grokSaving}
-                        />
-                        <p className="text-[11px] text-muted-foreground">
-                          {t("grok.customContextWindowHint")}
-                        </p>
-                      </div>
-                    </div>
+                    ) : null}
 
                     {/* Compaction — session-global auto-compact threshold. */}
                     <div className="space-y-1.5">
@@ -10045,6 +10634,66 @@ supports_websockets = true`}
                       </Button>
                     </div>
                   </div>
+                ) : isCustomAgentType(selectedAgent.agent_type) ? (
+                  // A custom agent is driven purely by the ACP protocol: codeg
+                  // knows nothing about its config file layout or auth model,
+                  // so the generic "config management" editor below would be
+                  // offering to write a file that may not exist in a format it
+                  // cannot know. Environment variables (above) are the one
+                  // channel that works for every agent, so they are the whole
+                  // surface — plus the skills declaration and removing the
+                  // agent.
+                  <>
+                    <div className="space-y-3 rounded-md border bg-muted/10 p-3">
+                      <div>
+                        <label className="text-xs font-medium">
+                          {t("customAgentEdit")}
+                        </label>
+                        <p className="mt-1 text-[11px] text-muted-foreground">
+                          {t("customAgentEditHint")}
+                        </p>
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          setEditCustomAgentId(
+                            customAgentId(selectedAgent.agent_type)
+                          )
+                        }
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                        {t("customAgentEdit")}
+                      </Button>
+                    </div>
+                    <CustomAgentSkillsToggle
+                      registryId={customAgentId(selectedAgent.agent_type) ?? ""}
+                    />
+                    <div className="space-y-3 rounded-md border border-destructive/30 bg-destructive/5 p-3">
+                      <div>
+                        <label className="text-xs font-medium text-destructive">
+                          {t("customAgentRemove")}
+                        </label>
+                        <p className="mt-1 text-[11px] text-muted-foreground">
+                          {t("customAgentRemoveHint")}
+                        </p>
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="text-destructive hover:text-destructive"
+                        disabled={removingCustomAgent}
+                        onClick={() => setRemoveConfirmAgent(selectedAgent)}
+                      >
+                        {removingCustomAgent ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Trash2 className="h-3.5 w-3.5" />
+                        )}
+                        {t("customAgentRemove")}
+                      </Button>
+                    </div>
+                  </>
                 ) : (
                   <div className="space-y-3 rounded-md border bg-muted/10 p-3">
                     <div>
@@ -10257,7 +10906,7 @@ supports_websockets = true`}
                                   event.target.value
                                 )
                               }}
-                              placeholder="claude-opus-4-8"
+                              placeholder="claude-opus-5"
                             />
                           </div>
                           <div className="space-y-1.5">
@@ -10314,7 +10963,7 @@ supports_websockets = true`}
                                   event.target.value
                                 )
                               }}
-                              placeholder="claude-opus-4-8"
+                              placeholder="claude-opus-5"
                             />
                           </div>
                         </div>
@@ -10339,7 +10988,7 @@ supports_websockets = true`}
                                     event.target.value
                                   )
                                 }}
-                                placeholder="my-gateway/claude-opus-4-8"
+                                placeholder="my-gateway/claude-opus-5"
                               />
                             </div>
                             <div className="space-y-1.5">
@@ -10420,6 +11069,48 @@ supports_websockets = true`}
                             </SelectContent>
                           </Select>
                         </div>
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between rounded-md border px-3 py-2">
+                            <label className="text-[11px] text-muted-foreground">
+                              {t("claude.sendAttributionHeader")}
+                            </label>
+                            <Switch
+                              checked={
+                                selectedDraft.claudeSendAttributionHeader
+                              }
+                              onCheckedChange={(checked) => {
+                                handleClaudeEnvFlagChange(
+                                  "claudeSendAttributionHeader",
+                                  CLAUDE_ATTRIBUTION_HEADER_ENV_KEY,
+                                  checked
+                                )
+                              }}
+                              aria-label={t("claude.sendAttributionHeaderAria")}
+                            />
+                          </div>
+                        </div>
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between rounded-md border px-3 py-2">
+                            <label className="text-[11px] text-muted-foreground">
+                              {t("claude.disableNonessentialTraffic")}
+                            </label>
+                            <Switch
+                              checked={
+                                selectedDraft.claudeDisableNonessentialTraffic
+                              }
+                              onCheckedChange={(checked) => {
+                                handleClaudeEnvFlagChange(
+                                  "claudeDisableNonessentialTraffic",
+                                  CLAUDE_NONESSENTIAL_TRAFFIC_ENV_KEY,
+                                  checked
+                                )
+                              }}
+                              aria-label={t(
+                                "claude.disableNonessentialTrafficAria"
+                              )}
+                            />
+                          </div>
+                        </div>
                       </div>
                     ) : (
                       <div className="space-y-1.5">
@@ -10484,7 +11175,7 @@ supports_websockets = true`}
                           // env→config (never parallel): persistEnv also rewrites
                           // config.env on the backend, so concurrent writes would
                           // interleave two writers of ~/.claude/settings.json.
-                          const configToSave = configTextForClaudeSave(
+                          let configToSave = configTextForClaudeSave(
                             selectedDraft.configText,
                             selectedAgent.agent_type,
                             selectedDraft.modelProviderId,
@@ -10492,10 +11183,32 @@ supports_websockets = true`}
                               (p) => p.id === selectedDraft.modelProviderId
                             )
                           )
+                          // Materialize the Claude hardening toggles so the shown
+                          // default positions are actually applied on save —
+                          // writing the explicit "1"/"0" into both the native
+                          // config `env` and the DB env overlay — regardless of
+                          // whether the user touched the switches. Invalid JSON is
+                          // left untouched so persistConfig surfaces the error.
+                          let envToSave = selectedDraft.envText
+                          if (selectedAgent.agent_type === "claude_code") {
+                            const materialized =
+                              materializeClaudeHardeningFlags(
+                                configToSave,
+                                envToSave,
+                                {
+                                  sendAttributionHeader:
+                                    selectedDraft.claudeSendAttributionHeader,
+                                  disableNonessentialTraffic:
+                                    selectedDraft.claudeDisableNonessentialTraffic,
+                                }
+                              )
+                            configToSave = materialized.configText
+                            envToSave = materialized.envText
+                          }
                           persistEnv(
                             selectedAgent.agent_type,
                             selectedDraft.enabled,
-                            selectedDraft.envText,
+                            envToSave,
                             selectedDraft.modelProviderId
                           )
                             .then(() =>
@@ -10505,21 +11218,40 @@ supports_websockets = true`}
                               )
                             )
                             .then(() => {
-                              // Reflect the provider-authoritative rewrite in the
-                              // editor so the textarea doesn't keep showing a
-                              // stale value (e.g. a cleared custom model option)
-                              // until reload — only when the rewrite changed it.
-                              // The inner guard preserves any edit the user typed
-                              // into the still-editable textarea while the save
-                              // was in flight (don't clobber a newer draft).
-                              if (configToSave !== selectedDraft.configText) {
-                                const synced = normalizeConfigText(configToSave)
-                                updateSelectedDraft((current) =>
-                                  current.configText ===
-                                  selectedDraft.configText
-                                    ? { ...current, configText: synced }
-                                    : current
-                                )
+                              // Reflect the provider-authoritative rewrite AND the
+                              // materialized hardening flags in the editors so the
+                              // textareas don't show stale values until reload —
+                              // and so a later env-only save doesn't persist a
+                              // stale envText that drops the flags from the DB
+                              // overlay. Each inner guard preserves an edit the
+                              // user typed while the save was in flight.
+                              const syncedConfig =
+                                configToSave !== selectedDraft.configText
+                                  ? normalizeConfigText(configToSave)
+                                  : null
+                              const syncEnv =
+                                envToSave !== selectedDraft.envText
+                              if (syncedConfig !== null || syncEnv) {
+                                updateSelectedDraft((current) => {
+                                  let next = current
+                                  if (
+                                    syncedConfig !== null &&
+                                    current.configText ===
+                                      selectedDraft.configText
+                                  ) {
+                                    next = {
+                                      ...next,
+                                      configText: syncedConfig,
+                                    }
+                                  }
+                                  if (
+                                    syncEnv &&
+                                    current.envText === selectedDraft.envText
+                                  ) {
+                                    next = { ...next, envText: envToSave }
+                                  }
+                                  return next
+                                })
                               }
                               toast.success(t("toasts.configSaved"), {
                                 description: t("toasts.configSavedHint"),
@@ -10656,6 +11388,41 @@ supports_websockets = true`}
                   {t("actions.confirmUninstall")}
                 </>
               )}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={Boolean(removeConfirmAgent)}
+        onOpenChange={(open) => {
+          if (!open) setRemoveConfirmAgent(null)
+        }}
+      >
+        <AlertDialogContent size="sm">
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("customAgentRemove")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("customAgentRemoveConfirm", {
+                name: removeConfirmAgent?.name ?? "Agent",
+              })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={removingCustomAgent}>
+              {t("actions.cancel")}
+            </AlertDialogCancel>
+            <Button
+              variant="destructive"
+              onClick={confirmRemoveCustomAgent}
+              disabled={removingCustomAgent}
+            >
+              {removingCustomAgent ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Trash2 className="h-3.5 w-3.5" />
+              )}
+              {t("customAgentRemove")}
             </Button>
           </AlertDialogFooter>
         </AlertDialogContent>

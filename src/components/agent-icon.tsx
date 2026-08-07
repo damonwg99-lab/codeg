@@ -1,7 +1,15 @@
-import { memo, useId } from "react"
+import { memo, useId, useState, useSyncExternalStore } from "react"
 
 import type { AgentType } from "@/lib/types"
-import { AGENT_COLORS } from "@/lib/types"
+import {
+  getAgentColor,
+  getAgentIconUrl,
+  getAgentInitial,
+  getCustomAgentDisplayVersion,
+  isCustomAgentType,
+  isMonochromeSvgDataUrl,
+  subscribeCustomAgentDisplay,
+} from "@/lib/custom-agents"
 import { cn } from "@/lib/utils"
 
 interface AgentIconProps {
@@ -360,6 +368,27 @@ const GrokMonoIcon = memo(function GrokMonoIcon({ size = "1em" }: IconProps) {
   )
 })
 
+const CursorMonoIcon = memo(function CursorMonoIcon({
+  size = "1em",
+}: IconProps) {
+  // Cursor's cube mark — the official glyph from the ACP registry
+  // (cdn.agentclientprotocol.com/registry/v1/latest/cursor.svg), already
+  // authored in currentColor so it renders frameless like the other mono marks.
+  return (
+    <svg
+      fill="currentColor"
+      height={size}
+      style={baseSvgStyle}
+      viewBox="0 0 466.73 532.09"
+      width={size}
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <title>Cursor</title>
+      <path d="M457.43,125.94L244.42,2.96c-6.84-3.95-15.28-3.95-22.12,0L9.3,125.94c-5.75,3.32-9.3,9.46-9.3,16.11v247.99c0,6.65,3.55,12.79,9.3,16.11l213.01,122.98c6.84,3.95,15.28,3.95,22.12,0l213.01-122.98c5.75-3.32,9.3-9.46,9.3-16.11v-247.99c0-6.65-3.55-12.79-9.3-16.11h-.01ZM444.05,151.99l-205.63,356.16c-1.39,2.4-5.06,1.42-5.06-1.36v-233.21c0-4.66-2.49-8.97-6.53-11.31L24.87,145.67c-2.4-1.39-1.42-5.06,1.36-5.06h411.26c5.84,0,9.49,6.33,6.57,11.39h-.01Z" />
+    </svg>
+  )
+})
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyIcon = React.ComponentType<any>
 
@@ -378,6 +407,7 @@ const MONO_ICONS: Partial<Record<AgentType, AnyIcon>> = {
   hermes: HermesMonoIcon,
   code_buddy: CodeBuddyMonoIcon,
   grok: GrokMonoIcon,
+  cursor: CursorMonoIcon,
 }
 
 // Per-agent color override for mono marks, layered on top of the default
@@ -415,13 +445,113 @@ export function AgentIcon({ agentType, className }: AgentIconProps) {
     )
   }
 
+  // Custom ACP agents have no compiled-in mark, but most carry one of their
+  // own: the registry's `icon`, downloaded and inlined as a `data:` URL when
+  // the agent was added, or a file the user uploaded in the manual form. Agents
+  // with neither fall back to a deterministic colored initial.
+  if (isCustomAgentType(agentType)) {
+    return <CustomAgentIcon agentType={agentType} className={className} />
+  }
+
   return (
     <span
       className={cn(
         "rounded-full shrink-0",
-        AGENT_COLORS[agentType],
+        getAgentColor(agentType),
         className
       )}
     />
+  )
+}
+
+/**
+ * A monochrome custom-agent mark, drawn as a CSS mask filled with
+ * `currentColor` so it follows the theme — registry marks are `currentColor`
+ * SVGs, which an `<img>` renders black and therefore invisible in dark mode.
+ * Pinned to `text-foreground` like the compiled-in mono marks; an explicit
+ * `text-*` in `className` still wins.
+ */
+export function MaskedMonoIcon({
+  iconUrl,
+  className,
+}: {
+  iconUrl: string
+  className?: string
+}) {
+  // Only base64 `data:` URLs reach here (see `isMonochromeSvgDataUrl`), whose
+  // alphabet is safe inside a CSS `url("…")` verbatim.
+  const mask = `url("${iconUrl}")`
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        "inline-block shrink-0 bg-current text-foreground",
+        className
+      )}
+      style={{
+        WebkitMaskImage: mask,
+        WebkitMaskRepeat: "no-repeat",
+        WebkitMaskPosition: "center",
+        WebkitMaskSize: "contain",
+        maskImage: mask,
+        maskRepeat: "no-repeat",
+        maskPosition: "center",
+        maskSize: "contain",
+      }}
+    />
+  )
+}
+
+function CustomAgentIcon({ agentType, className }: AgentIconProps) {
+  // The icon map is hydrated asynchronously from the agent list; re-render when
+  // it lands so the mark replaces the placeholder initial on its own.
+  useSyncExternalStore(
+    subscribeCustomAgentDisplay,
+    getCustomAgentDisplayVersion,
+    getCustomAgentDisplayVersion
+  )
+  const iconUrl = getAgentIconUrl(agentType)
+  // An icon that fails to decode (a corrupt upload, or a stored URL the webview
+  // cannot reach) must degrade to the initial rather than leave a broken image.
+  // Tracked by URL rather than as a flag so replacing the icon retries it
+  // without needing an effect to clear the flag.
+  const [failedUrl, setFailedUrl] = useState<string | null>(null)
+  const failed = iconUrl !== null && failedUrl === iconUrl
+
+  if (iconUrl && isMonochromeSvgDataUrl(iconUrl)) {
+    return <MaskedMonoIcon iconUrl={iconUrl} className={className} />
+  }
+
+  if (iconUrl && !failed) {
+    return (
+      // eslint-disable-next-line @next/next/no-img-element
+      <img
+        src={iconUrl}
+        alt=""
+        aria-hidden
+        onError={() => setFailedUrl(iconUrl)}
+        // `<img>` never executes script in an SVG, so an untrusted mark is
+        // safe here in a way an inline `<svg>` would not be.
+        className={cn(
+          "inline-block shrink-0 rounded-[0.2em] object-contain",
+          className
+        )}
+      />
+    )
+  }
+
+  return (
+    <span
+      className={cn(
+        "inline-flex shrink-0 items-center justify-center rounded-full text-white",
+        getAgentColor(agentType),
+        className
+      )}
+      aria-hidden
+    >
+      <span className="text-[0.6em] font-semibold leading-none">
+        {getAgentInitial(agentType)}
+      </span>
+    </span>
   )
 }

@@ -21,7 +21,8 @@ import type {
   FileContentMatch,
 } from "@/lib/types"
 import { useFileTree, type FlatFileEntry } from "@/hooks/use-file-tree"
-import { AGENT_LABELS, compareAgentType } from "@/lib/types"
+import { compareAgentType } from "@/lib/types"
+import { getAgentLabel } from "@/lib/custom-agents"
 import { AgentIcon } from "@/components/agent-icon"
 import { ConversationStatusDot } from "@/components/conversations/conversation-status-dot"
 import {
@@ -72,6 +73,10 @@ export function SearchCommandDialog({
   const [searching, setSearching] = useState(false)
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined)
 
+  // Content-search state (files tab). Backed by the streaming
+  // `search_files_content_streaming` Tauri command on desktop (subscribed via
+  // the `search_files_content:results` event) and a single HTTP call on the
+  // web/server path.
   const [contentResults, setContentResults] = useState<FileContentMatch[]>([])
   const [contentSearching, setContentSearching] = useState(false)
   const contentDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined)
@@ -95,7 +100,10 @@ export function SearchCommandDialog({
     new Set(conversations.map((c) => c.agent_type))
   ).sort(compareAgentType)
 
-  // Filter files by query using pre-computed lowercase fields
+  // Filter files by query using pre-computed lowercase fields. When the query
+  // is empty, show top-level files/dirs (dotfiles excluded by default) so a
+  // freshly opened tab has something to browse; otherwise do a fast
+  // substring match against the precomputed lowercase name/path fields.
   const filteredFiles = useMemo(() => {
     const trimmed = query.trim()
     if (!trimmed) {
@@ -232,8 +240,7 @@ export function SearchCommandDialog({
   // Debounced content search on query change (files tab only)
   useEffect(() => {
     if (activeTab !== "files") return
-    if (contentDebounceRef.current)
-      clearTimeout(contentDebounceRef.current)
+    if (contentDebounceRef.current) clearTimeout(contentDebounceRef.current)
 
     const trimmed = query.trim()
     if (trimmed.length >= 2) {
@@ -244,8 +251,7 @@ export function SearchCommandDialog({
       doContentSearch(query)
     }, 400)
     return () => {
-      if (contentDebounceRef.current)
-        clearTimeout(contentDebounceRef.current)
+      if (contentDebounceRef.current) clearTimeout(contentDebounceRef.current)
     }
   }, [query, doContentSearch, activeTab])
 
@@ -394,7 +400,7 @@ export function SearchCommandDialog({
               )}
             >
               <AgentIcon agentType={at} className="w-3.5 h-3.5" />
-              {AGENT_LABELS[at]}
+              {getAgentLabel(at)}
             </button>
           ))}
         </div>
@@ -427,7 +433,7 @@ export function SearchCommandDialog({
                         t("untitledConversation")}
                     </span>
                     <span className="text-xs text-muted-foreground shrink-0">
-                      {AGENT_LABELS[conv.agent_type]}
+                      {getAgentLabel(conv.agent_type)}
                     </span>
                     <span className="text-xs text-muted-foreground shrink-0">
                       {formatDistanceToNow(new Date(conv.created_at), {
@@ -450,8 +456,7 @@ export function SearchCommandDialog({
                 ? t("searching")
                 : !query.trim()
                   ? t("typeToSearchFiles")
-                  : filteredFiles.length === 0 &&
-                      contentResults.length === 0
+                  : filteredFiles.length === 0 && contentResults.length === 0
                     ? t("noResults")
                     : contentSearching
                       ? t("searching")
@@ -482,9 +487,24 @@ export function SearchCommandDialog({
               <CommandGroup heading={t("contentMatches")}>
                 {contentSearching ? (
                   <div className="flex items-center gap-2 px-2 py-3 text-sm text-muted-foreground">
-                    <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                    <svg
+                      className="w-3 h-3 animate-spin"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                    >
+                      <circle
+                        className="opacity-25"
+                        cx="12"
+                        cy="12"
+                        r="10"
+                        stroke="currentColor"
+                        strokeWidth="4"
+                      />
+                      <path
+                        className="opacity-75"
+                        fill="currentColor"
+                        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+                      />
                     </svg>
                     {t("searching")}
                   </div>

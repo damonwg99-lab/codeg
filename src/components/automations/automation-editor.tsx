@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useRef, useState } from "react"
+import { getAgentLabel } from "@/lib/custom-agents"
 import { ArrowLeft, Folder, Globe, Wand2 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
@@ -9,13 +10,10 @@ import {
   RichComposer,
   type RichComposerHandle,
 } from "@/components/chat/composer/rich-composer"
-import {
-  useReferenceSearch,
-  type ReferenceGroupLabels,
-} from "@/components/chat/composer/use-reference-search"
+import { useReferenceSearch } from "@/components/chat/composer/use-reference-search"
+import { useComposerMentionLabels } from "@/components/chat/composer/use-composer-mention-labels"
 import { docToPromptBlocks } from "@/components/chat/composer/to-prompt-blocks"
 import { isComposerChromeClick } from "@/components/chat/composer/composer-commands"
-import type { MentionUiLabels } from "@/components/chat/composer/suggestion/types"
 import {
   AgentConfigSection,
   effectiveSelections,
@@ -41,7 +39,6 @@ import {
 } from "@/components/ui/select"
 import { cn } from "@/lib/utils"
 import { automationComputeNextRun } from "@/lib/api"
-import { AGENT_LABELS } from "@/lib/types"
 import type {
   AgentType,
   Automation,
@@ -84,8 +81,6 @@ export function AutomationEditor({
   onBackToTemplates,
 }: AutomationEditorProps) {
   const t = useTranslations("Automations")
-  // The @-mention panel chrome reuses the chat composer's existing keys.
-  const tComposer = useTranslations("Folder.chat.messageInput")
   const folders = useAppWorkspaceStore((s) => s.folders)
 
   const [name, setName] = useState(automation?.name ?? "")
@@ -146,27 +141,8 @@ export function AutomationEditor({
   // config snapshot scoped to the right folder.
   const folderPathResolving = folderId != null && folderPath == null
 
-  const referenceGroupLabels = useMemo<ReferenceGroupLabels>(
-    () => ({
-      file: tComposer("mentionGroupFile"),
-      agent: tComposer("mentionGroupAgent"),
-      session: tComposer("mentionGroupSession"),
-      commit: tComposer("mentionGroupCommit"),
-      skill: tComposer("mentionGroupSkill"),
-      context: tComposer("mentionGroupContext"),
-    }),
-    [tComposer]
-  )
-  const mentionUiLabels = useMemo<MentionUiLabels>(
-    () => ({
-      empty: tComposer("mentionEmpty"),
-      loading: tComposer("mentionLoading"),
-      listbox: tComposer("mentionListLabel"),
-      more: tComposer("mentionMore"),
-      count: (count: number) => tComposer("mentionCount", { count }),
-    }),
-    [tComposer]
-  )
+  const { groupLabels: referenceGroupLabels, uiLabels: mentionUiLabels } =
+    useComposerMentionLabels()
   // Live data sources for the @ panel (files/agents/sessions/commits). All
   // transport-only — no live ACP session needed; just the folder path.
   const referenceSearch = useReferenceSearch({
@@ -274,7 +250,7 @@ export function AutomationEditor({
         ? automation.agent_type
         : agentType
       const label_snapshot = {
-        agent_label: AGENT_LABELS[agentType] ?? agentType,
+        agent_label: getAgentLabel(agentType) ?? agentType,
         ...(folderName ? { folder_label: folderName } : {}),
         ...snapshotLabels(snapshot, mode_id, config_values),
       }

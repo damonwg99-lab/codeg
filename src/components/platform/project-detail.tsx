@@ -38,7 +38,8 @@ function resolveStatusLabel(t: (key: never) => string, status: string): string {
     confirmed: "task.status.confirmed",
     in_progress: "task.status.in_progress",
     done: "task.status.done",
-    released: "task.status.released",
+    pending: "task.status.pending",
+    archived: "task.status.archived",
   }
   const key = keyMap[status]
   return key ? (t(key as never) ?? status) : status
@@ -58,7 +59,7 @@ function resolveProjectStatusLabel(
 export function ProjectDetail({ id }: { id: number }) {
   const t = useTranslations("Platform")
   const { activeProjectId, loadProjectDetail, loadProjects } = usePlatform()
-  const { setRoute } = useWorkbenchRoute()
+  const { setRoute, fromRoute, back } = useWorkbenchRoute()
   const [detail, setDetail] = useState<ProjectDetail | null>(null)
   const [loading, setLoading] = useState(true)
   const [editing, setEditing] = useState(false)
@@ -153,7 +154,7 @@ export function ProjectDetail({ id }: { id: number }) {
       setScanResults([])
     }
     setScanning(false)
-  }, [detail])
+  }, [detail, setScanning, setScanResults, setSelectedScanRepos])
 
   const handleAddRepos = useCallback(async () => {
     if (!detail) return
@@ -193,6 +194,10 @@ export function ProjectDetail({ id }: { id: number }) {
     id,
     activeProjectId,
     loadProjectDetail,
+    setFailedAddRepos,
+    setDetail,
+    setScanResults,
+    setSelectedScanRepos,
   ])
 
   const handleRemoveRepo = useCallback(
@@ -233,18 +238,17 @@ export function ProjectDetail({ id }: { id: number }) {
 
   return (
     <ScrollArea className="h-full">
-      <div className="flex flex-col gap-6 p-4 sm:p-6">
+      <div className="flex flex-col gap-6 px-4 pb-4 pt-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Button
               variant="ghost"
               size="icon"
               className="h-7 w-7"
-              onClick={() => setRoute("project-list")}
+              onClick={() => (fromRoute ? back() : setRoute("project-list"))}
             >
               <ArrowLeft className="h-4 w-4" />
             </Button>
-            <h2 className="text-lg font-semibold">{project.name}</h2>
           </div>
           <div className="flex items-center gap-1">
             {editing ? (
@@ -311,7 +315,7 @@ export function ProjectDetail({ id }: { id: number }) {
             variant="outline"
             className="text-[0.625rem] bg-purple-50 text-purple-700 dark:bg-purple-950 dark:text-purple-300"
           >
-            {taskCountByStatus.released} {resolveStatusLabel(t, "released")}
+            {taskCountByStatus.archived} {resolveStatusLabel(t, "archived")}
           </Badge>
         </div>
 

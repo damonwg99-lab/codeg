@@ -24,6 +24,11 @@ pub struct TaskInfo {
     pub zentao_module: Option<String>,
     pub kb_refs_json: Option<String>,
     pub affected_repos_json: Option<String>,
+    pub related_db_scripts_json: Option<String>,
+    pub branch_count: i32,
+    pub db_script_count: i32,
+    pub branch_statuses: Vec<String>,
+    pub archived_release_code: Option<String>,
     pub delegation_config: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -37,6 +42,17 @@ pub struct TaskDetail {
     pub sub_tasks: Vec<TaskInfo>,
     pub attachments: Vec<KnowledgeDocInfo>,              // doc_type = "task_attachment"
     pub ai_intermediate_docs: Vec<KnowledgeDocInfo>,     // doc_type = "ai_intermediate"
+    pub branches: Vec<TaskBranchInfo>,                   // 任务关联的分支
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskBranchInfo {
+    pub branch_id: i32,
+    pub repo_name: String,
+    pub branch: String,
+    pub status: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

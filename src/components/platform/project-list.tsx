@@ -29,7 +29,7 @@ export function ProjectList() {
   if (loadingProjects) {
     return (
       <ScrollArea className="h-full">
-        <div className="flex flex-col gap-6 p-4 sm:p-6">
+        <div className="flex flex-col px-4 pb-4 pt-4">
           <div className="text-muted-foreground">Loading…</div>
         </div>
       </ScrollArea>
@@ -39,10 +39,14 @@ export function ProjectList() {
   if (projects.length === 0) {
     return (
       <ScrollArea className="h-full">
-        <div className="flex flex-col items-center justify-center gap-4 p-4 sm:p-6 py-16">
+        <div className="flex flex-col items-center justify-center gap-4 px-4 py-16">
           <FolderOpen className="h-12 w-12 text-muted-foreground" />
           <p className="text-muted-foreground">{t("switcher.noProject")}</p>
-          <Button onClick={() => setRoute("create-project")}>
+          <Button
+            onClick={() =>
+              setRoute("create-project", {}, { routeId: "project-list" })
+            }
+          >
             <Plus className="mr-1 h-4 w-4" />
             {t("project.create")}
           </Button>
@@ -53,13 +57,14 @@ export function ProjectList() {
 
   return (
     <ScrollArea className="h-full">
-      <div className="flex flex-col gap-6 p-4 sm:p-6">
-        <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold">{t("nav.projectList")}</h2>
+      <div className="flex flex-col gap-6 px-4 pb-4 pt-4">
+        <div className="flex items-center justify-end">
           <Button
             variant="outline"
             size="sm"
-            onClick={() => setRoute("create-project")}
+            onClick={() =>
+              setRoute("create-project", {}, { routeId: "project-list" })
+            }
           >
             <Plus className="mr-1 h-3.5 w-3.5" />
             {t("nav.createProject")}
@@ -73,7 +78,15 @@ export function ProjectList() {
                 "cursor-pointer transition-colors hover:bg-accent",
                 activeProjectId === project.id && "ring-2 ring-primary"
               )}
-              onClick={() => setRoute("project-detail", { id: project.id })}
+              onClick={() =>
+                setRoute(
+                  "project-detail",
+                  { id: project.id },
+                  {
+                    routeId: "project-list",
+                  }
+                )
+              }
             >
               <CardHeader className="pb-2">
                 <div className="flex items-center justify-between">

@@ -7,10 +7,15 @@ import type { Components, LinkSafetyModalProps } from "streamdown"
 
 import { ReferenceBadge } from "@/components/chat/composer/badges/reference-badge"
 import { parseCodegReferenceUri } from "@/components/chat/composer/reference-uri"
+import { FileReferenceActions } from "@/components/message/file-reference-actions"
 import type { ReferenceAttrs } from "@/components/chat/composer/types"
 import { classifyResourceKind, type ResourceKind } from "@/lib/resource-kind"
 import { cn } from "@/lib/utils"
-import { useStreamdownLinkSafety } from "./link-safety"
+import {
+  openExternalTab,
+  openLinkWithSafety,
+  useStreamdownLinkSafety,
+} from "./link-safety"
 
 const RESOURCE_KIND_ICON: Record<ResourceKind, LucideIcon> = {
   file: FileText,
@@ -65,15 +70,14 @@ export function MarkdownLink({
 
   const isIncomplete = href === INCOMPLETE_LINK
 
+  // Deliberately NOT async: `openLinkWithSafety` opens the tab inside this
+  // handler's own call stack, because awaiting the (synchronous) safety verdict
+  // costs the user gesture that WebKit's popup blocker requires — see #410.
   const handleClick = useCallback(
-    async (event: MouseEvent<HTMLButtonElement>) => {
+    (event: MouseEvent<HTMLButtonElement>) => {
       if (!href || isIncomplete) return
       event.preventDefault()
-      if (linkSafety.onLinkCheck && (await linkSafety.onLinkCheck(href))) {
-        window.open(href, "_blank", "noreferrer")
-        return
-      }
-      setModalOpen(true)
+      openLinkWithSafety(href, linkSafety, () => setModalOpen(true))
     },
     [href, isIncomplete, linkSafety]
   )
@@ -111,7 +115,7 @@ export function MarkdownLink({
     url: href,
     isOpen: modalOpen,
     onClose: () => setModalOpen(false),
-    onConfirm: () => window.open(href, "_blank", "noreferrer"),
+    onConfirm: () => openExternalTab(href),
   }
 
   // A file reference — a `file://` uri (rewritten to a local path by
@@ -148,15 +152,19 @@ export function MarkdownLink({
     }
     return (
       <>
-        <button
-          type="button"
-          data-resource-kind="file"
-          title={href}
-          onClick={handleClick}
-          className="inline-flex max-w-full -translate-y-[1.5px] cursor-pointer appearance-none items-center align-middle leading-none hover:opacity-80"
-        >
-          <ReferenceBadge data={fileData} />
-        </button>
+        {/* Right-clicking the badge opens its actions (reveal in file manager /
+            copy paths); a left click still opens the file. */}
+        <FileReferenceActions target={href}>
+          <button
+            type="button"
+            data-resource-kind="file"
+            title={href}
+            onClick={handleClick}
+            className="inline-flex max-w-full -translate-y-[1.5px] cursor-pointer appearance-none items-center align-middle leading-none hover:opacity-80"
+          >
+            <ReferenceBadge data={fileData} />
+          </button>
+        </FileReferenceActions>
         {linkSafety.renderModal ? linkSafety.renderModal(modalProps) : null}
       </>
     )

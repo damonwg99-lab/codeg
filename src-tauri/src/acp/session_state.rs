@@ -10,10 +10,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::acp::event_stream::{ConnectionEventStream, RecentEventsBuffer};
 use crate::acp::feedback::{FeedbackItem, FeedbackStatus};
+use crate::acp::plan_approval::PendingPlanApprovalState;
 use crate::acp::question::PendingQuestionState;
 use crate::acp::types::{
     AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionStatus, EventEnvelope,
-    PromptCapabilitiesInfo, SessionConfigOptionInfo, SessionModeStateInfo, ToolCallImageInfo,
+    GrokEffortSpec, PromptCapabilitiesInfo, SessionConfigOptionInfo, SessionModeStateInfo,
+    ToolCallImageInfo,
 };
 use crate::models::agent::AgentType;
 use crate::models::message::MessageRole;
@@ -31,8 +33,22 @@ pub struct LiveMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LiveContentBlock {
-    Text { text: String },
-    Thinking { text: String },
+    Text {
+        text: String,
+        /// Subagent attribution (`_meta.claudeCode.parentToolUseId`,
+        /// claude-agent-acp ≥0.63 with `subagent-transcript` advertised).
+        /// `None` = main-thread content. `default` keeps snapshots written
+        /// by older backends parseable; skip-none keeps every other agent's
+        /// snapshot byte-identical.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
+    Thinking {
+        text: String,
+        /// Same contract as `Text::parent_tool_use_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
     ToolCallRef { tool_call_id: String },
     Plan { entries: serde_json::Value },
 }
@@ -149,6 +165,11 @@ pub struct PendingPermissionState {
 pub struct SessionLastError {
     pub message: String,
     pub code: Option<String>,
+    /// Mirrors `AcpEvent::Error.details` so a client that attached after the
+    /// error (snapshot path) sees the same diagnostic evidence as one that was
+    /// live for it. Already redacted at the source.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub details: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -188,6 +209,15 @@ pub struct ActiveDelegationState {
     pub child_connection_id: String,
     pub child_conversation_id: i32,
     pub agent_type: AgentType,
+    /// Bounded task text preview + broker task id, mirrored from
+    /// `DelegationStarted` so a snapshot re-attach mid-delegation reseeds the
+    /// frontend binding WITH its label — required on hosts whose parent tool
+    /// call never carries the arguments in `raw_input` (Cursor). `default` so
+    /// a snapshot serialized by an older backend still deserializes.
+    #[serde(default)]
+    pub task_preview: String,
+    #[serde(default)]
+    pub task_id: String,
 }
 
 /// The in-flight user prompt for the current turn. Captured from
@@ -237,6 +267,16 @@ pub struct SessionState {
     /// the backend's `pending_questions` registry keys the answer one-shot.
     pub pending_question: Option<PendingQuestionState>,
 
+    /// The agent's in-flight Grok `exit_plan_mode` approval (the plan awaiting the
+    /// user's Approve / Request-changes / Abandon decision). Set by
+    /// `PlanApprovalRequest`, cleared by a matching `PlanApprovalResolved` (and
+    /// defensively on `TurnComplete`). Carried on `to_snapshot()` so a client
+    /// attaching mid-turn re-renders the approval card the one-shot event won't
+    /// replay for it. At most one is pending (the agent is blocked in its
+    /// `exit_plan_mode` tool call); the connection parks the ext responder keyed
+    /// by `approval_id`.
+    pub pending_plan_approval: Option<PendingPlanApprovalState>,
+
     /// In-flight (running) sub-agent delegations keyed by `parent_tool_use_id`.
     /// `DelegationStarted` inserts; `DelegationCompleted` removes. UNLIKE
     /// `active_tool_calls`, NOT cleared on `TurnComplete` (an async delegation
@@ -277,6 +317,14 @@ pub struct SessionState {
     pub modes: Option<SessionModeStateInfo>,
     pub current_mode: Option<String>,
     pub config_options: Option<Vec<SessionConfigOptionInfo>>,
+    /// Grok only: per-model reasoning-effort specs, parsed from the top-level
+    /// `models` of the session-establishment response (guaranteed on
+    /// `session/new`; opportunistic on resume/fork). Grok never re-sends this on
+    /// `set_model`, so it is cached here to rebuild the composer's effort
+    /// selector for the target model on a mid-session model switch. `None` for
+    /// non-Grok agents and when the response carried no `models` (flat fallback).
+    /// Backend-internal — not serialized.
+    pub grok_effort_specs: Option<std::collections::HashMap<String, GrokEffortSpec>>,
     pub prompt_capabilities: Option<PromptCapabilitiesInfo>,
     pub fork_supported: bool,
     pub available_commands: Vec<AvailableCommandInfo>,
@@ -287,15 +335,15 @@ pub struct SessionState {
     /// "init complete" without waiting for an event that already fired.
     pub selectors_ready: bool,
 
-    /// Most recent `AcpEvent::Error` payload, or `None` if no error has
-    /// landed since the connection started. The probe path reads this
-    /// after `wait_for_session_options` errors so it can fold the
-    /// agent's own error message into the returned `AcpError` instead
-    /// of surfacing a generic "connection not found" once the
-    /// connection task has cleaned up its map entry.
+    /// Most recent unresolved `AcpEvent::Error` payload. Cleared when a new
+    /// prompt starts, matching the frontend reducer's live-event behavior. The
+    /// probe path reads this after `wait_for_session_options` errors so it can
+    /// fold the agent's own error message into the returned `AcpError` instead
+    /// of surfacing a generic "connection not found" once the connection task
+    /// has cleaned up its map entry.
     ///
-    /// Not exposed on `to_snapshot()` today — chat-side error UX already
-    /// flows through the live `AcpEvent::Error` channel.
+    /// Exposed on `to_snapshot()` so clients that reconnect after missing the
+    /// live `AcpEvent::Error` can still surface the latest agent failure.
     pub last_error: Option<SessionLastError>,
 
     /// Single-fire signal that fires when `SessionStarted` applies (i.e.
@@ -344,6 +392,17 @@ pub struct SessionState {
     /// (possibly later-toggled) global setting.
     pub feedback_tool_available: bool,
 
+    /// Whether live-feedback notes for THIS session go over the native ACP
+    /// `_session/steering` push channel instead of the `check_user_feedback`
+    /// pull tool. Synthesized ONCE at initialize from three gates (extension
+    /// advertised + registry policy + `agent_info.version` runtime proof — see
+    /// `connection.rs::init_advertises_steering`) so every consumer reads one
+    /// authoritative bool and the frontend never re-derives it from agent
+    /// type. Downgraded to `false` for the rest of the session if a steer ever
+    /// comes back `startedNewTurn` (adapter ignored the `promptRequired`
+    /// opt-in), rerouting subsequent notes to the MCP pull path.
+    pub native_steering_available: bool,
+
     /// Concatenated text content of the just-completed turn's assistant
     /// message. Captured at TurnComplete (just before live_message is
     /// cleared) so the lifecycle subscriber can surface it as the
@@ -377,6 +436,30 @@ pub struct SessionState {
     /// seeing success. Not serialized: it is a connection-loop liveness flag,
     /// not part of the client-visible snapshot.
     pub turn_in_flight: bool,
+
+    /// Number of user prompts sent on THIS connection (incremented by the
+    /// manager under the prompt lock, once per send). Used as a robust
+    /// per-connection signal for context injection: the very first prompt
+    /// (count == 0) gets the full KB-rules/task-context injection; subsequent
+    /// prompts get the compact re-injection preamble every
+    /// `CODEG_REINJECTION_INTERVAL` turns. Deliberately NOT derived from the
+    /// conversation row's `message_count`, which stays 0 for the whole
+    /// lifetime of a live session. Not serialized in the client snapshot.
+    pub prompt_turn_count: usize,
+
+    /// Whether the most recently completed turn ended via a stop reason other
+    /// than `"end_turn"` (cancelled, refusal, max_tokens, max_turn_requests,
+    /// empty, unknown — the same "abnormal ending" bucket `connection.rs`
+    /// already treats uniformly for cascade-cancelling child delegations). Set
+    /// by `AcpEvent::TurnComplete`, alongside `pending_user_message`/
+    /// `turn_in_flight` clearing. The transcript watcher reads this at the
+    /// Prompting→Connected falling edge: an abnormal ending means the turn's
+    /// content never reached the wire (the ACP call was torn down before a
+    /// held sub-agent's real completion), so `current_turn_launched_ids`
+    /// must release immediately instead of waiting for the next turn — that
+    /// content has nowhere else to render. Not serialized: backend-internal,
+    /// like `turn_in_flight`.
+    pub last_turn_ended_abnormally: bool,
 
     /// True when the agent's effective settings changed after this connection
     /// was spawned — the running process is still on its launch-time config and
@@ -414,6 +497,7 @@ impl SessionState {
             active_tool_calls: BTreeMap::new(),
             pending_permission: None,
             pending_question: None,
+            pending_plan_approval: None,
             active_delegations: BTreeMap::new(),
             feedback: Vec::new(),
             background_outstanding: 0,
@@ -421,6 +505,7 @@ impl SessionState {
             modes: None,
             current_mode: None,
             config_options: None,
+            grok_effort_specs: None,
             prompt_capabilities: None,
             fork_supported: false,
             available_commands: Vec::new(),
@@ -434,10 +519,21 @@ impl SessionState {
             recent_events: RecentEventsBuffer::new(),
             delegation_token: None,
             feedback_tool_available: false,
+            native_steering_available: false,
             last_assistant_text: None,
             pending_user_message: None,
             pending_user_message_started_at: None,
             turn_in_flight: false,
+            last_turn_ended_abnormally: false,
+            // Number of user prompts sent on THIS connection (incremented by
+            // the manager under the prompt lock, once per send). Used as a
+            // robust per-connection signal for context injection: the very
+            // first prompt (count == 0) gets the full KB-rules/task-context
+            // injection; subsequent prompts get the compact re-injection
+            // preamble every `CODEG_REINJECTION_INTERVAL` turns. Deliberately
+            // NOT derived from the conversation row's `message_count`, which
+            // stays 0 for the whole lifetime of a live session.
+            prompt_turn_count: 0,
             config_stale: false,
             config_stale_kind: None,
         }
@@ -502,6 +598,24 @@ impl SessionState {
                 }
             }
             AcpEvent::StatusChanged { status } => {
+                // Diagnostic only (no behavior change): StatusChanged was
+                // never logged anywhere, so there was no way to confirm from
+                // the log alone whether a held-open turn (claude-agent-acp
+                // v0.59.0's #870) actually stayed `Prompting` through an async
+                // sub-agent's full lifecycle, or settled earlier than assumed.
+                // The suppression filter reads live `Prompting` status and is
+                // only correct if the hold behaves as documented.
+                tracing::info!(
+                    "[ACP] status_changed session={:?} {:?} -> {status:?}",
+                    self.external_id,
+                    self.status
+                );
+                if matches!(status, ConnectionStatus::Prompting) {
+                    // Match the live frontend reducer: a new prompt starts a
+                    // new error scope, so stale recoverable errors must not be
+                    // resurrected by a later snapshot attach.
+                    self.last_error = None;
+                }
                 self.status = status.clone();
             }
             AcpEvent::SessionModes { modes } => {
@@ -545,11 +659,28 @@ impl SessionState {
                     size: *size,
                 });
             }
-            AcpEvent::ContentDelta { text } => {
-                self.append_text_delta(text);
+            AcpEvent::ContentDelta {
+                text,
+                parent_tool_use_id,
+            } => {
+                // Subagent-attributed chunks accumulate only while the turn
+                // is live. Out-of-turn parented chunks (an async subagent
+                // still streaming after its parent turn settled) must not
+                // resurrect a stale `live_message` via `ensure_live_message`
+                // — a snapshot would then hand that ghost to every client
+                // (the same disease the #870 held-turn work fenced off).
+                // Main-thread chunks keep today's unconditional append.
+                if parent_tool_use_id.is_none() || self.status == ConnectionStatus::Prompting {
+                    self.append_text_delta(text, parent_tool_use_id.as_deref());
+                }
             }
-            AcpEvent::Thinking { text } => {
-                self.append_thinking_delta(text);
+            AcpEvent::Thinking {
+                text,
+                parent_tool_use_id,
+            } => {
+                if parent_tool_use_id.is_none() || self.status == ConnectionStatus::Prompting {
+                    self.append_thinking_delta(text, parent_tool_use_id.as_deref());
+                }
             }
             AcpEvent::ToolCall {
                 tool_call_id,
@@ -661,7 +792,48 @@ impl SessionState {
                     self.pending_question = None;
                 }
             }
-            AcpEvent::TurnComplete { .. } => {
+            AcpEvent::PlanApprovalRequest {
+                approval_id,
+                tool_call_id,
+                plan_markdown,
+            } => {
+                self.pending_plan_approval = Some(PendingPlanApprovalState {
+                    approval_id: approval_id.clone(),
+                    tool_call_id: tool_call_id.clone(),
+                    plan_markdown: plan_markdown.clone(),
+                    created_at: Utc::now(),
+                });
+            }
+            AcpEvent::PlanApprovalResolved { approval_id } => {
+                // Mirror `QuestionResolved`: only clear when the resolved id
+                // matches the current one, so a late event for an already-
+                // replaced approval can't wipe a live card from under the user.
+                if matches!(
+                    &self.pending_plan_approval,
+                    Some(p) if p.approval_id == *approval_id,
+                ) {
+                    self.pending_plan_approval = None;
+                }
+            }
+            AcpEvent::TurnComplete { stop_reason, .. } => {
+                // Diagnostic only (no behavior change): pairs with the
+                // StatusChanged log above. This is the ACTUAL point the turn
+                // settles (`self.status` flips to `Connected` right below,
+                // bypassing StatusChanged entirely) — needed to tell whether
+                // claude-agent-acp v0.59.0's #870 held the turn open through
+                // an async sub-agent's full lifecycle, or settled earlier.
+                // `background_outstanding` at this instant shows whether a
+                // sub-agent/shell the watcher still considers live was
+                // outstanding when the ORIGINAL turn settled.
+                tracing::info!(
+                    "[ACP] turn_complete session={:?} stop_reason={stop_reason} background_outstanding={}",
+                    self.external_id,
+                    self.background_outstanding
+                );
+                // See `last_turn_ended_abnormally`'s doc comment: any reason
+                // other than a normal end-of-turn means this turn's content
+                // may never have reached the wire.
+                self.last_turn_ended_abnormally = stop_reason != "end_turn";
                 // Snapshot the just-finished turn's FINAL assistant text — what
                 // `get_delegation_status` returns as the child result. We take
                 // the Text blocks that follow the LAST tool call (the agent's
@@ -682,7 +854,15 @@ impl SessionState {
                     let assembled: String = live.content[after_last_tool_call..]
                         .iter()
                         .filter_map(|b| match b {
-                            LiveContentBlock::Text { text } => Some(text.as_str()),
+                            // Main-thread text only: a subagent's trailing
+                            // prose (parented blocks, claude-agent-acp ≥0.63
+                            // subagent transcripts) is the CHILD's voice and
+                            // must never read as the parent's delegation
+                            // result.
+                            LiveContentBlock::Text {
+                                text,
+                                parent_tool_use_id: None,
+                            } => Some(text.as_str()),
                             _ => None,
                         })
                         .collect::<Vec<&str>>()
@@ -718,6 +898,10 @@ impl SessionState {
                 // answer one-shot is cleaned via the listener's peer-close race;
                 // this just keeps the snapshot honest.
                 self.pending_question = None;
+                // Likewise a blocked `exit_plan_mode` approval: the parked ext
+                // responder is drained by the connection's teardown/cancel path;
+                // this just keeps the snapshot honest if the turn settles first.
+                self.pending_plan_approval = None;
                 self.status = ConnectionStatus::Connected;
             }
             AcpEvent::UserMessage { message_id, blocks } => {
@@ -730,8 +914,18 @@ impl SessionState {
                 });
                 // Reference instant for the in-flight prompt's recency check in
                 // `apply_in_flight_message_id`. Set here (not at manager enqueue)
-                // so it tracks `pending_user_message` exactly.
-                self.pending_user_message_started_at = Some(Utc::now());
+                // so it tracks `pending_user_message` exactly. Truncated to
+                // whole milliseconds: the gate compares this against parsed
+                // turn timestamps that carry at most millisecond precision
+                // (Cursor's journal upgrade rewrites the in-flight user turn
+                // to a millisecond send stamp taken right after this event
+                // applies — sub-ms residue here would push the threshold past
+                // that stamp and unstamp the turn). The shed sub-ms window
+                // cannot admit a prior identical prompt: no agent turn
+                // round-trips in under a millisecond.
+                let now = Utc::now();
+                self.pending_user_message_started_at =
+                    DateTime::from_timestamp_millis(now.timestamp_millis());
                 // Live-feedback notes are turn-scoped steering: a new user turn
                 // starts with a clean slate. The previous turn's notes (read or
                 // not) are history at this point; the frontend's "agent didn't
@@ -740,6 +934,11 @@ impl SessionState {
                 self.feedback.clear();
                 // A new user turn supersedes any stale pending question.
                 self.pending_question = None;
+                // Likewise a stale plan approval: a new turn started without a
+                // clean TurnComplete (fork/resume re-prompt, error recovery, or a
+                // queued prompt sent instead of answering) must not leave a dead
+                // approval in the snapshot for a mid-turn attach to render.
+                self.pending_plan_approval = None;
             }
             AcpEvent::ConversationLinked {
                 conversation_id,
@@ -777,7 +976,12 @@ impl SessionState {
                 // already done — the event fires only once per connection.
                 self.selectors_ready = true;
             }
-            AcpEvent::Error { message, code, .. } => {
+            AcpEvent::Error {
+                message,
+                code,
+                details,
+                ..
+            } => {
                 // Capture so post-mortem readers (probe path, debug
                 // snapshots) can surface the agent's own error message
                 // after the connection task has cleaned up its map
@@ -786,6 +990,7 @@ impl SessionState {
                 self.last_error = Some(SessionLastError {
                     message: message.clone(),
                     code: code.clone(),
+                    details: details.clone(),
                 });
             }
             AcpEvent::DelegationStarted {
@@ -793,6 +998,8 @@ impl SessionState {
                 child_connection_id,
                 child_conversation_id,
                 agent_type,
+                task_preview,
+                task_id,
                 ..
             } => {
                 // Record the running delegation so the binding is snapshot-
@@ -808,6 +1015,8 @@ impl SessionState {
                         child_connection_id: child_connection_id.clone(),
                         child_conversation_id: *child_conversation_id,
                         agent_type: *agent_type,
+                        task_preview: task_preview.clone(),
+                        task_id: task_id.clone(),
                     },
                 );
             }
@@ -855,9 +1064,12 @@ impl SessionState {
             }
             AcpEvent::ClaudeSdkMessage { .. }
             | AcpEvent::SessionLoadFailed { .. }
+            | AcpEvent::TurnRetrying { .. }
             | AcpEvent::UserPromptSent { .. } => {
                 // 这些事件不直接修改 SessionState 的可见字段。
                 // UserPromptSent 是纯通知事件，仅供 chat-channel 推送消费。
+                // TurnRetrying 与 Claude 的 api_retry 一样是前端瞬态提示（重试横幅），
+                // 不进快照——回合边界会清除它。
             }
         }
         self.last_activity_at = Utc::now();
@@ -918,10 +1130,16 @@ impl SessionState {
             .rposition(|b| matches!(b, LiveContentBlock::ToolCallRef { .. }))
             .map(|i| i + 1)
             .unwrap_or(0);
+        // Main-thread blocks only (`parent_tool_use_id: None`): a Claude
+        // subagent's parented transcript chunks describe the CHILD's work and
+        // must not surface as the parent's live reply.
         let mut texts = live.content[after_last_tool_call..]
             .iter()
             .filter_map(|b| match b {
-                LiveContentBlock::Text { text } => Some(text.as_str()),
+                LiveContentBlock::Text {
+                    text,
+                    parent_tool_use_id: None,
+                } => Some(text.as_str()),
                 _ => None,
             });
         match (texts.next(), texts.next()) {
@@ -944,13 +1162,18 @@ impl SessionState {
             }
         }
 
-        // (2) Latest thinking block — the agent is reasoning, not silent.
+        // (2) Latest main-thread thinking block — the agent is reasoning, not
+        // silent. Parented (subagent) thinking is excluded for the same
+        // reason as (1).
         if let Some(line) = live
             .content
             .iter()
             .rev()
             .find_map(|b| match b {
-                LiveContentBlock::Thinking { text } => Some(text.as_str()),
+                LiveContentBlock::Thinking {
+                    text,
+                    parent_tool_use_id: None,
+                } => Some(text.as_str()),
                 _ => None,
             })
             .and_then(last_nonempty_line)
@@ -998,25 +1221,37 @@ impl SessionState {
             .expect("live_message just initialized")
     }
 
-    fn append_text_delta(&mut self, text: &str) {
+    fn append_text_delta(&mut self, text: &str, parent_tool_use_id: Option<&str>) {
         let live = self.ensure_live_message();
-        if let Some(LiveContentBlock::Text { text: existing }) = live.content.last_mut() {
-            existing.push_str(text);
-        } else {
-            live.content.push(LiveContentBlock::Text {
+        // Merge only into a trailing block of the same kind AND the same
+        // subagent attribution — main text → subagent text → main text must
+        // produce three blocks, never one. The frontend reducer applies the
+        // identical predicate over the same seq-ordered stream, so a client
+        // hydrated from a snapshot converges on the same block boundaries as
+        // one that streamed live.
+        match live.content.last_mut() {
+            Some(LiveContentBlock::Text {
+                text: existing,
+                parent_tool_use_id: p,
+            }) if p.as_deref() == parent_tool_use_id => existing.push_str(text),
+            _ => live.content.push(LiveContentBlock::Text {
                 text: text.to_string(),
-            });
+                parent_tool_use_id: parent_tool_use_id.map(str::to_owned),
+            }),
         }
     }
 
-    fn append_thinking_delta(&mut self, text: &str) {
+    fn append_thinking_delta(&mut self, text: &str, parent_tool_use_id: Option<&str>) {
         let live = self.ensure_live_message();
-        if let Some(LiveContentBlock::Thinking { text: existing }) = live.content.last_mut() {
-            existing.push_str(text);
-        } else {
-            live.content.push(LiveContentBlock::Thinking {
+        match live.content.last_mut() {
+            Some(LiveContentBlock::Thinking {
+                text: existing,
+                parent_tool_use_id: p,
+            }) if p.as_deref() == parent_tool_use_id => existing.push_str(text),
+            _ => live.content.push(LiveContentBlock::Thinking {
                 text: text.to_string(),
-            });
+                parent_tool_use_id: parent_tool_use_id.map(str::to_owned),
+            }),
         }
     }
 
@@ -1130,11 +1365,13 @@ impl SessionState {
             active_tool_calls: self.active_tool_calls.values().cloned().collect(),
             pending_permission: self.pending_permission.clone(),
             pending_question: self.pending_question.clone(),
+            pending_plan_approval: self.pending_plan_approval.clone(),
             pending_user_message: self.pending_user_message.clone(),
             active_delegations: self.active_delegations.values().cloned().collect(),
             feedback: self.feedback.clone(),
             background_outstanding: self.background_outstanding,
             feedback_tool_available: self.feedback_tool_available,
+            native_steering_available: self.native_steering_available,
             modes: self.modes.clone(),
             current_mode: self.current_mode.clone(),
             config_options: self.config_options.clone(),
@@ -1145,6 +1382,7 @@ impl SessionState {
             selectors_ready: self.selectors_ready,
             config_stale: self.config_stale,
             config_stale_kind: self.config_stale_kind,
+            last_error: self.last_error.clone(),
             event_seq: self.event_seq,
         }
     }
@@ -1184,6 +1422,13 @@ pub struct LiveSessionSnapshot {
     /// the wire so every snapshot stays byte-identical with the pre-feature shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_question: Option<PendingQuestionState>,
+    /// The agent's in-flight Grok `exit_plan_mode` approval (see
+    /// `SessionState.pending_plan_approval`). `#[serde(default)]` so older
+    /// payloads deserialize; `skip_serializing_if` keeps the common no-approval
+    /// case off the wire so every snapshot stays byte-identical with the
+    /// pre-feature shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_plan_approval: Option<PendingPlanApprovalState>,
     /// The in-flight user prompt for the current turn (see
     /// `SessionState.pending_user_message`). `#[serde(default)]` so older
     /// payloads still deserialize; `skip_serializing_if` so the no-pending case
@@ -1217,6 +1462,12 @@ pub struct LiveSessionSnapshot {
     /// it. Always serialized (a plain bool) so the frontend can rely on it.
     #[serde(default)]
     pub feedback_tool_available: bool,
+    /// Whether feedback notes ride the native `_session/steering` push channel
+    /// (see `SessionState.native_steering_available`). `#[serde(default)]` so
+    /// older payloads deserialize to `false`; always serialized (plain bool)
+    /// like `feedback_tool_available` so the frontend can rely on it.
+    #[serde(default)]
+    pub native_steering_available: bool,
     pub modes: Option<SessionModeStateInfo>,
     pub current_mode: Option<String>,
     pub config_options: Option<Vec<SessionConfigOptionInfo>>,
@@ -1236,6 +1487,10 @@ pub struct LiveSessionSnapshot {
     /// byte-identical with the pre-feature wire shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_stale_kind: Option<ConfigStaleKind>,
+    /// Most recent agent/runtime error for this live connection. Omitted when
+    /// no error has occurred so older clients and common snapshots stay small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<SessionLastError>,
     pub event_seq: u64,
 }
 
@@ -1345,6 +1600,71 @@ mod tests {
     }
 
     #[test]
+    fn plan_approval_applies_clears_by_id_and_survives_snapshot() {
+        let mut s = fresh_state();
+        // Request → pending set + carried on the snapshot for mid-turn attach.
+        s.apply_event(&AcpEvent::PlanApprovalRequest {
+            approval_id: "ap-1".into(),
+            tool_call_id: "call-1".into(),
+            plan_markdown: "# Plan".into(),
+        });
+        let pending = s.pending_plan_approval.clone().expect("pending set");
+        assert_eq!(pending.approval_id, "ap-1");
+        assert_eq!(pending.tool_call_id, "call-1");
+        assert_eq!(pending.plan_markdown, "# Plan");
+        assert!(s.to_snapshot().pending_plan_approval.is_some());
+
+        // A resolve for a DIFFERENT id must not wipe the live approval.
+        s.apply_event(&AcpEvent::PlanApprovalResolved {
+            approval_id: "other".into(),
+        });
+        assert!(s.pending_plan_approval.is_some());
+
+        // Matching resolve clears it (and the snapshot).
+        s.apply_event(&AcpEvent::PlanApprovalResolved {
+            approval_id: "ap-1".into(),
+        });
+        assert!(s.pending_plan_approval.is_none());
+        assert!(s.to_snapshot().pending_plan_approval.is_none());
+    }
+
+    #[test]
+    fn turn_complete_clears_pending_plan_approval() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::PlanApprovalRequest {
+            approval_id: "ap-1".into(),
+            tool_call_id: "c".into(),
+            plan_markdown: String::new(),
+        });
+        assert!(s.pending_plan_approval.is_some());
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "sid".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "grok".into(),
+        });
+        assert!(s.pending_plan_approval.is_none());
+    }
+
+    #[test]
+    fn user_message_supersedes_stale_pending_plan_approval() {
+        // A new turn starting without a clean TurnComplete (fork/resume re-prompt,
+        // queued prompt sent instead of answering) must not leave a dead approval
+        // in the snapshot for a mid-turn attach to render.
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::PlanApprovalRequest {
+            approval_id: "ap-1".into(),
+            tool_call_id: "c".into(),
+            plan_markdown: "# plan".into(),
+        });
+        assert!(s.pending_plan_approval.is_some());
+        s.apply_event(&AcpEvent::UserMessage {
+            message_id: "m1".into(),
+            blocks: vec![],
+        });
+        assert!(s.pending_plan_approval.is_none());
+    }
+
+    #[test]
     fn background_activity_mirrors_outstanding_and_gates_keepalive() {
         let mut s = fresh_state();
         assert!(!s.has_active_background_work(Utc::now()));
@@ -1445,6 +1765,20 @@ mod tests {
     }
 
     #[test]
+    fn pending_user_message_started_at_has_no_sub_ms_residue() {
+        // The recency gate in `apply_in_flight_message_id` compares this
+        // stamp against millisecond-precision parsed-turn timestamps
+        // (Cursor's journal upgrade rewrites the in-flight user turn to a
+        // ms send stamp taken right after this event applies). Sub-ms
+        // residue would order the threshold AFTER a stamp taken later in
+        // real time and unstamp the turn.
+        let mut s = fresh_state();
+        s.apply_event(&text_user_message("user-1", "hello"));
+        let at = s.pending_user_message_started_at.expect("stamp set");
+        assert_eq!(at.timestamp_subsec_nanos() % 1_000_000, 0);
+    }
+
+    #[test]
     fn turn_complete_clears_pending_user_message() {
         let mut s = fresh_state();
         s.apply_event(&text_user_message("user-1", "hi"));
@@ -1493,10 +1827,51 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_carries_last_error_and_clears_on_next_prompt() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::Error {
+            message: "ACP protocol error: forbidden".into(),
+            agent_type: "claude_code".into(),
+            code: Some("forbidden".into()),
+            details: None,
+            terminal: true,
+        });
+
+        let snap = s.to_snapshot();
+        assert_eq!(
+            snap.last_error,
+            Some(SessionLastError {
+                message: "ACP protocol error: forbidden".into(),
+                code: Some("forbidden".into()),
+                details: None,
+            })
+        );
+
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: LiveSessionSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.last_error, snap.last_error);
+
+        let empty_json = serde_json::to_string(&fresh_state().to_snapshot()).expect("serialize");
+        assert!(
+            !empty_json.contains("last_error"),
+            "no-error snapshot must omit last_error"
+        );
+
+        s.apply_event(&AcpEvent::StatusChanged {
+            status: ConnectionStatus::Prompting,
+        });
+        assert!(
+            s.to_snapshot().last_error.is_none(),
+            "new prompts clear stale snapshot-recoverable errors"
+        );
+    }
+
+    #[test]
     fn latest_live_reply_prefers_answer_after_last_tool_call() {
         let mut s = fresh_state();
         s.apply_event(&AcpEvent::ContentDelta {
             text: "let me check".into(),
+            parent_tool_use_id: None,
         });
         s.apply_event(&AcpEvent::ToolCall {
             tool_call_id: "tc-1".into(),
@@ -1512,6 +1887,7 @@ mod tests {
         });
         s.apply_event(&AcpEvent::ContentDelta {
             text: "Found 3 files.\nDetails here".into(),
+            parent_tool_use_id: None,
         });
         // Last non-empty line of the text that follows the final tool call.
         assert_eq!(s.latest_live_reply(100).as_deref(), Some("Details here"));
@@ -1523,6 +1899,7 @@ mod tests {
         let mut s = fresh_state();
         s.apply_event(&AcpEvent::Thinking {
             text: "pondering options".into(),
+            parent_tool_use_id: None,
         });
         assert_eq!(
             s.latest_live_reply(100).as_deref(),
@@ -1557,6 +1934,7 @@ mod tests {
         let mut s = fresh_state();
         s.apply_event(&AcpEvent::ContentDelta {
             text: "0123456789abcdef".into(),
+            parent_tool_use_id: None,
         });
         assert_eq!(s.latest_live_reply(10).as_deref(), Some("0123456789…"));
     }
@@ -1572,6 +1950,7 @@ mod tests {
         let last = "résumé 完成 ▸ 配置已更新";
         s.apply_event(&AcpEvent::ContentDelta {
             text: format!("{huge}\nintermediate\n{last}\n   \n"),
+            parent_tool_use_id: None,
         });
         let out = s.latest_live_reply(8).unwrap();
         // First 8 chars of `last` are r é s u m é <space> 完, then a truncation
@@ -1588,10 +1967,12 @@ mod tests {
         let mut s = fresh_state();
         s.apply_event(&AcpEvent::ContentDelta {
             text: "Answer ".into(),
+            parent_tool_use_id: None,
         });
-        s.apply_event(&AcpEvent::Thinking { text: "hmm".into() });
+        s.apply_event(&AcpEvent::Thinking { text: "hmm".into(), parent_tool_use_id: None });
         s.apply_event(&AcpEvent::ContentDelta {
             text: "continues here".into(),
+            parent_tool_use_id: None,
         });
         assert_eq!(
             s.latest_live_reply(100).as_deref(),
@@ -1623,6 +2004,7 @@ mod tests {
         });
         s.apply_event(&AcpEvent::ContentDelta {
             text: "hello".into(),
+            parent_tool_use_id: None,
         });
         s.apply_event(&AcpEvent::ToolCall {
             tool_call_id: "tc-1".into(),
@@ -1761,9 +2143,11 @@ mod tests {
         let mut s = fresh_state();
         s.apply_event(&AcpEvent::ContentDelta {
             text: "hello ".into(),
+            parent_tool_use_id: None,
         });
         s.apply_event(&AcpEvent::ContentDelta {
             text: "world".into(),
+            parent_tool_use_id: None,
         });
         let live = s.live_message.as_ref().expect("live_message expected");
         assert_eq!(
@@ -1772,7 +2156,7 @@ mod tests {
             "consecutive text deltas merge into one block"
         );
         match &live.content[0] {
-            LiveContentBlock::Text { text } => assert_eq!(text, "hello world"),
+            LiveContentBlock::Text { text, .. } => assert_eq!(text, "hello world"),
             _ => panic!("expected text block"),
         }
         assert!(matches!(live.role, MessageRole::Assistant));
@@ -1781,23 +2165,197 @@ mod tests {
     #[test]
     fn thinking_delta_creates_separate_block_from_text() {
         let mut s = fresh_state();
-        s.apply_event(&AcpEvent::ContentDelta { text: "T".into() });
-        s.apply_event(&AcpEvent::Thinking { text: "X".into() });
-        s.apply_event(&AcpEvent::ContentDelta { text: "Y".into() });
+        s.apply_event(&AcpEvent::ContentDelta { text: "T".into(), parent_tool_use_id: None });
+        s.apply_event(&AcpEvent::Thinking { text: "X".into(), parent_tool_use_id: None });
+        s.apply_event(&AcpEvent::ContentDelta { text: "Y".into(), parent_tool_use_id: None });
         let live = s.live_message.as_ref().unwrap();
         assert_eq!(live.content.len(), 3);
         match &live.content[0] {
-            LiveContentBlock::Text { text } => assert_eq!(text, "T"),
+            LiveContentBlock::Text { text, .. } => assert_eq!(text, "T"),
             _ => panic!("expected text"),
         }
         match &live.content[1] {
-            LiveContentBlock::Thinking { text } => assert_eq!(text, "X"),
+            LiveContentBlock::Thinking { text, .. } => assert_eq!(text, "X"),
             _ => panic!("expected thinking"),
         }
         match &live.content[2] {
-            LiveContentBlock::Text { text } => assert_eq!(text, "Y"),
+            LiveContentBlock::Text { text, .. } => assert_eq!(text, "Y"),
             _ => panic!("expected text"),
         }
+    }
+
+    /// Parent → subagent → parent interleave must produce three blocks: the
+    /// merge predicate requires the SAME `parent_tool_use_id`, so subagent
+    /// prose can never concatenate onto the main thread (and vice versa).
+    #[test]
+    fn parented_delta_interleave_never_merges_across_attribution() {
+        let mut s = fresh_state();
+        s.status = ConnectionStatus::Prompting;
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "main ".into(),
+            parent_tool_use_id: None,
+        });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "sub".into(),
+            parent_tool_use_id: Some("toolu_parent".into()),
+        });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "more main".into(),
+            parent_tool_use_id: None,
+        });
+        let live = s.live_message.as_ref().unwrap();
+        assert_eq!(live.content.len(), 3, "attribution boundaries split blocks");
+        match &live.content[1] {
+            LiveContentBlock::Text {
+                text,
+                parent_tool_use_id,
+            } => {
+                assert_eq!(text, "sub");
+                assert_eq!(parent_tool_use_id.as_deref(), Some("toolu_parent"));
+            }
+            other => panic!("expected parented text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parented_deltas_with_same_parent_merge() {
+        let mut s = fresh_state();
+        s.status = ConnectionStatus::Prompting;
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "a".into(),
+            parent_tool_use_id: Some("toolu_p".into()),
+        });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "b".into(),
+            parent_tool_use_id: Some("toolu_p".into()),
+        });
+        // A different parent's thinking starts its own block.
+        s.apply_event(&AcpEvent::Thinking {
+            text: "t1".into(),
+            parent_tool_use_id: Some("toolu_p".into()),
+        });
+        s.apply_event(&AcpEvent::Thinking {
+            text: "t2".into(),
+            parent_tool_use_id: Some("toolu_q".into()),
+        });
+        let live = s.live_message.as_ref().unwrap();
+        assert_eq!(live.content.len(), 3);
+        assert!(
+            matches!(&live.content[0], LiveContentBlock::Text { text, .. } if text == "ab"),
+            "same-parent text deltas merge"
+        );
+        assert!(
+            matches!(&live.content[2], LiveContentBlock::Thinking { text, parent_tool_use_id }
+                if text == "t2" && parent_tool_use_id.as_deref() == Some("toolu_q")),
+            "different-parent thinking splits"
+        );
+    }
+
+    /// Out-of-turn parented chunks (async subagent still streaming after the
+    /// parent turn settled) must not resurrect a live_message via
+    /// `ensure_live_message` — the snapshot would hand that ghost to every
+    /// attaching client. Main-thread chunks keep the unconditional append.
+    #[test]
+    fn parented_delta_outside_prompting_does_not_touch_live_message() {
+        let mut s = fresh_state();
+        assert_ne!(s.status, ConnectionStatus::Prompting);
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "late sub text".into(),
+            parent_tool_use_id: Some("toolu_gone".into()),
+        });
+        s.apply_event(&AcpEvent::Thinking {
+            text: "late sub think".into(),
+            parent_tool_use_id: Some("toolu_gone".into()),
+        });
+        assert!(
+            s.live_message.is_none(),
+            "parented chunks must not create live_message outside a turn"
+        );
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "main".into(),
+            parent_tool_use_id: None,
+        });
+        assert!(
+            s.live_message.is_some(),
+            "main-thread append stays unconditional"
+        );
+    }
+
+    /// Snapshot round-trip: `parent_tool_use_id` survives serialization, and a
+    /// snapshot written by an older backend (no field) still deserializes.
+    #[test]
+    fn live_block_parent_survives_snapshot_and_old_snapshots_parse() {
+        let mut s = fresh_state();
+        s.status = ConnectionStatus::Prompting;
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "sub".into(),
+            parent_tool_use_id: Some("toolu_p".into()),
+        });
+        let snap = s.to_snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: LiveSessionSnapshot = serde_json::from_str(&json).unwrap();
+        let live = back.live_message.expect("live message in snapshot");
+        assert!(matches!(
+            &live.content[0],
+            LiveContentBlock::Text { parent_tool_use_id, .. }
+                if parent_tool_use_id.as_deref() == Some("toolu_p")
+        ));
+
+        let legacy: LiveContentBlock =
+            serde_json::from_str(r#"{"kind":"text","text":"old"}"#).unwrap();
+        assert!(matches!(
+            legacy,
+            LiveContentBlock::Text {
+                parent_tool_use_id: None,
+                ..
+            }
+        ));
+    }
+
+    /// `last_assistant_text` is the delegation child's result — a subagent's
+    /// trailing prose is the CHILD's voice and must not read as the answer.
+    #[test]
+    fn last_assistant_text_ignores_parented_blocks() {
+        let mut s = fresh_state();
+        s.status = ConnectionStatus::Prompting;
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "final answer".into(),
+            parent_tool_use_id: None,
+        });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: " SUBAGENT NOISE".into(),
+            parent_tool_use_id: Some("toolu_p".into()),
+        });
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "sess-1".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "claude_code".into(),
+        });
+        assert_eq!(s.last_assistant_text.as_deref(), Some("final answer"));
+    }
+
+    #[test]
+    fn latest_live_reply_ignores_parented_blocks() {
+        let mut s = fresh_state();
+        s.status = ConnectionStatus::Prompting;
+        s.apply_event(&AcpEvent::Thinking {
+            text: "sub thinking".into(),
+            parent_tool_use_id: Some("toolu_p".into()),
+        });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "sub text".into(),
+            parent_tool_use_id: Some("toolu_p".into()),
+        });
+        assert_eq!(
+            s.latest_live_reply(200),
+            None,
+            "parented-only content must not surface as the parent's live reply"
+        );
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "main progress".into(),
+            parent_tool_use_id: None,
+        });
+        assert_eq!(s.latest_live_reply(200).as_deref(), Some("main progress"));
     }
 
     #[test]
@@ -1925,7 +2483,7 @@ mod tests {
     #[test]
     fn turn_complete_clears_live_and_tool_calls_and_pending_permission() {
         let mut s = fresh_state();
-        s.apply_event(&AcpEvent::ContentDelta { text: "hi".into() });
+        s.apply_event(&AcpEvent::ContentDelta { text: "hi".into(), parent_tool_use_id: None });
         s.apply_event(&AcpEvent::ToolCall {
             tool_call_id: "tc-1".into(),
             title: "x".into(),
@@ -1966,6 +2524,8 @@ mod tests {
             child_connection_id: "child-conn-1".into(),
             child_conversation_id: child_conv,
             agent_type: AgentType::Codex,
+            task_preview: "run the tests".into(),
+            task_id: "task-ss-1".into(),
         }
     }
 
@@ -2139,12 +2699,14 @@ mod tests {
             content: vec![
                 LiveContentBlock::Text {
                     text: "let me check ".into(),
+                    parent_tool_use_id: None,
                 },
                 LiveContentBlock::ToolCallRef {
                     tool_call_id: "tc".into(),
                 },
                 LiveContentBlock::Text {
                     text: "the answer is 42".into(),
+                    parent_tool_use_id: None,
                 },
             ],
             started_at: Utc::now(),
@@ -2167,9 +2729,11 @@ mod tests {
             content: vec![
                 LiveContentBlock::Text {
                     text: "part 1 ".into(),
+                    parent_tool_use_id: None,
                 },
                 LiveContentBlock::Text {
                     text: "part 2".into(),
+                    parent_tool_use_id: None,
                 },
             ],
             started_at: Utc::now(),
@@ -2193,6 +2757,7 @@ mod tests {
             content: vec![
                 LiveContentBlock::Text {
                     text: "running a tool".into(),
+                    parent_tool_use_id: None,
                 },
                 LiveContentBlock::ToolCallRef {
                     tool_call_id: "tc".into(),
@@ -2220,12 +2785,14 @@ mod tests {
             content: vec![
                 LiveContentBlock::Text {
                     text: "let me check".into(),
+                    parent_tool_use_id: None,
                 },
                 LiveContentBlock::ToolCallRef {
                     tool_call_id: "tc".into(),
                 },
                 LiveContentBlock::Text {
                     text: "the answer is 42".into(),
+                    parent_tool_use_id: None,
                 },
                 LiveContentBlock::Plan {
                     entries: serde_json::json!([]),
@@ -2253,6 +2820,7 @@ mod tests {
             content: vec![
                 LiveContentBlock::Text {
                     text: "working".into(),
+                    parent_tool_use_id: None,
                 },
                 LiveContentBlock::ToolCallRef {
                     tool_call_id: "tc".into(),
@@ -2472,9 +3040,11 @@ mod tests {
             },
             AcpEvent::ContentDelta {
                 text: "Hello ".into(),
+                parent_tool_use_id: None,
             },
             AcpEvent::ContentDelta {
                 text: "world".into(),
+                parent_tool_use_id: None,
             },
             AcpEvent::ToolCall {
                 tool_call_id: "tc-1".into(),
@@ -2502,9 +3072,11 @@ mod tests {
             },
             AcpEvent::Thinking {
                 text: "considering".into(),
+                parent_tool_use_id: None,
             },
             AcpEvent::ContentDelta {
                 text: " More text".into(),
+                parent_tool_use_id: None,
             },
             AcpEvent::UsageUpdate {
                 used: 1234,
@@ -2594,8 +3166,8 @@ mod tests {
                 lm.content
                     .iter()
                     .map(|b| match b {
-                        LiveContentBlock::Text { text } => ("text", text.clone()),
-                        LiveContentBlock::Thinking { text } => ("thinking", text.clone()),
+                        LiveContentBlock::Text { text, .. } => ("text", text.clone()),
+                        LiveContentBlock::Thinking { text, .. } => ("thinking", text.clone()),
                         LiveContentBlock::ToolCallRef { tool_call_id } => {
                             ("tool_call_ref", tool_call_id.clone())
                         }
@@ -2628,10 +3200,12 @@ mod tests {
         let mut s = fresh_state();
         s.apply_event(&AcpEvent::ContentDelta {
             text: "before ".into(),
+            parent_tool_use_id: None,
         });
         s.apply_event(&tool_call_event("tc-1", "ls"));
         s.apply_event(&AcpEvent::ContentDelta {
             text: "between".into(),
+            parent_tool_use_id: None,
         });
         s.apply_event(&tool_call_event("tc-2", "pwd"));
 
@@ -2874,7 +3448,7 @@ mod tests {
     fn plan_update_appends_at_end_replacing_existing() {
         use crate::acp::types::PlanEntryInfo;
         let mut s = fresh_state();
-        s.apply_event(&AcpEvent::ContentDelta { text: "A".into() });
+        s.apply_event(&AcpEvent::ContentDelta { text: "A".into(), parent_tool_use_id: None });
         s.apply_event(&AcpEvent::PlanUpdate {
             entries: vec![PlanEntryInfo {
                 content: "step v1".into(),
@@ -2882,7 +3456,7 @@ mod tests {
                 status: "pending".into(),
             }],
         });
-        s.apply_event(&AcpEvent::ContentDelta { text: "B".into() });
+        s.apply_event(&AcpEvent::ContentDelta { text: "B".into(), parent_tool_use_id: None });
         s.apply_event(&AcpEvent::PlanUpdate {
             entries: vec![PlanEntryInfo {
                 content: "step v2".into(),
@@ -2944,7 +3518,7 @@ mod tests {
     fn turn_complete_clears_plan_and_tool_refs() {
         use crate::acp::types::PlanEntryInfo;
         let mut s = fresh_state();
-        s.apply_event(&AcpEvent::ContentDelta { text: "x".into() });
+        s.apply_event(&AcpEvent::ContentDelta { text: "x".into(), parent_tool_use_id: None });
         s.apply_event(&tool_call_event("tc-1", "ls"));
         s.apply_event(&AcpEvent::PlanUpdate {
             entries: vec![PlanEntryInfo {
@@ -2974,14 +3548,14 @@ mod tests {
         let env = EventEnvelope {
             seq: 7,
             connection_id: "conn-x".into(),
-            payload: AcpEvent::ContentDelta { text: "abc".into() },
+            payload: AcpEvent::ContentDelta { text: "abc".into(), parent_tool_use_id: None },
         };
         let json = serde_json::to_string(&env).unwrap();
         let back: EventEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(back.seq, 7);
         assert_eq!(back.connection_id, "conn-x");
         match back.payload {
-            AcpEvent::ContentDelta { text } => assert_eq!(text, "abc"),
+            AcpEvent::ContentDelta { text, .. } => assert_eq!(text, "abc"),
             _ => panic!("expected ContentDelta"),
         }
     }

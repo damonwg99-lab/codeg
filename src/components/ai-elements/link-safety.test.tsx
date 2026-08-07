@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { LinkSafetyModalProps } from "streamdown"
 import {
   FilePathLink,
+  openLinkWithSafety,
   useStreamdownLinkSafety,
 } from "@/components/ai-elements/link-safety"
 
@@ -63,15 +64,13 @@ function LinkSafetyHarness({ url }: { url: string }) {
 
   return (
     <div>
+      {/* Dispatch through the very helper MarkdownLink uses, so these config
+          tests exercise the real click path instead of a copy that can drift
+          from it (this harness used to hand-roll an awaiting handler — the
+          exact shape #410 was about). */}
       <button
         type="button"
-        onClick={async () => {
-          if (linkSafety.onLinkCheck && (await linkSafety.onLinkCheck(url))) {
-            window.open(url, "_blank", "noreferrer")
-            return
-          }
-          setOpen(true)
-        }}
+        onClick={() => openLinkWithSafety(url, linkSafety, () => setOpen(true))}
       >
         Trigger link
       </button>
@@ -98,18 +97,18 @@ describe("link safety direct opening", () => {
     vi.restoreAllMocks()
   })
 
-  it("opens markdown hyperlinks directly from Streamdown without rendering a confirmation dialog", async () => {
+  it("opens markdown hyperlinks in the click's own task, without rendering a confirmation dialog", () => {
     render(<LinkSafetyHarness url="https://example.com/docs" />)
 
     fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
 
-    await waitFor(() => {
-      expect(window.open).toHaveBeenCalledWith(
-        "https://example.com/docs",
-        "_blank",
-        "noreferrer"
-      )
-    })
+    // No waitFor: the web verdict is synchronous, so the open must land in the
+    // click's own task or WebKit's popup blocker eats it. See #410.
+    expect(window.open).toHaveBeenCalledWith(
+      "https://example.com/docs",
+      "_blank",
+      "noreferrer"
+    )
     expect(mocks.openUrl).not.toHaveBeenCalled()
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument()
   })
@@ -177,6 +176,26 @@ describe("link safety direct opening", () => {
     expect(window.open).not.toHaveBeenCalled()
   })
 
+  it("opens a Windows drive link through the real chat path (remark-rewritten /C:/ form)", async () => {
+    // In chat, remark-file-uri-links rewrites a bare `E:/…` (and file:///E:/…)
+    // to the sanitize-safe `/E:/…` form BEFORE MarkdownLink sees it. That
+    // rewritten href must route to the file opener as `E:/…` (leading slash
+    // stripped), not the browser.
+    render(<LinkSafetyHarness url="/E:/Desktop/docs/G.docx" />)
+
+    fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
+
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith(
+        "E:/Desktop/docs/G.docx",
+        {
+          line: undefined,
+        }
+      )
+    })
+    expect(window.open).not.toHaveBeenCalled()
+  })
+
   it("passes ~ paths through for home expansion by the opener", async () => {
     render(<LinkSafetyHarness url="~/.claude/plans/notes.md" />)
 
@@ -206,7 +225,7 @@ describe("link safety direct opening", () => {
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument()
   })
 
-  it("treats protocol-relative // URLs as web links, never local file IO", async () => {
+  it("treats protocol-relative // URLs as web links, never local file IO", () => {
     // `//cdn.example.com/app.js` is protocol-relative — the browser resolves
     // it against the page protocol. parseLocalFileTarget must NOT claim it
     // (that would route "//Users/…"-style urls into local file reads);
@@ -215,13 +234,11 @@ describe("link safety direct opening", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
 
-    await waitFor(() => {
-      expect(window.open).toHaveBeenCalledWith(
-        "//cdn.example.com/app.js",
-        "_blank",
-        "noreferrer"
-      )
-    })
+    expect(window.open).toHaveBeenCalledWith(
+      "//cdn.example.com/app.js",
+      "_blank",
+      "noreferrer"
+    )
     expect(mocks.openFilePreview).not.toHaveBeenCalled()
   })
 

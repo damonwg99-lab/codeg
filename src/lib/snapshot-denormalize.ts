@@ -6,6 +6,7 @@ import type {
   LiveContentBlock as WireLiveContentBlock,
   LiveMessage as WireLiveMessage,
   LiveSessionSnapshot,
+  PendingPlanApprovalState,
   PendingQuestionState,
   PromptCapabilitiesInfo,
   SessionConfigOptionInfo,
@@ -24,9 +25,9 @@ import type {
 
 /**
  * Snapshot-derived subset of ConnectionState. Fields not present here
- * (pendingQuestion, claudeApiRetry, error, contextKey, agentType,
- * workingDir) are frontend-only or set elsewhere and must not be touched
- * by HYDRATE_FROM_SNAPSHOT.
+ * (pendingQuestion, claudeApiRetry, contextKey, agentType, workingDir) are
+ * frontend-only or set elsewhere and must not be touched by
+ * HYDRATE_FROM_SNAPSHOT.
  */
 export interface SnapshotPatch {
   // Carries the snapshot's source connection_id so the reducer can reject
@@ -49,6 +50,10 @@ export interface SnapshotPatch {
    *  no question is pending. (Distinct from the frontend-only free-text
    *  `pendingQuestion`, which is NOT in the snapshot.) */
   pendingAskQuestion: PendingQuestionState | null
+  /** Awaiting-decision Grok `exit_plan_mode` approval carried by the snapshot,
+   *  so a client attaching mid-turn re-renders the plan-approval card. `null`
+   *  when no approval is pending. */
+  pendingPlanApproval: PendingPlanApprovalState | null
   /** In-flight user prompt carried by the snapshot, so a client attaching
    *  mid-turn can synthesize the user turn (Bug-2 / cross-client viewing).
    *  `null` when no turn is in flight. */
@@ -66,6 +71,13 @@ export interface SnapshotPatch {
    *  the one-shot `background_activity` events won't replay. `0` when the
    *  server omitted the field. */
   backgroundOutstanding: number
+  /** Latest ACP runtime error carried by the snapshot. `null` means none. */
+  lastError: string | null
+  /** Diagnostic evidence attached to `lastError` (agent stderr tail, unparsed
+   *  update counts) — only the inferred `turn_failed_empty*` family carries it.
+   *  Already redacted by the backend. Kept separate from `lastError` because
+   *  that string feeds the composer status tooltip, which must stay one line. */
+  lastErrorDetails: string | null
   eventSeq: number
   /** Live sub-agent delegations carried by the snapshot. Consumed directly at
    *  the attach call sites to re-seed `DelegationProvider` bindings (see
@@ -85,6 +97,10 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
   for (const tc of wire.active_tool_calls) {
     toolMap.set(tc.id, tc)
   }
+  const lastError = normalizeSnapshotLastError(wire.last_error)
+  const lastErrorDetails = wire.last_error?.details?.trim()
+    ? wire.last_error.details
+    : null
 
   return {
     connectionId: wire.connection_id,
@@ -111,6 +127,8 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
       : null,
     // The snapshot shape already matches PendingQuestionState; pass through.
     pendingAskQuestion: wire.pending_question ?? null,
+    // The snapshot shape already matches PendingPlanApprovalState; pass through.
+    pendingPlanApproval: wire.pending_plan_approval ?? null,
     pendingUserMessage: wire.pending_user_message
       ? {
           messageId: wire.pending_user_message.message_id,
@@ -123,9 +141,21 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
     configStale: wire.config_stale ?? false,
     configStaleKind: wire.config_stale_kind ?? null,
     backgroundOutstanding: wire.background_outstanding ?? 0,
+    lastError,
+    lastErrorDetails,
     eventSeq: wire.event_seq,
     activeDelegations: wire.active_delegations ?? [],
   }
+}
+
+function normalizeSnapshotLastError(
+  lastError: LiveSessionSnapshot["last_error"]
+): string | null {
+  const message =
+    lastError && typeof lastError.message === "string"
+      ? lastError.message.trim()
+      : ""
+  return message || null
 }
 
 function denormalizeLiveMessage(
@@ -148,10 +178,21 @@ function denormalizeBlock(
   toolMap: Map<string, ToolCallState>
 ): LocalLiveContentBlock | null {
   switch (wire.kind) {
+    // Subagent attribution must be forwarded explicitly — a mid-run attach
+    // (cold attach / refresh while a Claude subagent streams) rebuilds the
+    // capsule-vs-main routing from these fields alone.
     case "text":
-      return { type: "text", text: wire.text }
+      return {
+        type: "text",
+        text: wire.text,
+        parentToolUseId: wire.parent_tool_use_id ?? undefined,
+      }
     case "thinking":
-      return { type: "thinking", text: wire.text }
+      return {
+        type: "thinking",
+        text: wire.text,
+        parentToolUseId: wire.parent_tool_use_id ?? undefined,
+      }
     case "plan":
       // Wire `plan.entries` is `unknown` (passed through opaque from agent);
       // local shape expects PlanEntryInfo[]. We cast — backend's typed plan

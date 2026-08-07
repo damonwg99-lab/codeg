@@ -4,10 +4,12 @@ use serde::{Deserialize, Serialize};
 /// Folder classification. `regular` folders are user-facing; `chat` folders
 /// are hidden per-conversation scratch dirs backing folderless chat mode
 /// (excluded from folder lists; their conversations route to the sidebar
-/// "Chat" group). `platform_repo` folders back project repos — they are
-/// excluded from the sidebar folder list but available for git / file-tree
-/// switching via RepoSelector. A `loop_worktree` variant is reserved for M2+
-/// engine-created worktrees — add it then. Written once at insert, never updated.
+/// "Chat" group). A `loop_worktree` variant is reserved for M2+ engine-created
+/// worktrees — add it then. A `platform_repo` folder is a project git
+/// sub-repo registered through Cluster A's `add_project_repo` flow: it is
+/// hidden from the sidebar folder list (frontend excludes via `kind` filter)
+/// but still selectable as a working scope. Written once at insert, never
+/// updated.
 #[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
 #[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
 #[serde(rename_all = "snake_case")]
@@ -43,6 +45,9 @@ pub struct Model {
     pub parent_id: Option<i32>,
     /// See [`FolderKind`]. Replaces the former `is_chat` boolean.
     pub kind: FolderKind,
+    /// User-supplied display alias. NULL means "no alias" — the UI falls back to
+    /// the path-derived `name`. When set, surfaces render `alias [name]`.
+    pub alias: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

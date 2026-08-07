@@ -354,9 +354,14 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
     // UUID-shaped ones production emits. (`ENVELOPE_OVERHEAD` covers its key.)
     let base = ENVELOPE_OVERHEAD + json_str_len(&envelope.connection_id);
     let payload = match &envelope.payload {
-        AcpEvent::ContentDelta { text } | AcpEvent::Thinking { text } => {
-            json_str_len(text)
+        AcpEvent::ContentDelta {
+            text,
+            parent_tool_use_id,
         }
+        | AcpEvent::Thinking {
+            text,
+            parent_tool_use_id,
+        } => json_str_len(text) + opt_str_size(parent_tool_use_id),
         AcpEvent::ClaudeSdkMessage {
             session_id,
             message,
@@ -436,10 +441,16 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
                 + settled
                     .iter()
                     .map(|s| {
-                        // `{"task_id":…,"status":…,"summary":…}` + comma
-                        64 + json_str_len(&s.task_id)
+                        // Keys + braces + commas for every field (task_id,
+                        // status, summary, tool_use_id, result, wire_visible)
+                        // plus the `wire_visible` bool value and the element
+                        // comma — generously fixed so `estimate >= serialized`
+                        // holds for every present/absent optional combination.
+                        128 + json_str_len(&s.task_id)
                             + json_str_len(&s.status)
                             + opt_str_size(&s.summary)
+                            + opt_str_size(&s.tool_use_id)
+                            + opt_str_size(&s.result)
                     })
                     .sum::<usize>()
         }
@@ -545,7 +556,7 @@ mod tests {
         Arc::new(EventEnvelope {
             seq,
             connection_id: "c".into(),
-            payload: AcpEvent::ContentDelta { text: text.into() },
+            payload: AcpEvent::ContentDelta { text: text.into(), parent_tool_use_id: None },
         })
     }
 
@@ -832,6 +843,25 @@ mod tests {
                 connection_id: "conn-xyz".into(),
                 payload: AcpEvent::Thinking {
                     text: "reason\"ing\n".into(),
+                    parent_tool_use_id: None,
+                },
+            }),
+            // Parented (subagent-attributed) chunks: the optional id is a
+            // sized string field, including an escape-heavy id.
+            Arc::new(EventEnvelope {
+                seq: 31,
+                connection_id: "conn-xyz".into(),
+                payload: AcpEvent::ContentDelta {
+                    text: "sub text".into(),
+                    parent_tool_use_id: Some("toolu_01ABC".into()),
+                },
+            }),
+            Arc::new(EventEnvelope {
+                seq: 32,
+                connection_id: "conn-xyz".into(),
+                payload: AcpEvent::Thinking {
+                    text: "sub think".into(),
+                    parent_tool_use_id: Some("id\"with\\escapes\n".into()),
                 },
             }),
             Arc::new(EventEnvelope {
@@ -997,11 +1027,19 @@ mod tests {
                         task_id: "ae6bd822f7a0e23a8".into(),
                         status: "completed".into(),
                         summary: Some("Agent \"Run pnpm build\" finished".into()),
+                        tool_use_id: Some("toolu_01P782zHv8AMMpXYqaz39ijf".into()),
+                        // Escape-heavy + large, to exercise the estimate's
+                        // coverage of the (previously omitted) `result` field.
+                        result: Some("Build \"log\"\n\t".repeat(2048)),
+                        wire_visible: true,
                     },
                     crate::acp::types::BackgroundSettledInfo {
                         task_id: "bipkee1pw".into(),
                         status: "failed".into(),
                         summary: None,
+                        tool_use_id: None,
+                        result: None,
+                        wire_visible: false,
                     },
                 ],
                 watermark: u64::MAX,
@@ -1109,6 +1147,7 @@ mod tests {
             connection_id: "\"".repeat(65_200),
             payload: AcpEvent::ContentDelta {
                 text: String::new(),
+                parent_tool_use_id: None,
             },
         });
         let serialized = serde_json::to_vec(&*env).expect("serialize").len();

@@ -42,6 +42,7 @@ fn to_detail(m: folder::Model) -> FolderDetail {
         color: m.color,
         parent_id: m.parent_id,
         kind: m.kind,
+        alias: m.alias,
     }
 }
 
@@ -60,7 +61,7 @@ pub async fn get_folder_by_id(
 /// How [`add_folder_inner`] writes the `parent_id` column. The two callers want
 /// different semantics on reopen of an existing path, which a bare `Option<i32>`
 /// could not express (it conflates "no parent" with "don't touch the parent").
-enum ParentWrite {
+pub(crate) enum ParentWrite {
     /// Plain open: leave an existing row's `parent_id` untouched (insert NULL).
     /// A plain reopen must never clear a worktree's recorded root.
     Preserve,
@@ -87,10 +88,16 @@ pub async fn add_folder_with_parent(
     path: &str,
     parent_id: Option<i32>,
 ) -> Result<FolderHistoryEntry, DbError> {
-    add_folder_inner(conn, path, ParentWrite::Set(parent_id), FolderKind::Regular).await
+    add_folder_inner(
+        conn,
+        path,
+        ParentWrite::Set(parent_id),
+        FolderKind::Regular,
+    )
+    .await
 }
 
-async fn add_folder_inner(
+pub(crate) async fn add_folder_inner(
     conn: &DatabaseConnection,
     path: &str,
     parent: ParentWrite,
@@ -145,6 +152,7 @@ async fn add_folder_inner(
                 ParentWrite::Set(parent_id) => parent_id,
             }),
             kind: Set(kind),
+            alias: Set(None),
         };
         active.insert(conn).await?
     };
@@ -186,24 +194,10 @@ pub async fn add_chat_folder(
         color: Set(DEFAULT_FOLDER_COLOR.to_string()),
         parent_id: Set(None),
         kind: Set(FolderKind::Chat),
+        alias: Set(None),
     };
     let model = active.insert(conn).await?;
     Ok(to_detail(model))
-}
-
-/// Create a platform-repo folder backing a project git repository.
-///
-/// Unlike [`add_folder`], `kind = platform_repo` is set so the frontend
-/// excludes this folder from the sidebar folder list. It is still available
-/// for git / file-tree switching via RepoSelector. The name is derived from
-/// the path, and `default_agent_type` can be set separately afterwards.
-/// If a folder with this path already exists (including soft-deleted ones),
-/// it is re-opened — but its kind is NOT changed (written once at insert).
-pub async fn add_platform_repo_folder(
-    conn: &DatabaseConnection,
-    path: &str,
-) -> Result<FolderHistoryEntry, DbError> {
-    add_folder_inner(conn, path, ParentWrite::Preserve, FolderKind::PlatformRepo).await
 }
 
 pub async fn update_folder_color(
@@ -222,6 +216,29 @@ pub async fn update_folder_color(
 
     let mut active = row.into_active_model();
     active.color = Set(color.to_string());
+    active.updated_at = Set(Utc::now());
+    let updated = active.update(conn).await?;
+    Ok(Some(to_detail(updated)))
+}
+
+/// Sets (or clears) a folder's display alias. `alias = None` clears it; callers
+/// are expected to have already normalized empty/whitespace input to `None`.
+pub async fn update_folder_alias(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    alias: Option<String>,
+) -> Result<Option<FolderDetail>, DbError> {
+    let row = folder::Entity::find_by_id(folder_id)
+        .filter(folder::Column::DeletedAt.is_null())
+        .one(conn)
+        .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let mut active = row.into_active_model();
+    active.alias = Set(alias);
     active.updated_at = Set(Utc::now());
     let updated = active.update(conn).await?;
     Ok(Some(to_detail(updated)))

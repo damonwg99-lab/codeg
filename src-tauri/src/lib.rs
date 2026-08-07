@@ -1,4 +1,14 @@
+// The ACP connection driver (`acp::connection`) wraps the enormous
+// `run_connection` future in a `block_on(async move { … })` frame whose type
+// layout nests deep enough to blow rustc's default query depth of 128 (it
+// overflowed by ~130 when computing the async block's layout). This is a
+// compile-time type-recursion knob, unrelated to any runtime limit — bump it
+// so the giant future's layout resolves. See the big-stack thread in
+// `acp/connection.rs` for the sibling *runtime* mitigation of the same frame.
+#![recursion_limit = "256"]
+
 pub mod acp;
+pub mod acp_transcript;
 pub use acp::{
     idle_sweep_task, idle_timeout_from_env, lifecycle_subscriber_task, SWEEP_INTERVAL_SECS,
 };
@@ -6,11 +16,14 @@ pub use network::proxy::init_proxy_from_db;
 mod app_error;
 pub mod app_state;
 pub mod automation;
+pub mod backgrounds;
 pub mod chat_channel;
 pub mod commands;
 pub mod db;
+pub mod folder_links;
 pub mod git_credential;
 pub mod git_repo;
+pub mod intern;
 pub mod keyring_store;
 pub mod logging;
 pub mod models;
@@ -21,16 +34,18 @@ pub mod paths;
 pub mod pet_sessions;
 pub mod pet_state_mapper;
 pub mod pets;
+pub mod platform;
 #[cfg(feature = "tauri-runtime")]
 pub mod preferences;
 pub mod process;
 pub mod supervise;
 mod terminal;
+pub mod turn_timings;
 pub mod update;
 pub mod web;
+pub mod work_task;
 pub mod workspace_state;
 pub mod workspace_transfer;
-pub mod platform;
 
 /// Sweep stale ACP binary cache trash created by the rename-aside fallback in
 /// `acp::binary_cache::clear_agent_cache`. Safe to call any time; intended to
@@ -48,21 +63,26 @@ mod tauri_app {
     use crate::chat_channel::manager::ChatChannelManager;
     use crate::commands::{
         acp as acp_commands, app_update as app_update_commands,
-        automation as automation_commands, backup,
-        chat_channel as chat_channel_commands, conversations, delegation as delegation_commands,
-        experts as experts_commands, feedback as feedback_commands, file_io, file_search,
-        folder_commands,
-        office_tools as office_tools_commands,
+        automation as automation_commands, background as background_commands, backup,
+        chat_channel as chat_channel_commands, conversations,
+        custom_skills as custom_skills_commands, delegation as delegation_commands,
+         experts as experts_commands, feedback as feedback_commands, file_io, file_search,
+         folder_commands, folder_links,
+         knowledge as knowledge_commands,
+         office_tools as office_tools_commands,
         folders, logging as logging_commands, mcp as mcp_commands,
         model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
-        project as project_commands, task as task_commands,
-        knowledge as knowledge_commands,
+        project as project_commands,
         question as question_commands, quick_messages as quick_messages_commands,
+        release as release_commands,
         remote_proxy as remote_proxy_commands,
         remote_workspace as remote_workspace_commands, science as science_commands,
         session_info as session_info_commands,
-        system_settings, terminal as terminal_commands,
-        version_control, windows, workspace_state as workspace_state_commands,
+        system_settings, task as task_commands,
+        terminal as terminal_commands,
+        token_usage as token_usage_commands,
+        version_control, windows, work_task as work_task_commands,
+        workspace_state as workspace_state_commands,
     };
     use crate::terminal::manager::TerminalManager;
     use crate::{db, git_credential, network, paths, process, web};
@@ -194,7 +214,6 @@ mod tauri_app {
             .manage(ConnectionManager::new())
             .manage(TerminalManager::new())
             .manage(ChatChannelManager::new())
-            .manage(crate::platform::project::manager::PlatformManager::new())
             .manage(windows::SettingsWindowState::new())
             .manage(windows::CommitWindowState::new())
             .manage(windows::MergeWindowState::new())
@@ -227,6 +246,11 @@ mod tauri_app {
             // embedded web server's AppState so HTTP and webview clients see the
             // same download progress; lets the upgrade UI survive navigation.
             .manage(crate::update::new_update_state_handle())
+            // Cluster A: PlatformManager shared state for the project/task/release
+            // surface. Cheap to clone via inner Arc; tauri commands reach it via
+            // `app.state::<PlatformManager>()`. Mirrors main's idiom for the
+            // other long-lived manage()'d singletons.
+            .manage(crate::app_state::default_platform_manager())
             .setup(|app| {
                 let app_data_dir = app.path().app_data_dir()?;
 
@@ -301,9 +325,13 @@ mod tauri_app {
                 ))
                 .map_err(|e| e.to_string())?;
                 app.manage(database);
-                app.manage(
-                    crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone()),
-                );
+                // Cluster A: Platform commands (commands/project.rs, task.rs,
+                // knowledge.rs, release.rs) take `tauri::State<'_, EventEmitter>`
+                // in their #[tauri::command] wrappers. Provide a managed
+                // `EventEmitter::Tauri(handle)` so those commands resolve state.
+                app.manage(crate::web::event_bridge::EventEmitter::Tauri(
+                    app.handle().clone(),
+                ));
 
                 // Restore and apply saved system proxy settings before any network operation.
                 let db = app.state::<db::AppDatabase>();
@@ -423,6 +451,7 @@ mod tauri_app {
                     let broadcaster =
                         app.state::<std::sync::Arc<web::event_bridge::WebEventBroadcaster>>();
                     let db_conn = app.state::<db::AppDatabase>().conn.clone();
+                    let data_dir = effective_data_dir.clone();
                     let ccm_ref = ccm.clone_ref();
                     let br = broadcaster.inner().clone();
                     let bus = app
@@ -432,7 +461,9 @@ mod tauri_app {
                     let cm = app.state::<ConnectionManager>().clone_ref();
                     let emitter = web::event_bridge::EventEmitter::Tauri(app.handle().clone());
                     tauri::async_runtime::spawn(async move {
-                        ccm_ref.start_background(br, bus, db_conn, cm, emitter).await;
+                        ccm_ref
+                            .start_background(br, bus, db_conn, data_dir, cm, emitter)
+                            .await;
                     });
                 }
 
@@ -582,6 +613,7 @@ mod tauri_app {
                                 }),
                             ),
                         ),
+                        std::sync::Arc::new(crate::work_task::EngineWorkTaskTools),
                     );
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = listener.run(socket_path).await {
@@ -674,6 +706,23 @@ mod tauri_app {
                     tauri::async_runtime::spawn(crate::automation::run_automation_engine(engine));
                 }
 
+                // Work-task engine: drives the todo→…→done pipeline, settles
+                // runs off the event bus, recovers merges from git truth on
+                // boot. One per process; mirrored in `bin/codeg_server.rs`.
+                if let Some(engine) = crate::work_task::build_task_engine(
+                    crate::db::AppDatabase {
+                        conn: app.state::<crate::db::AppDatabase>().conn.clone(),
+                    },
+                    app.state::<ConnectionManager>().clone_ref(),
+                    crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone()),
+                    app.state::<std::sync::Arc<crate::acp::InternalEventBus>>()
+                        .inner()
+                        .clone(),
+                    effective_data_dir.clone(),
+                ) {
+                    tauri::async_runtime::spawn(crate::work_task::run_task_engine(engine));
+                }
+
                 // Single-window workspace: ensure the main window exists.
                 // Workspace state (open folders, opened tabs, active tab) is
                 // restored by the frontend via `list_open_folder_details` /
@@ -684,7 +733,15 @@ mod tauri_app {
                         .title("Codeg")
                         .inner_size(1260.0, 860.0)
                         .min_inner_size(400.0, 600.0);
-                    if let Ok(w) = windows::apply_platform_window_style(builder).build() {
+                    let builder = windows::apply_platform_window_style(builder);
+                    // The workspace title bar is taller than the shared default
+                    // (it hosts the tab strips), so nudge the native macOS
+                    // traffic lights down to stay vertically centred.
+                    #[cfg(target_os = "macos")]
+                    let builder = builder.traffic_light_position(
+                        windows::workspace_window_traffic_light_position(),
+                    );
+                    if let Ok(w) = builder.build() {
                         windows::post_window_setup(&w);
                     }
                 }
@@ -876,6 +933,8 @@ mod tauri_app {
                 conversations::list_opened_tabs,
                 conversations::save_opened_tabs,
                 conversations::import_local_conversations,
+                conversations::scan_importable_sessions,
+                conversations::import_selected_sessions,
                 conversations::get_folder_conversation,
                 conversations::list_folders,
                 conversations::get_stats,
@@ -899,7 +958,14 @@ mod tauri_app {
                 folders::remove_folder_from_workspace,
                 folders::reorder_folders,
                 folders::update_folder_color,
+                folders::update_folder_alias,
                 folders::update_folder_default_agent,
+                folder_links::list_folder_links,
+                folder_links::preview_folder_links,
+                folder_links::create_folder_links,
+                folder_links::rename_folder_link,
+                folder_links::repair_folder_link,
+                folder_links::remove_folder_link,
                 folders::add_folder_to_history,
                 folders::remove_folder_from_history,
                 folders::create_folder_directory,
@@ -911,6 +977,7 @@ mod tauri_app {
                 folders::git_start_pull_merge,
                 folders::git_has_merge_head,
                 folders::git_fetch,
+                folders::git_update_branch,
                 folders::git_push_info,
                 folders::git_push,
                 folders::git_new_branch,
@@ -956,7 +1023,7 @@ mod tauri_app {
                 folders::list_directory_entries,
                 folders::list_directory_with_files,
                 folders::get_file_tree,
-                file_search::search_files_content_streaming,
+                folders::list_workspace_files,
                 folders::read_file_base64,
                 folders::read_workspace_file_base64,
                 folders::read_file_preview,
@@ -964,9 +1031,13 @@ mod tauri_app {
                 folders::save_file_content,
                 folders::save_file_copy,
                 folders::rename_file_tree_entry,
+                folders::move_file_tree_entry,
                 folders::delete_file_tree_entry,
                 folders::create_file_tree_entry,
                 folders::git_log,
+                folders::git_current_user,
+                folders::git_commit_files,
+                folders::git_search_authors,
                 folders::git_commit_branches,
                 windows::open_folder_window,
                 windows::open_commit_window,
@@ -975,6 +1046,7 @@ mod tauri_app {
                 windows::open_stash_window,
                 windows::open_push_window,
                 windows::open_project_boot_window,
+                windows::open_import_sessions_window,
                 remote_workspace_commands::list_remote_workspace_connections,
                 remote_workspace_commands::create_remote_workspace_connection,
                 remote_workspace_commands::update_remote_workspace_connection,
@@ -1019,9 +1091,13 @@ mod tauri_app {
                 pet_commands::pet_save_window_state,
                 pet_commands::pet_marketplace_list,
                 pet_commands::pet_marketplace_install,
+                pet_commands::pet_marketplace_asset,
                 pet_commands::pet_celebrate,
                 pet_commands::pet_get_current_state,
                 pet_commands::pet_list_active_sessions,
+                background_commands::background_read,
+                background_commands::background_set,
+                background_commands::background_clear,
                 app_update_commands::app_update_state,
                 app_update_commands::perform_app_update,
                 app_update_commands::restart_app,
@@ -1030,49 +1106,6 @@ mod tauri_app {
                 project_boot::detect_hyperframes_skills,
                 project_boot::install_hyperframes_skills,
                 project_boot::create_hyperframes_project,
-                project_commands::list_projects,
-                project_commands::get_project,
-                project_commands::create_project,
-                project_commands::update_project,
-                project_commands::delete_project,
-                project_commands::list_project_repos,
-                project_commands::add_project_repo,
-                project_commands::remove_project_repo,
-                project_commands::scan_git_repos,
-                project_commands::get_global_config,
-                project_commands::set_global_config,
-                project_commands::save_credential,
-                project_commands::delete_credential,
-                task_commands::list_tasks,
-                task_commands::get_task,
-                task_commands::create_task,
-                task_commands::update_task,
-                task_commands::update_task_status,
-                task_commands::delete_task,
-                task_commands::link_conversation,
-                task_commands::create_conversation_for_task,
-                task_commands::unlink_conversation,
-                task_commands::list_task_conversations,
-                task_commands::get_task_by_conversation,
-                task_commands::list_task_type_mappings,
-                task_commands::create_task_type_mapping,
-                task_commands::update_task_type_mapping,
-                task_commands::delete_task_type_mapping,
-                task_commands::create_decomposition,
-                knowledge_commands::scan_knowledge_repo,
-                knowledge_commands::list_knowledge_docs,
-                knowledge_commands::search_knowledge_docs,
-                knowledge_commands::get_knowledge_doc,
-                knowledge_commands::update_knowledge_doc,
-                knowledge_commands::delete_knowledge_doc,
-                knowledge_commands::list_skills,
-                knowledge_commands::upload_kb_doc,
-                knowledge_commands::upload_task_attachment,
-                knowledge_commands::upload_task_ai_intermediate_doc,
-                knowledge_commands::init_knowledge_repo,
-                knowledge_commands::read_kb_doc_content,
-                knowledge_commands::start_kb_watch,
-                knowledge_commands::stop_kb_watch,
                 system_settings::get_system_proxy_settings,
                 system_settings::update_system_proxy_settings,
                 system_settings::get_system_language_settings,
@@ -1108,15 +1141,19 @@ mod tauri_app {
                 version_control::get_account_token,
                 version_control::delete_account_token,
                 acp_commands::acp_preflight,
+                acp_commands::acp_cursor_auth_status,
+                acp_commands::acp_cursor_list_models,
                 acp_commands::acp_connect,
                 acp_commands::acp_prompt,
                 acp_commands::acp_set_mode,
                 acp_commands::acp_set_config_option,
+                acp_commands::acp_goal_control,
                 acp_commands::acp_describe_agent_options,
                 acp_commands::acp_cancel,
                 acp_commands::acp_fork,
                 acp_commands::acp_respond_permission,
                 acp_commands::acp_answer_question,
+                acp_commands::acp_answer_plan_approval,
                 acp_commands::acp_disconnect,
                 acp_commands::acp_touch_connection,
                 acp_commands::acp_list_connections,
@@ -1125,6 +1162,7 @@ mod tauri_app {
                 acp_commands::acp_find_connection_for_conversation,
                 acp_commands::acp_list_agents,
                 acp_commands::acp_get_agent_status,
+                acp_commands::acp_env_diagnostics,
                 acp_commands::acp_clear_binary_cache,
                 acp_commands::acp_download_agent_binary,
                 acp_commands::acp_install_uv_tool,
@@ -1145,12 +1183,19 @@ mod tauri_app {
                 acp_commands::acp_open_hermes_setup_terminal,
                 acp_commands::acp_reveal_hermes_home,
                 acp_commands::acp_reorder_agents,
+                crate::commands::custom_agents::acp_list_custom_agents,
+                crate::commands::custom_agents::acp_save_custom_agent,
+                crate::commands::custom_agents::acp_delete_custom_agent,
+                crate::commands::custom_agents::acp_fetch_registry_catalog,
+                crate::commands::custom_agents::acp_add_registry_agent,
+                crate::commands::custom_agents::acp_current_platform,
                 acp_commands::acp_list_agent_skills,
                 acp_commands::acp_read_agent_skill,
                 acp_commands::acp_save_agent_skill,
                 acp_commands::acp_delete_agent_skill,
                 acp_commands::opencode_list_plugins,
                 acp_commands::opencode_provider_catalog,
+                acp_commands::codex_bundled_catalog,
                 acp_commands::opencode_install_plugins,
                 acp_commands::opencode_uninstall_plugin,
                 acp_commands::codex_request_device_code,
@@ -1171,6 +1216,16 @@ mod tauri_app {
                 science_commands::science_apply_links,
                 science_commands::science_read_content,
                 science_commands::science_open_central_dir,
+                custom_skills_commands::custom_list,
+                custom_skills_commands::custom_list_all_install_statuses,
+                custom_skills_commands::custom_apply_links,
+                custom_skills_commands::custom_read_skill,
+                custom_skills_commands::custom_create_skill,
+                custom_skills_commands::custom_save_skill,
+                custom_skills_commands::custom_duplicate_skill,
+                custom_skills_commands::custom_import_skill,
+                custom_skills_commands::custom_import_from_agent,
+                custom_skills_commands::custom_delete_skills,
                 office_tools_commands::officecli_detect,
                 office_tools_commands::officecli_install,
                 office_tools_commands::officecli_uninstall,
@@ -1207,6 +1262,38 @@ mod tauri_app {
                 automation_commands::automation_compute_next_run,
                 automation_commands::automation_run_now,
                 automation_commands::automation_cancel_run,
+                token_usage_commands::token_usage_report,
+                token_usage_commands::token_usage_facets,
+                token_usage_commands::token_usage_status,
+                token_usage_commands::token_usage_sync,
+                work_task_commands::work_task_list,
+                work_task_commands::work_task_get,
+                work_task_commands::work_task_events,
+                work_task_commands::work_task_attention_count,
+                work_task_commands::work_task_create,
+                work_task_commands::work_task_update,
+                work_task_commands::work_task_reorder,
+                work_task_commands::work_task_delete,
+                work_task_commands::work_task_start,
+                work_task_commands::work_task_start_all,
+                work_task_commands::work_task_retry,
+                work_task_commands::work_task_requeue,
+                work_task_commands::work_task_return,
+                work_task_commands::work_task_cancel,
+                work_task_commands::work_task_merge,
+                work_task_commands::work_task_complete,
+                work_task_commands::work_task_archive,
+                work_task_commands::work_task_cleanup,
+                work_task_commands::work_task_diff,
+                work_task_commands::work_task_changed_files,
+                work_task_commands::work_task_settings_get,
+                work_task_commands::work_task_settings_get_own,
+                work_task_commands::work_task_settings_effective,
+                work_task_commands::work_task_settings_set,
+                work_task_commands::work_task_settings_delete,
+                work_task_commands::work_task_template_list,
+                work_task_commands::work_task_template_save,
+                work_task_commands::work_task_template_delete,
                 terminal_commands::terminal_spawn,
                 terminal_commands::terminal_write,
                 terminal_commands::terminal_resize,
@@ -1260,6 +1347,70 @@ mod tauri_app {
                 web::get_web_service_config,
                 web::update_web_service_config,
                 web::probe_web_service_port,
+
+                // ─── Platform (Cluster A/B/C/D/E) ───────────────────────────
+                // File content search (Cluster E).
+                file_search::search_files_content_streaming,
+
+                // Project + zentao integration + credentials (Cluster A).
+                project_commands::list_projects,
+                project_commands::get_project,
+                project_commands::create_project,
+                project_commands::update_project,
+                project_commands::delete_project,
+                project_commands::list_project_repos,
+                project_commands::add_project_repo,
+                project_commands::remove_project_repo,
+                project_commands::scan_git_repos,
+                project_commands::get_global_config,
+                project_commands::set_global_config,
+                project_commands::save_credential,
+                project_commands::delete_credential,
+
+                // Tasks + task-type mapping + decomposition + branch links (Clusters A/B/D).
+                task_commands::list_tasks,
+                task_commands::get_task,
+                task_commands::create_task,
+                task_commands::update_task,
+                task_commands::update_task_status,
+                task_commands::delete_task,
+                task_commands::link_conversation,
+                task_commands::create_conversation_for_task,
+                task_commands::unlink_conversation,
+                task_commands::list_task_conversations,
+                task_commands::get_task_by_conversation,
+                task_commands::list_task_type_mappings,
+                task_commands::create_task_type_mapping,
+                task_commands::update_task_type_mapping,
+                task_commands::delete_task_type_mapping,
+                task_commands::create_decomposition,
+                task_commands::link_task_branch,
+                task_commands::update_task_branch,
+                task_commands::update_task_db_scripts,
+                task_commands::unlink_task_branch,
+
+                // Releases (Cluster B).
+                release_commands::create_release,
+                release_commands::list_releases,
+                release_commands::get_release,
+                release_commands::update_release,
+                release_commands::delete_release,
+
+                // Knowledge Base: scan / docs / skills / upload / watcher (Cluster C).
+                knowledge_commands::scan_knowledge_repo,
+                knowledge_commands::list_knowledge_docs,
+                knowledge_commands::search_knowledge_docs,
+                knowledge_commands::get_knowledge_doc,
+                knowledge_commands::update_knowledge_doc,
+                knowledge_commands::delete_knowledge_doc,
+                knowledge_commands::list_skills,
+                knowledge_commands::upload_kb_doc,
+                knowledge_commands::upload_task_attachment,
+                knowledge_commands::upload_task_ai_intermediate_doc,
+                knowledge_commands::init_knowledge_repo,
+                knowledge_commands::read_kb_doc_content,
+                knowledge_commands::start_kb_watch,
+                knowledge_commands::stop_kb_watch,
             ])
             .build(tauri::generate_context!())
             .expect("error while building tauri application")

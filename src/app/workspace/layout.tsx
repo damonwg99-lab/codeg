@@ -10,7 +10,6 @@ import {
 } from "react"
 import type { ImperativePanelGroupHandle } from "react-resizable-panels"
 import { FolderTitleBar } from "@/components/layout/folder-title-bar"
-import { useIsActiveChatMode } from "@/hooks/use-is-active-chat-mode"
 import { Sidebar } from "@/components/layout/sidebar"
 import { StatusBar } from "@/components/layout/status-bar"
 import {
@@ -27,16 +26,20 @@ import {
 import { DelegationProvider } from "@/contexts/delegation-context"
 import { ConversationRuntimeProvider } from "@/contexts/conversation-runtime-context"
 import { TabProvider, useTabStore, useTabActions } from "@/contexts/tab-context"
-import { SessionStatsProvider } from "@/contexts/session-stats-context"
+import { selectIsSplit } from "@/stores/tab-store"
 import { SidebarProvider, useSidebarContext } from "@/contexts/sidebar-context"
-import { PlatformProvider } from "@/contexts/platform-context"
 import { SearchDialogProvider } from "@/contexts/search-dialog-context"
 import { AutomationsViewProvider } from "@/contexts/automations-view-context"
+import { TasksViewProvider } from "@/contexts/tasks-view-context"
 import {
   WorkbenchRouteProvider,
   useWorkbenchRoute,
 } from "@/contexts/workbench-route-context"
-import { WorkbenchRoutePage } from "@/components/workbench/workbench-content"
+import {
+  WorkbenchRoutePage,
+  WorkbenchRouteStrip,
+  useHasWorkbenchRouteStrip,
+} from "@/components/workbench/workbench-content"
 import {
   AuxPanelProvider,
   useAuxPanelContext,
@@ -46,17 +49,26 @@ import {
   useTerminalContext,
 } from "@/contexts/terminal-context"
 import { GitCredentialProvider } from "@/contexts/git-credential-context"
+import { PlatformProvider } from "@/contexts/platform-context"
 import {
   WorkspaceProvider,
   useWorkspaceActions,
+  useWorkspaceFileTabs,
   useWorkspaceView,
 } from "@/contexts/workspace-context"
 import { RemoteConnectionGate } from "@/contexts/remote-connection-context"
 import { UpdateProvider } from "@/components/providers/update-provider"
+import { useWorkspaceBackground, useZoomLevel } from "@/hooks/use-appearance"
+import { FILL_MODE_STYLE } from "@/lib/workspace-background"
 import { TabBar } from "@/components/tabs/tab-bar"
 import { TerminalPanel } from "@/components/terminal/terminal-panel"
 import { AuxPanel } from "@/components/layout/aux-panel"
+import { LeftEdgeChrome } from "@/components/layout/left-edge-chrome"
+import { RightEdgeChrome } from "@/components/layout/right-edge-chrome"
+import { WorkspaceChromeController } from "@/components/layout/workspace-chrome-controller"
+import { WindowControls } from "@/components/layout/window-controls"
 import { FileWorkspaceTabBar } from "@/components/files/file-workspace-tab-bar"
+import { FileWorkspaceHeader } from "@/components/files/file-workspace-header"
 import { FileWorkspacePanel } from "@/components/files/file-workspace-panel"
 import { ExternalConflictDialog } from "@/components/files/external-conflict-dialog"
 import { AppToaster } from "@/components/ui/app-toaster"
@@ -72,7 +84,14 @@ import {
   ResizablePanelGroup,
 } from "@/components/ui/resizable"
 import { cn } from "@/lib/utils"
+import { isDesktop } from "@/lib/platform"
+import {
+  WINDOW_CAPTION_WIDTH,
+  leftChromeReserve,
+  rightChromeReserve,
+} from "@/lib/window-chrome"
 import { useIsMobile } from "@/hooks/use-mobile"
+import { usePlatform } from "@/hooks/use-platform"
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet"
 
 function WorkspaceDocumentTitle() {
@@ -87,6 +106,7 @@ function WorkspaceDocumentTitle() {
 
 const TOAST_DURATION_MS = 15000
 const WORKSPACE_PANEL_GROUP_ID = "workspace-panel-group"
+const WORKSPACE_OVERLAY_PANEL_GROUP_ID = "workspace-overlay-panel-group"
 const WORKSPACE_CONVERSATION_PANEL_ID = "workspace-conversation-panel"
 const WORKSPACE_FILES_PANEL_ID = "workspace-files-panel"
 const FOLDER_SHELL_GROUP_ID = "folder-shell-group"
@@ -114,23 +134,6 @@ function TabKeysSync() {
   useEffect(() => {
     registerOpenTabKeys(keys)
   }, [keys, registerOpenTabKeys])
-  return null
-}
-
-/**
- * Auto-hides the right (aux) panel whenever a folderless chat conversation
- * becomes active. Effect fires only on the `isChatMode` rising edge (it does NOT
- * depend on `isOpen`), so it won't fight a user who reopens the panel — though in
- * practice the toggle button and shortcut are also hidden in chat mode, making
- * the hide effectively sticky for the chat session. Leaving chat mode does not
- * auto-restore (kept simple); the user reopens it on a normal folder.
- */
-function ChatModeAuxAutoHide() {
-  const isChatMode = useIsActiveChatMode()
-  const { setOpen } = useAuxPanelContext()
-  useEffect(() => {
-    if (isChatMode) setOpen(false)
-  }, [isChatMode, setOpen])
   return null
 }
 
@@ -201,6 +204,7 @@ function usePanelSlideOnToggle(open: boolean, ready: boolean): boolean {
 function WorkspaceContent({ children }: { children: React.ReactNode }) {
   const { mode, filesMaximized } = useWorkspaceView()
   const { setActivePane } = useWorkspaceActions()
+  const { fileTabs } = useWorkspaceFileTabs()
   const panelGroupRef = useRef<ImperativePanelGroupHandle | null>(null)
   const fusionLayoutRef = useRef<[number, number]>(DEFAULT_FUSION_LAYOUT)
   const desiredLayoutRef = useRef<[number, number]>(DEFAULT_FUSION_LAYOUT)
@@ -215,6 +219,28 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
     if (mode !== "fusion") return
     setActivePane("files")
   }, [mode, setActivePane])
+
+  // The file column reused both in the conversation+files split and inside the
+  // full-screen workbench overlay's split (tab strip + header + panel).
+  const fileColumnSection = (
+    <section className="flex h-full min-h-0 flex-col overflow-hidden">
+      <div className="flex h-10 shrink-0 items-stretch bg-muted ws-transparent-bg">
+        <div className="flex min-w-0 flex-1 items-stretch">
+          <FileWorkspaceTabBar />
+        </div>
+      </div>
+      <div
+        className="flex min-h-0 flex-1 flex-col overflow-hidden"
+        onPointerDownCapture={markFileActive}
+        onFocusCapture={markFileActive}
+      >
+        <FileWorkspaceHeader />
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <FileWorkspacePanel />
+        </div>
+      </div>
+    </section>
+  )
 
   const applyLayout = useCallback((layout: [number, number]) => {
     desiredLayoutRef.current = layout
@@ -265,73 +291,320 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
   )
 
   const { isConversations } = useWorkbenchRoute()
+  const hasRouteStrip = useHasWorkbenchRouteStrip()
+  const { isOpen: sidebarOpen } = useSidebarContext()
+  const { isOpen: auxOpen } = useAuxPanelContext()
+  const { isMac, isWindows, isLinux } = usePlatform()
+  const { zoomLevel } = useZoomLevel()
+  const hasConvTabs = useTabStore((s) => s.tabs.length > 0)
+  const isConvSplit = useTabStore(selectIsSplit)
+  const winLinuxControls = isDesktop() && (isWindows || isLinux)
+  // The window chrome (toggle/remote left, terminal/aux/settings right) now
+  // lives in fixed corner overlays (see FolderLayoutShell) that never move on
+  // panel toggles. Each edge column just reserves the overlay's width so its
+  // tabs never render underneath. The reserve scales with the app zoom so it
+  // tracks the rem-sized overlay buttons (which grow with zoom).
+  const leftReserve = leftChromeReserve(isMac && isDesktop(), zoomLevel)
+  const rightReserve = rightChromeReserve(winLinuxControls, zoomLevel)
+  // A middle column reserves the right overlay only when it (not the aux panel)
+  // is the window's right edge: the file column in fusion, else conversation.
+  const convReservesRight = !auxOpen && mode === "conversation"
+  const fileReservesRight = !auxOpen && mode === "fusion"
+  // Maximizing files overlays the whole middle area, so the file column then
+  // also owns the window's LEFT edge when the sidebar is collapsed — reserve the
+  // left overlay too (normally that's the conversation column's job).
+  const fileReservesLeft = filesMaximized && !sidebarOpen
 
   return (
     <div className="relative h-full min-h-0 overflow-hidden">
-      <ResizablePanelGroup
-        id={WORKSPACE_PANEL_GROUP_ID}
-        ref={panelGroupRef}
-        direction="horizontal"
-        onLayout={handleLayout}
+      {/* Kept mounted (and only hidden) when a workbench route takes over, so
+          background conversations keep streaming. `inert` drops it from the tab
+          order; `invisible` (visibility, not display — keeps mount/layout/
+          scroll) stops it painting, because with a workspace background image
+          the route overlay's ws-surface is translucent and the conversation
+          would ghost through it. conversation-tab-hidden hardens that hidden
+          subtree (see globals.css): it kills the subtree's transitions so
+          visibility flips instantly (transition-all ghosts) and re-hides the
+          descendants that declare `visibility: visible` themselves — Monaco's
+          diff panes do, which is why an open git-diff file tab used to show
+          through the tasks / automations / token-usage pages. */}
+      <div
+        className={cn(
+          "h-full min-h-0",
+          !isConversations && "conversation-tab-hidden invisible"
+        )}
+        inert={!isConversations || undefined}
       >
-        <ResizablePanel
-          id={WORKSPACE_CONVERSATION_PANEL_ID}
-          order={1}
-          defaultSize={56}
-          minSize={mode === "fusion" ? 25 : 0}
+        <ResizablePanelGroup
+          id={WORKSPACE_PANEL_GROUP_ID}
+          ref={panelGroupRef}
+          direction="horizontal"
+          onLayout={handleLayout}
         >
-          <section
-            className={cn(
-              "flex h-full min-h-0 flex-col overflow-hidden",
-              mode === "conversation" && "absolute inset-0 z-30 bg-background"
-            )}
-            onPointerDownCapture={markConversationActive}
-            onFocusCapture={markConversationActive}
-            inert={filesMaximized || undefined}
+          <ResizablePanel
+            id={WORKSPACE_CONVERSATION_PANEL_ID}
+            order={1}
+            defaultSize={56}
+            minSize={mode === "fusion" ? 25 : 0}
           >
-            {isConversations ? (
-              <>
-                <TabBar />
-                <div className="relative flex-1 min-h-0 overflow-hidden">
-                  {children}
+            <section
+              className={cn(
+                "flex h-full min-h-0 flex-col overflow-hidden",
+                mode === "conversation" &&
+                  "absolute inset-0 z-30 bg-background ws-transparent-bg",
+                // Covered by the files-maximized overlay: stop painting so it
+                // can't show through the now-translucent overlay. `invisible`
+                // (visibility:hidden), not display:none, keeps mount + box size
+                // intact so the stick-to-bottom scroll doesn't reset;
+                // conversation-tab-hidden is the shared hardening for a hidden
+                // keep-alive subtree (kills its transitions, and re-hides the
+                // descendants that declare `visibility: visible` themselves).
+                filesMaximized && "conversation-tab-hidden invisible"
+              )}
+              inert={filesMaximized || undefined}
+            >
+              {/* Conversation column top bar (UNSPLIT only): the tab strip,
+                  plus a left reserve (only when the sidebar is collapsed, so
+                  this column owns the window's left edge) and a right reserve
+                  (only when it's the window's right edge) for the fixed corner
+                  overlays. The detail header + tiles render inside {children},
+                  directly below. `bg-muted` shades the strip like a browser tab
+                  bar (matching the bottom StatusBar) — the active tab
+                  (bg-background) reads as a white tab seated on it, with
+                  reverse bottom corners. With a workspace background image on,
+                  the strip + every tab go transparent (reveal the image); a
+                  hairline bottom border (ws-strip-line) runs under the reserves
+                  and inactive tabs while the active tab omits it and the border
+                  arches over its top (the active browser-tab-item's `::after`)
+                  instead. While SPLIT this row disappears entirely (no blank
+                  drag strip above the shells): each group shell hosts its own
+                  strip whose tail spacer is a window-drag region, and the
+                  TOP-edge strips re-create the corner reserves themselves (see
+                  SplitStripCornerReserve in conversation-detail-panel). */}
+              {!isConvSplit && (
+                <div className="flex h-10 shrink-0 items-stretch bg-muted ws-transparent-bg">
+                  {!sidebarOpen && (
+                    <div
+                      data-tauri-drag-region
+                      className="h-full shrink-0 ws-strip-line"
+                      style={{ width: leftReserve }}
+                    />
+                  )}
+                  <div className="flex min-w-0 flex-1 items-stretch">
+                    {hasConvTabs ? (
+                      <TabBar />
+                    ) : (
+                      // No tabs → TabBar renders null; keep a drag region so
+                      // the title bar can still move the window.
+                      <div
+                        data-tauri-drag-region
+                        className="h-full min-w-0 flex-1 ws-strip-line"
+                      />
+                    )}
+                  </div>
+                  {convReservesRight && (
+                    <div
+                      data-tauri-drag-region
+                      className="h-full shrink-0 ws-strip-line"
+                      style={{ width: rightReserve }}
+                    />
+                  )}
                 </div>
-              </>
-            ) : (
-              <WorkbenchRoutePage />
-            )}
-          </section>
-        </ResizablePanel>
-        <ResizableHandle
-          withHandle
-          disabled={mode !== "fusion"}
-          className={
-            mode === "fusion"
-              ? ""
-              : "pointer-events-none w-0 opacity-0 after:w-0"
-          }
-        />
-        <ResizablePanel
-          id={WORKSPACE_FILES_PANEL_ID}
-          order={2}
-          defaultSize={44}
-          minSize={mode === "fusion" ? 20 : 0}
-        >
-          <section
+              )}
+              {/* Pane activation lives on the CONTENT, not the top bar: clicking
+                  edge chrome (terminal/settings/toggles) or grabbing a drag
+                  region stays pane-neutral so it never hijacks close-tab /
+                  next-tab routing. Tabs self-activate via switchTab. */}
+              <div
+                className="relative flex-1 min-h-0 overflow-hidden"
+                onPointerDownCapture={markConversationActive}
+                onFocusCapture={markConversationActive}
+              >
+                {children}
+              </div>
+            </section>
+          </ResizablePanel>
+          {/* The divider only belongs to a real two-column split. In conversation
+              mode the column overlays the whole area, so the handle collapses to
+              zero width. While files are MAXIMIZED it must go too: that overlay
+              is translucent under a workspace background image, so the handle's
+              1px `bg-border` line stayed visible straight through it — a stray
+              vertical divider running down the maximized file column and on
+              through the editor / diff canvas below. There it only turns
+              invisible (no `w-0`): dropping its width would resize the
+              conversation panel and reset its stick-to-bottom scroll, the very
+              thing the overlay approach avoids. */}
+          <ResizableHandle
+            withHandle
+            disabled={mode !== "fusion" || filesMaximized}
             className={cn(
-              "flex h-full min-h-0 flex-col overflow-hidden",
-              filesMaximized && "absolute inset-0 z-30 bg-background"
+              mode !== "fusion" &&
+                "pointer-events-none w-0 opacity-0 after:w-0",
+              mode === "fusion" &&
+                filesMaximized &&
+                "pointer-events-none invisible"
             )}
-            onPointerDownCapture={markFileActive}
-            onFocusCapture={markFileActive}
-            aria-hidden={mode === "conversation"}
+          />
+          <ResizablePanel
+            id={WORKSPACE_FILES_PANEL_ID}
+            order={2}
+            defaultSize={44}
+            minSize={mode === "fusion" ? 20 : 0}
           >
-            <FileWorkspaceTabBar />
-            <div className="flex-1 min-h-0 overflow-hidden">
-              <FileWorkspacePanel />
+            {/* When maximized, overlay the file section across the entire
+                workspace area instead of resizing the conversation panel — that
+                would fire ResizeObserver on the conversation's stick-to-bottom
+                scroll container and reset its position.
+                The `absolute inset-0` resolves to the outer `relative` wrapper
+                (the static `h-full` wrapper here is skipped), not the Panel
+                root. This depends on react-resizable-panels keeping the Panel
+                root at `position: static`; if a future version sets
+                `position: relative` there, this overlay (and the mirrored
+                `mode === "conversation"` overlay above) would clip to the
+                Panel's allocated slice and need to be lifted outside the panel
+                group. */}
+            <section
+              className={cn(
+                "flex h-full min-h-0 flex-col overflow-hidden",
+                filesMaximized &&
+                  "absolute inset-0 z-30 bg-background ws-transparent-bg",
+                // Covered by the conversation overlay in conversation mode: hide
+                // from paint (keep mount + layout) so it can't show through the
+                // translucent overlay. conversation-tab-hidden goes with it —
+                // an open git-diff tab lives in this column and Monaco's diff
+                // panes set their own inline `visibility: visible` (see
+                // globals.css), so `invisible` alone leaves them painting.
+                mode === "conversation" && "conversation-tab-hidden invisible"
+              )}
+              aria-hidden={mode === "conversation"}
+            >
+              {/* File column top bar: the file tab strip + a right reserve for
+                  the fixed corner overlay (only when the aux panel is collapsed,
+                  so this column owns the window's right edge). Per-file actions
+                  live in FileWorkspaceHeader below, above every
+                  FileWorkspacePanel render branch. `bg-muted` shades the strip
+                  like a browser tab bar (matches the conversation column and the
+                  bottom StatusBar). With a workspace background image on, the
+                  strip + every tab go transparent (reveal the image) and a
+                  hairline bottom border (ws-strip-line) sits under the reserves
+                  and inactive tabs, arching over the active tab (the active
+                  browser-tab-item's `::after`) — same as the conversation column. */}
+              <div className="flex h-10 shrink-0 items-stretch bg-muted ws-transparent-bg">
+                {fileReservesLeft && (
+                  <div
+                    data-tauri-drag-region
+                    className="h-full shrink-0 ws-strip-line"
+                    style={{ width: leftReserve }}
+                  />
+                )}
+                <div className="flex min-w-0 flex-1 items-stretch">
+                  <FileWorkspaceTabBar />
+                </div>
+                {fileReservesRight && (
+                  <div
+                    data-tauri-drag-region
+                    className="h-full shrink-0 ws-strip-line"
+                    style={{ width: rightReserve }}
+                  />
+                )}
+              </div>
+              {/* Pane activation on the file content + its detail header, not
+                  the top bar (see the conversation section). */}
+              <div
+                className="flex min-h-0 flex-1 flex-col overflow-hidden"
+                onPointerDownCapture={markFileActive}
+                onFocusCapture={markFileActive}
+              >
+                <FileWorkspaceHeader />
+                <div className="flex-1 min-h-0 overflow-hidden">
+                  <FileWorkspacePanel />
+                </div>
+              </div>
+            </section>
+          </ResizablePanel>
+        </ResizablePanelGroup>
+      </div>
+      {!isConversations ? (
+        // `bg-background ws-transparent-bg` matches the conversation surface
+        // exactly: opaque background normally, fully transparent (image shows
+        // through, no frost) with a workspace background image on — the
+        // conversation beneath is `invisible` so nothing else paints through.
+        <div className="absolute inset-0 z-40 flex flex-col bg-background ws-transparent-bg">
+          {/* Window-chrome strip: reserves the fixed corner overlays' h-10
+              band, hosts the active route's title on the left, and keeps the
+              empty middle as a window-drag region. With a title present it
+              closes with the sidebar-header hairline (ws-chrome-border keeps
+              it legible over a background image). */}
+          <div
+            className={cn(
+              "flex h-10 shrink-0 items-stretch",
+              hasRouteStrip && "border-b border-border/50 ws-chrome-border"
+            )}
+          >
+            {!sidebarOpen && (
+              <div
+                data-tauri-drag-region
+                className="h-full shrink-0"
+                style={{ width: leftReserve }}
+              />
+            )}
+            <WorkbenchRouteStrip />
+            <div data-tauri-drag-region className="h-full min-w-0 flex-1" />
+          </div>
+          {/* Body: the active route full-width, or — when files are open on a
+              full-screen route (e.g. a task detail with previewed docs) — a
+              split that keeps the route on the left and reuses the file
+              column (tab strip + panel) on the right, so the detail stays
+              visible while the file is inspected. No files: route fills the
+              whole overlay, identical to main. */}
+          {fileTabs.length > 0 ? (
+            /* Kept mounted and switched with CSS (like the conversation+files
+               split below): maximize overlays the file column across the whole
+               split area instead of tearing down / remounting the panel group
+               and the detail route — unmounting the route (e.g. a heavy task
+               detail) on every toggle is what made the button feel laggy. The
+               `relative` wrapper anchors the file column's `absolute inset-0`. */
+            <div className="relative min-h-0 flex-1">
+              <ResizablePanelGroup
+                direction="horizontal"
+                className="min-h-0 flex-1"
+                id={WORKSPACE_OVERLAY_PANEL_GROUP_ID}
+              >
+                <ResizablePanel
+                  defaultSize={60}
+                  minSize={30}
+                  className={cn(filesMaximized && "invisible")}
+                >
+                  <WorkbenchRoutePage />
+                </ResizablePanel>
+                <ResizableHandle
+                  withHandle
+                  className={cn(filesMaximized && "invisible")}
+                />
+                <ResizablePanel defaultSize={40} minSize={20}>
+                  {/* When maximized the file column overlays the whole split
+                      area (anchored by the `relative` wrapper) — visibility
+                      instead of unmount keeps both panes mounted so toggling
+                      never tears down the detail route. */}
+                  <div
+                    className={cn(
+                      "h-full min-h-0",
+                      filesMaximized &&
+                        "absolute inset-0 z-30 bg-background ws-transparent-bg"
+                    )}
+                  >
+                    {fileColumnSection}
+                  </div>
+                </ResizablePanel>
+              </ResizablePanelGroup>
             </div>
-          </section>
-        </ResizablePanel>
-      </ResizablePanelGroup>
+          ) : (
+            <div className="min-h-0 flex-1">
+              <WorkbenchRoutePage />
+            </div>
+          )}
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -339,31 +612,57 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
 function MobileWorkspaceContent({ children }: { children: React.ReactNode }) {
   const { mode, activePane } = useWorkspaceView()
   const { isConversations } = useWorkbenchRoute()
+  const hasRouteStrip = useHasWorkbenchRouteStrip()
 
   const showConversation =
     mode === "conversation" || activePane === "conversation"
 
   return (
     <div className="relative h-full min-h-0 overflow-hidden">
-      {isConversations ? (
-        showConversation ? (
+      {/* Same keep-alive hiding as the desktop shell: stop painting under the
+          translucent route overlay without unmounting. */}
+      <div
+        className={cn(
+          "h-full min-h-0",
+          !isConversations && "conversation-tab-hidden invisible"
+        )}
+        inert={!isConversations || undefined}
+      >
+        {showConversation ? (
+          // Mobile mirrors the desktop chrome: no tab strip — the conversation
+          // detail header (folder › title) renders inside {children}, and tabs
+          // are navigated from the sidebar (single active conversation at a time).
           <section className="flex h-full min-h-0 flex-col overflow-hidden">
-            <TabBar />
             <div className="relative flex-1 min-h-0 overflow-hidden">
               {children}
             </div>
           </section>
         ) : (
+          // File view: the shared FileWorkspaceHeader (folder › file breadcrumb)
+          // replaces the file tab strip, matching the desktop file column.
           <section className="flex h-full min-h-0 flex-col overflow-hidden">
-            <FileWorkspaceTabBar />
+            <FileWorkspaceHeader />
             <div className="flex-1 min-h-0 overflow-hidden">
               <FileWorkspacePanel />
             </div>
           </section>
-        )
-      ) : (
-        <WorkbenchRoutePage />
-      )}
+        )}
+      </div>
+      {!isConversations ? (
+        // Same canvas as the desktop overlay: conversation-identical background
+        // (opaque normally, transparent under a workspace background image).
+        <div className="absolute inset-0 z-40 flex flex-col bg-background ws-transparent-bg">
+          {hasRouteStrip ? (
+            <div className="flex h-10 shrink-0 items-stretch border-b border-border/50 ws-chrome-border">
+              <WorkbenchRouteStrip />
+              <div className="min-w-0 flex-1" />
+            </div>
+          ) : null}
+          <div className="min-h-0 flex-1">
+            <WorkbenchRoutePage />
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -439,7 +738,7 @@ function FolderWorkspaceShell({ children }: { children: React.ReactNode }) {
     setWidth: setSidebarWidth,
   } = useSidebarContext()
   const {
-    isOpen: auxOpen,
+    isOpen: auxOpenRequested,
     restored: auxRestored,
     width: auxWidth,
     minWidth: auxMinWidth,
@@ -447,12 +746,22 @@ function FolderWorkspaceShell({ children }: { children: React.ReactNode }) {
     setWidth: setAuxWidth,
   } = useAuxPanelContext()
   const {
-    isOpen: terminalOpen,
+    isOpen: terminalOpenRequested,
     height: terminalHeight,
     minHeight: terminalMinHeight,
     maxHeight: terminalMaxHeight,
     setHeight: setTerminalHeight,
   } = useTerminalContext()
+  // A full-page workbench route (tasks / automations) replaces only the CENTER
+  // panel — the terminal sits below it and the aux panel beside it, both
+  // outside the overlay. Their toggles are hidden on those routes
+  // (RightEdgeChrome), so anything left open would be stranded on screen with
+  // no way to close it. Collapse both for the duration; the contexts keep the
+  // user's real open state (and the terminal keeps running), so switching back
+  // to conversations restores exactly what was there.
+  const { isConversations } = useWorkbenchRoute()
+  const auxOpen = auxOpenRequested && isConversations
+  const terminalOpen = terminalOpenRequested && isConversations
 
   // Animate the shell (horizontal) group while the sidebar/aux toggle and the
   // main (vertical) group while the terminal toggles, so the panes slide open
@@ -771,7 +1080,12 @@ function FolderWorkspaceShell({ children }: { children: React.ReactNode }) {
           minSize={sidebarOpen ? sidebarSizeRange.minSize : 0}
           maxSize={sidebarOpen ? sidebarSizeRange.maxSize : 0}
         >
-          <div className="h-full min-h-0 overflow-hidden">
+          {/* `bg-sidebar` on the wrapper (not just the Sidebar surface) so the
+              collapse never flashes white: Sidebar `return null`s the instant
+              it closes, but the panel keeps a shrinking width for the 240ms
+              slide — an un-backed wrapper would show the root `bg-background`
+              (white) through that gap. */}
+          <div className="h-full min-h-0 overflow-hidden ws-surface-sidebar">
             <Sidebar />
           </div>
         </ResizablePanel>
@@ -852,7 +1166,14 @@ function FolderWorkspaceShell({ children }: { children: React.ReactNode }) {
           minSize={auxOpen ? auxSizeRange.minSize : 0}
           maxSize={auxOpen ? auxSizeRange.maxSize : 0}
         >
-          <div className="h-full min-h-0 overflow-hidden">
+          {/* Transparent canvas so the right column reads like the middle
+              conversation area (its own frosted chrome — the aux toolbar — sits
+              on top): with a background image on, the file tree shows the image
+              through instead of a second frosted layer over the toolbar. The
+              paired `bg-background` is the off-state (image disabled): equivalent
+              to the old opaque wrapper, so the 240ms collapse slide still never
+              flashes white while AuxPanel `return null`s. */}
+          <div className="h-full min-h-0 overflow-hidden bg-background ws-transparent-bg">
             <AuxPanel />
           </div>
         </ResizablePanel>
@@ -863,17 +1184,86 @@ function FolderWorkspaceShell({ children }: { children: React.ReactNode }) {
 
 function FolderLayoutShell({ children }: { children: React.ReactNode }) {
   const isMobile = useIsMobile()
+  const { isWindows, isLinux } = usePlatform()
+  const winLinuxControls = isDesktop() && (isWindows || isLinux)
+  const {
+    workspaceBgEnabled,
+    workspaceBgImageUrl,
+    workspaceBgMaskOpacity,
+    workspaceBgImageBlur,
+    workspaceBgFillMode,
+  } = useWorkspaceBackground()
+  const showBackground = workspaceBgEnabled && workspaceBgImageUrl !== null
+  const fillStyle = FILL_MODE_STYLE[workspaceBgFillMode]
 
   return (
     <div className="fixed inset-0 flex flex-col overflow-hidden bg-background text-foreground pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)]">
-      <ChatModeAuxAutoHide />
-      <FolderTitleBar />
+      {/* 用户背景图片：铺在整个工作区底层。根 div 是 fixed，已建立层叠上下文，故
+          -z-10 绘于自身 bg-background 之上、所有流内容之下。遮罩是朝 --background 的
+          面纱（明暗自适配），保证内容可读；结构性面板的半透明由 globals.css 的
+          [data-workspace-bg] 规则处理，不在此。 */}
+      {showBackground && (
+        <>
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-0 -z-10 bg-center"
+            style={{
+              backgroundImage: `url("${workspaceBgImageUrl}")`,
+              backgroundSize: fillStyle.size,
+              backgroundRepeat: fillStyle.repeat,
+              filter: workspaceBgImageBlur
+                ? `blur(${workspaceBgImageBlur}px)`
+                : undefined,
+            }}
+          />
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-0 -z-10"
+            style={{
+              backgroundColor: `color-mix(in oklch, var(--background) ${Math.round(
+                workspaceBgMaskOpacity * 100
+              )}%, transparent)`,
+            }}
+          />
+        </>
+      )}
+      {/* Global shortcuts + the search / remote-directory dialogs (formerly
+          owned by the full-width FolderTitleBar). Mounted on both platforms. */}
+      <WorkspaceChromeController />
       {isMobile ? (
-        <MobileFolderWorkspaceShell>{children}</MobileFolderWorkspaceShell>
+        <>
+          {/* Mobile keeps the visible full-width bar; desktop moved its buttons
+              into fixed corner overlays (LeftEdgeChrome / RightEdgeChrome). */}
+          <FolderTitleBar />
+          <MobileFolderWorkspaceShell>{children}</MobileFolderWorkspaceShell>
+        </>
       ) : (
         <FolderWorkspaceShell>{children}</FolderWorkspaceShell>
       )}
       <StatusBar />
+      {/* Desktop window chrome, pinned to the window corners so it never moves —
+          or re-mounts — when the side panels open/close (that re-parenting is
+          what made the old in-header clusters flicker). Left = sidebar toggle +
+          remote; right = terminal/aux/settings, sitting to the LEFT of the
+          Windows/Linux caption buttons; then the caption buttons themselves
+          (self-null on macOS/web). Each edge column reserves the matching width
+          beneath these (see leftChromeReserve / rightChromeReserve). */}
+      {!isMobile && (
+        <>
+          <div className="absolute left-0 top-0 z-50 h-10">
+            <LeftEdgeChrome />
+          </div>
+          <div
+            className="absolute top-0 z-50 h-10"
+            style={{ right: winLinuxControls ? WINDOW_CAPTION_WIDTH : 0 }}
+          >
+            <RightEdgeChrome />
+          </div>
+          <div className="absolute right-0 top-0 z-50 h-10">
+            <WindowControls />
+          </div>
+        </>
+      )}
       <AppToaster
         position="bottom-right"
         duration={TOAST_DURATION_MS}
@@ -912,55 +1302,61 @@ function WorkbenchRouteConversationSync() {
 function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
   return (
     <AppWorkspaceProvider>
-      <AlertProvider>
-        <GitCredentialProvider>
-          <TaskProvider>
-            <AcpConnectionsProvider>
-              <DelegationProvider>
-                <ConversationStatusEventBridge />
-                <ConversationRuntimeProvider>
-                  <WorkspaceProvider>
-                    <TabProvider>
-                      <WorkspaceDocumentTitle />
-                      <TabKeysSync />
-                      <HeavyPluginsWarmup />
-                      <DeepLinkBootstrap />
-                      <PetFocusBridge />
-                      {/* Always mounted: external-change conflicts must be
-                            resolvable even with the aux file tree closed. */}
-                      <ExternalConflictDialog />
-                      <SessionStatsProvider>
-                        <PlatformProvider>
-                          <SidebarProvider>
-                            <AuxPanelProvider>
-                              <TerminalProvider>
-                                <SearchDialogProvider>
-                                  <AutomationsViewProvider>
+      {/* Platform (Cluster A) — scoped project context. Mounted OUTSIDE
+          ConversationRuntimeProvider per D31 so platform pages (project/task
+          releases) can read active project + repos without spawning an ACP
+          session. Sits inside AppWorkspaceProvider because platform-context
+          needs the workspace folder/activeFolder APIs to auto-open the
+          project's root folder. */}
+      <PlatformProvider>
+        <AlertProvider>
+          <GitCredentialProvider>
+            <TaskProvider>
+              <AcpConnectionsProvider>
+                <DelegationProvider>
+                  <ConversationStatusEventBridge />
+                  <ConversationRuntimeProvider>
+                    <WorkspaceProvider>
+                      <TabProvider>
+                        <WorkspaceDocumentTitle />
+                        <TabKeysSync />
+                        <HeavyPluginsWarmup />
+                        <DeepLinkBootstrap />
+                        <PetFocusBridge />
+                        {/* Always mounted: external-change conflicts must be
+                              resolvable even with the aux file tree closed. */}
+                        <ExternalConflictDialog />
+                        <SidebarProvider>
+                          <AuxPanelProvider>
+                            <TerminalProvider>
+                              <SearchDialogProvider>
+                                <AutomationsViewProvider>
+                                  <TasksViewProvider>
                                     <WorkbenchRouteProvider>
                                       <WorkbenchRouteConversationSync />
                                       {/* Inside WorkbenchRouteProvider: the
-                                          listener calls openConversations() to
-                                          surface a launcher-opened folder. */}
+                                            listener calls openConversations() to
+                                            surface a launcher-opened folder. */}
                                       <WorkspaceOpenFolderListener />
                                       <FolderLayoutShell>
                                         {children}
                                       </FolderLayoutShell>
                                     </WorkbenchRouteProvider>
-                                  </AutomationsViewProvider>
-                                </SearchDialogProvider>
-                              </TerminalProvider>
-                            </AuxPanelProvider>
-                          </SidebarProvider>
-                        </PlatformProvider>
-                      </SessionStatsProvider>
-                    </TabProvider>
-                  </WorkspaceProvider>
-                </ConversationRuntimeProvider>
-              </DelegationProvider>
-            </AcpConnectionsProvider>
-          </TaskProvider>
-        </GitCredentialProvider>
-      </AlertProvider>
+                                  </TasksViewProvider>
+                                </AutomationsViewProvider>
+                              </SearchDialogProvider>
+                            </TerminalProvider>
+                          </AuxPanelProvider>
+                        </SidebarProvider>
+                      </TabProvider>
+                    </WorkspaceProvider>
+                  </ConversationRuntimeProvider>
+                </DelegationProvider>
+              </AcpConnectionsProvider>
+            </TaskProvider>
+          </GitCredentialProvider>
+        </AlertProvider>
+      </PlatformProvider>
     </AppWorkspaceProvider>
   )
 }

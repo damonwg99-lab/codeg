@@ -30,6 +30,7 @@ import {
 } from "streamdown"
 import { markdownLinkComponents } from "./markdown-link"
 import { rehypePluginsAllowingCodeg } from "./rehype-allow-codeg"
+import { remarkTrimCjkAutolinkTail } from "./remark-cjk-autolink-tail"
 import { remarkRewriteFileUriLinks } from "./remark-file-uri-links"
 import { useStreamdownPlugins } from "./streamdown-plugins"
 
@@ -40,10 +41,14 @@ export type MessageProps = HTMLAttributes<HTMLDivElement> & {
 export const Message = ({ className, from, ...props }: MessageProps) => (
   <div
     className={cn(
-      "group flex w-full flex-col gap-2",
+      "group flex flex-col gap-2",
       from === "user"
-        ? "is-user ml-auto justify-end max-w-[88%]"
-        : "is-assistant",
+        ? // Outer user capsule hugs its content (`w-fit`) instead of always
+          // reserving the full `max-w-[88%]` box — the inner bubble
+          // (`MessageContent`) is already `w-fit`, so this just drops the
+          // phantom full-width wrapper. Assistant keeps `w-full`.
+          "is-user ml-auto justify-end w-fit max-w-[88%]"
+        : "is-assistant w-full",
       className
     )}
     {...props}
@@ -60,7 +65,13 @@ export const MessageContent = ({
   <div
     className={cn(
       "is-user:dark flex min-w-0 flex-col gap-2 overflow-hidden text-sm",
-      "group-[.is-user]:ml-auto group-[.is-user]:w-fit group-[.is-user]:max-w-full group-[.is-user]:rounded-lg group-[.is-user]:bg-secondary group-[.is-user]:px-4 group-[.is-user]:py-3 group-[.is-user]:text-foreground",
+      // `ws-msg-secondary` pairs with the user bubble's `bg-secondary`: with
+      // a workspace background image on it turns the bubble translucent + frosted
+      // with a hairline ring (fixed `--ws-msg-alpha` + backdrop blur — see
+      // globals.css, scoped to `.is-user`) so it stays legible over a busy
+      // background. Off / assistant messages: inert (no base rule, no `.is-user`
+      // ancestor).
+      "group-[.is-user]:ml-auto group-[.is-user]:w-fit group-[.is-user]:max-w-full group-[.is-user]:rounded-lg group-[.is-user]:bg-secondary group-[.is-user]:px-4 group-[.is-user]:py-3 group-[.is-user]:text-foreground ws-msg-secondary",
       "group-[.is-assistant]:w-full group-[.is-assistant]:text-foreground",
       className
     )}
@@ -358,6 +369,7 @@ export function normalizeMathDelimiters(text: string): string {
 const remarkPlugins = [
   ...Object.values(defaultRemarkPlugins),
   remarkRewriteFileUriLinks,
+  remarkTrimCjkAutolinkTail,
 ]
 
 // Streamdown's default rehype pipeline strips `codeg://` reference hrefs in

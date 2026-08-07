@@ -5,18 +5,33 @@ import { getGitHead } from "@/lib/api"
 import { onTransportReconnect, subscribe } from "@/lib/platform"
 import { useAcpEvent } from "@/contexts/acp-connections-context"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
+import { useConversationRuntimeStore } from "@/stores/conversation-runtime-store"
+import { useTabStore } from "@/stores/tab-store"
 import {
+  CONVERSATIONS_BULK_CHANGED_EVENT,
   CONVERSATION_CHANGED_EVENT,
   FOLDER_CHANGED_EVENT,
   type ConversationChange,
+  type ConversationsBulkChanged,
   type EventEnvelope,
   type FolderChange,
 } from "@/lib/types"
 
-export { useAppWorkspaceStore as useAppWorkspace } from "@/stores/app-workspace-store"
-
 interface AppWorkspaceProviderProps {
   children: ReactNode
+}
+
+/**
+ * On a cross-client `conversation://changed` nudge, poll the persisted detail of
+ * a conversation THIS client is passively viewing back into sync (its just-
+ * completed reply, streamed to whoever owns the agent, isn't on our live path).
+ * The runtime store no-ops unless the conversation is open and this client is a
+ * pure viewer of it — the owner's in-memory reply is never refetched over.
+ */
+function syncOpenViewerDetail(conversationId: number): void {
+  useConversationRuntimeStore
+    .getState()
+    .actions.syncViewerDetail(conversationId)
 }
 
 /**
@@ -48,12 +63,20 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
           const store = useAppWorkspaceStore.getState()
           if (change.kind === "upsert") {
             store.applyConversationUpsert(change.summary)
+            // This side-channel keeps the sidebar in sync but does NOT touch an
+            // open conversation's detail. If THIS client is only viewing that
+            // conversation (another client owns the live agent), a turn that
+            // just completed there has no live promotion path here — so pull the
+            // reply from the persisted transcript. No-op unless the conversation
+            // is open and this client is a pure viewer of it.
+            syncOpenViewerDetail(change.summary.id)
           } else if (change.kind === "deleted") {
             store.applyConversationRemove(change.id)
           } else {
             store.updateConversationLocal(change.id, {
               status: change.status,
             })
+            syncOpenViewerDetail(change.id)
           }
         }
       )
@@ -75,11 +98,38 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
     }
   }, [])
 
+  // A batch import (the import-picker window, possibly a different window than
+  // this one) announces completion with ONE `conversations://bulk-changed`
+  // nudge instead of per-row upserts; answer it with a single full refetch.
+  // Folder creations arrive separately on `folder://changed` below.
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+
+    void (async () => {
+      const dispose = await subscribe<ConversationsBulkChanged>(
+        CONVERSATIONS_BULK_CHANGED_EVENT,
+        () => {
+          void useAppWorkspaceStore.getState().refreshConversations()
+        }
+      )
+      if (disposed) dispose()
+      else unlisten = dispose
+    })()
+
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [])
+
   // Subscribe to the global `folder://changed` side-channel so a folder created
   // headlessly (e.g. an automation per-run worktree) lands in this client's
   // workspace list in real time — without it, a conversation produced in that
   // worktree has no known folder to group under and never renders in the sidebar.
-  // Only upserts the list (+ seeds its branch); unlike WorkspaceOpenFolderListener
+  // `deleted` closes the loop: a task worktree removed after its merge vanishes
+  // from the sidebar right away instead of lingering until the next reload.
+  // Only syncs the list (+ seeds branches); unlike WorkspaceOpenFolderListener
   // it never opens/focuses a tab, so a background emitter can't steal focus.
   useEffect(() => {
     let disposed = false
@@ -89,8 +139,8 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
       const dispose = await subscribe<FolderChange>(
         FOLDER_CHANGED_EVENT,
         (change) => {
+          const store = useAppWorkspaceStore.getState()
           if (change.kind === "upsert") {
-            const store = useAppWorkspaceStore.getState()
             store.upsertFolder(change.folder)
             // Only seed the branch when the event actually carries one. A
             // freshly-minted worktree row stores `git_branch: null` (resolved
@@ -99,6 +149,18 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
             if (change.folder.git_branch) {
               store.setBranch(change.folder.id, change.folder.git_branch)
             }
+          } else if (change.kind === "deleted") {
+            // A folder that stops existing takes its tabs with it — the same
+            // pairing the sidebar's own "remove folder" makes (it calls
+            // `closeTabsByFolder` before the API). The backend drops this
+            // folder's PERSISTED tabs and broadcasts that snapshot, but drafts
+            // are device-local and never reach it: without this, a draft opened
+            // in the worktree stays on screen pointing at a cwd that no longer
+            // exists (`pruneOrphanDraftsOnce` would only clean it up on the next
+            // launch). Closing retargets `activeTabId`, which TabProvider syncs
+            // back into `activeFolderId`.
+            useTabStore.getState().closeTabsByFolder(change.id)
+            store.applyFolderRemove(change.id)
           }
         }
       )

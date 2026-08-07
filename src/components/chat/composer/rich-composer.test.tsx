@@ -79,6 +79,65 @@ describe("RichComposer", () => {
     // onCreate sets content with emitUpdate:false → no spurious change events.
     expect(onChange).not.toHaveBeenCalled()
   })
+
+  it("hydrates serialized references in setText into badges", async () => {
+    // Restored draft / queued message / injected template: seeded wire-format
+    // text shows badges and re-serializes to exactly what was seeded.
+    const { ref } = await mount()
+    const text = "续 [排查登录](codeg://session/42) 的问题"
+    act(() => {
+      ref.current?.setText(text)
+    })
+    expect(JSON.stringify(ref.current?.getJSON())).toContain(
+      '"type":"reference"'
+    )
+    expect(ref.current?.getText()).toBe(text)
+  })
+
+  it("round-trips an angle-wrapped destination through setText verbatim", async () => {
+    // A uri containing `\`, `<` or `>` is angle-wrapped and backslash-escaped on
+    // the wire. Seeding it must reproduce the SAME text on send — otherwise the
+    // escapes compound (and the badge points at a `C:\\repo` path that doesn't
+    // exist) every time a draft/queued message/automation is reopened.
+    const { ref } = await mount()
+    // Wire form: `\`/`<`/`>` escaped inside the `<…>` destination, and (for the
+    // second link) inside the label too — what referenceToMarkdown emits.
+    const text =
+      "[app.ts](<file:///C:\\\\repo\\\\app.ts>) and [a\\<b\\>.ts](<file:///x/a\\<b\\>.ts>)"
+    act(() => {
+      ref.current?.setText(text)
+    })
+    expect(
+      JSON.stringify(ref.current?.getJSON()).match(/"type":"reference"/g)
+    ).toHaveLength(2)
+    expect(ref.current?.getText()).toBe(text)
+    // Re-seeding the serialized result is a fixed point (no escape growth).
+    act(() => {
+      ref.current?.setText(ref.current.getText())
+    })
+    expect(ref.current?.getText()).toBe(text)
+  })
+
+  it("hydrates serialized references in defaultText into badges", async () => {
+    // A saved automation's prompt is seeded via defaultText. Badge node views
+    // mount inside the editor's onCreate, so also assert React logged no
+    // warning (@tiptap/react defers that first render to a microtask instead of
+    // flushSync — see ReactRenderer — but keep the guard in place).
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+    try {
+      const text = "run /review on [app.ts](file:///repo/app.ts)"
+      const { ref } = await mount({ defaultText: text })
+      await waitFor(() =>
+        expect(JSON.stringify(ref.current?.getJSON())).toContain(
+          '"type":"reference"'
+        )
+      )
+      expect(ref.current?.getText()).toBe(text)
+      expect(errorSpy).not.toHaveBeenCalled()
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
 })
 
 function dispatchKey(
@@ -98,6 +157,18 @@ describe("RichComposer imperative inserts", () => {
     const { ref } = await mount()
     act(() => ref.current?.insertTextAtCursor("hello **world**"))
     expect(ref.current?.getText()).toContain("**world**")
+  })
+
+  it("hydrates serialized references in inserted text into badges", async () => {
+    // The quick-message fill path: stored wire-format text must show badges at
+    // insert time, and re-serialize to exactly what was inserted.
+    const { ref } = await mount()
+    const content = "review [app.ts](file:///repo/app.ts) now"
+    act(() => ref.current?.insertTextAtCursor(content))
+    const doc = JSON.stringify(ref.current?.getJSON())
+    expect(doc).toContain('"type":"reference"')
+    expect(doc).toContain("file:///repo/app.ts")
+    expect(ref.current?.getText()).toBe(content)
   })
 
   it("inserts a reference badge and exposes it via getJSON", async () => {
@@ -268,5 +339,102 @@ describe("RichComposer paste without formatting (Ctrl/⌘+Shift+V)", () => {
     const event = pressKey(dom, { key: "v", ctrlKey: true })
     expect(onPlainPaste).not.toHaveBeenCalled()
     expect(event.defaultPrevented).toBe(false)
+  })
+})
+
+/** Dispatch a `paste` carrying the given clipboard flavors at the editor. */
+function dispatchPaste(
+  dom: HTMLElement,
+  flavors: { html?: string; text?: string }
+): void {
+  const html = flavors.html ?? ""
+  const text = flavors.text ?? ""
+  const clipboardData = {
+    getData: (type: string) =>
+      type === "text/html" ? html : type === "text/plain" ? text : "",
+    setData: () => {},
+    clearData: () => {},
+    types: [html && "text/html", text && "text/plain"].filter(Boolean),
+    files: [] as unknown as FileList,
+    items: [] as unknown,
+  }
+  const event = new Event("paste", { bubbles: true, cancelable: true })
+  Object.defineProperty(event, "clipboardData", { value: clipboardData })
+  act(() => {
+    dom.dispatchEvent(event)
+  })
+}
+
+describe("RichComposer text paste (plain-text schema)", () => {
+  it("pastes a URL as text/plain, not the browser's title-bearing <a> fragment", async () => {
+    const { ref } = await mount()
+    act(() => ref.current?.focus())
+    const dom = ref.current?.getEditor()?.view.dom as HTMLElement
+    // Exactly what a browser writes when a URL is copied from the address bar:
+    // the anchor text is the page <title>, so the default HTML parse (no Link
+    // mark) would keep the title. We must insert the URL instead.
+    dispatchPaste(dom, {
+      html: '<a href="https://github.com/">GitHub · Change is constant. GitHub keeps you ahead. · GitHub</a>',
+      text: "https://github.com/",
+    })
+    expect(ref.current?.getText()).toBe("https://github.com/")
+  })
+
+  it("preserves structure for content copied from within the editor (data-pm-slice), without blank lines", async () => {
+    const { ref } = await mount()
+    act(() => ref.current?.focus())
+    const dom = ref.current?.getEditor()?.view.dom as HTMLElement
+    // A native ProseMirror copy of two paragraphs: HTML tagged with data-pm-slice,
+    // and text/plain "one\n\ntwo" (block separator is "\n\n"). We must defer to
+    // the native HTML paste — forcing text/plain would serialize back to
+    // "one\n\ntwo", introducing a blank line the composer never had.
+    dispatchPaste(dom, {
+      html: '<p data-pm-slice="0 0 []">one</p><p>two</p>',
+      text: "one\n\ntwo",
+    })
+    expect(ref.current?.getText()).toBe("one\ntwo")
+  })
+
+  it("reconstructs a reference badge pasted from within the composer", async () => {
+    const { ref } = await mount()
+    act(() => ref.current?.focus())
+    const dom = ref.current?.getEditor()?.view.dom as HTMLElement
+    // A real composer copy carries both the slice wrapper and the badge span;
+    // defer to ProseMirror so the badge round-trips instead of collapsing to its
+    // plain-text token.
+    dispatchPaste(dom, {
+      html: '<p data-pm-slice="0 0 []"><span data-reference data-ref-type="file" data-ref-id="a.ts" data-label="a.ts" data-uri="file:///a.ts">a.ts</span></p>',
+      text: "a.ts",
+    })
+    expect(JSON.stringify(ref.current?.getJSON())).toContain(
+      '"type":"reference"'
+    )
+  })
+
+  it("hydrates serialized references in a plain-text paste into badges", async () => {
+    const { ref } = await mount()
+    act(() => ref.current?.focus())
+    const dom = ref.current?.getEditor()?.view.dom as HTMLElement
+    // The wire form of a sent message (file link + Codex `$` skill token): the
+    // composer must preview the same badges the transcript renders, not the
+    // literal serialized text.
+    const wire = "see [app.ts](file:///repo/app.ts) and $deploy"
+    dispatchPaste(dom, { text: wire })
+    const json = JSON.stringify(ref.current?.getJSON())
+    expect(json).toContain('"refType":"file"')
+    expect(json).toContain('"refType":"skill"')
+    // Round-trip: the hydrated badges re-serialize to exactly the pasted text
+    // (the `$` trigger survives — never downgraded to `/deploy`).
+    expect(ref.current?.getText()).toBe(wire)
+  })
+
+  it("does not insert text when the host consumes the paste as files", async () => {
+    const onPasteFiles = vi.fn(() => true)
+    const { ref } = await mount({ onPasteFiles })
+    act(() => ref.current?.focus())
+    const dom = ref.current?.getEditor()?.view.dom as HTMLElement
+    dispatchPaste(dom, { html: "<a href='x'>x</a>", text: "some text" })
+    expect(onPasteFiles).toHaveBeenCalledTimes(1)
+    expect(ref.current?.getText()).toBe("")
   })
 })

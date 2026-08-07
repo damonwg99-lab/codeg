@@ -62,9 +62,22 @@ pub struct EventEnvelope {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AcpEvent {
     /// Agent returned text content (streaming delta)
-    ContentDelta { text: String },
+    ContentDelta {
+        text: String,
+        /// `_meta.claudeCode.parentToolUseId` of a subagent chunk
+        /// (claude-agent-acp ≥0.63 with the `subagent-transcript`
+        /// capability advertised). `None` = main-thread content. Skip-none
+        /// keeps the wire shape byte-identical for every other agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
     /// Agent thinking/reasoning
-    Thinking { text: String },
+    Thinking {
+        text: String,
+        /// Same contract as `ContentDelta::parent_tool_use_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_use_id: Option<String>,
+    },
     /// Raw SDK message forwarded from Claude ACP extension notification
     ClaudeSdkMessage {
         session_id: String,
@@ -184,6 +197,22 @@ pub enum AcpEvent {
         /// When present, the frontend renders a localized message keyed on
         /// this code; otherwise it falls back to `message`.
         code: Option<String>,
+        /// Out-of-band diagnostic evidence for errors codeg *inferred* rather
+        /// than received — currently the `turn_failed_empty*` family, where the
+        /// agent reported success and the wire carried no error at all. Holds
+        /// the turn's agent stderr tail and a summary of updates codeg failed
+        /// to parse.
+        ///
+        /// **Already redacted and length-bounded at the source**
+        /// ([`crate::acp::stderr_tail`]): it is rendered in the UI and, in
+        /// server mode, pushed over the WebSocket, so it must never carry a
+        /// credential or a `session/update` payload fragment. Deliberately kept
+        /// out of the OS notification and out of the frontend's `conn.error`
+        /// tooltip — see the frontend `case "error"` handler.
+        ///
+        /// Omitted from the wire when absent, so old clients are unaffected.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        details: Option<String>,
         /// Whether this Error signals connection-level death — i.e. the
         /// `run_connection` task is about to emit `Disconnected` and tear
         /// the session down. Non-terminal Errors (turn failure, `SetMode`
@@ -199,6 +228,21 @@ pub enum AcpEvent {
         /// JSON round-trip; only the original emitter sees `true`.)
         #[serde(skip, default)]
         terminal: bool,
+    },
+    /// A retryable turn error that keeps the turn alive (codex-acp #289,
+    /// v1.1.3+). Codex reports a transient, auto-retried error as
+    /// `session_info_update._meta.codex.error` (only when `willRetry == true`)
+    /// and continues the turn rather than terminating it. Surfaced as a
+    /// transient "retrying" indicator on the active turn — it is NOT a turn
+    /// failure and must not be rendered as one. The frontend reuses the Claude
+    /// API-retry banner and clears it at the next turn boundary.
+    TurnRetrying {
+        /// Human-readable transient error (`_meta.codex.error.message`).
+        message: String,
+        /// HTTP status pulled from a `codexErrorInfo` object variant
+        /// (e.g. `responseStreamDisconnected.httpStatusCode`), when present.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_status: Option<i64>,
     },
     /// `session/load` failed in a non-recoverable way (e.g. the agent has no
     /// record of this `session_id`). Emitted instead of silently falling back
@@ -255,6 +299,15 @@ pub enum AcpEvent {
         child_connection_id: String,
         child_conversation_id: i32,
         agent_type: crate::models::agent::AgentType,
+        /// Bounded preview of the delegated task text (broker's
+        /// `TASK_PREVIEW_CAP`). Lets the live card show WHAT was delegated even
+        /// when the parent tool call's `raw_input` never carries the arguments
+        /// (Cursor announces MCP calls identity-less and never re-sends them).
+        task_preview: String,
+        /// Broker-minted task id — the same id the running ack embeds as
+        /// `task_id=<id>` — so the live card can label the delegation before
+        /// the ack text lands on the tool output.
+        task_id: String,
     },
     /// The child sub-session has finished (or errored / timed out / been
     /// canceled). The MCP tool_result has been delivered to the parent agent.
@@ -322,6 +375,23 @@ pub enum AcpEvent {
     /// (the tool call was aborted / the connection drained). Carries only the
     /// `question_id`; clients clear the matching card. Idempotent on apply.
     QuestionResolved { question_id: String },
+    /// A Grok `exit_plan_mode` call: the agent finished planning and is BLOCKED
+    /// on the user's approval of the plan before it leaves plan mode and starts
+    /// implementing (Grok's native `_x.ai/exit_plan_mode` ext request). Broadcast
+    /// so every client viewing this conversation renders the interactive
+    /// plan-approval card above the input box, and captured into
+    /// `SessionState.pending_plan_approval` so a client attaching mid-turn (cold
+    /// attach, reconnect, another window) recovers it from the snapshot. The
+    /// backend parks the blocked ext-request responder keyed by `approval_id`.
+    PlanApprovalRequest {
+        approval_id: String,
+        tool_call_id: String,
+        plan_markdown: String,
+    },
+    /// A previously-pending plan approval was answered (from any client) or
+    /// canceled (the connection drained). Carries only the `approval_id`; clients
+    /// clear the matching card. Idempotent on apply.
+    PlanApprovalResolved { approval_id: String },
     /// The agent's effective settings (env vars / model provider / native config
     /// files) changed AFTER this connection was spawned, so the running process
     /// is still using its launch-time config. Emitted by
@@ -344,12 +414,46 @@ pub enum AcpEvent {
 /// `status` is the notification's `<status>` passed through verbatim
 /// (`"completed"` on success). The same task id may settle more than once —
 /// a completed sub-agent can be resumed via `SendMessage` and re-notify.
+///
+/// `tool_use_id` and `result` come from the same `<task-notification>` record's
+/// `<tool-use-id>`/`<result>` tags. They let the frontend flip the LAUNCH card
+/// (`AgentToolCallPart`) from "running in background" to its terminal state
+/// entirely in-memory — rewriting the launching tool call's own
+/// `[[codeg-background-task]]` marker — WITHOUT a `refetchDetail`. That refetch
+/// path used to be the only card-flip trigger, but it re-parses the still-open
+/// transcript mid-`#870`-hold and both double-renders the held turn and races
+/// the file's own last write.
+/// `tool_use_id` is the launching `tool_use`/`tool_result` block's id (Claude's
+/// SDK-level `toolu_…`), NOT `task_id`; `None` for a background shell (its
+/// notification carries no tool-use-id and it has no marker card to flip).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundSettledInfo {
     pub task_id: String,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// The launching tool call's `tool_use_id` (from the notification's
+    /// `<tool-use-id>`), so the frontend can locate the exact card to flip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    /// The notification's `<result>` markdown (capped at
+    /// [`crate::parsers::claude::BACKGROUND_RESULT_MAX_CHARS`], matching the
+    /// cold-parse fold), so the live path renders identically to a cold detail
+    /// parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// Whether this task's reply is/was rendered on the ACP wire as the tail of
+    /// a turn `#870` (claude-agent-acp v0.59.0) held open for it — i.e. the
+    /// settling task's id was still in `current_turn_launched_ids` when the
+    /// watcher read the notification. The frontend uses this to decide whether
+    /// to arm the "syncing results" hint: for a wire-visible settle the reply
+    /// is already on screen (no gap to bridge), whereas a genuinely out-of-turn
+    /// settle's reply arrives later as a separate overlay turn. Derived from the
+    /// backend set (which persists until the next turn's rising edge), NOT from
+    /// the connection's current status — so it's correct even when the watcher
+    /// reads the settlement AFTER the turn already fell back to `Connected`.
+    #[serde(default)]
+    pub wire_visible: bool,
 }
 
 /// Which settings surface drifted, so the frontend can word the
@@ -366,8 +470,11 @@ pub enum ConfigStaleKind {
 /// A block of the user's submitted prompt, broadcast via [`AcpEvent::UserMessage`]
 /// and stored in the live snapshot. Intentionally narrower than
 /// [`PromptInputBlock`]: only what a viewer needs to render the user turn.
-/// `Resource` / `ResourceLink` prompt blocks are folded into `Text` markdown
-/// links by [`user_blocks_from_prompt`].
+/// Non-image `Resource` / `ResourceLink` prompt blocks are folded into `Text`
+/// markdown links by [`user_blocks_from_prompt`]; an image-mime embedded
+/// `Resource` (how an `image:false` / `embedded_context:true` agent like Grok
+/// carries a pasted image) is promoted to `Image` so the viewer renders a
+/// thumbnail, not a link.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UserMessageBlock {
@@ -376,9 +483,11 @@ pub enum UserMessageBlock {
 }
 
 /// Project the wire `PromptInputBlock`s the sender submitted into the lean
-/// [`UserMessageBlock`]s broadcast to viewers: text and images pass through;
-/// resources/resource-links collapse to a `[label](uri)` markdown line so a
-/// viewer still sees what was attached without shipping blob bytes twice.
+/// [`UserMessageBlock`]s broadcast to viewers: text and images pass through; an
+/// image-mime embedded resource (Grok's pasted-image encoding) is promoted to an
+/// `Image`; other resources/resource-links collapse to a `[label](uri)` markdown
+/// line so a viewer still sees what was attached without shipping blob bytes
+/// twice.
 pub fn user_blocks_from_prompt(blocks: &[PromptInputBlock]) -> Vec<UserMessageBlock> {
     blocks
         .iter()
@@ -390,8 +499,23 @@ pub fn user_blocks_from_prompt(blocks: &[PromptInputBlock]) -> Vec<UserMessageBl
                 data: data.clone(),
                 mime_type: mime_type.clone(),
             },
-            PromptInputBlock::Resource { uri, .. } => UserMessageBlock::Text {
-                text: format!("[{uri}]({uri})"),
+            // An image-mime embedded resource carries a pasted image for agents
+            // that reject native image blocks (Grok: `image:false` +
+            // `embedded_context:true`). Promote it to `Image` so viewers render
+            // the thumbnail; non-image resources still collapse to a link.
+            PromptInputBlock::Resource {
+                uri,
+                mime_type,
+                blob,
+                ..
+            } => match (mime_type, blob) {
+                (Some(mt), Some(b)) if mt.starts_with("image/") => UserMessageBlock::Image {
+                    data: b.clone(),
+                    mime_type: mt.clone(),
+                },
+                _ => UserMessageBlock::Text {
+                    text: format!("[{uri}]({uri})"),
+                },
             },
             PromptInputBlock::ResourceLink { uri, name, .. } => UserMessageBlock::Text {
                 text: format!("[{name}]({uri})"),
@@ -423,6 +547,19 @@ pub struct PermissionOptionInfo {
     pub option_id: String,
     pub name: String,
     pub kind: String,
+    /// The option's ACP `_meta`, forwarded verbatim (same opaque-passthrough
+    /// treatment as the request's `tool_call`). codex-acp ≥1.1.8 (#342) and
+    /// claude-agent-acp ≥0.64.1 (#930) hang
+    /// `_meta.permission = {version: 1, changes: [...]}` here, where each change
+    /// carries a ready-made human `description` of what picking this option
+    /// would grant, plus the `lifetime` saying for how long — the permission
+    /// card renders those instead of leaving the user to guess what "Allow for
+    /// Session" or "Always Allow" covers.
+    ///
+    /// `default` so pre-existing serialized snapshots (`PendingPermissionState`,
+    /// the pet payload, the chat-channel bridge) still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -472,6 +609,23 @@ pub struct SessionConfigOptionInfo {
     pub description: Option<String>,
     pub category: Option<String>,
     pub kind: SessionConfigKindInfo,
+}
+
+/// Grok's per-model reasoning-effort capability, parsed from a session
+/// response's top-level `models.availableModels[]._meta` (only reachable via the
+/// raw JSON, since the `unstable_session_model` feature that would surface the
+/// typed `models` field is intentionally off). Drives the model-reactive
+/// composer effort selector: `supports == false` ⇒ the model shows NO effort
+/// selector. Backend-internal — NOT serialized onto the wire.
+#[derive(Debug, Clone, Default)]
+pub struct GrokEffortSpec {
+    /// Switchable efforts the model advertises: `(id, label, description)`.
+    pub options: Vec<(String, String, Option<String>)>,
+    /// The model's default/current effort. MAY fall outside `options`
+    /// (e.g. grok-4.5 defaults to `xhigh` while only listing `high/medium/low`).
+    pub default: Option<String>,
+    /// Whether the model advertises `supportsReasoningEffort`.
+    pub supports: bool,
 }
 
 /// Read-only snapshot of the modes + config_options an agent advertises
@@ -534,12 +688,28 @@ pub struct ConversationConnectionInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct AcpAgentInfo {
     pub agent_type: crate::models::agent::AgentType,
+    /// Whether this agent has a codeg-known skill store — every built-in, and
+    /// custom agents that declared the shared `.agents/skills` store. Gates
+    /// the skills matrices frontend-side.
+    pub skills_capable: bool,
     pub registry_id: String,
     pub registry_version: Option<String>,
     pub name: String,
     pub description: String,
     pub available: bool,
     pub distribution_type: String,
+    /// Whether codeg's entry for this agent is a third-party ACP *adapter*
+    /// wrapping a vendor CLI of a different name (Claude Code, Codex — see
+    /// `registry::acp_adapter_relation`). Lets the surfaces that have no
+    /// preflight result (composer block banner, settings header badge) say
+    /// "the adapter isn't installed" instead of "the agent isn't", without
+    /// hardcoding a second copy of the agent list frontend-side.
+    pub is_acp_adapter: bool,
+    /// For custom agents, where the definition came from (`registry` |
+    /// `manual`); `None` for built-ins. A manual definition's
+    /// `registry_version` is user-typed, so the version-status display shows
+    /// only the local version for those.
+    pub custom_source: Option<String>,
     pub enabled: bool,
     pub sort_order: i32,
     pub installed_version: Option<String>,
@@ -549,6 +719,14 @@ pub struct AcpAgentInfo {
     pub opencode_auth_json: Option<String>,
     pub codex_auth_json: Option<String>,
     pub codex_config_toml: Option<String>,
+    /// Compact structured codex model-catalog source (the `codeg` custom-model
+    /// list) round-tripped into the settings editor. Only populated for
+    /// `AgentType::Codex`, and only in api-key mode (no bound provider).
+    pub codex_model_catalog: Option<String>,
+    /// Parsed sandbox / approval keys from `~/.codex/config.toml` backing the
+    /// Codex panel's structured controls. Only populated for `AgentType::Codex`.
+    /// Derived from `codex_config_toml`.
+    pub codex_sandbox_settings: Option<CodexSandboxSettings>,
     pub cline_secrets_json: Option<String>,
     /// Raw `~/.hermes/config.yaml` text, attached for the Hermes settings panel's
     /// advanced editor. Only populated for `AgentType::Hermes`.
@@ -561,7 +739,165 @@ pub struct AcpAgentInfo {
     /// effort). Only populated for `AgentType::Grok`. `None` fields mean the key
     /// is absent from the config. Derived from `grok_config_toml`.
     pub grok_settings: Option<GrokSettings>,
+    /// Raw `~/.cursor/cli-config.json` text, attached for the Cursor settings
+    /// panel's advanced view. Only populated for `AgentType::Cursor`.
+    pub cursor_cli_config_json: Option<String>,
+    /// Parsed scalar settings from cli-config.json backing the Cursor panel's
+    /// structured controls (sandbox / permission rules; the Run Everything
+    /// permission mode is a launch flag, not a config key). Only populated
+    /// for `AgentType::Cursor`. Derived from `cursor_cli_config_json`.
+    pub cursor_settings: Option<CursorSettings>,
     pub model_provider_id: Option<i32>,
+    /// Display icon for a custom ACP agent — normally an inlined
+    /// `data:image/…;base64,…` URL (see
+    /// `crate::acp::custom_registry::CustomAgentDef::icon_url`). Always `None`
+    /// for built-ins, which ship hand-drawn marks in the frontend.
+    pub icon_url: Option<String>,
+}
+
+/// The `~/.codex/config.toml` sandbox / approval keys surfaced as structured
+/// controls in the Codex settings panel.
+///
+/// ## Why these keys matter even though the composer already has a preset
+///
+/// codex-acp attaches `approvalPolicy` + `sandboxPolicy` to EVERY normal turn
+/// (`runTurn`), sourced from the composer's mode preset — so for ordinary
+/// prompts these config keys are overridden per turn and invisible. `/goal` is
+/// different: `thread/goal/set` only records the objective and the turn is then
+/// started SERVER-side with no policy attached (same for `/review` and
+/// `/compact`), so those turns fall back to the thread defaults — i.e. exactly
+/// these config.toml keys. Without them a user who picked "Agent (full access)"
+/// still gets `on-request` + `workspace-write` + no network inside `/goal`.
+///
+/// Vocabulary is pinned to codex-cli 0.145.0: `AskForApproval`
+/// (codex-rs/protocol/src/protocol.rs) and `SandboxMode`
+/// (codex-rs/protocol/src/config_types.rs).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CodexSandboxSettings {
+    /// Root `approval_policy` when it is one of the plain string variants
+    /// (`untrusted` / `on-request` / `never`). The legacy `on-failure` spelling
+    /// is a serde ALIAS of `on-request` upstream, so it is normalized to
+    /// `on-request` on read. `None` when the key is absent or when the granular
+    /// table form is in use — the enum is externally tagged, so a value is
+    /// either a string or the table below, never both.
+    pub approval_policy: Option<String>,
+    /// The `approval_policy = { granular = { … } }` variant.
+    pub granular: Option<CodexGranularApproval>,
+    /// Root `sandbox_mode` — `read-only` / `workspace-write` / `danger-full-access`.
+    /// `None` = absent, in which case codex falls back to `workspace-write` for
+    /// any directory carrying a `[projects]` trust decision, else `read-only`
+    /// (and on Windows without the experimental sandbox, `workspace-write` is
+    /// further downgraded to `read-only`).
+    pub sandbox_mode: Option<String>,
+    /// `[sandbox_workspace_write]`.
+    pub workspace_write: CodexWorkspaceWrite,
+    /// `default_permissions` is set, which makes codex resolve permissions
+    /// through the profile pipeline and ignore `sandbox_mode` entirely
+    /// (`resolve_permission_config_syntax` evaluates `default_permissions` after
+    /// `sandbox_mode` within a layer, so it wins). Verified against 0.145:
+    /// `default_permissions = ":read-only"` alongside
+    /// `sandbox_mode = "danger-full-access"` yields a read-only sandbox. The
+    /// panel disables the sandbox controls and says why.
+    pub shadowed_by_default_permissions: bool,
+    /// A `[permissions]` profile table exists. Combined with an absent
+    /// `default_permissions` that is a hard startup error upstream ("config
+    /// defines `[permissions]` profiles but does not set `default_permissions`"),
+    /// so the panel surfaces it instead of writing into a config that cannot
+    /// load.
+    pub has_permissions_table: bool,
+}
+
+/// `approval_policy = { granular = { … } }` — `GranularApprovalConfig` upstream.
+///
+/// Field names stay snake_case on BOTH the read projection and the write payload
+/// (unlike the camelCase parent payload) so one type serves both directions.
+///
+/// `sandbox_approval`, `rules` and `mcp_elicitations` carry no `#[serde(default)]`
+/// upstream: omitting any of them makes codex refuse to load the config
+/// (verified — `thread/start` fails with "missing field `sandbox_approval`"), so
+/// all five keys are always written together.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct CodexGranularApproval {
+    /// Shell command approval requests, including inline
+    /// `with_additional_permissions` / `require_escalated` escalations.
+    pub sandbox_approval: bool,
+    /// Prompts triggered by execpolicy `prompt` rules.
+    pub rules: bool,
+    /// Prompts triggered by skill script execution.
+    pub skill_approval: bool,
+    /// Prompts triggered by the `request_permissions` tool.
+    pub request_permissions: bool,
+    /// MCP elicitation prompts.
+    pub mcp_elicitations: bool,
+}
+
+/// `[sandbox_workspace_write]` — only consulted when the effective sandbox mode
+/// is `workspace-write`. Every field defaults to false/empty upstream, so an
+/// absent key and an explicit `false` are equivalent; codeg writes only the
+/// non-default ones to keep the file tidy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CodexWorkspaceWrite {
+    /// Extra writable folders beyond cwd. Upstream these are `AbsolutePathBuf`,
+    /// but a RELATIVE entry is not rejected — codex resolves it against
+    /// `CODEX_HOME` (verified: `"rel/dir"` became `~/.codex/rel/dir`). codeg
+    /// therefore refuses to write relative entries rather than let a user
+    /// silently grant write access inside `~/.codex`.
+    pub writable_roots: Vec<String>,
+    /// Allow outbound network access from inside the sandbox.
+    pub network_access: bool,
+    /// Drop the per-user `TMPDIR` from the default writable roots.
+    pub exclude_tmpdir_env_var: bool,
+    /// Drop `/tmp` from the default writable roots (UNIX).
+    pub exclude_slash_tmp: bool,
+}
+
+/// `absent` vs `null` for a nullable field: serde folds both into `None` on a
+/// plain `Option<T>`, so a field that must distinguish "not sent" from "sent as
+/// null" needs `Option<Option<T>>` plus this deserializer.
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer).map(Some)
+}
+
+/// The structured-control values the Codex settings panel sends on save. Merged
+/// format-preservingly (via `toml_edit`) onto the current `~/.codex/config.toml`
+/// so comments and unmanaged keys survive. camelCase on the wire to match the
+/// enclosing request body, except the nested `granular` object (see
+/// [`CodexGranularApproval`]).
+///
+/// **This is a per-field PATCH, not a snapshot.** An absent field leaves its key
+/// exactly as the merge base has it. That matters because the settings panel
+/// sends the raw config.toml text alongside this patch and the patch is applied
+/// last: if it carried the whole group, any key the user had hand-edited in the
+/// raw editor — a surface the panel never parses back into its controls — would
+/// be silently reverted by the panel's stale value for that key. Sending only
+/// what the user actually moved keeps the two surfaces from fighting.
+///
+/// Field semantics:
+/// - `approval_policy` / `granular`: move as a PAIR (the upstream enum is one
+///   externally tagged key, either a string or a table). Both absent leaves the
+///   key untouched; both `Some(None)` removes it; exactly one carrying a value
+///   writes that form; both carrying values is rejected.
+/// - `sandbox_mode`: absent leaves, `Some(None)` removes, `Some(Some(v))` sets.
+/// - workspace-write fields: absent leaves; a value sets it, and `false` / an
+///   empty list removes the key (identical to codex's own defaults). A section
+///   left with no keys is removed wholesale.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSandboxStructuredConfig {
+    #[serde(default, deserialize_with = "double_option")]
+    pub approval_policy: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub granular: Option<Option<CodexGranularApproval>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub sandbox_mode: Option<Option<String>>,
+    pub writable_roots: Option<Vec<String>>,
+    pub network_access: Option<bool>,
+    pub exclude_tmpdir_env_var: Option<bool>,
+    pub exclude_slash_tmp: Option<bool>,
 }
 
 /// The subset of `~/.grok/config.toml` keys surfaced as structured controls in
@@ -578,7 +914,10 @@ pub struct AcpAgentInfo {
 pub struct GrokSettings {
     /// `[models].default_reasoning_effort` — one of low/medium/high/xhigh.
     pub default_reasoning_effort: Option<String>,
-    /// `[ui].permission_mode` — one of ask/always-approve.
+    /// `[ui].permission_mode` — grok's real enum
+    /// (default/acceptEdits/auto/dontAsk/bypassPermissions/plan). Legacy codeg
+    /// markers (`ask`/`always-approve`) are migrated to `default`/`bypassPermissions`
+    /// on read (see `migrate_grok_permission_mode`).
     pub permission_mode: Option<String>,
     /// The codeg-managed custom model id: the `[model.<id>]` block whose id
     /// equals `[models].default`. `None` when there is no such managed block.
@@ -622,6 +961,83 @@ pub struct GrokStructuredConfig {
     pub auto_compact_threshold_percent: Option<i64>,
 }
 
+/// The subset of `~/.cursor/cli-config.json` surfaced as structured controls
+/// in the Cursor settings panel. The file is shared with the Cursor CLI's own
+/// `/config` UI, so codeg only projects the keys it manages; everything else
+/// is preserved verbatim on write. `None` means the key is absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CursorSettings {
+    /// `sandbox.mode` — "enabled" | "disabled".
+    pub sandbox_mode: Option<String>,
+    /// `permissions.allow` rules, e.g. `Shell(ls)`.
+    pub permissions_allow: Vec<String>,
+    /// `permissions.deny` rules.
+    pub permissions_deny: Vec<String>,
+}
+
+/// The structured-control values the Cursor settings panel sends on save.
+/// `None` fields leave the corresponding key untouched; `Some` fields replace
+/// it (lists are replaced wholesale). Merged onto the current on-disk
+/// cli-config.json so unmanaged keys are preserved. camelCase on the wire to
+/// match the enclosing request body.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorStructuredConfig {
+    pub sandbox_mode: Option<String>,
+    pub permissions_allow: Option<Vec<String>>,
+    pub permissions_deny: Option<Vec<String>>,
+}
+
+/// Result of probing `cursor-agent status --format json` for the Cursor
+/// settings panel's auth card. Parsed defensively: unknown shapes surface as
+/// `raw_status` so the panel can still show something useful.
+#[derive(Debug, Clone, Serialize)]
+pub struct CursorAuthStatus {
+    /// A launchable cursor-agent binary was found (cache or system install).
+    pub installed: bool,
+    pub is_authenticated: bool,
+    /// The CLI's own `status` string (e.g. "unauthenticated").
+    pub raw_status: Option<String>,
+    /// Account email when logged in. The CLI nests it under `userInfo.email`
+    /// (a top-level `email` is also accepted as a fallback).
+    pub email: Option<String>,
+    /// Membership/plan label when the CLI reports one. Current `status --format
+    /// json` output carries no such field, so this is usually `None`.
+    pub membership: Option<String>,
+    /// Probe failure detail (spawn error / timeout / non-JSON output).
+    pub error: Option<String>,
+    /// Absolute path to the cursor-agent binary codeg would launch (managed
+    /// cache or system install). The settings panel builds a copy-pasteable
+    /// `"<binary_path>" login` command from it — the managed binary lives in
+    /// codeg's cache and is NOT on the user's PATH, so a bare `cursor-agent
+    /// login` fails. `None` when no binary is installed.
+    pub binary_path: Option<String>,
+}
+
+/// One entry from `cursor-agent models`, whose lines are `<id> - <label>
+/// [(default)]` (e.g. `claude-opus-4-8-high - Opus 4.8 1M`). The panel shows
+/// `label` (falling back to `id`) and passes `id` to the CLI as `--model`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CursorModelInfo {
+    /// The model id (`--model` value), e.g. `claude-opus-4-8-high`.
+    pub id: String,
+    /// Human-readable label from the CLI, e.g. `Opus 4.8 1M`. Empty when the
+    /// CLI emitted a bare id with no ` - <label>` suffix.
+    pub label: String,
+    /// The account default (the CLI marks it `(default)`, e.g. `auto`).
+    pub is_default: bool,
+}
+
+/// Result of `cursor-agent models` for the Cursor settings panel's model
+/// picker. `models` is best-effort parsed CLI output; `error` carries the
+/// failure reason when the probe could not run (e.g. not logged in).
+#[derive(Debug, Clone, Serialize)]
+pub struct CursorModelsResult {
+    pub models: Vec<CursorModelInfo>,
+    pub default_model: Option<String>,
+    pub error: Option<String>,
+}
+
 /// Lightweight status info for a single agent, used by connect() pre-check.
 #[derive(Debug, Clone, Serialize)]
 pub struct AcpAgentStatus {
@@ -629,6 +1045,66 @@ pub struct AcpAgentStatus {
     pub available: bool,
     pub enabled: bool,
     pub installed_version: Option<String>,
+    /// See [`AcpAgentInfo::is_acp_adapter`] — the connect pre-check uses it to
+    /// pick the right "not installed" wording.
+    pub is_acp_adapter: bool,
+}
+
+/// Severity of a single diagnostics check / the overall verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagLevel {
+    /// Healthy / expected.
+    Ok,
+    /// Suspicious but not necessarily broken (e.g. slow `npm prefix -g`).
+    Warn,
+    /// A concrete problem that explains a failure.
+    Fail,
+    /// Neutral information (not a pass/fail signal).
+    Info,
+}
+
+/// One labelled probe result inside a [`DiagSection`]. `value` and `hint` carry
+/// dynamic data (paths, versions) and are rendered as plain text in the UI —
+/// they are NEVER fed through i18n/ICU (see `label`, which is a language-neutral
+/// technical string emitted by the backend).
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagCheck {
+    pub label: String,
+    pub value: String,
+    pub status: DiagLevel,
+    pub hint: Option<String>,
+}
+
+/// A titled group of [`DiagCheck`]s.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagSection {
+    pub title: String,
+    pub checks: Vec<DiagCheck>,
+}
+
+/// The one-line "likely cause" conclusion. `code` is a stable identifier the
+/// frontend localizes via `DiagnosticsSettings.verdict.<code>`; `summary` is a
+/// pre-formatted English sentence used only inside [`AgentDiagnosticsReport::plain_text`]
+/// so a copied report reads the same regardless of UI locale.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagnosticsVerdict {
+    pub level: DiagLevel,
+    pub code: String,
+    pub summary: String,
+}
+
+/// Full environment-diagnostics report returned by `acp_env_diagnostics`.
+///
+/// Plain `Serialize` with snake_case fields (the repo convention for response
+/// DTOs), mirrored field-for-field by the `AgentDiagnosticsReport` TS interface.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentDiagnosticsReport {
+    pub generated_at: String,
+    pub agent_type: Option<crate::models::agent::AgentType>,
+    pub verdict: DiagnosticsVerdict,
+    pub sections: Vec<DiagSection>,
+    pub plain_text: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -720,6 +1196,7 @@ mod envelope_tests {
             connection_id: "conn-1".to_string(),
             payload: AcpEvent::ContentDelta {
                 text: "hello".to_string(),
+                parent_tool_use_id: None,
             },
         };
         let json = serde_json::to_value(&env).unwrap();
@@ -767,5 +1244,49 @@ mod envelope_tests {
             }
             other => panic!("expected ConversationStatusChanged, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn user_blocks_promote_image_resource_and_fold_other_resources() {
+        let blocks = vec![
+            PromptInputBlock::Text { text: "hi".into() },
+            // Grok's pasted image: an embedded resource with an image mime + blob.
+            PromptInputBlock::Resource {
+                uri: "clipboard://image.png-abc".into(),
+                mime_type: Some("image/png".into()),
+                text: None,
+                blob: Some("QUJD".into()),
+            },
+            // A non-image embedded resource still folds to a link.
+            PromptInputBlock::Resource {
+                uri: "clipboard://notes.txt".into(),
+                mime_type: Some("text/plain".into()),
+                text: Some("note".into()),
+                blob: None,
+            },
+            PromptInputBlock::ResourceLink {
+                uri: "file:///a/app.ts".into(),
+                name: "app.ts".into(),
+                mime_type: None,
+                description: None,
+            },
+        ];
+        let out = user_blocks_from_prompt(&blocks);
+        assert_eq!(
+            out,
+            vec![
+                UserMessageBlock::Text { text: "hi".into() },
+                UserMessageBlock::Image {
+                    data: "QUJD".into(),
+                    mime_type: "image/png".into(),
+                },
+                UserMessageBlock::Text {
+                    text: "[clipboard://notes.txt](clipboard://notes.txt)".into(),
+                },
+                UserMessageBlock::Text {
+                    text: "[app.ts](file:///a/app.ts)".into(),
+                },
+            ]
+        );
     }
 }
