@@ -147,7 +147,7 @@ export function ArchiveView({
                         setRoute(
                           "task-detail",
                           { taskId: task.id, projectId },
-                          { routeId: "archive-view" }
+                          { routeId: "task-kanban", params: { projectId, tab: "archive" } }
                         )
                       }
                     >

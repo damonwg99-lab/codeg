@@ -334,10 +334,14 @@ function KanbanColumn({
 
 export function TaskKanban({ projectId }: { projectId: number }) {
   const t = useTranslations("Platform")
-  const { setRoute } = useWorkbenchRoute()
+  const { setRoute, routeParams } = useWorkbenchRoute()
   const [tasks, setTasks] = useState<TaskInfo[]>([])
   const [loading, setLoading] = useState(true)
-  const [activeTab, setActiveTab] = useState("kanban")
+  const initialTab =
+    routeParams.tab === "archive" || routeParams.tab === "release"
+      ? routeParams.tab
+      : "kanban"
+  const [activeTab, setActiveTab] = useState(initialTab)
 
   const [searchInput, setSearchInput] = useState("")
   const [searchKeyword, setSearchKeyword] = useState("")
@@ -589,7 +593,7 @@ export function TaskKanban({ projectId }: { projectId: number }) {
       </div>
 
       {/* Kanban board */}
-      <TabsContent value="kanban" className="flex-1 min-h-0">
+      <TabsContent value="kanban" className="flex flex-col flex-1 min-h-0">
       <DndContext collisionDetection={closestCorners} onDragEnd={handleDragEnd}>
         <div className="hidden md:flex flex-1 min-h-0 gap-0 divide-x">
           {KANBAN_STATUS_LIST.map((status) => (
@@ -649,10 +653,10 @@ export function TaskKanban({ projectId }: { projectId: number }) {
         </div>
       </DndContext>
       </TabsContent>
-      <TabsContent value="release" className="flex flex-1 min-h-0 overflow-auto">
+      <TabsContent value="release" className="flex flex-col flex-1 min-h-0 overflow-auto">
         <ReleaseList projectId={projectId} setRoute={setRoute as (id: string) => void} />
       </TabsContent>
-      <TabsContent value="archive" className="flex flex-1 min-h-0 overflow-auto">
+      <TabsContent value="archive" className="flex flex-col flex-1 min-h-0 overflow-auto">
         <ArchiveView
           projectId={projectId}
           searchKeyword={searchKeyword}

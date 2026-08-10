@@ -24,7 +24,7 @@ const SKIP_DIRS: &[&str] = &[
 
 /// Files to skip during KB scanning — project-level metadata or VCS
 /// configuration that should not appear as knowledge docs.
-const SKIP_FILES: &[&str] = &["README.md", ".gitignore"];
+const SKIP_FILES: &[&str] = &["README.md", ".gitignore", "RULES.md"];
 
 /// Maximum recursion depth for KB scanning.
 const MAX_DEPTH: u32 = 10;

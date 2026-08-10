@@ -169,21 +169,28 @@ pub async fn build_first_prompt_injection(
 
 /// Build a compact re-injection preamble for long-running conversations.
 /// Only contains the critical file-storage and branch-tracking rules to
-/// prevent exceeding token budgets.
-pub fn build_reinjection_preamble(kb_dir: &str, task_id: i32) -> String {
+/// prevent exceeding token budgets. Branch-tracking instructions are omitted
+/// when the project root is not a git repository.
+pub fn build_reinjection_preamble(kb_dir: &str, task_id: i32, has_git: bool) -> String {
     let task_dir = format!("{kb_dir}/.private/tasks/{task_id}/ai-intermediate/");
-    let branch_log = format!("{kb_dir}/.private/tasks/{task_id}/.branch-log.md");
 
-    format!(
+    let mut reminder = format!(
         "{}\n=== Task Reminder ===\n\
          Task ID: {task_id}\n\
-         - Save generated documents to: `{task_dir}`\n\
-         - Record new git branches in: `{branch_log}`\n\
-         Format per branch: `- {{repo_name}}: {{branch_name}}`\n\
-         === End Reminder ===\n{}",
+         - Save generated documents to: `{task_dir}`\n",
         INJECTION_MARKER_START,
-        INJECTION_MARKER_END,
-    )
+    );
+
+    if has_git {
+        let branch_log = format!("{kb_dir}/.private/tasks/{task_id}/.branch-log.md");
+        reminder.push_str(&format!(
+            "- Record new git branches in: `{branch_log}`\n\
+             Format per branch: `- {{repo_name}}: {{branch_name}}`\n",
+        ));
+    }
+
+    reminder.push_str(&format!("=== End Reminder ===\n{}", INJECTION_MARKER_END));
+    reminder
 }
 
 /// Whether the current session should receive a re-injection.
@@ -204,14 +211,14 @@ pub fn should_reinject(
         || (current_tokens as f64 / max_tokens as f64) > 0.5
 }
 
-/// Resolve the KB directory + task id for a conversation linked to a task
-/// (same resolution as the Task Context section of
+/// Resolve the KB directory + task id + git presence for a conversation
+/// linked to a task (same resolution as the Task Context section of
 /// [`build_first_prompt_injection`]). Returns `None` when the conversation is
 /// not linked to a task.
 async fn resolve_task_context(
     conn: &DatabaseConnection,
     conversation_id: i32,
-) -> Option<(String, i32)> {
+) -> Option<(String, i32, bool)> {
     let link = platform_task_conversation_service::get_by_conversation(conn, conversation_id)
         .await
         .ok()??;
@@ -222,7 +229,8 @@ async fn resolve_task_context(
     let kb_dir = project
         .kb_local_dir
         .unwrap_or_else(|| format!("{}/_knowledge", project.root_dir));
-    Some((kb_dir, task.id))
+    let has_git = crate::git_repo::is_git_repo(std::path::Path::new(&project.root_dir));
+    Some((kb_dir, task.id, has_git))
 }
 
 /// Build the wrapped re-injection preamble block for a task-linked
@@ -233,9 +241,9 @@ pub async fn build_reinjection_block(
     conn: &DatabaseConnection,
     conversation_id: i32,
 ) -> Option<PromptInputBlock> {
-    let (kb_dir, task_id) = resolve_task_context(conn, conversation_id).await?;
+    let (kb_dir, task_id, has_git) = resolve_task_context(conn, conversation_id).await?;
     Some(PromptInputBlock::Text {
-        text: build_reinjection_preamble(&kb_dir, task_id),
+        text: build_reinjection_preamble(&kb_dir, task_id, has_git),
     })
 }
 
@@ -285,13 +293,24 @@ mod tests {
 
     #[test]
     fn reinjection_preamble_is_marker_wrapped_and_mentions_task_dir() {
-        let text = build_reinjection_preamble("/repo/_knowledge", 42);
+        let text = build_reinjection_preamble("/repo/_knowledge", 42, true);
         assert!(text.starts_with(INJECTION_MARKER_START));
         assert!(text.contains(INJECTION_MARKER_END));
         assert!(is_injected_block(&text));
         assert!(text.contains("/repo/_knowledge/.private/tasks/42/ai-intermediate/"));
         assert!(text.contains(".branch-log.md"));
         assert!(text.contains("Task ID: 42"));
+    }
+
+    #[test]
+    fn reinjection_preamble_omits_branch_log_when_no_git() {
+        let text = build_reinjection_preamble("/repo/_knowledge", 42, false);
+        assert!(text.starts_with(INJECTION_MARKER_START));
+        assert!(text.contains(INJECTION_MARKER_END));
+        assert!(text.contains("Task ID: 42"));
+        assert!(text.contains("ai-intermediate/"));
+        assert!(!text.contains(".branch-log.md"));
+        assert!(!text.contains("Record new git branches"));
     }
 
     #[test]
