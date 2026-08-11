@@ -41,6 +41,7 @@ function task(): WorkTask {
     merge_commit: null,
     preflight: null,
     archived_at: null,
+    scheduled_at: null,
     created_at: "2026-08-01T00:00:00Z",
     updated_at: "2026-08-01T00:00:00Z",
     started_at: null,
@@ -59,6 +60,7 @@ function settings(
     auto_process: false,
     max_concurrent: 2,
     merge_strategy: "squash",
+    auto_merge: false,
     delete_worktree_default: true,
     ...overrides,
   }

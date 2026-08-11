@@ -19,6 +19,12 @@ pub struct WorkTaskInfo {
     pub run_seq: i32,
     pub sort_order: i32,
     pub worktree_folder_id: Option<i32>,
+    /// A worktree is recorded but unusable: its folder row was removed, or its
+    /// directory is gone from disk. Stamped by the list/get commands (the row
+    /// itself cannot know) — the board reads it to stop offering a merge that
+    /// can only fail.
+    #[serde(default)]
+    pub worktree_missing: bool,
     pub conversation_id: Option<i32>,
     /// Live ACP connection of the current generation — the transcript viewer
     /// attaches by it. Only meaningful while the task is running/awaiting;
@@ -38,6 +44,9 @@ pub struct WorkTaskInfo {
     /// preflight command ran for this review.
     pub preflight: Option<serde_json::Value>,
     pub archived_at: Option<DateTime<Utc>>,
+    /// Planned start of a to-do task (`None` = no plan). Cleared the moment the
+    /// task is claimed, by the scheduler or by hand.
+    pub scheduled_at: Option<DateTime<Utc>>,
     /// Latest `agent_progress` milestone (filled by `list` for live tasks only
     /// — the card's realtime progress line).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,6 +143,14 @@ pub struct WorkTaskFolderSettings {
     /// "squash" (default) | "merge"
     #[serde(default = "default_merge_strategy")]
     pub merge_strategy: String,
+    /// Land reviewed tasks automatically: when a task settles into review and
+    /// is actually mergeable (something to land, live worktree, preflight —
+    /// when configured — green, no earlier merge failure on the row), the
+    /// engine dispatches the same merge a click on the button would, with the
+    /// agent writing the commit message and `delete_worktree_default` deciding
+    /// the worktree.
+    #[serde(default)]
+    pub auto_merge: bool,
     /// Merge dialog's "delete worktree after merge" default.
     #[serde(default = "default_true")]
     pub delete_worktree_default: bool,
@@ -169,6 +186,7 @@ impl Default for WorkTaskFolderSettings {
             auto_process: false,
             max_concurrent: default_max_concurrent(),
             merge_strategy: default_merge_strategy(),
+            auto_merge: false,
             delete_worktree_default: true,
             preflight_command_id: None,
             preflight_command: None,
@@ -315,6 +333,7 @@ mod tests {
         let settings: WorkTaskFolderSettings =
             serde_json::from_str(legacy).expect("legacy settings decode");
         assert!(settings.stage_prompts.is_empty());
+        assert!(!settings.auto_merge);
         assert_eq!(settings.max_concurrent, 3);
         assert_eq!(settings.merge_strategy, "merge");
         assert!(settings.auto_process);

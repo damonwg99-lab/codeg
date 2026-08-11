@@ -4,6 +4,7 @@ pub mod app_update;
 pub mod automation;
 pub mod background;
 pub mod backup;
+pub mod chat_authoring;
 pub mod chat_channel;
 pub mod conversations;
 pub mod custom_agents;
@@ -41,6 +42,7 @@ pub mod session_info;
 pub mod system_settings;
 pub mod terminal;
 pub mod token_usage;
+pub mod turn_window;
 pub mod version_control;
 #[cfg(feature = "tauri-runtime")]
 pub mod windows;

@@ -100,11 +100,18 @@ export function WorkbenchRouteProvider({ children }: { children: ReactNode }) {
   >({})
 
   const openConversations = useCallback(() => {
+    // Desktop: the conversation column coexists with the workbench right zone,
+    // so do NOT clear the focused workbench tab (that would drop the right
+    // zone onto the empty "open a file or diff" hint).
+    if (typeof window !== "undefined") {
+      const isMobile = window.matchMedia?.("(max-width: 767px)").matches
+      if (!isMobile && routeId !== "conversations") return
+    }
     setRouteId("conversations")
     setRouteParams({})
     setFromRoute(null)
     setFromParams({})
-  }, [])
+  }, [routeId])
 
   const setRoute = useCallback(
     (

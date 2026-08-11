@@ -32,6 +32,7 @@ function task(overrides?: Partial<WorkTask>): WorkTask {
     merge_commit: null,
     preflight: null,
     archived_at: null,
+    scheduled_at: null,
     created_at: "2026-08-01T00:00:00Z",
     updated_at: "2026-08-01T00:00:00Z",
     started_at: null,
@@ -43,23 +44,30 @@ function task(overrides?: Partial<WorkTask>): WorkTask {
 
 function renderCard(
   t: WorkTask,
-  handlers: { onMerge: () => void; onComplete: () => void }
+  handlers?: Partial<Record<string, () => void>>
 ) {
+  const noop = () => {}
+  const props = {
+    onOpen: noop,
+    onStart: noop,
+    onCancel: noop,
+    onRetry: noop,
+    onRequeue: noop,
+    onViewSession: noop,
+    onMerge: noop,
+    onComplete: noop,
+    onArchive: noop,
+    onEdit: noop,
+    onSchedule: noop,
+    ...handlers,
+  }
   return render(
     <NextIntlClientProvider locale="en" messages={enMessages}>
       <TaskCard
         task={t}
         folderName="repo"
         now={Date.parse("2026-08-01T01:00:00Z")}
-        onOpen={() => {}}
-        onStart={() => {}}
-        onCancel={() => {}}
-        onRetry={() => {}}
-        onRequeue={() => {}}
-        onViewSession={() => {}}
-        onArchive={() => {}}
-        onEdit={() => {}}
-        {...handlers}
+        {...props}
       />
     </NextIntlClientProvider>
   )
@@ -87,5 +95,100 @@ describe("TaskCard review primary", () => {
 
     expect(screen.getByRole("button", { name: "Merge" })).toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "Complete" })).toBeNull()
+  })
+})
+
+describe("TaskCard secondaries", () => {
+  it("keeps the session viewer on an archived card", () => {
+    // Archiving is exactly when someone wants to reread the session: the
+    // "unarchive" primary must not displace the viewer.
+    const onViewSession = vi.fn()
+    renderCard(
+      task({
+        status: "done",
+        archived_at: "2026-08-01T02:00:00Z",
+        conversation_id: 42,
+      }),
+      { onViewSession }
+    )
+    expect(
+      screen.getByRole("button", { name: "View session" })
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole("button", { name: "Unarchive" })
+    ).toBeInTheDocument()
+  })
+
+  it("offers scheduling on a pending card, and only there", async () => {
+    const onSchedule = vi.fn()
+    renderCard(task({ status: "todo", files_changed: null }), { onSchedule })
+    await userEvent.click(screen.getByRole("button", { name: "Schedule" }))
+    expect(onSchedule).toHaveBeenCalledTimes(1)
+
+    // A task that already has a run of its own has no start left to plan.
+    renderCard(task({ status: "review" }))
+    expect(screen.queryAllByRole("button", { name: "Schedule" })).toHaveLength(
+      1
+    )
+  })
+
+  it("shows the planned start on a pending card", () => {
+    const planned = new Date(2026, 7, 8, 9, 30)
+    renderCard(
+      task({
+        status: "todo",
+        files_changed: null,
+        scheduled_at: planned.toISOString(),
+      })
+    )
+    expect(screen.getByTitle(/Scheduled to start at/)).toBeInTheDocument()
+  })
+
+  it("does not open the sheet when a footer button is activated by keyboard", async () => {
+    const onOpen = vi.fn()
+    const onMerge = vi.fn()
+    renderCard(task({ files_changed: 3 }), { onOpen, onMerge })
+
+    screen.getByRole("button", { name: "Merge" }).focus()
+    await userEvent.keyboard("{Enter}")
+    expect(onMerge).toHaveBeenCalledTimes(1)
+    // The keydown bubbles to the card — which must neither open the sheet nor
+    // cancel the button's own activation.
+    expect(onOpen).not.toHaveBeenCalled()
+  })
+})
+
+describe("TaskCard worktree-removed badge", () => {
+  it("flags a deleted worktree in any status — done and canceled included", () => {
+    // Detached after removal: the pointer is gone, the branch remains.
+    renderCard(task({ status: "done", worktree_folder_id: null }))
+    expect(screen.getByText("Worktree removed")).toBeInTheDocument()
+  })
+
+  it("flags a worktree whose directory vanished behind the app", () => {
+    renderCard(task({ status: "canceled", worktree_missing: true }))
+    expect(screen.getByText("Worktree removed")).toBeInTheDocument()
+    // "Worktree kept" claims the opposite — it must stay silent here.
+    expect(screen.queryByText("Worktree kept")).toBeNull()
+  })
+
+  it("keeps the kept-badge for a canceled task whose worktree is intact", () => {
+    renderCard(task({ status: "canceled" }))
+    expect(screen.getByText("Worktree kept")).toBeInTheDocument()
+    expect(screen.queryByText("Worktree removed")).toBeNull()
+  })
+
+  it("says nothing on a just-created task that never initialized", () => {
+    renderCard(
+      task({
+        status: "todo",
+        files_changed: null,
+        worktree_folder_id: null,
+        work_branch: null,
+        base_branch: null,
+        base_sha: null,
+      })
+    )
+    expect(screen.queryByText("Worktree removed")).toBeNull()
   })
 })

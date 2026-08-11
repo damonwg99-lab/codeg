@@ -9,7 +9,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover"
 import { useActiveFolder } from "@/contexts/active-folder-context"
-import { usePlatform } from "@/contexts/platform-context"
+import { usePlatformOptional } from "@/contexts/platform-context"
 import { useTabContext } from "@/contexts/tab-context"
 import { useLinkedTask } from "@/hooks/use-linked-task"
 import { linkConversation, listKnowledgeDocs } from "@/lib/platform/api"
@@ -34,7 +34,8 @@ export function PlatformComposerToolbar({
   >([])
   const [popoverKbLoading, setPopoverKbLoading] = useState(false)
 
-  const { activeProject } = usePlatform()
+  const platform = usePlatformOptional()
+  const activeProject = platform?.activeProject ?? null
   const { tabs, activeTabId } = useTabContext()
   const ownTab = activeTabId
     ? tabs.find((t) => t.id === activeTabId)

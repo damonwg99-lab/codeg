@@ -2,24 +2,21 @@
 
 import { useTranslations } from "next-intl"
 import {
-  Archive,
-  ArchiveRestore,
-  Ban,
+  CalendarClock,
   Check,
   CircleAlert,
   CircleCheck,
   CircleX,
-  GitMerge,
+  FolderX,
   Loader2,
-  MessageSquareText,
-  Pencil,
-  Play,
-  RotateCw,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { formatRelative } from "@/components/conversations/sidebar-conversation-grouping"
+import { formatScheduleFull, formatScheduleShort } from "@/lib/task-schedule"
 import { cn } from "@/lib/utils"
-import { hasNothingToMerge } from "./task-acceptance"
+import { worktreeWasRemoved } from "./task-acceptance"
+import { buildTaskActions, type TaskActionItem } from "./task-actions"
+import type { TaskActionHandlers } from "./task-actions"
 import type { WorkTask } from "@/lib/types"
 
 type StatusLabelKey =
@@ -64,74 +61,116 @@ export function statusLabelKey(status: WorkTask["status"]): StatusLabelKey {
  * same-looking chips: live statuses are primary-colored spinner text,
  * attention statuses an outlined amber pill, `done` a bare green check,
  * `failed` a tinted red pill, the rest a muted pill.
+ *
+ * The label truncates inside whatever width it is given (with the full text on
+ * `title`): the list view puts the chip in a fixed status column, and locales
+ * whose "awaiting input" runs to twenty characters must not blow that column
+ * out. In the card, where the chip sizes to its content, this never engages.
  */
-export function StatusChip({ task }: { task: WorkTask }) {
+export function StatusChip({
+  task,
+  className,
+}: {
+  task: WorkTask
+  className?: string
+}) {
   const t = useTranslations("Tasks")
   // An interrupted failure (restart) reads differently from an agent failure.
   const label =
     task.status === "failed" && task.failure_reason === "interrupted"
       ? t("statusInterrupted")
       : t(statusLabelKey(task.status))
+
+  let tone: string
+  let icon: React.ReactNode = null
   switch (task.status) {
     case "queued":
     case "preparing":
     case "running":
     case "merging":
-      return (
-        <span className="inline-flex shrink-0 items-center gap-1 text-[0.6875rem] font-medium text-primary">
-          <Loader2 className="size-3 animate-spin" aria-hidden="true" />
-          {label}
-        </span>
+      tone = "gap-1 text-[0.6875rem] text-primary"
+      icon = (
+        <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden="true" />
       )
+      break
     case "awaiting_input":
     case "review":
-      return (
-        <span className="inline-flex shrink-0 items-center rounded-full border border-amber-500/45 bg-amber-500/5 px-2 py-1 text-[0.625rem] font-medium leading-none text-amber-600 dark:border-amber-400/40 dark:text-amber-400">
-          {label}
-        </span>
-      )
+      tone =
+        "rounded-full border border-amber-500/45 bg-amber-500/5 px-2 py-1 text-[0.625rem] text-amber-600 dark:border-amber-400/40 dark:text-amber-400"
+      break
     case "done":
-      return (
-        <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-1 text-[0.625rem] font-medium leading-none text-emerald-600 dark:text-emerald-400">
-          <Check className="size-2.5" strokeWidth={3} aria-hidden="true" />
-          {label}
-        </span>
+      tone =
+        "gap-1 rounded-full bg-emerald-500/10 px-2 py-1 text-[0.625rem] text-emerald-600 dark:text-emerald-400"
+      icon = (
+        <Check
+          className="size-2.5 shrink-0"
+          strokeWidth={3}
+          aria-hidden="true"
+        />
       )
+      break
     case "failed":
-      return (
-        <span className="inline-flex shrink-0 items-center rounded-full bg-destructive/10 px-2 py-1 text-[0.625rem] font-medium leading-none text-destructive">
-          {label}
-        </span>
-      )
+      tone =
+        "rounded-full bg-destructive/10 px-2 py-1 text-[0.625rem] text-destructive"
+      break
     default:
-      return (
-        <span className="inline-flex shrink-0 items-center rounded-full bg-muted px-2 py-1 text-[0.625rem] font-medium leading-none text-muted-foreground">
-          {label}
-        </span>
-      )
+      tone =
+        "rounded-full bg-muted px-2 py-1 text-[0.625rem] text-muted-foreground"
+  }
+
+  return (
+    <span
+      className={cn(
+        "inline-flex min-w-0 shrink-0 items-center font-medium leading-none",
+        tone,
+        className
+      )}
+      title={label}
+    >
+      {icon}
+      <span className="truncate">{label}</span>
+    </span>
+  )
+}
+
+/**
+ * The list row's leading accent bar — the board's column markers turned on
+ * their side, so the two views speak one colour language.
+ *
+ * It refines the mapping where a board column lumps two outcomes together:
+ * `failed` reads red rather than the attention column's amber, and `canceled`
+ * stays neutral instead of inheriting Done's green (a green bar on a row that
+ * says "已取消" is a lie the board gets away with only because its column
+ * heading says "Done" once, at the top).
+ */
+export function statusAccent(task: WorkTask): string {
+  if (task.archived_at != null) return "bg-muted-foreground/20"
+  switch (task.status) {
+    case "todo":
+    case "queued":
+      return "bg-muted-foreground/35"
+    case "preparing":
+    case "running":
+      return "bg-primary"
+    case "awaiting_input":
+    case "review":
+    case "merging":
+      return "bg-amber-500"
+    case "failed":
+      return "bg-destructive"
+    case "done":
+      return "bg-emerald-500"
+    case "canceled":
+      return "bg-muted-foreground/25"
   }
 }
 
-interface TaskCardProps {
+interface TaskCardProps extends TaskActionHandlers {
   task: WorkTask
   folderName: string | null
   /** Shared render-tick timestamp for relative times (refreshed by the page). */
   now: number
   onOpen: () => void
-  onStart: () => void
-  onCancel: () => void
-  onRetry: () => void
-  onRequeue: () => void
-  /** Opens the read-only live session viewer (TaskTranscriptDialog). */
-  onViewSession: () => void
-  onMerge: () => void
-  /** Takes the merge slot when the task changed nothing (see
-   *  `hasNothingToMerge`) — accepts it outright instead. */
-  onComplete: () => void
-  /** Toggles by `task.archived_at` (archive ⇄ unarchive). */
-  onArchive: () => void
-  /** Opens the editor dialog — offered while editable (todo / failed). */
-  onEdit: () => void
 }
 
 /** The acceptance red/green light for a reviewed card. */
@@ -173,34 +212,59 @@ export function PreflightChip({ task }: { task: WorkTask }) {
   )
 }
 
-interface CardActionItem {
-  icon: typeof Play
-  label: string
-  onClick: () => void
+/**
+ * "The worktree this task ran in has been deleted" — shown in EVERY status
+ * (a reviewed task explains its Complete button, a canceled one warns that a
+ * requeue starts over, a done one explains why there is no diff). The one
+ * exception is built into the predicate: a just-created task that never
+ * initialized has nothing removed to report.
+ */
+export function WorktreeRemovedChip({ task }: { task: WorkTask }) {
+  const t = useTranslations("Tasks")
+  if (!worktreeWasRemoved(task)) return null
+  return (
+    <span
+      className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[0.625rem] font-medium leading-none text-amber-600 dark:text-amber-400"
+      title={t("badgeWorktreeRemoved")}
+    >
+      <FolderX className="size-2.5 shrink-0" aria-hidden="true" />
+      <span className="truncate">{t("badgeWorktreeRemoved")}</span>
+    </span>
+  )
+}
+
+/**
+ * The planned start of a to-do task. Primary-tinted rather than muted: it is
+ * the one thing on a pending card that says something WILL happen, and it is
+ * how a card that looks idle explains itself.
+ */
+export function ScheduleChip({ task }: { task: WorkTask }) {
+  const t = useTranslations("Tasks")
+  if (task.status !== "todo" || !task.scheduled_at) return null
+  return (
+    <span
+      className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-full bg-primary/10 px-1.5 py-0.5 text-[0.625rem] font-medium leading-none text-primary"
+      title={t("scheduleBadge", {
+        time: formatScheduleFull(task.scheduled_at),
+      })}
+    >
+      <CalendarClock className="size-2.5 shrink-0" aria-hidden="true" />
+      <span className="truncate">{formatScheduleShort(task.scheduled_at)}</span>
+    </span>
+  )
 }
 
 /**
  * One board card. The whole card opens the detail sheet; the footer carries
- * exactly one filled primary action per status on the left, and on the right a
- * row of round icon buttons for the secondaries (edit / archive), always
- * ending in "查看会话" when a session exists. The full action set — with
- * labels — lives in the sheet. `merging` has no primary: it cannot be
- * canceled.
+ * the shared action set (see `buildTaskActions`): one filled primary on the
+ * left, round icon buttons for the secondaries on the right.
  */
 export function TaskCard({
   task,
   folderName,
   now,
   onOpen,
-  onStart,
-  onCancel,
-  onRetry,
-  onRequeue,
-  onViewSession,
-  onMerge,
-  onComplete,
-  onArchive,
-  onEdit,
+  ...handlers
 }: TaskCardProps) {
   const t = useTranslations("Tasks")
   const archived = task.archived_at != null
@@ -223,85 +287,7 @@ export function TaskCard({
     now
   )
 
-  const { primary, more } = (() => {
-    const more: CardActionItem[] = []
-    let primary: CardActionItem | null = null
-    // An archived card offers exactly one way back.
-    if (archived) {
-      primary = {
-        icon: ArchiveRestore,
-        label: t("actionUnarchive"),
-        onClick: onArchive,
-      }
-      return { primary, more }
-    }
-    switch (task.status) {
-      case "todo":
-        primary = { icon: Play, label: t("actionStart"), onClick: onStart }
-        more.push({ icon: Pencil, label: t("actionEdit"), onClick: onEdit })
-        break
-      case "queued":
-      case "preparing":
-      case "running":
-      case "awaiting_input":
-        primary = { icon: Ban, label: t("actionCancel"), onClick: onCancel }
-        break
-      case "review":
-        // Nothing was changed ⟹ nothing to merge: the card offers the
-        // acceptance that actually applies.
-        primary = hasNothingToMerge(task)
-          ? {
-              icon: CircleCheck,
-              label: t("actionComplete"),
-              onClick: onComplete,
-            }
-          : { icon: GitMerge, label: t("actionMerge"), onClick: onMerge }
-        break
-      case "merging":
-        break
-      case "failed":
-        primary = { icon: RotateCw, label: t("actionRetry"), onClick: onRetry }
-        more.push({ icon: Pencil, label: t("actionEdit"), onClick: onEdit })
-        more.push({
-          icon: Archive,
-          label: t("actionArchive"),
-          onClick: onArchive,
-        })
-        break
-      case "done":
-        primary = {
-          icon: Archive,
-          label: t("actionArchive"),
-          onClick: onArchive,
-        }
-        break
-      case "canceled":
-        primary = {
-          icon: RotateCw,
-          label: t("actionRequeue"),
-          onClick: onRequeue,
-        }
-        more.push({
-          icon: Archive,
-          label: t("actionArchive"),
-          onClick: onArchive,
-        })
-        break
-    }
-    return { primary, more }
-  })()
-
-  // Round icon row on the right: the status's own secondaries, then the
-  // uniform session viewer — offered in every status once a session exists
-  // (live ones stream it in real time).
-  const secondaries = [...more]
-  if (task.conversation_id != null) {
-    secondaries.push({
-      icon: MessageSquareText,
-      label: t("actionViewSession"),
-      onClick: onViewSession,
-    })
-  }
+  const { primary, secondaries } = buildTaskActions(task, t, handlers)
 
   return (
     <div
@@ -309,6 +295,10 @@ export function TaskCard({
       tabIndex={0}
       onClick={onOpen}
       onKeyDown={(e) => {
+        // Only the card's own focus opens the sheet: Enter/Space on one of the
+        // footer buttons bubbles up here, and preventing the default would
+        // swallow that button's activation and open the sheet instead.
+        if (e.target !== e.currentTarget) return
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault()
           onOpen()
@@ -354,13 +344,19 @@ export function TaskCard({
           <span className="text-muted-foreground/40">·</span>
         ) : null}
         {when ? <span className="shrink-0">{when}</span> : null}
+        <ScheduleChip task={task} />
         <PreflightChip task={task} />
+        <WorktreeRemovedChip task={task} />
         {task.cleanup_state === "failed" ? (
           <span className="rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[0.625rem] text-amber-600 dark:text-amber-400">
             {t("badgeCleanupFailed")}
           </span>
         ) : null}
-        {task.status === "canceled" && task.worktree_folder_id != null ? (
+        {/* "Kept" claims the worktree is still there — stay silent when its
+            directory is actually gone (the removed chip above speaks then). */}
+        {task.status === "canceled" &&
+        task.worktree_folder_id != null &&
+        task.worktree_missing !== true ? (
           <span className="rounded-full bg-muted px-1.5 py-0.5 text-[0.625rem]">
             {t("badgeWorktreeKept")}
           </span>
@@ -429,7 +425,7 @@ export function TaskCard({
   )
 }
 
-function CardIconAction({ item }: { item: CardActionItem }) {
+function CardIconAction({ item }: { item: TaskActionItem }) {
   return (
     <Button
       type="button"

@@ -59,7 +59,7 @@ import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { useGitCredential } from "@/contexts/git-credential-context"
 
 type ConfirmAction = {
-  type: "merge" | "rebase" | "delete" | "forceDelete" | "deleteRemote"
+  type: "merge" | "rebase" | "delete" | "forceDelete" | "deleteRemote" | "deleteWorktree" | "deleteWorktreeAndBranch"
   branchName: string
 }
 
@@ -494,6 +494,7 @@ export function RepoGitBranchPanel({
     local: [],
     remote: [],
     worktree_branches: [],
+    main_worktree_branch: null,
   })
   const [branchLoading, setBranchLoading] = useState(() => !!folder?.path)
 
@@ -506,7 +507,7 @@ export function RepoGitBranchPanel({
       })
       .catch(() => {
         if (!cancelled)
-          setBranchList({ local: [], remote: [], worktree_branches: [] })
+          setBranchList({ local: [], remote: [], worktree_branches: [], main_worktree_branch: null })
       })
       .finally(() => {
         if (!cancelled) setBranchLoading(false)
@@ -590,6 +591,7 @@ export function RepoGitBranchPanel({
 
   return (
     <BranchSelectorList
+      mainWorktreeBranch={branchList.main_worktree_branch}
       operations={operations}
       localNodes={localNodes}
       remoteSections={remoteSections}
