@@ -1,6 +1,6 @@
 "use client"
 
-import type { ComponentType } from "react"
+import { useCallback, type ComponentType } from "react"
 import { useTranslations } from "next-intl"
 import {
   Archive,
@@ -9,10 +9,12 @@ import {
   FolderPlus,
   KanbanSquare,
   ListTodo,
+  MessagesSquare,
   PackagePlus,
   Rocket,
   type LucideIcon,
 } from "lucide-react"
+import { Button } from "@/components/ui/button"
 import {
   useWorkbenchRoute,
   type WorkbenchRouteId,
@@ -118,6 +120,31 @@ export interface WorkbenchChromeActionsProps {
   iconClassName: string
 }
 
+/** Back-to-conversations button shared by platform routes in the right-edge
+ *  chrome cluster, next to the settings gear. Mirrors the breadcrumb button
+ *  in `WorkbenchPageTitle` so the user can exit from either corner. */
+function PlatformBackAction({
+  buttonClassName,
+  iconClassName,
+}: WorkbenchChromeActionsProps) {
+  const tTitleBar = useTranslations("Folder.folderTitleBar")
+  const { openConversations } = useWorkbenchRoute()
+  const handleClick = useCallback(() => openConversations(), [openConversations])
+
+  return (
+    <Button
+      variant="ghost"
+      size="icon"
+      className={buttonClassName}
+      onClick={handleClick}
+      title={tTitleBar("backToConversations")}
+      aria-label={tTitleBar("backToConversations")}
+    >
+      <MessagesSquare className={iconClassName} />
+    </Button>
+  )
+}
+
 /** Optional per-route buttons for the window's top-right chrome cluster, drawn
  *  to the LEFT of the settings gear. A full-page route hides the terminal and
  *  aux toggles (they act on the workspace it covers), so its own page-level
@@ -126,6 +153,16 @@ const WORKBENCH_ROUTE_CHROME_ACTIONS: Partial<
   Record<WorkbenchRouteId, ComponentType<WorkbenchChromeActionsProps>>
 > = {
   tasks: TasksChromeActions,
+  "project-list": PlatformBackAction,
+  "project-detail": PlatformBackAction,
+  "create-project": PlatformBackAction,
+  "task-kanban": PlatformBackAction,
+  "task-detail": PlatformBackAction,
+  "create-task": PlatformBackAction,
+  "release-list": PlatformBackAction,
+  "release-detail": PlatformBackAction,
+  "create-release": PlatformBackAction,
+  "archive-view": PlatformBackAction,
 }
 
 /**
