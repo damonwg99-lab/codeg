@@ -4698,6 +4698,7 @@
       "addRepo": "Add repo",
       "addRepoFailed": "Failed to add repos: {repos}",
       "rescan": "Rescan",
+      "cloneRepo": "Clone Repository",
       "noRepos": "No repos linked to this project",
       "statusValues": {
         "planning": "Planning",

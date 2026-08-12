@@ -4698,6 +4698,7 @@
       "addRepo": "Ajouter un dépôt",
       "addRepoFailed": "Échec de l'ajout des dépôts : {repos}",
       "rescan": "Rescanner",
+      "cloneRepo": "Cloner le dépôt",
       "noRepos": "Aucun dépôt lié",
       "statusValues": {
         "planning": "Planification",

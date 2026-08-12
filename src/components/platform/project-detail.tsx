@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react"
 import { useTranslations } from "next-intl"
-import { Loader2, Pencil, Save, X, RefreshCw, ArrowLeft } from "lucide-react"
+import { Loader2, Pencil, Save, X, RefreshCw, ArrowLeft, Download } from "lucide-react"
 import {
   getProject,
   updateProject,
@@ -14,6 +14,7 @@ import type { ProjectDetail, GitRepoScanResult } from "@/lib/platform/types"
 import { KnowledgeManager } from "./knowledge-manager"
 import { usePlatform } from "@/contexts/platform-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
+import { CloneDialog } from "@/components/layout/clone-dialog"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -82,6 +83,7 @@ export function ProjectDetail({ id }: { id: number }) {
     new Set()
   )
   const [failedAddRepos, setFailedAddRepos] = useState<string[]>([])
+  const [cloneOpen, setCloneOpen] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -218,6 +220,31 @@ export function ProjectDetail({ id }: { id: number }) {
     [id, activeProjectId, loadProjectDetail]
   )
 
+  const handleCloneSuccess = useCallback(
+    async (fullPath: string) => {
+      if (!detail) return
+      const repoName = fullPath.split("/").pop() ?? fullPath
+      const localDir = fullPath
+      try {
+        await addProjectRepo({
+          projectId: detail.project.id,
+          name: repoName,
+          gitUrl: "",
+          localDir,
+          hasClaudeMd: false,
+        })
+        const d = await getProject(id)
+        setDetail(d)
+        if (activeProjectId === id) {
+          await loadProjectDetail()
+        }
+      } catch (e) {
+        console.error("Failed to add cloned repo to project:", e)
+      }
+    },
+    [detail, id, activeProjectId, loadProjectDetail]
+  )
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-16 text-muted-foreground">
@@ -237,8 +264,9 @@ export function ProjectDetail({ id }: { id: number }) {
   const { project, repos, taskCountByStatus } = detail
 
   return (
-    <ScrollArea className="h-full">
-      <div className="flex flex-col gap-6 px-4 pb-4 pt-4">
+    <>
+      <ScrollArea className="h-full">
+        <div className="flex flex-col gap-6 px-4 pb-4 pt-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Button
@@ -464,19 +492,29 @@ export function ProjectDetail({ id }: { id: number }) {
                   <CardTitle className="text-[0.9375rem]">
                     {t("project.repos")}
                   </CardTitle>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleScan}
-                    disabled={scanning}
-                  >
-                    {scanning ? (
-                      <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <RefreshCw className="mr-1 h-3.5 w-3.5" />
-                    )}
-                    {t("project.rescan")}
-                  </Button>
+                  <div className="flex items-center gap-1.5">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setCloneOpen(true)}
+                    >
+                      <Download className="mr-1 h-3.5 w-3.5" />
+                      {t("project.cloneRepo")}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleScan}
+                      disabled={scanning}
+                    >
+                      {scanning ? (
+                        <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="mr-1 h-3.5 w-3.5" />
+                      )}
+                      {t("project.rescan")}
+                    </Button>
+                  </div>
                 </div>
               </CardHeader>
               <CardContent className="flex flex-col gap-2">
@@ -611,5 +649,14 @@ export function ProjectDetail({ id }: { id: number }) {
         </Tabs>
       </div>
     </ScrollArea>
+      {detail && (
+        <CloneDialog
+          open={cloneOpen}
+          onOpenChange={setCloneOpen}
+          defaultTargetDir={detail.project.rootDir}
+          onSuccess={handleCloneSuccess}
+        />
+      )}
+    </>
   )
 }

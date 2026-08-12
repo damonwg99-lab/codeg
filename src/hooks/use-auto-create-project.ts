@@ -23,7 +23,18 @@ export function useAutoCreateProject() {
       const normalizedPath = folderDetail.path.replace(/\\/g, "/")
       const existing = projects.find((p) => {
         const projPath = p.rootDir.replace(/\\/g, "/")
-        return projPath === normalizedPath
+        // Exact match: the path itself is a project rootDir
+        if (projPath === normalizedPath) return true
+        // Parent-directory match: the path is a subdirectory of a project
+        // rootDir (e.g. /projectA/repoB is under /projectA). This prevents
+        // auto-creating a duplicate project for repos cloned under an
+        // existing project rootDir.
+        if (
+          normalizedPath.startsWith(projPath + "/") ||
+          projPath.startsWith(normalizedPath + "/")
+        )
+          return true
+        return false
       })
       if (existing) return // Already has a project — skip
 

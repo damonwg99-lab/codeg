@@ -4698,6 +4698,7 @@
       "addRepo": "添加仓库",
       "addRepoFailed": "添加仓库失败: {repos}",
       "rescan": "重新扫描",
+      "cloneRepo": "克隆仓库",
       "noRepos": "暂无关联仓库",
       "statusValues": {
         "planning": "规划中",

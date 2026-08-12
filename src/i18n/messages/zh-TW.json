@@ -4698,6 +4698,7 @@
       "addRepo": "新增倉庫",
       "addRepoFailed": "新增倉庫失敗: {repos}",
       "rescan": "重新掃描",
+      "cloneRepo": "複製倉庫",
       "noRepos": "暫無關聯倉庫",
       "statusValues": {
         "planning": "規劃中",

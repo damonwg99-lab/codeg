@@ -4698,6 +4698,7 @@
       "addRepo": "リポジトリを追加",
       "addRepoFailed": "リポジトリの追加に失敗しました: {repos}",
       "rescan": "再スキャン",
+      "cloneRepo": "リポジトリをクローン",
       "noRepos": "関連リポジトリなし",
       "statusValues": {
         "planning": "計画中",

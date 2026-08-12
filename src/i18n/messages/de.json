@@ -4698,6 +4698,7 @@
       "addRepo": "Repo hinzufügen",
       "addRepoFailed": "Repo(s) konnten nicht hinzugefügt werden: {repos}",
       "rescan": "Neu suchen",
+      "cloneRepo": "Repository klonen",
       "noRepos": "Keine verknüpften Repos",
       "statusValues": {
         "planning": "Planung",

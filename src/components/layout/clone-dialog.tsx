@@ -6,6 +6,7 @@ import { toast } from "sonner"
 import { Loader2 } from "lucide-react"
 import { cloneRepository } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
+import type { FolderDetail } from "@/lib/types"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useGitCredential } from "@/contexts/git-credential-context"
 import { useAutoCreateProject } from "@/hooks/use-auto-create-project"
@@ -24,16 +25,23 @@ import { DirectoryPathInput } from "@/components/shared/directory-path-input"
 interface CloneDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  defaultTargetDir?: string
+  onSuccess?: (fullPath: string, detail: FolderDetail) => void
 }
 
-export function CloneDialog({ open, onOpenChange }: CloneDialogProps) {
+export function CloneDialog({
+  open,
+  onOpenChange,
+  defaultTargetDir,
+  onSuccess,
+}: CloneDialogProps) {
   const t = useTranslations("Folder.cloneDialog")
   const tToasts = useTranslations("Folder.toasts")
   const openFolder = useAppWorkspaceStore((s) => s.openFolder)
   const { autoCreateProject } = useAutoCreateProject()
   const { withCredentialRetry } = useGitCredential()
   const [url, setUrl] = useState("")
-  const [targetDir, setTargetDir] = useState("")
+  const [targetDir, setTargetDir] = useState(defaultTargetDir ?? "")
   const [cloning, setCloning] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -48,7 +56,7 @@ export function CloneDialog({ open, onOpenChange }: CloneDialogProps) {
 
   const resetForm = () => {
     setUrl("")
-    setTargetDir("")
+    setTargetDir(defaultTargetDir ?? "")
     setError(null)
   }
 
@@ -67,6 +75,7 @@ export function CloneDialog({ open, onOpenChange }: CloneDialogProps) {
       // platform surface (Project list / Switcher / KB watcher) lights up
       // automatically. Failures are swallowed by the hook itself.
       void autoCreateProject(detail)
+      await onSuccess?.(fullPath, detail)
       onOpenChange(false)
       resetForm()
     } catch (err) {

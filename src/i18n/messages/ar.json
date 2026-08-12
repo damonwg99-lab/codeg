@@ -4698,6 +4698,7 @@
       "addRepo": "إضافة مستودع",
       "addRepoFailed": "فشل إضافة المستودعات: {repos}",
       "rescan": "إعادة الفحص",
+      "cloneRepo": "استنساخ المستودع",
       "noRepos": "لا مستودعات مرتبطة",
       "statusValues": {
         "planning": "تخطيط",
