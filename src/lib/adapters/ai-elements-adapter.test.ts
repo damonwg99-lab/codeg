@@ -1556,3 +1556,99 @@ describe("adaptMessageTurn — user reference resources", () => {
     expect(joined).toContain("[foo.ts](file:///x/foo.ts)")
   })
 })
+
+describe("adaptMessageTurn — codeg injection stripping", () => {
+  const msgText = {
+    attachedResources: "Attached resources",
+    toolCallFailed: "Tool failed",
+  }
+  const INJECT =
+    "<!-- codeg:inject:start -->\n=== Rules ===\n<!-- codeg:inject:end -->"
+
+  function adaptedFor(text: string) {
+    return adaptMessageTurn(
+      {
+        id: "u-inject",
+        role: "user",
+        timestamp: "2026-08-14T00:00:00.000Z",
+        blocks: [{ type: "text", text }],
+      },
+      msgText
+    )
+  }
+
+  it("hides a block that contains only injected context", () => {
+    const adapted = adaptedFor(INJECT)
+    expect(adapted.content).toHaveLength(0)
+  })
+
+  it("keeps the user's real prompt when injection is concatenated into the same block", () => {
+    const adapted = adaptedFor(`${INJECT}\n你是谁`)
+    expect(adapted.content).toHaveLength(1)
+    const part = adapted.content[0]
+    if (part.type !== "text") throw new Error("expected a text part")
+    expect(part.text).toBe("你是谁")
+  })
+
+  it("strips every injected region when a block holds multiple start/end pairs", () => {
+    const multi =
+      "<!-- codeg:inject:start -->\n规则A\n<!-- codeg:inject:end -->\n你是谁\n" +
+      "<!-- codeg:inject:start -->\n规则B\n<!-- codeg:inject:end -->\n今天天气如何"
+    const adapted = adaptedFor(multi)
+    expect(adapted.content).toHaveLength(1)
+    const part = adapted.content[0]
+    if (part.type !== "text") throw new Error("expected a text part")
+    expect(part.text).not.toContain("规则")
+    expect(part.text).not.toContain("<!-- codeg:inject:")
+    expect(part.text.trim()).toContain("你是谁")
+    expect(part.text.trim()).toContain("今天天气如何")
+  })
+
+  it("strips consecutive injection blocks that precede the user content", () => {
+    const consecutive =
+      "<!-- codeg:inject:start -->\n规则A\n<!-- codeg:inject:end -->\n" +
+      "<!-- codeg:inject:start -->\n规则B\n<!-- codeg:inject:end -->\n用户内容。。。"
+    const adapted = adaptedFor(consecutive)
+    expect(adapted.content).toHaveLength(1)
+    const part = adapted.content[0]
+    if (part.type !== "text") throw new Error("expected a text part")
+    expect(part.text).not.toContain("规则")
+    expect(part.text).not.toContain("<!-- codeg:inject:")
+    expect(part.text.trim()).toBe("用户内容。。。")
+  })
+
+  it("hides only the injected region when it sits in the middle of a block", () => {
+    const mid = `你是谁 <!-- codeg:inject:start -->\n规则\n<!-- codeg:inject:end --> 请继续`
+    const adapted = adaptedFor(mid)
+    expect(adapted.content).toHaveLength(1)
+    const part = adapted.content[0]
+    if (part.type !== "text") throw new Error("expected a text part")
+    expect(part.text).not.toContain("规则")
+    expect(part.text).not.toContain("<!-- codeg:inject:")
+    expect(part.text).toContain("你是谁")
+    expect(part.text).toContain("请继续")
+  })
+
+  it("leaves non-injected text unchanged", () => {
+    const adapted = adaptedFor("正常消息")
+    expect(adapted.content).toHaveLength(1)
+    const part = adapted.content[0]
+    if (part.type !== "text") throw new Error("expected a text part")
+    expect(part.text).toBe("正常消息")
+  })
+
+  it("hides the whole block when a dangling start marker has no end marker", () => {
+    const adapted = adaptedFor("<!-- codeg:inject:start -->\nrest")
+    expect(adapted.content).toHaveLength(0)
+  })
+
+  it("strips an initial pure-injection region while keeping trailing real content", () => {
+    const adapted = adaptedFor(
+      "<!-- codeg:inject:start -->\n不变式\n<!-- codeg:inject:end -->\n继续"
+    )
+    expect(adapted.content).toHaveLength(1)
+    const part = adapted.content[0]
+    if (part.type !== "text") throw new Error("expected a text part")
+    expect(part.text).toBe("继续")
+  })
+})

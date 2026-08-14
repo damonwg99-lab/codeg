@@ -1098,16 +1098,13 @@ impl ConnectionManager {
             let s = state_arc.read().await;
             (s.conversation_id, s.folder_id, s.prompt_turn_count)
         };
-        let use_decomp_injection = match prompt_turn_count {
-            // First prompt → only when the user's message carries
-            // decomposition intent.
-            0 => crate::acp::context_injection::has_decomposition_intent_in_blocks(
-                &blocks,
-            ),
-            // Follow-up prompt → every re-injection cycle regardless of intent,
-            // so a long-running session keeps the decomposition rule in mind.
-            _ => true,
-        };
+        // Inject the decomposition instruction only when the user's own message
+        // expresses decomposition intent. Injecting unconditionally on follow-up
+        // turns keeps the agent primed to decompose on its own, so its own
+        // mentions of "分解/拆分" would trigger the flow. Gate on the current
+        // user message instead.
+        let use_decomp_injection =
+            crate::acp::context_injection::has_decomposition_intent_in_blocks(&blocks);
 
         let blocks = if prompt_turn_count == 0 {
             // First prompt on this connection → full context injection.

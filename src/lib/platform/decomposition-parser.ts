@@ -2,46 +2,16 @@
  * Decomposition parser — detects and extracts structured sub-task proposals
  * from AI assistant messages.
  *
- * When the user expresses a decomposition intent (keywords like "分解",
- * "拆分", "decompose", etc.), the frontend appends a lightweight instruction
- * to the prompt asking the AI to output sub-tasks in a specific JSON format
- * wrapped in a ```task_decomposition_json code fence.
+ * The instruction that asks the AI to emit sub-tasks is injected server-side
+ * (see `src-tauri/src/acp/context_injection.rs`); this module only parses the
+ * result — the ```task_decomposition_json code fence and the
+ * `create_task_decomposition` MCP tool input.
  *
  * This module provides:
- * 1. Intent detection (hasDecompositionIntent)
- * 2. JSON extraction (parseDecompositionFromText)
- * 3. The instruction text (DECOMPOSITION_INSTRUCTION)
+ * 1. JSON extraction (parseDecompositionFromText)
+ * 2. Text segmentation (extractDecompositionSegments)
+ * 3. MCP tool-call parsing (parseDecompositionToolInput)
  */
-
-// ─── Intent Detection ───
-
-/** Keywords (Chinese + English) that signal the user wants task decomposition. */
-export const DECOMPOSITION_KEYWORDS = [
-  "分解",
-  "拆分",
-  "子任务",
-  "细化",
-  "拆解",
-  "分析并提出任务",
-  "decompose",
-  "break down",
-  "sub-tasks",
-  "subtasks",
-  "split into tasks",
-  "task breakdown",
-  "propose tasks",
-  "create tasks from",
-]
-
-/**
- * Check whether the user's message text contains decomposition intent.
- * Case-insensitive; returns true if any keyword appears as a substring.
- */
-export function hasDecompositionIntent(text: string): boolean {
-  if (!text) return false
-  const lower = text.toLowerCase()
-  return DECOMPOSITION_KEYWORDS.some((kw) => lower.includes(kw.toLowerCase()))
-}
 
 // ─── Proposed Sub-Task Model ───
 
@@ -85,22 +55,6 @@ function normalizeEntry(
 
   return { title, description, taskType, priority }
 }
-
-// ─── Instruction ───
-
-/**
- * Instruction appended to the prompt when the user expresses decomposition intent.
- *
- * Provides BOTH paths so the AI can choose based on its capabilities:
- * - Primary: call the `create_task_decomposition` MCP tool (reliable, JSON guaranteed)
- * - Fallback: output a ```task_decomposition_json code fence (for agents that
- *   can't or won't call MCP tools)
- *
- * The frontend detects both paths:
- *   tool_call block → parseDecompositionToolInput (primary)
- *   text fence      → extractDecompositionSegments (fallback)
- */
-export const DECOMPOSITION_INSTRUCTION = `[系统指令：当提出任务分解时，请优先调用 create_task_decomposition 工具传入子任务列表。如果无法调用该工具（如不在可用工具列表中），请在回复末尾的 \`\`\`task_decomposition_json 代码块中输出 JSON。格式为 {"subTasks":[{"title":"任务标题（中文）","description":"任务描述（中文）","taskType":"bug|feature|task|improvement","priority":"low|medium|high|urgent"}]}。title 和 description 必须用中文填写。]`
 
 // ─── JSON Extraction ───
 

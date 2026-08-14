@@ -25,8 +25,6 @@ pub fn is_injected_block(text: &str) -> bool {
 }
 
 /// Keywords (Chinese + English) that signal the user wants task decomposition.
-/// Mirrors `DECOMPOSITION_KEYWORDS` in
-/// `src/lib/platform/decomposition-parser.ts`.
 const DECOMPOSITION_KEYWORDS: &[&str] = &[
     "分解",
     "拆分",
@@ -44,8 +42,7 @@ const DECOMPOSITION_KEYWORDS: &[&str] = &[
     "create tasks from",
 ];
 
-/// Case-insensitive substring check for decomposition intent. Mirrors
-/// `hasDecompositionIntent` in `decomposition-parser.ts`.
+/// Case-insensitive substring check for decomposition intent.
 pub fn has_decomposition_intent(text: &str) -> bool {
     if text.is_empty() {
         return false;
@@ -74,11 +71,10 @@ pub fn has_decomposition_intent_in_blocks(blocks: &[PromptInputBlock]) -> bool {
 }
 
 /// The decomposition instruction appended to the prompt when the user expresses
-/// decomposition intent. Mirrors `DECOMPOSITION_INSTRUCTION` in
-/// `decomposition-parser.ts` — instructs the agent to call the
+/// decomposition intent — instructs the agent to call the
 /// `create_task_decomposition` tool, falling back to a
 /// `task_decomposition_json` code fence.
-pub const DECOMPOSITION_INSTRUCTION: &str = "[系统指令：当提出任务分解时，请优先调用 create_task_decomposition 工具传入子任务列表。如果无法调用该工具（如不在可用工具列表中），请在回复末尾的 ```task_decomposition_json 代码块中输出 JSON。格式为 {\"subTasks\":[{\"title\":\"任务标题（中文）\",\"description\":\"任务描述（中文）\",\"taskType\":\"bug|feature|task|improvement\",\"priority\":\"low|medium|high|urgent\"}]}。title 和 description 必须用中文填写。]";
+pub const DECOMPOSITION_INSTRUCTION: &str = "[系统指令：仅当用户明确提出任务分解需求时，才调用 create_task_decomposition 工具传入子任务列表。如果用户没有提出该需求，不要仅因回复中出现了「分解」「拆分」等词就自行触发。如果无法调用该工具（如不在可用工具列表中），请在回复末尾的 ```task_decomposition_json 代码块中输出 JSON。格式为 {\"subTasks\":[{\"title\":\"任务标题（中文）\",\"description\":\"任务描述（中文）\",\"taskType\":\"bug|feature|task|improvement\",\"priority\":\"low|medium|high|urgent\"}]}。title 和 description 必须用中文填写。]";
 
 /// Build a marker-wrapped decomposition instruction block. Because it is
 /// wrapped in the `codeg:inject` markers, the frontend hides it from the user
@@ -101,6 +97,16 @@ pub async fn build_first_prompt_injection(
     conversation_id: i32,
     folder_id: i32,
 ) -> Option<PromptInputBlock> {
+    // Only inject for conversations linked to a task. A plain (non-task)
+    // conversation must not receive the KB rules / task context block.
+    if platform_task_conversation_service::get_by_conversation(conn, conversation_id)
+        .await
+        .ok()?
+        .is_none()
+    {
+        return None;
+    }
+
     let mut parts: Vec<String> = Vec::new();
 
     // 1. Project KB Rules (from RULES.md)

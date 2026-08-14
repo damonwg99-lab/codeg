@@ -1093,6 +1093,37 @@ function generateToolCallId(messageId: string, blockIndex: number): string {
   return `${messageId}-tool-${blockIndex}`
 }
 
+const CODEG_INJECT_START = "<!-- codeg:inject:start -->"
+const CODEG_INJECT_END = "<!-- codeg:inject:end -->"
+// Matches one injected region: from a start marker up to its end marker, or to
+// the end of the string when the end marker is missing (dangling start).
+const CODEG_INJECT_REGION_RE = new RegExp(
+  `${CODEG_INJECT_START}[\\s\\S]*?(?:${CODEG_INJECT_END}|$)`,
+  "g"
+)
+
+/**
+ * A text block carrying the `codeg:inject` marker is injected context that
+ * should be hidden from the user. Normally such a block contains only injected
+ * text and is hidden entirely. But when the injected context is concatenated
+ * with the user's own prompt into a single block (as some agents persist the
+ * transcript), only the injected regions must be stripped so the user's real
+ * message stays visible. Every `start…end` region is removed (a block may hold
+ * several injected regions), and a dangling `start` marker without a matching
+ * `end` discards the rest of the block.
+ *
+ * Returns `null` when nothing but injected regions remain.
+ */
+function stripCodegInjection(text: string): AdaptedContentPart | null {
+  if (!text.includes(CODEG_INJECT_START)) {
+    return { type: "text", text }
+  }
+  const stripped = text.replace(CODEG_INJECT_REGION_RE, "")
+  const trimmed = stripped.trim()
+  if (trimmed.length === 0) return null
+  return { type: "text", text: trimmed }
+}
+
 /**
  * Transform a single ContentBlock to AdaptedContentPart
  */
@@ -1104,11 +1135,7 @@ function adaptContentBlock(
 ): AdaptedContentPart | null {
   switch (block.type) {
     case "text":
-      if (block.text.startsWith("<!-- codeg:inject:start -->")) return null
-      return {
-        type: "text",
-        text: block.text,
-      }
+      return stripCodegInjection(block.text)
 
     case "tool_use":
       return {

@@ -2185,6 +2185,8 @@ mod tests {
         sessions: true,
         decomposition: false,
         tasks: false,
+        automations: false,
+        taskboard: false,
     };
     const DECOMPOSITION_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
