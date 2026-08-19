@@ -65,7 +65,7 @@ export function ProjectSwitcher() {
           </Avatar>
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start">
+      <DropdownMenuContent align="start" className="min-w-[220px]">
         {projects.map((p) => (
           <DropdownMenuItem
             key={p.id}
