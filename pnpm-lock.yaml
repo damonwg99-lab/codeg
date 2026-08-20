@@ -273,12 +273,24 @@ importers:
       prettier:
         specifier: ^3.8.1
         version: 3.8.1
+      remark-math:
+        specifier: ^6.0.0
+        version: 6.0.0
+      remark-parse:
+        specifier: ^11.0.0
+        version: 11.0.0
       tw-animate-css:
         specifier: ^1.4.0
         version: 1.4.0
       typescript:
         specifier: ~5.8.3
         version: 5.8.3
+      unified:
+        specifier: ^11.0.5
+        version: 11.0.5
+      unist-util-visit:
+        specifier: ^5.0.0
+        version: 5.1.0
       vitest:
         specifier: ^2.1.8
         version: 2.1.9(@types/node@25.2.2)(@vitest/ui@2.1.9)(jsdom@25.0.1)(lightningcss@1.30.2)(msw@2.12.9(@types/node@25.2.2)(typescript@5.8.3))

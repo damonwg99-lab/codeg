@@ -42,14 +42,14 @@ fn nudge_schedule() {
     }
 }
 
-/// Best-effort auto-merge nudge after a settings change: switching auto-merge
+/// Best-effort merge-pump nudge after a settings change: switching auto-merge
 /// on should drain the review backlog now, not at the next reconcile tick.
 /// Scope 0 is the global row, which any folder without its own row follows —
-/// that one sweeps every folder holding reviewed tasks.
-fn nudge_auto_merge(folder_id: i32) {
+/// that one pumps every folder holding reviewed tasks.
+fn nudge_merge_pump(folder_id: i32) {
     if let Some(engine) = crate::work_task::engine() {
         let scope = (folder_id != 0).then_some(folder_id);
-        tokio::spawn(async move { engine.sweep_auto_merge_backlog(scope).await });
+        tokio::spawn(async move { engine.sweep_merge_backlog(scope).await });
     }
 }
 
@@ -61,12 +61,14 @@ pub async fn work_task_list_core(
 ) -> Result<Vec<WorkTaskInfo>, DbError> {
     let mut infos = work_task_service::list(&db.conn, folder_id).await?;
     annotate_worktree_missing(db, &mut infos).await?;
+    annotate_agent_type(db, &mut infos).await?;
     Ok(infos)
 }
 
 pub async fn work_task_get_core(db: &AppDatabase, id: i32) -> Result<WorkTaskInfo, DbError> {
     let mut infos = vec![work_task_service::get(&db.conn, id).await?];
     annotate_worktree_missing(db, &mut infos).await?;
+    annotate_agent_type(db, &mut infos).await?;
     Ok(infos.pop().expect("annotated the one row"))
 }
 
@@ -113,6 +115,99 @@ async fn annotate_worktree_missing(
     Ok(())
 }
 
+/// Stamp `agent_type` on every row: the agent that runs — or ran — this task,
+/// which both task views draw beside the title. The client cannot resolve it
+/// itself, because an inheriting task's agent lives in the folder's settings
+/// rather than on the row, so the whole list is resolved here in three batched
+/// queries instead of a lookup per card.
+///
+/// The engine's own layering (`effective_agent_config`) with the conversation
+/// in front: a task that already ran is named by the agent that actually ran
+/// it, then by its own override, then by the folder's task settings (its own
+/// row wholesale, else the global one — `settings_get_effective`'s rule), then
+/// by the folder's default agent. All four empty leaves `None`, which is
+/// exactly the state the engine refuses to launch.
+async fn annotate_agent_type(db: &AppDatabase, infos: &mut [WorkTaskInfo]) -> Result<(), DbError> {
+    use crate::db::entities::{conversation, folder, work_task_settings};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use std::collections::{BTreeSet, HashMap};
+    use work_task_service::GLOBAL_SETTINGS_FOLDER_ID;
+
+    if infos.is_empty() {
+        return Ok(());
+    }
+
+    // Every source read here already stores a wire name ("claude_code",
+    // "custom:<id>"), which is what the client keys its icon map on — so these
+    // strings pass through verbatim.
+    let conv_ids: BTreeSet<i32> = infos.iter().filter_map(|t| t.conversation_id).collect();
+    let conv_agents: HashMap<i32, String> = if conv_ids.is_empty() {
+        HashMap::new()
+    } else {
+        conversation::Entity::find()
+            .filter(conversation::Column::Id.is_in(conv_ids.iter().copied()))
+            .all(&db.conn)
+            .await?
+            .into_iter()
+            .map(|c| (c.id, c.agent_type))
+            .collect()
+    };
+
+    let folder_ids: BTreeSet<i32> = infos.iter().map(|t| t.folder_id).collect();
+    let folder_defaults: HashMap<i32, String> = folder::Entity::find()
+        .filter(folder::Column::Id.is_in(folder_ids.iter().copied()))
+        .all(&db.conn)
+        .await?
+        .into_iter()
+        .filter_map(|f| f.default_agent_type.map(|agent| (f.id, agent)))
+        .collect();
+
+    // Every settings row the list can consult, in one query: the folders it
+    // spans plus the global row they fall back to. An unparseable row is
+    // dropped rather than defaulted, so it falls through to the global one
+    // exactly as `settings_get_effective` would.
+    let settings_ids: BTreeSet<i32> = folder_ids
+        .iter()
+        .copied()
+        .chain(std::iter::once(GLOBAL_SETTINGS_FOLDER_ID))
+        .collect();
+    let settings_agents: HashMap<i32, Option<String>> = work_task_settings::Entity::find()
+        .filter(work_task_settings::Column::FolderId.is_in(settings_ids))
+        .all(&db.conn)
+        .await?
+        .into_iter()
+        .filter_map(|row| {
+            serde_json::from_str::<WorkTaskFolderSettings>(&row.config)
+                .ok()
+                .map(|settings| (row.folder_id, settings.default_agent_type))
+        })
+        .collect();
+
+    for info in infos.iter_mut() {
+        let from_conversation = info
+            .conversation_id
+            .and_then(|id| conv_agents.get(&id))
+            .cloned();
+        let own_override = info
+            .config
+            .get("agent_type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        // A folder that saved settings of its own detaches from the global row
+        // wholesale — including when its agent field is the empty one.
+        let from_settings = settings_agents
+            .get(&info.folder_id)
+            .or_else(|| settings_agents.get(&GLOBAL_SETTINGS_FOLDER_ID))
+            .cloned()
+            .flatten();
+        info.agent_type = from_conversation
+            .or(own_override)
+            .or(from_settings)
+            .or_else(|| folder_defaults.get(&info.folder_id).cloned());
+    }
+    Ok(())
+}
+
 pub async fn work_task_events_core(
     db: &AppDatabase,
     task_id: i32,
@@ -143,17 +238,98 @@ pub async fn work_task_create_core(
 pub async fn work_task_update_core(
     emitter: &EventEmitter,
     db: &AppDatabase,
+    chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
     id: i32,
     draft: WorkTaskDraft,
 ) -> Result<WorkTaskInfo, DbError> {
+    // Read the pre-edit name first: a session this card already produced was
+    // named after it (and locked), so a rename here should carry over — but only
+    // while the two are still in sync, which only the OLD name can attest.
+    let before = work_task_service::get_model(&db.conn, id).await.ok();
+
     let info = work_task_service::update(&db.conn, id, draft).await?;
     emit_event(
         emitter,
         WORK_TASK_CHANGED_EVENT,
         WorkTaskChange::Upsert { id },
     );
+    if let Some(before) = before {
+        rename_task_conversation(emitter, db, chat_channel_manager, &before, &info.title).await;
+    }
     nudge_pump(info.folder_id);
     Ok(info)
+}
+
+/// Carry a card's rename over to the session it produced. Only reachable from
+/// the editable statuses (`todo` / `failed` / `canceled`), so in practice this
+/// fires for a task the user is re-shaping after a failed or canceled run.
+///
+/// Best-effort and deliberately narrow: `retitle_if_unchanged` writes only if
+/// the conversation still carries the card's PREVIOUS name, so a session the
+/// user renamed by hand keeps the name they chose. A skipped or failed write
+/// costs a stale title, never the edit itself.
+///
+/// A written title is pushed on to the chat channels exactly as
+/// `update_conversation_title` does. Engine-minted rows are not off-limits to
+/// bindings: Telegram's `/resume <id>` takes ANY conversation id and binds it to
+/// the forum topic it was typed in, so a task's session can own a topic whose
+/// name would otherwise go stale forever — locked titles never pass through the
+/// auto-title path that would re-sync it.
+///
+/// Known limitation (deliberate): the guard is a VALUE, not provenance, and the
+/// card's own edit path is last-writer-wins with no CAS. Two clients editing the
+/// same card at the same instant can therefore leave the session on the losing
+/// name, and it will not re-sync — the next edit compares against a name the row
+/// no longer carries. The cost is a stale display title on a failed/canceled
+/// card; telling "the card named this" from "the user named this" apart for real
+/// needs a provenance column on `conversation`, which is not worth it here.
+async fn rename_task_conversation(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
+    before: &crate::db::entities::work_task::Model,
+    new_title: &str,
+) {
+    use crate::work_task::engine::conversation_title_for_task;
+
+    let Some(conversation_id) = before.conversation_id else {
+        return;
+    };
+    let (old, new) = (
+        conversation_title_for_task(&before.title),
+        conversation_title_for_task(new_title),
+    );
+    if old == new {
+        return;
+    }
+    match crate::db::service::conversation_service::retitle_if_unchanged(
+        &db.conn,
+        conversation_id,
+        &old,
+        &new,
+    )
+    .await
+    {
+        Ok(true) => {
+            crate::commands::conversations::emit_conversation_upsert(
+                emitter,
+                &db.conn,
+                conversation_id,
+            )
+            .await;
+            crate::commands::conversations::sync_conversation_title_to_channels_core(
+                &db.conn,
+                chat_channel_manager,
+                conversation_id,
+            )
+            .await;
+        }
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            "[work_task] task {}: could not retitle conversation {conversation_id}: {e}",
+            before.id
+        ),
+    }
 }
 
 /// How many times a delete re-reads before giving up. A retry only happens when
@@ -360,15 +536,40 @@ pub async fn work_task_cancel_core(id: i32, reason: Option<String>) -> Result<()
 /// review with a readable error). This awaits only the dispatch (validation +
 /// agent spawn), so refused merges surface directly in the dialog.
 /// `message: None` = the agent writes the commit message itself.
+///
+/// Returns `true` when the merge was QUEUED instead of started — the folder was
+/// already landing another task, and this one goes in as soon as that finishes.
 pub async fn work_task_merge_core(
     id: i32,
     message: Option<String>,
     delete_worktree: bool,
-) -> Result<(), DbError> {
+) -> Result<bool, DbError> {
     engine()?
         .merge_task(id, message, delete_worktree, false)
         .await
+        .map(|dispatch| dispatch.is_queued())
         .map_err(DbError::Validation)
+}
+
+/// Withdraw a merge that is waiting in the folder's queue (the task stays in
+/// review, untouched). Pure DB — no engine needed: the pump only ever reads
+/// intents that are still on the row.
+pub async fn work_task_merge_unqueue_core(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    id: i32,
+) -> Result<(), DbError> {
+    if !work_task_service::unqueue_merge(&db.conn, id).await? {
+        return Err(DbError::Validation(
+            "this task is not waiting to merge".to_string(),
+        ));
+    }
+    emit_event(
+        emitter,
+        WORK_TASK_CHANGED_EVENT,
+        WorkTaskChange::Upsert { id },
+    );
+    Ok(())
 }
 
 /// Finish a reviewed task that has nothing to land (review → done, no merge),
@@ -490,7 +691,7 @@ pub async fn work_task_settings_set_core(
         WorkTaskChange::Settings { folder_id },
     );
     nudge_pump(folder_id);
-    nudge_auto_merge(folder_id);
+    nudge_merge_pump(folder_id);
     Ok(())
 }
 
@@ -510,7 +711,7 @@ pub async fn work_task_settings_delete_core(
     nudge_pump(folder_id);
     // Reverting to the global row can also switch auto-merge ON for this
     // folder (the global row may carry it) — same drain-now semantics.
-    nudge_auto_merge(folder_id);
+    nudge_merge_pump(folder_id);
     Ok(())
 }
 
@@ -584,10 +785,18 @@ pub async fn work_task_create(
 pub async fn work_task_update(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
+    chat_channel_manager: tauri::State<'_, crate::chat_channel::manager::ChatChannelManager>,
     id: i32,
     draft: WorkTaskDraft,
 ) -> Result<WorkTaskInfo, DbError> {
-    work_task_update_core(&EventEmitter::Tauri(app), &db, id, draft).await
+    work_task_update_core(
+        &EventEmitter::Tauri(app),
+        &db,
+        &chat_channel_manager,
+        id,
+        draft,
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -693,8 +902,18 @@ pub async fn work_task_merge(
     id: i32,
     message: Option<String>,
     delete_worktree: bool,
-) -> Result<(), DbError> {
+) -> Result<bool, DbError> {
     work_task_merge_core(id, message, delete_worktree).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_merge_unqueue(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    id: i32,
+) -> Result<(), DbError> {
+    work_task_merge_unqueue_core(&EventEmitter::Tauri(app), &db, id).await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -811,4 +1030,343 @@ pub async fn work_task_template_delete(
     id: i32,
 ) -> Result<(), DbError> {
     work_task_template_delete_core(&db, id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::service::folder_service;
+    use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+    use crate::models::agent::AgentType;
+
+    fn draft(folder_id: i32, title: &str, agent: Option<&str>) -> WorkTaskDraft {
+        WorkTaskDraft {
+            folder_id,
+            title: title.to_string(),
+            config: serde_json::json!({
+                "display_text": "do the thing",
+                "prompt_blocks": [{ "type": "text", "text": "do the thing" }],
+                "agent_type": agent,
+            }),
+        }
+    }
+
+    async fn agent_of(db: &AppDatabase, task_id: i32) -> Option<String> {
+        work_task_get_core(db, task_id).await.unwrap().agent_type
+    }
+
+    /// The list must name each task's agent the way the ENGINE would pick it
+    /// (`effective_agent_config`), or the views draw a mark for an agent that
+    /// never runs. Walks the layering from the outside in.
+    #[tokio::test]
+    async fn agent_type_is_stamped_with_the_engines_own_layering() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-agent").await;
+        folder_service::update_folder_default_agent(
+            &db.conn,
+            folder_id,
+            Some(AgentType::ClaudeCode),
+        )
+        .await
+        .unwrap();
+
+        let overridden = work_task_service::create(&db.conn, draft(folder_id, "a", Some("codex")))
+            .await
+            .unwrap();
+        let inheriting = work_task_service::create(&db.conn, draft(folder_id, "b", None))
+            .await
+            .unwrap();
+
+        // Nothing between the task and its folder yet.
+        assert_eq!(agent_of(&db, overridden.id).await.as_deref(), Some("codex"));
+        assert_eq!(
+            agent_of(&db, inheriting.id).await.as_deref(),
+            Some("claude_code")
+        );
+
+        // The folder's task settings sit between the two — and only the
+        // inheriting task feels them.
+        let settings = WorkTaskFolderSettings {
+            default_agent_type: Some("grok".to_string()),
+            ..Default::default()
+        };
+        work_task_service::settings_set(&db.conn, folder_id, &settings)
+            .await
+            .unwrap();
+        assert_eq!(agent_of(&db, overridden.id).await.as_deref(), Some("codex"));
+        assert_eq!(agent_of(&db, inheriting.id).await.as_deref(), Some("grok"));
+
+        // Once the task has actually run, the agent that ran it wins over
+        // every configured layer — including the task's own override.
+        let conversation_id = seed_conversation(&db, folder_id, AgentType::Gemini).await;
+        let run_seq =
+            work_task_service::claim_for_run(&db.conn, overridden.id, WorkTaskStatus::Todo, "user")
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(work_task_service::begin_setup(&db.conn, overridden.id, run_seq)
+            .await
+            .unwrap());
+        assert!(
+            work_task_service::mark_running(&db.conn, overridden.id, run_seq, conversation_id, "c1")
+                .await
+                .unwrap()
+        );
+        assert_eq!(agent_of(&db, overridden.id).await.as_deref(), Some("gemini"));
+
+        // A list stamps every row the same way a get does.
+        let listed = work_task_list_core(&db, Some(folder_id)).await.unwrap();
+        let stamped: Vec<Option<String>> = listed.into_iter().map(|t| t.agent_type).collect();
+        assert!(stamped.iter().all(|a| a.is_some()), "{stamped:?}");
+    }
+
+    /// A folder with no default and no settings anywhere leaves the field
+    /// empty rather than guessing — the same state the engine refuses to
+    /// launch, which both views draw as a placeholder.
+    #[tokio::test]
+    async fn agent_type_is_none_when_nothing_is_configured() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-agent-none").await;
+        let task = work_task_service::create(&db.conn, draft(folder_id, "a", None))
+            .await
+            .unwrap();
+        assert_eq!(agent_of(&db, task.id).await, None);
+
+        // The global settings row is what a folder without its own follows.
+        let settings = WorkTaskFolderSettings {
+            default_agent_type: Some("cursor".to_string()),
+            ..Default::default()
+        };
+        work_task_service::settings_set(
+            &db.conn,
+            work_task_service::GLOBAL_SETTINGS_FOLDER_ID,
+            &settings,
+        )
+        .await
+        .unwrap();
+        assert_eq!(agent_of(&db, task.id).await.as_deref(), Some("cursor"));
+    }
+
+    fn test_emitter() -> EventEmitter {
+        EventEmitter::test_web_only(std::sync::Arc::new(
+            crate::web::event_bridge::WebEventBroadcaster::new(),
+        ))
+    }
+
+    /// No backend is registered on a bare manager, so a title sync reaches the
+    /// binding lookup and then stops at `NotFound` — no network, no waiting.
+    fn test_channels() -> crate::chat_channel::manager::ChatChannelManager {
+        crate::chat_channel::manager::ChatChannelManager::new()
+    }
+
+    /// The state the engine leaves behind once a card has produced a session.
+    async fn bind_conversation(db: &AppDatabase, task_id: i32, conversation_id: i32) {
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+        let row = crate::db::entities::work_task::Entity::find_by_id(task_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("task row");
+        let mut active = row.into_active_model();
+        active.conversation_id = Set(Some(conversation_id));
+        active.update(&db.conn).await.unwrap();
+    }
+
+    async fn conversation_title(db: &AppDatabase, id: i32) -> Option<String> {
+        crate::db::service::conversation_service::get_by_id(&db.conn, id)
+            .await
+            .unwrap()
+            .title
+    }
+
+    /// Renaming a card renames the session it produced: the two must not drift
+    /// apart, or the sidebar goes back to showing a name nothing on the board
+    /// answers to (issue #495).
+    #[tokio::test]
+    async fn renaming_a_task_renames_the_session_it_produced() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-retitle").await;
+        let task = work_task_service::create(&db.conn, draft(folder_id, "Fix login", None))
+            .await
+            .unwrap();
+        let conv = seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
+        crate::db::service::conversation_service::update_title(
+            &db.conn,
+            conv,
+            "Fix login".to_string(),
+        )
+        .await
+        .unwrap();
+        bind_conversation(&db, task.id, conv).await;
+
+        work_task_update_core(
+            &test_emitter(),
+            &db,
+            &test_channels(),
+            task.id,
+            draft(folder_id, "Fix logout too", None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            conversation_title(&db, conv).await.as_deref(),
+            Some("Fix logout too")
+        );
+    }
+
+    /// …but a session the user named themselves keeps that name. Both titles
+    /// are `title_locked`, so only the card's PREVIOUS name can tell "still in
+    /// sync" from "the user picked this".
+    #[tokio::test]
+    async fn renaming_a_task_leaves_a_hand_named_session_alone() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-retitle-manual").await;
+        let task = work_task_service::create(&db.conn, draft(folder_id, "Fix login", None))
+            .await
+            .unwrap();
+        let conv = seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
+        crate::db::service::conversation_service::update_title(
+            &db.conn,
+            conv,
+            "My own name".to_string(),
+        )
+        .await
+        .unwrap();
+        bind_conversation(&db, task.id, conv).await;
+
+        work_task_update_core(
+            &test_emitter(),
+            &db,
+            &test_channels(),
+            task.id,
+            draft(folder_id, "Fix logout too", None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            conversation_title(&db, conv).await.as_deref(),
+            Some("My own name"),
+            "a hand-picked session name outranks the card it came from"
+        );
+    }
+
+    /// A task's session CAN own a chat-channel thread: Telegram's `/resume <id>`
+    /// takes any conversation id and binds it to the forum topic it was typed
+    /// in (`chat_channel/session_commands.rs::handle_resume`). So the rename has
+    /// to walk the same channel-sync path a manual rename does — a locked title
+    /// never passes through the auto-title backfill that would otherwise
+    /// re-sync the topic, so skipping it here would strand the topic name
+    /// forever.
+    ///
+    /// The remote edit itself is not observable here (a bare manager has no
+    /// backend registered, so the sync stops at `NotFound` without touching the
+    /// network); what this pins is that the path is wired, reached with a real
+    /// binding in place, and leaves the binding row intact.
+    #[tokio::test]
+    async fn renaming_a_task_syncs_a_bound_session_through_the_channel_path() {
+        use crate::chat_channel::types::{ChannelMessageTarget, TELEGRAM_FORUM_THREAD_KIND};
+        use crate::db::service::thread_binding_service;
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-retitle-bound").await;
+        let task = work_task_service::create(&db.conn, draft(folder_id, "Fix login", None))
+            .await
+            .unwrap();
+        let conv = seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
+        crate::db::service::conversation_service::update_title(
+            &db.conn,
+            conv,
+            "Fix login".to_string(),
+        )
+        .await
+        .unwrap();
+        bind_conversation(&db, task.id, conv).await;
+
+        // The binding is FK-constrained to a real channel row.
+        let channel = {
+            use sea_orm::{ActiveModelTrait, NotSet, Set};
+            let now = chrono::Utc::now();
+            crate::db::entities::chat_channel::ActiveModel {
+                id: NotSet,
+                name: Set("tg".to_string()),
+                channel_type: Set("telegram".to_string()),
+                enabled: Set(true),
+                config_json: Set("{}".to_string()),
+                event_filter_json: Set(None),
+                daily_report_enabled: Set(false),
+                daily_report_time: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&db.conn)
+            .await
+            .expect("seed channel")
+            .id
+        };
+        let target = ChannelMessageTarget {
+            channel_id: channel,
+            chat_id: Some("-100123".to_string()),
+            thread_key: Some("42".to_string()),
+            thread_kind: Some(TELEGRAM_FORUM_THREAD_KIND.to_string()),
+            provider_payload: None,
+        };
+        thread_binding_service::upsert_for_target(
+            &db.conn,
+            &target,
+            "telegram",
+            conv,
+            None,
+            "sender",
+            Some("Fix login".to_string()),
+        )
+        .await
+        .expect("bind topic");
+
+        work_task_update_core(
+            &test_emitter(),
+            &db,
+            &test_channels(),
+            task.id,
+            draft(folder_id, "Fix logout too", None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            conversation_title(&db, conv).await.as_deref(),
+            Some("Fix logout too")
+        );
+        let bindings = thread_binding_service::list_by_conversation(&db.conn, conv)
+            .await
+            .expect("bindings");
+        assert_eq!(bindings.len(), 1, "the binding must survive the rename");
+        assert!(
+            bindings[0].title_sync_enabled,
+            "the rename must not disable title sync on the topic"
+        );
+    }
+
+    /// A card that never ran has no session to follow it — the edit must still
+    /// succeed, untouched by the propagation path.
+    #[tokio::test]
+    async fn renaming_a_task_without_a_session_is_harmless() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-retitle-none").await;
+        let task = work_task_service::create(&db.conn, draft(folder_id, "Fix login", None))
+            .await
+            .unwrap();
+
+        let info = work_task_update_core(
+            &test_emitter(),
+            &db,
+            &test_channels(),
+            task.id,
+            draft(folder_id, "Renamed", None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(info.title, "Renamed");
+    }
 }

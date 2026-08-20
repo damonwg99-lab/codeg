@@ -72,6 +72,24 @@ fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
     )
 }
 
+/// Whether this event starts or ends a prompt that BLOCKS the agent until a
+/// human answers. Deliberately not folded into [`is_lifecycle_relevant`]: these
+/// never reach a worker, they only wake the delegation broker's parked status
+/// long-polls (see the dispatcher loop). Both edges matter — the raise so a
+/// waiting parent learns it is blocked, the resolve so a subsequent poll finds
+/// the child working again.
+fn is_blocking_prompt_event(event: &AcpEvent) -> bool {
+    matches!(
+        event,
+        AcpEvent::PermissionRequest { .. }
+            | AcpEvent::PermissionResolved { .. }
+            | AcpEvent::QuestionRequest { .. }
+            | AcpEvent::QuestionResolved { .. }
+            | AcpEvent::PlanApprovalRequest { .. }
+            | AcpEvent::PlanApprovalResolved { .. }
+    )
+}
+
 /// Whether the dispatcher should tear down (drop the sender for) the per-
 /// connection worker after forwarding this event. Two cases:
 ///
@@ -184,9 +202,23 @@ pub(crate) async fn handle_event(
             else {
                 return Ok(());
             };
-            let conversation_id = state_arc.read().await.conversation_id;
+            let (conversation_id, agent_type) = {
+                let snap = state_arc.read().await;
+                (snap.conversation_id, snap.agent_type)
+            };
             if let Some(cid) = conversation_id {
-                conversation_service::update_external_id(db_conn, cid, session_id.clone()).await?;
+                // Guarded bind: the row may already be bound to a DIFFERENT
+                // session. That is legitimate for a fork (which has already
+                // inserted the sibling holding the outgoing id, so this is a
+                // plain re-point) and for a custom agent continuing its
+                // conversation under a new session (`continues`), and
+                // destructive otherwise — a session re-minted under a live
+                // binding would otherwise overwrite the id the row's whole
+                // history hangs off. See codeg#500.
+                let continues = crate::acp::continued_session_ids(agent_type, session_id);
+                let preserved =
+                    conversation_service::bind_external_id(db_conn, cid, session_id, &continues)
+                        .await?;
                 // The external_id just landed on the row. The create-time
                 // sidebar upsert carried `external_id: null` (no session yet),
                 // so re-broadcast the full summary on `conversation://changed`
@@ -194,6 +226,10 @@ pub(crate) async fn handle_event(
                 // delegation children). Best-effort, after the DB write.
                 crate::commands::conversations::emit_conversation_upsert(&emitter, db_conn, cid)
                     .await;
+                crate::commands::conversations::emit_preserved_conversation(
+                    &emitter, db_conn, preserved,
+                )
+                .await;
             }
             Ok(())
         }
@@ -1526,6 +1562,15 @@ pub fn lifecycle_subscriber_task(
                     // worker at all. See `register_delegation_tool_call_from_event`.
                     if let Some(b) = broker.as_ref() {
                         register_delegation_tool_call_from_event(b.as_ref(), &envelope_arc).await;
+                        // Same placement rationale: a blocking prompt raised on
+                        // a delegation child must reach the broker's parked
+                        // status long-polls immediately, so the parent LLM can
+                        // report "waiting on you" instead of hanging until the
+                        // user happens to notice (#447). Ahead of the
+                        // `is_lifecycle_relevant` filter, which drops all six.
+                        if is_blocking_prompt_event(&envelope_arc.payload) {
+                            b.note_blocking_changed();
+                        }
                     }
 
                     // Fast-path filter: skip events the worker would no-op.
@@ -1598,6 +1643,17 @@ pub fn lifecycle_subscriber_task(
                     // authoritative loss record (unthrottled); the log line is
                     // throttled to at most one per window.
                     metrics.lagged_count.fetch_add(skipped, Ordering::Relaxed);
+                    // A dropped batch may have contained a blocking prompt, and
+                    // a child parked on one emits nothing further — so no later
+                    // event is guaranteed to wake the broker's parked status
+                    // long-polls, and a `wait_ms: 0` caller would hang for good.
+                    // Wake them unconditionally: they re-probe live
+                    // `SessionState`, which is written directly and therefore
+                    // survives any bus loss. Same "resync from authoritative
+                    // state" recovery the pet aggregator does on lag.
+                    if let Some(b) = broker.as_ref() {
+                        b.note_blocking_changed();
+                    }
                     if let Some(s) = lag_throttle.record(skipped) {
                         tracing::warn!(
                             "[lifecycle][WARN] internal bus lagged: dropped {} events across \
@@ -1739,7 +1795,7 @@ mod tests {
         // A fork emits `SessionStarted{S2}`. If the bound conversation was
         // soft-deleted while its ACP connection stayed live (delete only
         // soft-marks the row; it never disconnects the agent), this late write
-        // must be a total no-op: `update_external_id` is guarded on
+        // must be a total no-op: `bind_external_id` is guarded on
         // `deleted_at IS NULL`, so the deleted row keeps its S1 session id and
         // its `updated_at`, and `emit_conversation_upsert` (which re-fetches via
         // `get_by_id`, itself deleted-filtered) broadcasts nothing. This locks
@@ -1754,7 +1810,7 @@ mod tests {
             conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
                 .await
                 .unwrap();
-        conversation_service::update_external_id(&db.conn, conv.id, "session-S1".into())
+        conversation_service::bind_external_id(&db.conn, conv.id, "session-S1", &[])
             .await
             .unwrap();
         conversation_service::soft_delete(&db.conn, conv.id)
@@ -2634,11 +2690,21 @@ mod tests {
         // Wait for the worker to fully drain. The TurnComplete is at the
         // tail of the queue, so observing PendingReview proves nothing
         // before it was dropped.
+        //
+        // The budget was 2s when each SessionStarted was a single UPDATE. Every
+        // id in the burst above is distinct, so under the session-binding guard
+        // each one is a re-point away from a live session and costs a
+        // transaction plus a preserving INSERT — ~200 of them here. That is
+        // pathological by construction: a real connection emits SessionStarted
+        // once (plus once per fork, which the guard short-circuits), so this
+        // cost never appears in production. The budget is widened rather than
+        // the burst weakened, because what this test exists to prove is
+        // DELIVERY of the tail event, not the speed of the arms ahead of it.
         let observed = poll_status(
             &db,
             conv.id,
             ConversationStatus::PendingReview,
-            Duration::from_secs(2),
+            Duration::from_secs(30),
         )
         .await;
 

@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react"
 import { getAgentLabel } from "@/lib/custom-agents"
-import { ArrowLeft, Folder, Globe, Wand2 } from "lucide-react"
+import { ArrowLeft, Globe, Wand2 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { AgentSelector } from "@/components/chat/agent-selector"
@@ -30,13 +30,7 @@ import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
+import { FolderSelect } from "@/components/shared/folder-select"
 import { cn } from "@/lib/utils"
 import { automationComputeNextRun } from "@/lib/api"
 import type {
@@ -122,6 +116,8 @@ export function AutomationEditor({
   const [cronBuilderOpen, setCronBuilderOpen] = useState(false)
 
   const editorRef = useRef<RichComposerHandle>(null)
+  // The composer's outer box, so the `@` panel spans it like the `/` menu does.
+  const composerBoxRef = useRef<HTMLDivElement>(null)
   // True once the user explicitly picks an agent. A system fallback (saved agent
   // unavailable on this device) updates the displayed type via onFallback but
   // leaves this false, so submit can persist the original agent instead of
@@ -343,6 +339,7 @@ export function AutomationEditor({
       {/* The real conversation composer (rich text + @-mentions) plus an inline
           config bottom bar, matching the new-conversation input. */}
       <div
+        ref={composerBoxRef}
         // Clicking the box's blank chrome (padding, the dead space below a short
         // prompt, the config-bar gaps) focuses the editor at the click point —
         // same affordance as the chat composer. Interactive controls, badges and
@@ -364,6 +361,7 @@ export function AutomationEditor({
           referenceSearch={referenceSearch}
           mentionUiLabels={mentionUiLabels}
           tabLabels={referenceGroupLabels}
+          mentionAnchorRef={composerBoxRef}
           onChange={(text) => {
             setPrompt(text)
             invocations.detect()
@@ -400,33 +398,22 @@ export function AutomationEditor({
           {t("sectionTarget")}
         </h3>
         <div className="flex flex-wrap items-center gap-2">
-          <Select
-            value={folderId != null ? String(folderId) : undefined}
+          <FolderSelect
+            variant="field"
+            folders={folders}
+            value={folderId}
             // A branch belongs to a specific repo, so switching folders must drop
             // the previous folder's branch (else it'd be saved against the new
             // one). Done in this user-action handler, not a folderId effect, so
             // the initial hydrate/backfill never wipes a seeded branch on edit.
-            onValueChange={(v) => {
-              setFolderId(Number(v))
+            onChange={(id) => {
+              setFolderId(id)
               setBranch("")
               setIsRemoteBranch(false)
             }}
-          >
-            <SelectTrigger size="sm" className="h-7 gap-1.5 text-xs">
-              <Folder
-                className="size-3.5 text-muted-foreground"
-                aria-hidden="true"
-              />
-              <SelectValue placeholder={t("folderPlaceholder")} />
-            </SelectTrigger>
-            <SelectContent>
-              {folders.map((f) => (
-                <SelectItem key={f.id} value={String(f.id)}>
-                  {f.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+            placeholder={t("folderPlaceholder")}
+            title={t("folder")}
+          />
 
           {/* A worktree run gets its own fresh tree, so a branch only applies to
               the shared-folder case — the picker shows there and the checkbox

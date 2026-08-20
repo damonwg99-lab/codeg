@@ -3849,6 +3849,90 @@ pub(crate) fn grok_launch_permission_mode() -> Option<String> {
     load_grok_config_toml_raw().and_then(|raw| grok_config_permission_mode(&raw))
 }
 
+/// Map a `~/.codex/config.toml` sandbox/approval pair onto the `INITIAL_AGENT_MODE`
+/// preset id codex-acp accepts (`read-only` / `agent` / `agent-full-access`).
+///
+/// ## Why this mapping has to exist at all
+///
+/// codex-acp re-sends its OWN `approvalPolicy` + `sandboxPolicy` on every
+/// `runTurn`, taken from an `AgentMode` seeded once per session from
+/// `INITIAL_AGENT_MODE` (default `agent` = `on-request` + `workspace-write`).
+/// So `approval_policy` / `sandbox_mode` in `config.toml` are **dead** for any
+/// codeg session — chat and work task alike — even though codeg's Codex panel
+/// reads, writes and fingerprints them (#442). This env var is the only
+/// launch-time channel that makes the user's own config mean anything, exactly
+/// like [`grok_launch_permission_mode`] above.
+///
+/// ## Why it keys off the sandbox
+///
+/// The sandbox is the only axis where guessing wrong ENLARGES access, so it
+/// alone selects the preset; `approval_policy` is demoted to a gate that can
+/// only PREVENT choosing full-access. Invariants:
+///
+/// 1. never widen the sandbox — the result is identical or tighter;
+/// 2. never select `never` (no approvals at all) unless the config already says
+///    exactly that.
+///
+/// ## What is deliberately NOT preserved
+///
+/// `untrusted` is not in codex-acp's vocabulary and cannot be preserved, so it
+/// lands on `on-request`. That is a RELAXATION, not a tightening: `untrusted`
+/// asks for everything outside its safe-list, whereas `on-request` lets the
+/// model decide when to escalate, so a sandbox-permitted write stops asking.
+/// The loss is inherent to the three presets and is NOT introduced here —
+/// injecting nothing (the previous behavior) yields `agent`, i.e. the same
+/// `on-request` PLUS a widened sandbox. Mapping is therefore strictly better on
+/// the sandbox axis and neutral on the approval axis; the panel discloses the
+/// approval loss to the user rather than pretending it away.
+fn codex_initial_agent_mode(settings: &CodexSandboxSettings) -> Option<&'static str> {
+    // `default_permissions` makes codex resolve everything through that named
+    // profile and IGNORE the root sandbox/approval keys entirely (the panel
+    // already warns about this). Those keys are therefore not the effective
+    // policy, and mapping them would be reading a source codex itself discards:
+    //
+    //     approval_policy = "never"
+    //     sandbox_mode = "danger-full-access"
+    //     default_permissions = ":read-only"
+    //
+    // codex runs that read-only, but the root keys alone say "full access, no
+    // approvals" — and because codex-acp re-sends the preset's policy on every
+    // turn, injecting `agent-full-access` here would actually GRANT it. Decline
+    // instead. codeg cannot resolve the profile, so it must not guess: this
+    // leaves codex-acp's own default preset, i.e. exactly the behavior that
+    // existed before this mapping (the residual gap between that default and a
+    // stricter profile is pre-existing and not something codeg can close without
+    // implementing codex's whole `[permissions]` resolution).
+    if settings.shadowed_by_default_permissions {
+        return None;
+    }
+    // `parse_codex_sandbox_settings` has already folded `on-failure` into
+    // `on-request` and dropped anything outside `CODEX_APPROVAL_POLICIES`.
+    let never = settings.approval_policy.as_deref() == Some("never");
+    match settings.sandbox_mode.as_deref() {
+        Some("read-only") => Some("read-only"),
+        Some("workspace-write") => Some("agent"),
+        // Full access is the one preset that removes approvals entirely, so it
+        // requires the config to say BOTH halves. A danger-full-access sandbox
+        // paired with any approval-requiring policy tightens to `agent` instead
+        // — narrower sandbox, and approvals still happen.
+        Some("danger-full-access") if never => Some("agent-full-access"),
+        Some("danger-full-access") => Some("agent"),
+        // No sandbox expressed → nothing to preserve, so stay out of the way and
+        // let codex-acp's own default stand. (codex-acp always sends an explicit
+        // sandboxPolicy anyway, so config.toml's sandbox DEFAULT never applies.)
+        _ => None,
+    }
+}
+
+/// The `INITIAL_AGENT_MODE` value codex-acp's launch should carry, derived from
+/// the global `~/.codex/config.toml`. Best-effort: a missing/unreadable/
+/// unmappable config yields `None`, leaving codex-acp's default preset in place.
+pub(crate) fn codex_launch_initial_agent_mode() -> Option<String> {
+    let raw = load_codex_config_toml_raw()?;
+    let settings = parse_codex_sandbox_settings(&raw);
+    codex_initial_agent_mode(&settings).map(str::to_string)
+}
+
 /// Merge the Grok panel's structured control values into the raw config.toml
 /// text, format-preservingly (comments/layout of unmanaged keys are kept). Each
 /// `Some(value)` sets its documented key; each `None` removes it. Returns the
@@ -5093,72 +5177,508 @@ fn pi_agent_dir_for_env(runtime_env: &BTreeMap<String, String>) -> PathBuf {
     }
 }
 
-/// Per-agent `env_json` key gating launch-time workspace-trust seeding for pi.
-/// Absent or any value other than `"0"` ⇒ enabled (default on); `"0"` disables.
-pub(crate) const PI_TRUST_WORKSPACE_ENV: &str = "PI_ACP_TRUST_WORKSPACE";
+// NOTE: the per-agent `env_json` key `PI_ACP_TRUST_WORKSPACE` used to gate
+// launch-time workspace-trust seeding here. codeg no longer seeds trust at all —
+// project trust is an explicit per-workspace decision now — so nothing on the
+// Rust side reads that key. The frontend still lists it as a reserved pi env key
+// so a `"0"` persisted by an older build stays out of the raw env editor instead
+// of resurfacing there as a user-defined variable.
 
-/// Seed pi's `trust.json` so the workspace codeg is launching pi into is trusted.
+/// The `<cwd>/.pi/` entries whose mere presence makes a project "trust-requiring"
+/// for pi. Mirrors pi's own `TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES`
+/// (`core/trust-manager.js`, verified against pi 0.80.2).
 ///
-/// pi stores trust as a flat `{ "<canonical-dir>": true|false|null }` map and the
-/// nearest-ancestor entry decides whether it loads a project's local `.pi/*`
-/// config and `.agents/skills`. This gates ONLY config/skill loading, never tool
-/// execution — codeg has already authorized full execution in `cwd` by connecting
-/// an agent there, so trusting the same folder for config loading is consistent
-/// and removes a redundant, mid-connection trust prompt.
+/// This list is a mirror of another project's constant, so it can drift if pi
+/// adds a resource kind. It fails safe in both directions: under-detecting only
+/// means codeg stays quiet about resources pi would ignore anyway (pi's own
+/// non-interactive default is "don't load"), and over-detecting only costs one
+/// extra prompt. Neither direction can load a resource without the user's word.
+const PI_TRUST_REQUIRING_CONFIG_RESOURCES: [&str; 7] = [
+    "settings.json",
+    "extensions",
+    "skills",
+    "prompts",
+    "themes",
+    "SYSTEM.md",
+    "APPEND_SYSTEM.md",
+];
+
+/// One repo-shipped pi resource that only loads once the workspace is trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiProjectResource {
+    /// Absolute path pi would load.
+    pub path: String,
+    /// Stable, display-friendly kind (e.g. `.pi/extensions`, `.agents/skills`).
+    pub kind: String,
+    /// Whether loading this resource means executing repo-controlled code at pi
+    /// startup, as opposed to feeding it repo-controlled text. `.pi/extensions`
+    /// are JS/TS modules whose top level runs immediately, and `.pi/settings.json`
+    /// can make pi install project packages — the approval UI must say so plainly
+    /// rather than describing all of these as "config".
+    pub executes_code: bool,
+}
+
+/// pi keys `trust.json` by the directory's realpath. Mirror `realpathSync` with
+/// `fs::canonicalize`, dropping Windows' verbatim (`\\?\`) prefix — Node never
+/// emits that form, so leaving it on would produce keys pi can't match.
+/// Falls back to the path as given when it can't be resolved (e.g. missing dir),
+/// which keeps this usable for display.
+fn pi_canonical_path(path: &Path) -> PathBuf {
+    crate::paths::simplify_verbatim_path(&fs::canonicalize(path).unwrap_or_else(|_| path.into()))
+}
+
+/// List the repo-shipped pi resources in `cwd` that pi will only load once the
+/// workspace is trusted. Empty ⇒ pi trusts the project trivially (its
+/// `resolveProjectTrusted` returns `true` when nothing requires trust), so there
+/// is nothing to ask the user about.
 ///
-/// Guarantees: scoped (only `cwd`, never machine-wide), additive-only (never
-/// writes `false` or removes entries), idempotent (any existing entry for `cwd` —
-/// including a user's explicit `false`/`null` set in pi — is left untouched), and
-/// crash-safe for pi's file (a present-but-unparseable `trust.json` is never
-/// clobbered). Best-effort: every failure is logged at debug and swallowed so
-/// trust seeding can never block a connect. Honors `PI_CODING_AGENT_DIR` via
-/// `runtime_env`.
-pub(crate) fn seed_pi_workspace_trust(cwd: &Path, runtime_env: &BTreeMap<String, String>) {
-    // Default on: only an explicit "0" disables.
-    if runtime_env
-        .get(PI_TRUST_WORKSPACE_ENV)
-        .is_some_and(|v| v.trim() == "0")
-    {
-        return;
-    }
-    // pi keys trust by the realpath of the directory; mirror `realpathSync` with
-    // `fs::canonicalize`. A non-canonicalizable cwd can't be matched anyway.
-    let canonical = match fs::canonicalize(cwd) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::debug!("[pi] trust seed skipped: canonicalize {cwd:?} failed: {e}");
-            return;
+/// Mirrors pi's `hasTrustRequiringProjectResources`, but collects every match
+/// instead of returning on the first one so the approval UI can name the files.
+/// The emptiness of the result is equivalent to pi's boolean.
+pub(crate) fn pi_project_trust_resources(cwd: &Path) -> Vec<PiProjectResource> {
+    pi_project_trust_resources_with_home(cwd, &home_dir_or_default())
+}
+
+/// `pi_project_trust_resources` with the user's home passed in rather than
+/// resolved, so the `~/.agents/skills` exclusion can be exercised against a
+/// fixture: `dirs::home_dir()` reads the `FOLDERID_Profile` known folder on
+/// Windows and ignores `HOME`/`USERPROFILE`, so pinning the env there cannot
+/// redirect it.
+fn pi_project_trust_resources_with_home(cwd: &Path, home: &Path) -> Vec<PiProjectResource> {
+    let mut found = Vec::new();
+    let start = pi_canonical_path(cwd);
+
+    let config_dir = start.join(".pi");
+    for entry in PI_TRUST_REQUIRING_CONFIG_RESOURCES {
+        let path = config_dir.join(entry);
+        if path.exists() {
+            found.push(PiProjectResource {
+                path: path.to_string_lossy().to_string(),
+                kind: format!(".pi/{entry}"),
+                // Extensions are modules pi imports (top-level code runs); project
+                // settings can pull in and install project packages.
+                executes_code: matches!(entry, "extensions" | "settings.json"),
+            });
         }
-    };
-    let key = canonical.to_string_lossy().to_string();
-    let path = pi_agent_dir_for_env(runtime_env).join("trust.json");
+    }
 
-    // Read pi's file strictly: a missing file is fine (we create one), but a file
-    // that exists yet doesn't parse to a JSON object must NOT be overwritten —
-    // that would destroy decisions codeg can't see.
-    let mut obj = match fs::read_to_string(&path) {
+    // pi also honors `.agents/skills` from `cwd` upward, EXCEPT the user's own
+    // `~/.agents/skills` (that is a user-scope store, not a repo's).
+    let user_agents_skills = pi_canonical_path(home).join(".agents").join("skills");
+    let mut current = start.as_path();
+    loop {
+        let candidate = current.join(".agents").join("skills");
+        if candidate != user_agents_skills && candidate.exists() {
+            found.push(PiProjectResource {
+                path: candidate.to_string_lossy().to_string(),
+                kind: ".agents/skills".to_string(),
+                executes_code: false,
+            });
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent,
+            _ => break,
+        }
+    }
+
+    found
+}
+
+/// Resolve the decision that actually applies to `cwd`, mirroring pi's
+/// `findNearestTrustEntry`: walk `cwd` upward and take the first entry whose
+/// value is a real boolean. A `null` entry does NOT stop the walk (pi only
+/// accepts `true`/`false`), which is how "clear this folder's decision and defer
+/// to an ancestor" works.
+///
+/// Returns the deciding path alongside the verdict so the UI can distinguish
+/// "this folder" from "inherited from a parent folder" — the inherited case is
+/// how a single seeded parent silently covered every repo beneath it.
+fn pi_nearest_trust_decision(trust_file: &Path, cwd: &Path) -> Option<(String, bool)> {
+    let map = read_json_object_or_empty(trust_file);
+    if map.is_empty() {
+        return None;
+    }
+    let mut current = pi_canonical_path(cwd);
+    loop {
+        let key = current.to_string_lossy().to_string();
+        if let Some(serde_json::Value::Bool(decision)) = map.get(&key) {
+            return Some((key, *decision));
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => return None,
+        }
+    }
+}
+
+/// Effective project-trust state for one workspace, as shown in the approval UI.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiProjectTrustState {
+    /// Canonical directory the decision is (or would be) keyed by.
+    pub workspace: String,
+    /// Repo-shipped resources gated by the decision. Empty ⇒ nothing to approve.
+    pub resources: Vec<PiProjectResource>,
+    /// The verdict in force, or `None` when no ancestor has decided yet — in which
+    /// case pi's non-interactive default applies and the resources stay unloaded.
+    pub decision: Option<bool>,
+    /// Which directory carries the deciding entry (may be an ancestor).
+    pub decided_at: Option<String>,
+    /// Absolute path of pi's `trust.json`, so the UI can point at the real file.
+    pub trust_file: String,
+    /// Whether the user has been shown, in this codeg, that this folder is
+    /// trusted. A grant with `acknowledged == false` is one nobody here has
+    /// confirmed — most likely written by the build that auto-trusted every
+    /// opened folder — and blocks the launch until it is answered.
+    pub acknowledged: bool,
+}
+
+/// codeg's own record of which trusted workspaces the user has confirmed.
+///
+/// Deliberately NOT stored in pi's `trust.json`: that file is pi's, has no field
+/// for this, and its entries carry no provenance — which is the whole problem.
+/// A flat `{ "<canonical dir>": true }` map in codeg's own home.
+fn pi_trust_ack_path() -> PathBuf {
+    crate::paths::codeg_home_dir().join("pi-project-trust-ack.json")
+}
+
+fn pi_trust_is_acknowledged_at(ack_file: &Path, workspace: &str) -> bool {
+    matches!(
+        read_json_object_or_empty(ack_file).get(workspace),
+        Some(serde_json::Value::Bool(true))
+    )
+}
+
+/// Record (or clear) the user's confirmation that `cwd` is trusted. Clearing
+/// matters: after a revoke, a later grant must be disclosed again rather than
+/// ride on a stale "already seen".
+fn pi_set_trust_acknowledged_at(
+    ack_file: &Path,
+    cwd: &Path,
+    acknowledged: bool,
+) -> Result<(), AcpError> {
+    let key = pi_canonical_path(cwd).to_string_lossy().to_string();
+    let mut obj = read_json_object_or_empty(ack_file);
+    if acknowledged {
+        obj.insert(key, serde_json::Value::Bool(true));
+    } else if obj.remove(&key).is_none() {
+        return Ok(());
+    }
+    write_json_object_pretty(ack_file, &obj)
+}
+
+/// One raw entry of pi's `trust.json`, for the settings-page review list.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiTrustEntry {
+    pub path: String,
+    pub trusted: bool,
+}
+
+/// Resolve the pi agent dir the launch path will use: the per-agent `env_json`
+/// (BYO `PI_CODING_AGENT_DIR`) first, then the process env / `~/.pi/agent`.
+///
+/// The override only ever lands in the per-agent env, never codeg's own process
+/// env, so reading `std::env` here would silently target the wrong agent dir for
+/// BYO-pi users — the same trap the old launch-time seeding documented.
+async fn pi_agent_dir_from_db(db: &AppDatabase) -> PathBuf {
+    let setting = agent_setting_service::get_by_agent_type(&db.conn, AgentType::Pi)
+        .await
+        .ok()
+        .flatten();
+    let local_config_json = load_agent_local_config_json(AgentType::Pi);
+    let runtime_env = build_runtime_env_from_setting(
+        AgentType::Pi,
+        setting.as_ref(),
+        local_config_json.as_deref(),
+    );
+    pi_agent_dir_for_env(&runtime_env)
+}
+
+/// Project-trust state for `cwd` against explicit files. Split from the DB-backed
+/// command so it is directly unit-testable against a tempdir.
+fn pi_project_trust_state_at(
+    trust_file: &Path,
+    ack_file: &Path,
+    cwd: &Path,
+) -> PiProjectTrustState {
+    let decided = pi_nearest_trust_decision(trust_file, cwd);
+    let workspace = pi_canonical_path(cwd).to_string_lossy().to_string();
+    PiProjectTrustState {
+        acknowledged: pi_trust_is_acknowledged_at(ack_file, &workspace),
+        resources: pi_project_trust_resources(cwd),
+        decision: decided.as_ref().map(|(_, verdict)| *verdict),
+        decided_at: decided.map(|(path, _)| path),
+        trust_file: trust_file.to_string_lossy().to_string(),
+        workspace,
+    }
+}
+
+/// Refuse to launch pi into a folder whose trust grant nobody here has confirmed.
+///
+/// This has to run BEFORE the process starts, because pi resolves trust once at
+/// startup and executes `.pi/extensions` immediately: a warning shown after the
+/// connection is up has already been overtaken by the code it was warning about.
+/// Disclosing the grant post-hoc would have left every install that the old
+/// auto-seeding touched exposed on exactly the path that mattered — a repo cloned
+/// into a folder some earlier session trusted, opened for the first time.
+///
+/// Only an in-force `true` over real repo resources is blocked. An undecided or
+/// declined project is already safe (pi skips the resources), and an
+/// acknowledged one is the user's own answer.
+///
+/// Returns the message to fail the launch with, or `None` to proceed.
+pub(crate) fn pi_project_trust_launch_block(
+    cwd: &Path,
+    runtime_env: &BTreeMap<String, String>,
+) -> Option<String> {
+    let trust_file = pi_agent_dir_for_env(runtime_env).join("trust.json");
+    let state = pi_project_trust_state_at(&trust_file, &pi_trust_ack_path(), cwd);
+    if state.resources.is_empty() || state.decision != Some(true) || state.acknowledged {
+        return None;
+    }
+    let inherited = state
+        .decided_at
+        .as_deref()
+        .is_some_and(|at| at != state.workspace);
+    let via = if inherited {
+        format!(
+            " The grant comes from a parent folder ({}), so it covers this repository too.",
+            state.decided_at.as_deref().unwrap_or_default()
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "pi is allowed to load this project's own files from {}, which lets the repository run its .pi/extensions at startup.{via} \
+         An earlier version of codeg granted this automatically when a folder was opened, so you may never have been asked. \
+         Review it in the project-trust notice above, or under Settings → Agents → Pi, then connect again.",
+        state.workspace
+    ))
+}
+
+pub(crate) async fn acp_pi_project_trust_state_core(
+    db: &AppDatabase,
+    workspace: String,
+) -> Result<PiProjectTrustState, AcpError> {
+    let trust_file = pi_agent_dir_from_db(db).await.join("trust.json");
+    // Not trimmed, for the same reason as the write path: a directory name may
+    // legitimately start or end with a space, and the state must describe the
+    // exact folder the caller named.
+    Ok(pi_project_trust_state_at(
+        &trust_file,
+        &pi_trust_ack_path(),
+        Path::new(&workspace),
+    ))
+}
+
+/// Record that the user has seen and kept an existing trust grant, so the launch
+/// gate stops blocking this folder. Writes only codeg's own record — pi's
+/// `trust.json` is untouched, because the grant itself is not changing.
+pub(crate) async fn acp_pi_acknowledge_project_trust_core(workspace: String) -> Result<(), AcpError> {
+    tokio::task::spawn_blocking(move || {
+        pi_set_trust_acknowledged_at(&pi_trust_ack_path(), Path::new(&workspace), true)
+    })
+    .await
+    .map_err(|e| AcpError::protocol(format!("trust acknowledgement task failed: {e}")))?
+}
+
+/// Record an explicit project-trust decision for `workspace` in pi's `trust.json`.
+///
+/// This is the ONLY place codeg writes into pi's trust store, and it runs solely
+/// from a user action in the approval UI. codeg used to write `true` here on every
+/// pi launch, which auto-approved repo-shipped `.pi/extensions` (arbitrary code at
+/// pi startup) and — because entries are inherited by every subdirectory and are
+/// read by the user's standalone `pi` CLI too — silently widened far past the
+/// session that triggered it.
+///
+/// `trusted`: `Some(true)`/`Some(false)` write that verdict for the exact
+/// canonical dir; `None` removes codeg's entry so the folder falls back to any
+/// ancestor decision, then to pi's own default (the revoke path).
+///
+/// Scoped to the one directory, and never clobbers a `trust.json` codeg can't
+/// parse — that file holds decisions the user made inside pi.
+pub(crate) async fn acp_pi_set_project_trust_core(
+    db: &AppDatabase,
+    workspace: String,
+    trusted: Option<bool>,
+) -> Result<(), AcpError> {
+    let path = pi_agent_dir_from_db(db).await.join("trust.json");
+    // The write takes pi's file lock and can sleep on contention, so keep it off
+    // the async worker. NOTE: `workspace` is NOT trimmed — leading/trailing
+    // spaces are legal in a directory name, and silently trimming them would key
+    // the decision to a different folder than the one being approved.
+    tokio::task::spawn_blocking(move || {
+        let cwd = Path::new(&workspace);
+        pi_write_trust_decision_at(&path, cwd, trusted)?;
+        // Any verdict here IS the user answering, so a granted folder is
+        // acknowledged by construction and must not re-block the launch. A
+        // declined or revoked one drops the record, so a future grant gets
+        // disclosed again instead of riding on a stale "already seen".
+        pi_set_trust_acknowledged_at(&pi_trust_ack_path(), cwd, trusted == Some(true))
+    })
+    .await
+    .map_err(|e| AcpError::protocol(format!("trust write task failed: {e}")))?
+}
+
+/// Serializes codeg's own trust writes. Two surfaces can issue them at once —
+/// the approval banner and the settings list's revoke buttons — and the write is
+/// a read-modify-write, so without this one call could drop the entry another
+/// just added. The cross-process lock below does not cover this: both callers
+/// live in one process.
+static PI_TRUST_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// How long a lock may sit untouched before it counts as abandoned by a crashed
+/// process. Mirrors `proper-lockfile`'s default `stale` window so codeg and pi
+/// agree on when a leftover lock stops holding everyone up.
+const PI_TRUST_LOCK_STALE: Duration = Duration::from_secs(10);
+
+/// pi guards `trust.json` with a `proper-lockfile` lock — a DIRECTORY at
+/// `<trust.json>.lock`, created with `mkdir` (atomic) — and takes it for its own
+/// reads *and* writes (`withTrustFileLock`, `core/trust-manager.js`). Held only
+/// for the read-modify-write below, and released on drop.
+struct PiTrustLock {
+    path: PathBuf,
+}
+
+impl Drop for PiTrustLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+/// True when a lock directory is old enough that whoever made it is presumed
+/// gone. Unreadable metadata counts as stale: a lock we can't reason about must
+/// not wedge project-trust decisions forever.
+fn pi_trust_lock_is_stale(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .map(|modified| modified.elapsed().unwrap_or_default() > PI_TRUST_LOCK_STALE)
+        .unwrap_or(true)
+}
+
+/// Take pi's cross-process trust lock, retrying on contention the way pi does
+/// (10 attempts, 20ms apart) before giving up. Honoring pi's own protocol is
+/// what keeps a decision written here from interleaving with one the user makes
+/// inside pi, and keeps pi from ever reading a half-written file.
+fn acquire_pi_trust_lock(trust_file: &Path) -> Result<PiTrustLock, AcpError> {
+    let mut name = trust_file.as_os_str().to_os_string();
+    name.push(".lock");
+    let path = PathBuf::from(name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| AcpError::protocol(format!("create pi agent directory failed: {e}")))?;
+    }
+
+    for attempt in 1..=10 {
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(PiTrustLock { path }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if pi_trust_lock_is_stale(&path) {
+                    // Same tie-break proper-lockfile uses, so a lock orphaned by a
+                    // crash doesn't block every future decision.
+                    let _ = fs::remove_dir(&path);
+                    continue;
+                }
+                if attempt < 10 {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            Err(e) => {
+                return Err(AcpError::protocol(format!(
+                    "lock {} failed: {e}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Err(AcpError::protocol(format!(
+        "pi's trust store at {} is locked by another process; try again in a moment",
+        trust_file.display()
+    )))
+}
+
+/// Write one decision into `path`. Split from the command so it is directly
+/// unit-testable against a tempdir.
+///
+/// Blocking (it can sleep waiting for pi's lock), so async callers hand it to
+/// `spawn_blocking` rather than stalling a runtime worker.
+fn pi_write_trust_decision_at(
+    path: &Path,
+    cwd: &Path,
+    trusted: Option<bool>,
+) -> Result<(), AcpError> {
+    let key = pi_canonical_path(cwd).to_string_lossy().to_string();
+    // Poisoning only means some earlier writer panicked; the map it guards lives
+    // on disk, not in the mutex, so the lock is still usable.
+    let _serialized = PI_TRUST_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _lock = acquire_pi_trust_lock(path)?;
+
+    // Strict read: a missing file is fine (we create one), but a file that exists
+    // and doesn't parse as a JSON object must NOT be rewritten from scratch.
+    // Surface that rather than silently doing nothing, so the user can go fix it.
+    let mut obj = match fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(serde_json::Value::Object(map)) => map,
             _ => {
-                tracing::debug!("[pi] trust seed skipped: {path:?} is not a JSON object");
-                return;
+                return Err(AcpError::protocol(format!(
+                    "pi's trust file at {} is not a JSON object; fix or remove it before changing project trust",
+                    path.display()
+                )));
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
         Err(e) => {
-            tracing::debug!("[pi] trust seed skipped: read {path:?} failed: {e}");
-            return;
+            return Err(AcpError::protocol(format!(
+                "read {} failed: {e}",
+                path.display()
+            )));
         }
     };
 
-    // Idempotent + respect any decision the user already made for this folder.
-    if obj.contains_key(&key) {
-        return;
+    match trusted {
+        Some(verdict) => {
+            obj.insert(key, serde_json::Value::Bool(verdict));
+        }
+        None => {
+            if obj.remove(&key).is_none() {
+                // Nothing of ours to clear (the decision came from an ancestor);
+                // don't create a file just to record an absence.
+                return Ok(());
+            }
+        }
     }
-    obj.insert(key, serde_json::Value::Bool(true));
-    if let Err(e) = write_json_object_pretty(&path, &obj) {
-        tracing::debug!("[pi] trust seed write failed for {path:?}: {e}");
-    }
+    write_json_object_pretty(path, &obj)
+}
+
+/// Every decision recorded in pi's `trust.json`, for the settings-page review
+/// list. Entries codeg auto-seeded before this became a user decision are
+/// indistinguishable from ones the user made inside pi (codeg never recorded
+/// provenance), so they are listed for review rather than pruned automatically —
+/// pruning would silently revoke the user's own approvals.
+pub(crate) async fn acp_pi_list_trust_entries_core(
+    db: &AppDatabase,
+) -> Result<Vec<PiTrustEntry>, AcpError> {
+    let path = pi_agent_dir_from_db(db).await.join("trust.json");
+    Ok(pi_trust_entries_at(&path))
+}
+
+/// Read decisions out of `path`. Split from the command so it is directly
+/// unit-testable against a tempdir.
+fn pi_trust_entries_at(path: &Path) -> Vec<PiTrustEntry> {
+    let mut entries = read_json_object_or_empty(path)
+        .into_iter()
+        .filter_map(|(path, value)| match value {
+            // `null` means "no decision" in pi; nothing to review or revoke.
+            serde_json::Value::Bool(trusted) => Some(PiTrustEntry { path, trusted }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries
 }
 
 /// Structured Pi config update from the settings UI. Writes pi's native files:
@@ -5178,7 +5698,35 @@ pub(crate) struct PiConfigUpdate {
     /// Wire protocol for the custom provider (defaults to `openai-completions`).
     /// Ignored when `custom_base_url` is `None`.
     pub custom_api: Option<String>,
+    /// Reasoning declaration for `model` inside the custom provider. `None` leaves
+    /// whatever the model entry already declares untouched (built-in provider path,
+    /// or a client that predates the control). Ignored when `custom_base_url` is
+    /// `None` — a built-in model carries pi's own, more accurate declaration.
+    pub model_reasoning: Option<PiModelReasoningSpec>,
 }
+
+/// A model's reasoning capability as pi records it in `models.json`.
+///
+/// pi reads `reasoning: modelDef.reasoning ?? false`, and an undeclared model gets
+/// `["off"]` as its entire thinking-level vocabulary — so every level the composer
+/// sends is clamped straight back to `off`. `thinking_level_map` is pi's
+/// `thinkingLevelMap`: `None` removes a level from the picker, `Some(value)` both
+/// keeps it and sets the effort string pi sends to the provider.
+///
+/// The panel owns the derivation (`src/lib/pi-thinking.ts`) so the availability rules
+/// live in exactly one place; this side only validates the level names and writes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiModelReasoningSpec {
+    pub reasoning: bool,
+    #[serde(default)]
+    pub thinking_level_map: BTreeMap<String, Option<String>>,
+}
+
+/// pi's fixed thinking-level vocabulary (`EXTENDED_THINKING_LEVELS` in pi-ai). A name
+/// outside this list is rejected by pi-acp with `invalidParams`, so it must never reach
+/// `models.json`.
+const PI_THINKING_LEVELS: [&str; 6] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
 /// Read a JSON file into an owned object map, returning an empty map when the
 /// file is absent, unreadable, or does not parse to a JSON object. Pi's native
@@ -5211,6 +5759,75 @@ fn write_json_object_pretty(
     fs::write(path, text)
         .map_err(|e| AcpError::protocol(format!("write pi config failed: {e}")))?;
     Ok(())
+}
+
+/// Upsert `model_id` into a custom provider's `models` array, applying `reasoning`
+/// when the panel sent one.
+///
+/// Merge-preserving by design: a model the user hand-tuned in `models.json` keeps its
+/// `cost` / `contextWindow` / `headers` / `compat` / renamed `name`, because those are
+/// fields codeg's form has no opinion about. Only the reasoning keys are re-authored.
+///
+/// The upsert also fixes the older skip-if-present behaviour, under which re-saving an
+/// already-listed model wrote nothing at all — the reason a reasoning declaration could
+/// never reach an existing entry.
+fn apply_pi_custom_model(
+    entry: &mut serde_json::Map<String, serde_json::Value>,
+    model_id: &str,
+    reasoning: Option<&PiModelReasoningSpec>,
+) {
+    let mut models = match entry.remove("models") {
+        Some(serde_json::Value::Array(arr)) => arr,
+        _ => Vec::new(),
+    };
+
+    let existing = models.iter_mut().find_map(|item| {
+        let obj = item.as_object_mut()?;
+        (obj.get("id").and_then(serde_json::Value::as_str) == Some(model_id)).then_some(obj)
+    });
+    let model_obj = match existing {
+        Some(obj) => obj,
+        None => {
+            let mut fresh = serde_json::Map::new();
+            fresh.insert("id".to_string(), model_id.into());
+            fresh.insert("name".to_string(), model_id.into());
+            models.push(serde_json::Value::Object(fresh));
+            models
+                .last_mut()
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("just pushed an object")
+        }
+    };
+
+    if let Some(spec) = reasoning {
+        model_obj.insert("reasoning".to_string(), spec.reasoning.into());
+        // An empty map means "pi's defaults" — drop the key rather than write `{}`,
+        // which reads as a declaration but constrains nothing.
+        let map: serde_json::Map<String, serde_json::Value> = spec
+            .thinking_level_map
+            .iter()
+            // A name pi does not know would make pi-acp reject the level with
+            // `invalidParams`; drop it rather than let it reach disk.
+            .filter(|(level, _)| PI_THINKING_LEVELS.contains(&level.as_str()))
+            .map(|(level, value)| {
+                let value = match value {
+                    Some(wire) => serde_json::Value::String(wire.clone()),
+                    None => serde_json::Value::Null,
+                };
+                (level.clone(), value)
+            })
+            .collect();
+        if map.is_empty() {
+            model_obj.remove("thinkingLevelMap");
+        } else {
+            model_obj.insert(
+                "thinkingLevelMap".to_string(),
+                serde_json::Value::Object(map),
+            );
+        }
+    }
+
+    entry.insert("models".to_string(), serde_json::Value::Array(models));
 }
 
 /// Apply a structured Pi config update to pi's native files. Validates the whole
@@ -5302,7 +5919,8 @@ pub(crate) async fn acp_update_pi_config_core(
     // given). Built-in providers leave this file untouched. Merge-preserving:
     // `baseUrl`/`api` are overwritten from the form, but any other fields the
     // user hand-tuned (headers/compat/modelOverrides) and previously-defined
-    // models are kept; the chosen model is folded into the `models` array. ----
+    // models are kept; the chosen model is upserted into the `models` array
+    // along with its reasoning declaration. ----
     let custom_base_url = update
         .custom_base_url
         .as_deref()
@@ -5333,26 +5951,7 @@ pub(crate) async fn acp_update_pi_config_core(
             "api".to_string(),
             serde_json::Value::String(custom_api.to_string()),
         );
-        let mut models_arr = match entry.remove("models") {
-            Some(serde_json::Value::Array(arr)) => arr,
-            _ => Vec::new(),
-        };
-        let already = models_arr
-            .iter()
-            .any(|m| m.get("id").and_then(serde_json::Value::as_str) == Some(model));
-        if !already {
-            let mut model_obj = serde_json::Map::new();
-            model_obj.insert(
-                "id".to_string(),
-                serde_json::Value::String(model.to_string()),
-            );
-            model_obj.insert(
-                "name".to_string(),
-                serde_json::Value::String(model.to_string()),
-            );
-            models_arr.push(serde_json::Value::Object(model_obj));
-        }
-        entry.insert("models".to_string(), serde_json::Value::Array(models_arr));
+        apply_pi_custom_model(&mut entry, model, update.model_reasoning.as_ref());
         providers.insert(provider.to_string(), serde_json::Value::Object(entry));
         models_doc.insert(
             "providers".to_string(),
@@ -5377,6 +5976,64 @@ pub struct PiCustomProvider {
     pub id: String,
     pub base_url: String,
     pub api: String,
+    /// Models this provider defines, sorted by id. The panel reads the entry
+    /// matching `default_model` to rehydrate its reasoning controls — reading the
+    /// file (rather than defaulting the form to "off") is what stops a save from
+    /// wiping a declaration the user hand-wrote.
+    pub models: Vec<PiCustomModel>,
+}
+
+/// One model inside a custom provider, carrying only the reasoning keys the panel
+/// edits. Absent keys stay absent (`None` / empty) so "never declared" is
+/// distinguishable from "declared false".
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiCustomModel {
+    pub id: String,
+    pub reasoning: Option<bool>,
+    /// pi's `thinkingLevelMap`: a level mapped to `None` is removed from the picker,
+    /// `Some(wire)` keeps it and sets the effort string sent to the provider.
+    pub thinking_level_map: BTreeMap<String, Option<String>>,
+}
+
+/// Project a custom provider's `models` array. Entries without a string `id` are
+/// skipped (pi ignores them too), and a `thinkingLevelMap` value that is neither a
+/// string nor `null` is dropped rather than guessed at.
+fn pi_custom_models_from_entry(entry: &serde_json::Value) -> Vec<PiCustomModel> {
+    let mut models: Vec<PiCustomModel> = entry
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let id = item.get("id").and_then(serde_json::Value::as_str)?;
+                    let thinking_level_map = item
+                        .get("thinkingLevelMap")
+                        .and_then(serde_json::Value::as_object)
+                        .map(|map| {
+                            map.iter()
+                                .filter_map(|(level, value)| match value {
+                                    serde_json::Value::Null => Some((level.clone(), None)),
+                                    serde_json::Value::String(wire) => {
+                                        Some((level.clone(), Some(wire.clone())))
+                                    }
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some(PiCustomModel {
+                        id: id.to_string(),
+                        reasoning: item.get("reasoning").and_then(serde_json::Value::as_bool),
+                        thinking_level_map,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5424,6 +6081,7 @@ pub(crate) fn load_pi_config_core() -> PiConfigProjection {
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("openai-completions")
                             .to_string(),
+                        models: pi_custom_models_from_entry(entry),
                     })
                     .collect()
             })
@@ -6145,7 +6803,7 @@ async fn hermes_setup_argvs() -> (Vec<String>, Vec<String>) {
         // Unreachable: Hermes is always an Npx distribution. Fall through to
         // the npx guidance with the same pinned spec so a future match-arm
         // change can't resurrect a stale recipe.
-        _ => "hermes-agent@0.20.0",
+        _ => "hermes-agent@0.20.4",
     };
     let build = |tail: &[&str]| -> Vec<String> {
         let mut argv = vec![
@@ -6752,8 +7410,26 @@ fn agent_local_config_path(agent_type: AgentType) -> Option<PathBuf> {
         // path lights up "open config file" + staleness tracking; the actual
         // load/persist are special-cased below (TOML, not the generic JSON path).
         AgentType::KimiCode => Some(kimi_code_config_toml_path()),
+        // Qoder's native config is `<QODER_CONFIG_DIR>/settings.json` (default
+        // `~/.qoder`), plain JSON — so the generic loader above reads it as-is
+        // and the Qoder panel's advanced editor round-trips it through
+        // `config_json`. The WRITE side is special-cased in
+        // `acp_update_agent_config_core` (written verbatim) and never reaches
+        // this module's generic merge-persist, which could not delete a key.
+        //
+        // Note this file has other writers: codeg's own MCP settings page owns
+        // its top-level `mcpServers` (see `commands::mcp::qoder_settings_path`,
+        // which resolves the same path through the same helper).
+        AgentType::Qoder => Some(qoder_settings_json_path()),
         _ => None,
     }
+}
+
+/// `<QODER_CONFIG_DIR>/settings.json` (default `~/.qoder/settings.json`).
+/// Delegates to the parser's resolver, which already honours both
+/// `QODER_CONFIG_DIR` (absolute path) and `QODER_CONFIG_DIR_NAME` (dir rename).
+fn qoder_settings_json_path() -> PathBuf {
+    crate::parsers::qoder::resolve_qoder_config_dir().join("settings.json")
 }
 
 pub(crate) fn load_agent_local_config_json(agent_type: AgentType) -> Option<String> {
@@ -6996,6 +7672,60 @@ pub(crate) fn skill_storage_spec(agent_type: AgentType) -> Option<SkillStorageSp
             ],
             project_rel_dirs: vec![".cursor/skills", ".agents/skills"],
         }),
+        // deepseek-acp mounts the upstream skills chain
+        // (`dsh-skill-filesystem`), which discovers BOTH directory bundles
+        // (`<id>/SKILL.md`) and flat `<id>.md` files — hence Codex's spec
+        // shape. Its roots, highest rank first: `<project>/.dsh/skills`,
+        // `<project>/.agents/skills`, `$DSH_HOME/skills` (default `~/.dsh`),
+        // `$DSH_AGENTS_HOME/skills` (default `~/.agents`). The DeepSeek-native
+        // directory comes first so linking targets it without cross-agent side
+        // effects on the shared `.agents` store — the same ordering rationale
+        // as pi and Cursor.
+        AgentType::DeepSeek => Some(SkillStorageSpec {
+            kind: SkillStorageKind::SkillDirectoryOrMarkdownFile,
+            global_dirs: vec![
+                crate::parsers::deepseek::resolve_dsh_home_dir().join("skills"),
+                crate::parsers::deepseek::resolve_dsh_agents_home_dir().join("skills"),
+            ],
+            project_rel_dirs: vec![".dsh/skills", ".agents/skills"],
+        }),
+        // Qoder discovers directory bundles only — `<id>/SKILL.md`, never flat
+        // `<id>.md` files — hence Claude's spec shape rather than Codex's.
+        //
+        // Roots read verbatim off `SkillCommandHandler.enumerate` in the
+        // qodercli 1.1.23 bundle, which resolves them through
+        // `{projectDir: <workDir>/<projectConfigDirName>, userDir: <globalDir>}`
+        // (both config dir names default to `.qoder`):
+        //
+        //   home       `<globalDir>/skills`            ← relocated by QODER_CONFIG_DIR
+        //   home       `~/.agents/skills`              ← only if loadFromAgentsDirectory
+        //   workspace  `<cwd>/.qoder/skills`
+        //   workspace  `<cwd>/.agents/skills`          ← only if loadFromAgentsDirectory
+        //
+        // Qoder's OWN dirs lead in both scopes because they are the ones it
+        // always scans: the `.agents` pair is gated behind
+        // `loadSkillsFromAgentsDirectory`, which defaults to FALSE. Writing
+        // installs to `.agents` alone (and to a bare `<cwd>/skills`, which
+        // nothing scans) is why this used to install skills the agent never
+        // loaded — while leaving whatever the user already had in
+        // `~/.qoder/skills` invisible to codeg. Both `.agents` roots stay in
+        // the list so a user who did turn the setting on still sees them.
+        AgentType::Qoder => Some(SkillStorageSpec {
+            kind: SkillStorageKind::SkillDirectoryOnly,
+            global_dirs: vec![
+                crate::parsers::qoder::resolve_qoder_config_dir().join("skills"),
+                // `getGlobalAgentsDir()` joins `.agents` onto Qoder's CLI HOME,
+                // not the OS home — the shared store moves with
+                // `QODER_CLI_HOME` even though it lives outside the config dir.
+                crate::parsers::qoder::resolve_qoder_home()
+                    .join(".agents")
+                    .join("skills"),
+            ],
+            project_rel_dirs: vec![
+                crate::parsers::qoder::qoder_project_skills_rel_dir(),
+                ".agents/skills",
+            ],
+        }),
         // codeg cannot detect where an arbitrary ACP agent loads skills from,
         // so custom agents are gated on the user's own declaration: that the
         // agent reads the shared `.agents/skills` store (the cross-agent
@@ -7092,11 +7822,43 @@ pub(crate) fn scoped_skill_dirs(
                 .ok_or_else(|| {
                     AcpError::protocol("workspace_path is required for project scoped skills")
                 })?;
+            let base = project_skill_base(agent_type, workspace);
             Ok(spec
                 .project_rel_dirs
                 .iter()
-                .map(|relative| PathBuf::from(workspace).join(relative))
+                .map(|relative| base.join(relative))
                 .collect())
+        }
+    }
+}
+
+/// The directory an agent's PROJECT-relative skill dirs hang off.
+///
+/// Normally the workspace itself. DeepSeek is the exception: its provider
+/// (`dsh-skill-filesystem`'s `findProjectRoot`) walks up from the session cwd
+/// to the nearest ancestor containing `.git` before joining `.dsh/skills` /
+/// `.agents/skills`, falling back to the cwd when it reaches the filesystem
+/// root. Opening a subdirectory of a repo as the workspace would otherwise
+/// make codeg create and list `<subdir>/.dsh/skills` — a directory the agent
+/// never scans, so the skill would simply never load, with nothing on screen
+/// saying so.
+///
+/// `.git` is matched as a plain path, file or directory: in a linked worktree
+/// (which codeg creates routinely) it is a FILE, and upstream's `pathExists`
+/// accepts that too.
+fn project_skill_base(agent_type: AgentType, workspace: &str) -> PathBuf {
+    let workspace = PathBuf::from(workspace);
+    if agent_type != AgentType::DeepSeek {
+        return workspace;
+    }
+    let mut current = workspace.as_path();
+    loop {
+        if current.join(".git").exists() {
+            return current.to_path_buf();
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent,
+            _ => return workspace.clone(),
         }
     }
 }
@@ -7220,6 +7982,12 @@ fn is_read_only_skill_path(agent_type: AgentType, skill_path: &Path) -> bool {
         // Cursor's bundled builtin skills; the CLI restores them on update,
         // so editing/deleting through codeg would silently be undone.
         AgentType::Cursor => home_dir_or_default().join(".cursor").join("skills-cursor"),
+        // `dsh-skill-filesystem` sets `skipSystem` on the `$DSH_HOME/skills`
+        // root, so anything under `.system/` there belongs to the DeepSeek
+        // Harness product CLI, not to the user — never write through it.
+        AgentType::DeepSeek => crate::parsers::deepseek::resolve_dsh_home_dir()
+            .join("skills")
+            .join(".system"),
         _ => return false,
     };
     skill_path.starts_with(&ro_root)
@@ -7538,6 +8306,188 @@ fn persist_cursor_cli_config(text: &str) -> Result<(), AcpError> {
         .map_err(|e| AcpError::protocol(format!("write cursor cli-config failed: {e}")))
 }
 
+// ---------------------------------------------------------------------------
+// Qoder settings.json helpers
+// ---------------------------------------------------------------------------
+
+/// Validate + write settings.json, whole-document.
+///
+/// The text is whatever the panel's advanced editor holds, which is the file as
+/// codeg last read it plus the user's edits — writing it verbatim is what lets
+/// a key be DELETED, which the generic merge-persist path cannot do.
+///
+/// Note this file has other writers (the Qoder CLI itself, and codeg's MCP
+/// settings page, which owns the top-level `mcpServers`). A verbatim write
+/// therefore reverts anything they wrote since the editor last loaded — the
+/// same last-writer-wins contract every raw editor in this module has.
+fn persist_qoder_settings(text: &str) -> Result<(), AcpError> {
+    let parsed = serde_json::from_str::<serde_json::Value>(text)
+        .map_err(|e| AcpError::protocol(format!("invalid qoder settings.json: {e}")))?;
+    if !parsed.is_object() {
+        return Err(AcpError::protocol(
+            "invalid qoder settings.json: root must be a JSON object",
+        ));
+    }
+    let path = qoder_settings_json_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| AcpError::protocol(format!("create qoder config dir failed: {e}")))?;
+    }
+    fs::write(&path, format!("{text}\n"))
+        .map_err(|e| AcpError::protocol(format!("write qoder settings failed: {e}")))
+}
+
+/// The `qoder` binary codeg would launch: managed cache first, then the user's
+/// own install (PATH / ~/.local/bin) — the same order as `build_agent`.
+fn resolve_qoder_binary() -> Option<PathBuf> {
+    if let Ok(Some((path, _))) =
+        binary_cache::find_best_cached_binary_for_agent(AgentType::Qoder, "qoder")
+    {
+        return Some(path);
+    }
+    resolve_system_agent_binary("qoder")
+}
+
+/// The Qoder agent's effective probe env: the saved env with the settings
+/// form's live personal access token applied on top, so `status` reports on the
+/// credential that is on screen rather than a stale saved one.
+///
+/// `PAT` is always materialized (empty when unset) so `run_qoder_probe` makes
+/// an explicit set-or-remove decision — an inherited token from the user's dev
+/// shell must not make the card claim an account that a launch would not use.
+async fn qoder_probe_env(db: &AppDatabase, personal_access_token: Option<&str>) -> BTreeMap<String, String> {
+    let mut env: BTreeMap<String, String> =
+        agent_setting_service::get_by_agent_type(&db.conn, AgentType::Qoder)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|m| m.env_json)
+            .and_then(|raw| serde_json::from_str::<BTreeMap<String, String>>(&raw).ok())
+            .unwrap_or_default();
+    if let Some(token) = personal_access_token {
+        env.insert(
+            "QODER_PERSONAL_ACCESS_TOKEN".to_string(),
+            token.trim().to_string(),
+        );
+    }
+    env.entry("QODER_PERSONAL_ACCESS_TOKEN".to_string())
+        .or_default();
+    env
+}
+
+/// Run a `qoder` subcommand with a timeout, capturing stdout.
+async fn run_qoder_probe(
+    args: &[&str],
+    timeout_secs: u64,
+    extra_env: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let bin = resolve_qoder_binary().ok_or_else(|| "qoder is not installed".to_string())?;
+    let mut cmd = crate::process::tokio_command(&bin);
+    cmd.args(args);
+    for (key, value) in extra_env {
+        if value.trim().is_empty() {
+            // This process's env is inherited by the child; an empty value means
+            // "ensure absent" so a stale inherited token can't leak in.
+            cmd.env_remove(key);
+        } else {
+            cmd.env(key, value);
+        }
+    }
+    let output = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
+        .await
+        .map_err(|_| format!("qoder {} timed out", args.join(" ")))?
+        .map_err(|e| format!("failed to run qoder: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() && stdout.trim().is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("qoder {} failed: {}", args.join(" "), stderr.trim()));
+    }
+    Ok(stdout)
+}
+
+/// Probe `qoder status -o json` for the Qoder settings panel's auth card.
+///
+/// The CLI prints one flat object — `{logged_in, version, allow_byok, username,
+/// email, avatar_url, user_type}` — so unlike the Cursor probe there is no
+/// nested `userInfo` to unwrap. A parse failure is reported as `error` with
+/// `logged_in: false`; the panel renders that as "could not check", not as
+/// "signed out", so a CLI output change never reads as a lost session.
+pub(crate) async fn acp_qoder_auth_status_core(
+    db: &AppDatabase,
+    personal_access_token: Option<String>,
+) -> crate::acp::types::QoderAuthStatus {
+    let binary_path = resolve_qoder_binary().map(|p| p.to_string_lossy().to_string());
+    if binary_path.is_none() {
+        return crate::acp::types::QoderAuthStatus {
+            installed: false,
+            logged_in: false,
+            username: None,
+            email: None,
+            user_type: None,
+            version: None,
+            allow_byok: None,
+            error: None,
+            binary_path: None,
+        };
+    }
+    let extra_env = qoder_probe_env(db, personal_access_token.as_deref()).await;
+    let failed = |error: Option<String>| crate::acp::types::QoderAuthStatus {
+        installed: true,
+        logged_in: false,
+        username: None,
+        email: None,
+        user_type: None,
+        version: None,
+        allow_byok: None,
+        error,
+        binary_path: binary_path.clone(),
+    };
+    match run_qoder_probe(&["status", "-o", "json"], 30, &extra_env).await {
+        Ok(stdout) => {
+            // Scan to the first `{` so a leading log/update-notice line can't
+            // break parsing.
+            let json_start = stdout.find('{').unwrap_or(0);
+            match serde_json::from_str::<serde_json::Value>(stdout[json_start..].trim()) {
+                Ok(v) => {
+                    let get_str = |key: &str| {
+                        v.get(key)
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    };
+                    crate::acp::types::QoderAuthStatus {
+                        installed: true,
+                        logged_in: v
+                            .get("logged_in")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
+                        username: get_str("username"),
+                        email: get_str("email"),
+                        user_type: get_str("user_type"),
+                        version: get_str("version"),
+                        // The CLI emits 0/1 here rather than a JSON boolean.
+                        allow_byok: v
+                            .get("allow_byok")
+                            .and_then(|b| {
+                                b.as_bool().or_else(|| b.as_i64().map(|n| n != 0))
+                            }),
+                        error: None,
+                        binary_path: binary_path.clone(),
+                    }
+                }
+                Err(e) => crate::acp::types::QoderAuthStatus {
+                    error: Some(format!(
+                        "unexpected status output: {e}: {}",
+                        truncate_probe_output(&stdout)
+                    )),
+                    ..failed(None)
+                },
+            }
+        }
+        Err(err) => failed(Some(err)),
+    }
+}
+
 /// The cursor-agent binary codeg would launch: managed cache first, then the
 /// user's own install (PATH / ~/.local/bin) — the same order as `build_agent`.
 fn resolve_cursor_binary() -> Option<PathBuf> {
@@ -7801,6 +8751,15 @@ pub async fn acp_cursor_auth_status(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_qoder_auth_status(
+    db: State<'_, AppDatabase>,
+    personal_access_token: Option<String>,
+) -> Result<crate::acp::types::QoderAuthStatus, AcpError> {
+    Ok(acp_qoder_auth_status_core(&db, personal_access_token).await)
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn acp_cursor_list_models(
     db: State<'_, AppDatabase>,
     api_key: Option<String>,
@@ -7835,6 +8794,37 @@ fn agent_env_keys(agent_type: AgentType) -> (&'static str, &'static str, &'stati
         // placeholder so the generic cascade never lands on OPENAI_* keys;
         // model selection flows through the Cursor panel / ACP instead.
         AgentType::Cursor => ("CURSOR_API_BASE_URL", "CURSOR_API_KEY", "CURSOR_MODEL"),
+        // The real endpoint knob is `DEEPSEEK_BASE_URL`, read by the
+        // `llm-deepseek` adapter through the launch-environment snapshot —
+        // which, when the host installs none (deepseek-acp does not), falls
+        // back to `process.env`, so codeg's launch env reaches it. It resolves
+        // per request (`config.baseURL ?? env ?? https://api.deepseek.com`),
+        // NOT at load. `DEEPSEEK_ACP_PROVIDER` is a different thing entirely —
+        // the provider ROUTE id (`deepseek-official`), a registry key rather
+        // than a URL — so it must not ride the base-url slot, or binding a
+        // model provider would write an endpoint into the route selector and
+        // break every request. All three keep the generic cascade off the
+        // OPENAI_* keys.
+        AgentType::DeepSeek => (
+            "DEEPSEEK_BASE_URL",
+            "DEEPSEEK_API_KEY",
+            "DEEPSEEK_ACP_MODEL",
+        ),
+        // Qoder's non-interactive credential is `QODER_PERSONAL_ACCESS_TOKEN`
+        // — "设置后自动使用 PAT 认证" in the 1.1.23 package's own README, and the
+        // only way to authenticate a headless/server/Docker install, where the
+        // `qoder login` browser flow cannot run. (An interactive login still
+        // outranks it; the credential itself lives in the machine key store.)
+        // `QODER_MODEL` is real too — the README lists it as the env twin of
+        // `-m/--model`. There is NO endpoint override, so the base-url slot
+        // stays an inert `QODER_BASE_URL` placeholder for the same reason
+        // `CURSOR_MODEL` above is one: it keeps the generic cascade off the
+        // OPENAI_* keys. `QODER_API_KEY` was never a thing Qoder reads.
+        AgentType::Qoder => (
+            "QODER_BASE_URL",
+            "QODER_PERSONAL_ACCESS_TOKEN",
+            "QODER_MODEL",
+        ),
         _ => ("OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"),
     }
 }
@@ -7947,6 +8937,7 @@ const CLAUDE_MODEL_KEY_MAP: &[(&str, &str)] = &[
 ///   entry is `None` when the provider's JSON omits that key or has an empty
 ///   value.
 /// - Gemini: returns `GEMINI_MODEL`.
+/// - DeepSeek: returns `DEEPSEEK_ACP_MODEL`.
 /// - Codex: returns `OPENAI_MODEL` so the provider can override env_json (the
 ///   root `model` in `config.toml` is handled separately by
 ///   `provider_codex_model_action`).
@@ -7981,6 +8972,15 @@ pub(crate) fn parse_provider_model(
         AgentType::KimiCode => {
             out.insert(
                 "KIMI_MODEL_NAME".to_string(),
+                trimmed_raw.map(str::to_string),
+            );
+        }
+        // deepseek-acp's launcher reads DEEPSEEK_ACP_MODEL (`readEnv`) and
+        // nothing else; leaving this on the OPENAI_MODEL fallback would apply
+        // a bound provider's URL and key while silently dropping its model.
+        AgentType::DeepSeek => {
+            out.insert(
+                "DEEPSEEK_ACP_MODEL".to_string(),
                 trimmed_raw.map(str::to_string),
             );
         }
@@ -8240,6 +9240,22 @@ fn cascade_update_agent_config(
             // runtime env var through the generic agent settings panel
             // (`acpUpdateAgentEnv`); it does not write provider creds into
             // ~/.grok/config.toml and does not participate in the cascade.
+        }
+        AgentType::DeepSeek => {
+            // deepseek-acp authenticates via `DEEPSEEK_API_KEY` (or
+            // `~/.dsh/.credentials.yaml`, which codeg never writes), injected
+            // as a runtime env var through the generic agent settings panel;
+            // it has no codeg-managed config file and does not participate in
+            // the model-provider credential cascade.
+        }
+        AgentType::Qoder => {
+            // Qoder talks only to Qoder's own service — no endpoint override
+            // and no BYO-provider key — so it stays off the model-provider
+            // credential cascade even though its env slots are real. The PAT
+            // (`QODER_PERSONAL_ACCESS_TOKEN`) is set directly in the agent's
+            // env, and while codeg DOES manage a Qoder config file
+            // (`settings.json`, via the Qoder settings panel), that file holds
+            // no credentials for the cascade to reconcile.
         }
         AgentType::Custom(_) => {
             // Custom agents are deliberately configuration-free: codeg writes
@@ -8659,9 +9675,12 @@ pub async fn acp_set_config_option(
 pub async fn acp_goal_control(
     connection_id: String,
     action: crate::acp::connection::GoalControlAction,
+    db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
-    manager.goal_control(&connection_id, action).await
+    manager
+        .goal_control(&db.conn, &connection_id, action)
+        .await
 }
 
 /// Spawn a transient ACP connection for `agent_type` with a silent emitter,
@@ -9198,7 +10217,6 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
         } else {
             None
         };
-
         agents.push(AcpAgentInfo {
             agent_type,
             registry_id: registry::registry_id_for(agent_type).to_string(),
@@ -9215,6 +10233,8 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
             enabled: setting.map(|m| m.enabled).unwrap_or(true),
             sort_order,
             installed_version: local_installed_version,
+            host_tools_agent_mode: !crate::acp::host_tools_policy::HostToolsPolicy::from_env(&env)
+                .hosts_channels(),
             env,
             config_json,
             config_file_path: agent_local_config_path(agent_type)
@@ -9801,6 +10821,20 @@ pub(crate) async fn acp_update_agent_config_core(
         return Ok(());
     }
 
+    if agent_type == AgentType::Qoder {
+        // The Qoder panel edits `<QODER_CONFIG_DIR>/settings.json` as a whole
+        // document, and that file IS Qoder's `agent_local_config_path` — so it
+        // arrives through the generic `config_json` channel but must NOT fall
+        // through to the merge-persist at the end of this function, which cannot
+        // delete a key. Hence the early return: the user authored the whole
+        // document, so it is written verbatim.
+        if let Some(text) = config_json.as_deref() {
+            persist_qoder_settings(text)?;
+        }
+        emit_acp_agents_updated(emitter, "config_updated", Some(agent_type));
+        return Ok(());
+    }
+
     if agent_type == AgentType::OpenCode {
         persist_opencode_native_config(
             opencode_auth_json.as_deref(),
@@ -10016,6 +11050,7 @@ pub async fn acp_update_pi_config(
     api_key: Option<String>,
     custom_base_url: Option<String>,
     custom_api: Option<String>,
+    model_reasoning: Option<PiModelReasoningSpec>,
     db: State<'_, AppDatabase>,
     app: tauri::AppHandle,
 ) -> Result<(), AcpError> {
@@ -10028,6 +11063,7 @@ pub async fn acp_update_pi_config(
             api_key,
             custom_base_url,
             custom_api,
+            model_reasoning,
         },
         &db,
         &emitter,
@@ -10052,6 +11088,49 @@ pub async fn acp_load_pi_config() -> Result<PiConfigProjection, AcpError> {
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn acp_validate_pi_command(command: String) -> Result<PiCommandValidation, AcpError> {
     Ok(acp_validate_pi_command_core(command))
+}
+
+/// Report which repo-shipped pi resources a workspace ships and whether any
+/// trust decision already covers it. Read-only. Desktop command; the web handler
+/// calls `acp_pi_project_trust_state_core` directly.
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_pi_project_trust_state(
+    db: tauri::State<'_, AppDatabase>,
+    workspace: String,
+) -> Result<PiProjectTrustState, AcpError> {
+    acp_pi_project_trust_state_core(&db, workspace).await
+}
+
+/// Record (or clear, with `trusted: null`) an explicit project-trust decision in
+/// pi's `trust.json`. Only ever called from a user action in the approval UI.
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_pi_set_project_trust(
+    db: tauri::State<'_, AppDatabase>,
+    workspace: String,
+    trusted: Option<bool>,
+) -> Result<(), AcpError> {
+    acp_pi_set_project_trust_core(&db, workspace, trusted).await
+}
+
+/// Record that the user reviewed an existing grant and chose to keep it, which
+/// clears the launch gate for that folder. Does not change pi's trust store.
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_pi_acknowledge_project_trust(workspace: String) -> Result<(), AcpError> {
+    acp_pi_acknowledge_project_trust_core(workspace).await
+}
+
+/// List every decision in pi's `trust.json` so the settings page can review and
+/// revoke them — including any auto-seeded by codeg before trust became a user
+/// decision.
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_pi_list_trust_entries(
+    db: tauri::State<'_, AppDatabase>,
+) -> Result<Vec<PiTrustEntry>, AcpError> {
+    acp_pi_list_trust_entries_core(&db).await
 }
 
 /// Launch Hermes's interactive setup in the OS terminal. `kind` selects the
@@ -10877,8 +11956,13 @@ pub async fn acp_list_agent_skills(
 
     if let Some(workspace) = workspace_path.as_deref().map(str::trim) {
         if !workspace.is_empty() {
+            // Same base the WRITE path resolves through `scoped_skill_dirs` —
+            // for DeepSeek that is the repo root, not the workspace. Joining
+            // onto the workspace here instead would make a skill saved from a
+            // nested workspace vanish from the list that is meant to show it.
+            let base = project_skill_base(agent_type, workspace);
             for relative in &spec.project_rel_dirs {
-                let project_dir = PathBuf::from(workspace).join(relative);
+                let project_dir = base.join(relative);
                 locations.push(AgentSkillLocation {
                     scope: AgentSkillScope::Project,
                     path: project_dir.to_string_lossy().to_string(),
@@ -11610,6 +12694,104 @@ mod tests {
         assert_eq!(s.approval_policy.as_deref(), Some("on-request"));
     }
 
+    /// Map a config.toml body the way the launch path does.
+    fn initial_mode_for(toml: &str) -> Option<&'static str> {
+        codex_initial_agent_mode(&parse_codex_sandbox_settings(toml))
+    }
+
+    #[test]
+    fn codex_initial_agent_mode_never_widens_the_sandbox() {
+        // The invariant that matters: codex-acp's default preset is `agent`
+        // (workspace-write), so an explicitly read-only config used to be
+        // silently upgraded to writable. Every approval policy — including the
+        // ones that cannot be represented — must still land on `read-only`.
+        for policy in [
+            "",
+            "approval_policy = \"untrusted\"\n",
+            "approval_policy = \"on-request\"\n",
+            "approval_policy = \"on-failure\"\n",
+            "approval_policy = \"never\"\n",
+        ] {
+            let toml = format!("{policy}sandbox_mode = \"read-only\"\n");
+            assert_eq!(
+                initial_mode_for(&toml),
+                Some("read-only"),
+                "read-only sandbox must survive {policy:?}"
+            );
+        }
+        for policy in ["", "approval_policy = \"untrusted\"\n"] {
+            let toml = format!("{policy}sandbox_mode = \"workspace-write\"\n");
+            assert_eq!(initial_mode_for(&toml), Some("agent"));
+        }
+    }
+
+    #[test]
+    fn codex_initial_agent_mode_only_grants_full_access_on_an_exact_match() {
+        // `agent-full-access` is the one preset with approvalPolicy `never`, so
+        // it must never be inferred — both halves have to already say so.
+        assert_eq!(
+            initial_mode_for(
+                "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n"
+            ),
+            Some("agent-full-access")
+        );
+        // Sandbox says full access but approvals are still wanted: tighten the
+        // sandbox to workspace-write rather than dropping approvals.
+        for policy in [
+            "",
+            "approval_policy = \"on-request\"\n",
+            "approval_policy = \"untrusted\"\n",
+        ] {
+            let toml = format!("{policy}sandbox_mode = \"danger-full-access\"\n");
+            assert_eq!(
+                initial_mode_for(&toml),
+                Some("agent"),
+                "must not remove approvals for {policy:?}"
+            );
+        }
+        // `never` alone must NOT reach for full access — that would widen the
+        // sandbox from whatever codex-acp would otherwise use.
+        assert_eq!(initial_mode_for("approval_policy = \"never\"\n"), None);
+    }
+
+    #[test]
+    fn codex_initial_agent_mode_declines_when_default_permissions_shadows_the_root_keys() {
+        // codex resolves through the named profile and ignores the root keys, so
+        // mapping them would hand the session a policy the config never asked
+        // for. The nastiest case: a read-only profile with stale permissive root
+        // keys would be GRANTED full access + no approvals, because codex-acp
+        // re-sends the preset's policy every turn.
+        assert_eq!(
+            initial_mode_for(
+                "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n\
+                 default_permissions = \":read-only\"\n"
+            ),
+            None,
+            "must not widen a shadowed config"
+        );
+        // Declining is unconditional — even when the root keys look harmless,
+        // they are not what codex is using.
+        for body in [
+            "sandbox_mode = \"read-only\"\ndefault_permissions = \":read-only\"\n",
+            "sandbox_mode = \"workspace-write\"\ndefault_permissions = \":full-access\"\n",
+        ] {
+            assert_eq!(initial_mode_for(body), None, "shadowed: {body:?}");
+        }
+    }
+
+    #[test]
+    fn codex_initial_agent_mode_stays_out_of_the_way_without_a_sandbox() {
+        // Nothing expressed → nothing to preserve; leave codex-acp's own default
+        // alone rather than pinning a preset the user never chose.
+        assert_eq!(initial_mode_for(""), None);
+        assert_eq!(initial_mode_for("model = \"gpt-5\"\n"), None);
+        assert_eq!(initial_mode_for("approval_policy = \"untrusted\"\n"), None);
+        // Unknown/malformed sandbox values are dropped by the parser, so they
+        // behave like "unset" rather than mapping to something arbitrary.
+        assert_eq!(initial_mode_for("sandbox_mode = \"wide-open\"\n"), None);
+        assert_eq!(initial_mode_for("this is not toml\n"), None);
+    }
+
     #[test]
     fn parse_codex_sandbox_settings_reads_granular_in_both_toml_forms() {
         let inline = parse_codex_sandbox_settings(
@@ -12169,141 +13351,806 @@ mod tests {
         assert!(grok_config_permission_mode("[ui]\npermission_mode = \"bogus\"\n").is_none());
     }
 
-    /// Build a `runtime_env` whose `PI_CODING_AGENT_DIR` points at `agent_dir`,
-    /// so trust seeding writes a tempdir's `trust.json` instead of `~/.pi/agent`.
-    fn pi_env_for(agent_dir: &Path) -> BTreeMap<String, String> {
-        let mut env = BTreeMap::new();
-        env.insert(
-            "PI_CODING_AGENT_DIR".to_string(),
-            agent_dir.to_string_lossy().to_string(),
-        );
-        env
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, "x").unwrap();
     }
 
     fn canonical_key(dir: &Path) -> String {
-        fs::canonicalize(dir)
-            .expect("canonicalize")
-            .to_string_lossy()
-            .to_string()
+        pi_canonical_path(dir).to_string_lossy().to_string()
     }
 
-    #[test]
-    fn pi_trust_seed_creates_file_and_trusts_canonical_cwd() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let agent_dir = tmp.path().join("agent");
-        let workspace = tmp.path().join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
-
-        seed_pi_workspace_trust(&workspace, &pi_env_for(&agent_dir));
-
-        let map = read_json_object_or_empty(&agent_dir.join("trust.json"));
-        assert_eq!(
-            map.get(&canonical_key(&workspace)),
-            Some(&serde_json::Value::Bool(true)),
-            "the opened workspace must be marked trusted",
-        );
+    /// A `runtime_env` whose `PI_CODING_AGENT_DIR` points at `agent_dir`, so the
+    /// launch gate reads a tempdir's `trust.json` instead of `~/.pi/agent`.
+    fn pi_env_for(agent_dir: &Path) -> BTreeMap<String, String> {
+        BTreeMap::from([(
+            "PI_CODING_AGENT_DIR".to_string(),
+            agent_dir.to_string_lossy().to_string(),
+        )])
     }
 
-    #[test]
-    fn pi_trust_seed_preserves_existing_entries() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let agent_dir = tmp.path().join("agent");
-        fs::create_dir_all(&agent_dir).unwrap();
-        let workspace = tmp.path().join("ws");
-        fs::create_dir_all(&workspace).unwrap();
-
-        // Pre-existing decisions for unrelated folders must survive untouched.
-        let mut initial = serde_json::Map::new();
-        initial.insert("/some/other".to_string(), serde_json::Value::Bool(true));
-        initial.insert("/denied".to_string(), serde_json::Value::Bool(false));
-        write_json_object_pretty(&agent_dir.join("trust.json"), &initial).unwrap();
-
-        seed_pi_workspace_trust(&workspace, &pi_env_for(&agent_dir));
-
-        let map = read_json_object_or_empty(&agent_dir.join("trust.json"));
-        assert_eq!(map.get("/some/other"), Some(&serde_json::Value::Bool(true)));
-        assert_eq!(map.get("/denied"), Some(&serde_json::Value::Bool(false)));
-        assert_eq!(
-            map.get(&canonical_key(&workspace)),
-            Some(&serde_json::Value::Bool(true)),
-        );
+    fn resource_kinds(cwd: &Path) -> Vec<String> {
+        pi_project_trust_resources(cwd)
+            .into_iter()
+            .map(|r| r.kind)
+            .collect()
     }
 
+    /// Every `.pi/*` entry pi gates behind project trust must be reported, so the
+    /// approval UI can name what it is about to let the repo load.
     #[test]
-    fn pi_trust_seed_respects_existing_false_and_is_idempotent() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let agent_dir = tmp.path().join("agent");
-        fs::create_dir_all(&agent_dir).unwrap();
-        let workspace = tmp.path().join("ws");
-        fs::create_dir_all(&workspace).unwrap();
-        let key = canonical_key(&workspace);
-        let env = pi_env_for(&agent_dir);
+    fn pi_trust_resources_detects_every_gated_pi_entry() {
+        for entry in PI_TRUST_REQUIRING_CONFIG_RESOURCES {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ws = tmp.path().join("ws");
+            let target = ws.join(".pi").join(entry);
+            // Directory-shaped entries and file-shaped ones both count.
+            if entry.contains('.') {
+                touch(&target);
+            } else {
+                fs::create_dir_all(&target).unwrap();
+            }
 
-        // The user explicitly distrusted this exact folder in pi: never overwrite.
-        let mut initial = serde_json::Map::new();
-        initial.insert(key.clone(), serde_json::Value::Bool(false));
-        write_json_object_pretty(&agent_dir.join("trust.json"), &initial).unwrap();
-
-        seed_pi_workspace_trust(&workspace, &env);
-        let map = read_json_object_or_empty(&agent_dir.join("trust.json"));
-        assert_eq!(
-            map.get(&key),
-            Some(&serde_json::Value::Bool(false)),
-            "an explicit deny must be preserved (additive-only)",
-        );
-
-        // Idempotent: seeding an already-trusted folder must not rewrite the file.
-        let mut trusted = serde_json::Map::new();
-        trusted.insert(key.clone(), serde_json::Value::Bool(true));
-        write_json_object_pretty(&agent_dir.join("trust.json"), &trusted).unwrap();
-        let mtime1 = fs::metadata(agent_dir.join("trust.json"))
-            .unwrap()
-            .modified()
-            .unwrap();
-        seed_pi_workspace_trust(&workspace, &env);
-        assert_eq!(
-            fs::metadata(agent_dir.join("trust.json"))
-                .unwrap()
-                .modified()
-                .unwrap(),
-            mtime1,
-            "a no-op seed must not rewrite trust.json",
-        );
+            assert_eq!(
+                resource_kinds(&ws),
+                vec![format!(".pi/{entry}")],
+                "`.pi/{entry}` must be reported as a trust-gated resource",
+            );
+        }
     }
 
+    /// `.pi/extensions` are modules whose top level runs at pi startup, and
+    /// `.pi/settings.json` can make pi install project packages. The approval UI
+    /// leans on this flag to say "this executes code" instead of calling it all
+    /// "config" — the exact confusion that produced the auto-trust bug.
     #[test]
-    fn pi_trust_seed_disabled_writes_nothing() {
+    fn pi_trust_resources_flag_the_code_executing_kinds() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let agent_dir = tmp.path().join("agent");
-        let workspace = tmp.path().join("ws");
-        fs::create_dir_all(&workspace).unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(ws.join(".pi").join("extensions")).unwrap();
+        touch(&ws.join(".pi").join("settings.json"));
+        fs::create_dir_all(ws.join(".pi").join("prompts")).unwrap();
 
-        let mut env = pi_env_for(&agent_dir);
-        env.insert(PI_TRUST_WORKSPACE_ENV.to_string(), "0".to_string());
-        seed_pi_workspace_trust(&workspace, &env);
+        let by_kind = pi_project_trust_resources(&ws)
+            .into_iter()
+            .map(|r| (r.kind, r.executes_code))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(by_kind.get(".pi/extensions"), Some(&true));
+        assert_eq!(by_kind.get(".pi/settings.json"), Some(&true));
+        assert_eq!(by_kind.get(".pi/prompts"), Some(&false));
+    }
+
+    /// A bare `.pi/` directory is not a project resource for pi, so codeg must not
+    /// prompt about it (`hasTrustRequiringProjectResources` ignores it too).
+    #[test]
+    fn pi_trust_resources_ignores_a_bare_pi_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(ws.join(".pi")).unwrap();
+
+        assert!(pi_project_trust_resources(&ws).is_empty());
+    }
+
+    /// pi walks ancestors for `.agents/skills`, so a parent directory's store is
+    /// gated for this workspace too.
+    #[test]
+    fn pi_trust_resources_walks_ancestors_for_agents_skills() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("parent");
+        let ws = parent.join("repo");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(parent.join(".agents").join("skills")).unwrap();
+
+        assert_eq!(resource_kinds(&ws), vec![".agents/skills".to_string()]);
+    }
+
+    /// `~/.agents/skills` is the USER's own store, not a repo's — pi excludes it
+    /// from the trust decision and so must codeg, or every workspace under $HOME
+    /// would raise a bogus prompt.
+    #[test]
+    fn pi_trust_resources_excludes_the_user_agents_skills_store() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let ws = home.join("repo");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(home.join(".agents").join("skills")).unwrap();
+
+        // The home is injected rather than pinned through the env: on Windows
+        // `dirs::home_dir()` resolves the `FOLDERID_Profile` known folder and
+        // ignores `HOME`/`USERPROFILE`, so an env-pinned home would leave the real
+        // profile as the exclusion and report the fixture's store.
+        //
+        // Scope the assertion to the fixture as well — the ancestor walk climbs out
+        // of the tempdir into the machine's own directories, and on Windows the
+        // tempdir sits under that very profile dir.
+        let root = pi_canonical_path(tmp.path());
+        let from_fixture = pi_project_trust_resources_with_home(&ws, &home)
+            .into_iter()
+            .map(|resource| resource.path)
+            .filter(|path| Path::new(path).starts_with(&root))
+            .collect::<Vec<_>>();
 
         assert!(
-            !agent_dir.join("trust.json").exists(),
-            "a disabled toggle must not touch trust.json",
+            from_fixture.is_empty(),
+            "the user's own ~/.agents/skills must not count as a repo resource, got {from_fixture:?}",
         );
     }
 
+    /// The decision for the exact folder wins.
     #[test]
-    fn pi_trust_seed_leaves_unparseable_file_untouched() {
+    fn pi_nearest_trust_decision_reads_the_exact_folder() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let agent_dir = tmp.path().join("agent");
-        fs::create_dir_all(&agent_dir).unwrap();
-        let workspace = tmp.path().join("ws");
-        fs::create_dir_all(&workspace).unwrap();
-        fs::write(agent_dir.join("trust.json"), "not json at all").unwrap();
-
-        seed_pi_workspace_trust(&workspace, &pi_env_for(&agent_dir));
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let trust = tmp.path().join("trust.json");
+        let mut map = serde_json::Map::new();
+        map.insert(canonical_key(&ws), serde_json::Value::Bool(false));
+        write_json_object_pretty(&trust, &map).unwrap();
 
         assert_eq!(
-            fs::read_to_string(agent_dir.join("trust.json")).unwrap(),
-            "not json at all",
-            "a present-but-unparseable trust.json must never be clobbered",
+            pi_nearest_trust_decision(&trust, &ws),
+            Some((canonical_key(&ws), false)),
         );
+    }
+
+    /// Inheritance is the amplifier that made the old auto-seed so wide: one
+    /// entry on a parent covers every repo beneath it, including repos cloned
+    /// later. The UI has to be able to show that, so resolution must report the
+    /// ancestor that actually decided.
+    #[test]
+    fn pi_nearest_trust_decision_inherits_from_an_ancestor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("projects");
+        let ws = parent.join("cloned-later");
+        fs::create_dir_all(&ws).unwrap();
+        let trust = tmp.path().join("trust.json");
+        let mut map = serde_json::Map::new();
+        map.insert(canonical_key(&parent), serde_json::Value::Bool(true));
+        write_json_object_pretty(&trust, &map).unwrap();
+
+        assert_eq!(
+            pi_nearest_trust_decision(&trust, &ws),
+            Some((canonical_key(&parent), true)),
+            "the deciding ancestor must be reported, not the workspace itself",
+        );
+    }
+
+    /// pi only honors real booleans; a `null` entry means "no decision here", so
+    /// the walk continues to the ancestor rather than stopping.
+    #[test]
+    fn pi_nearest_trust_decision_skips_null_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("projects");
+        let ws = parent.join("repo");
+        fs::create_dir_all(&ws).unwrap();
+        let trust = tmp.path().join("trust.json");
+        let mut map = serde_json::Map::new();
+        map.insert(canonical_key(&ws), serde_json::Value::Null);
+        map.insert(canonical_key(&parent), serde_json::Value::Bool(true));
+        write_json_object_pretty(&trust, &map).unwrap();
+
+        assert_eq!(
+            pi_nearest_trust_decision(&trust, &ws),
+            Some((canonical_key(&parent), true)),
+        );
+    }
+
+    /// No file, or no matching entry, means nobody has decided — pi's own
+    /// non-interactive default then applies and the resources stay unloaded.
+    #[test]
+    fn pi_nearest_trust_decision_is_none_without_a_match() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+
+        assert_eq!(
+            pi_nearest_trust_decision(&tmp.path().join("missing.json"), &ws),
+            None,
+        );
+    }
+
+    /// The launch path no longer writes trust, so the ONLY way a workspace becomes
+    /// trusted is this explicit call. Both verdicts must be recordable — declining
+    /// is a real answer, not just "don't write anything".
+    #[test]
+    fn pi_set_project_trust_records_either_verdict() {
+        for verdict in [true, false] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ws = tmp.path().join("ws");
+            fs::create_dir_all(&ws).unwrap();
+            let trust = tmp.path().join("agent").join("trust.json");
+
+            pi_write_trust_decision_at(&trust, &ws, Some(verdict)).unwrap();
+
+            assert_eq!(
+                read_json_object_or_empty(&trust).get(&canonical_key(&ws)),
+                Some(&serde_json::Value::Bool(verdict)),
+            );
+        }
+    }
+
+    /// Revoking removes codeg's entry so the folder falls back to any ancestor
+    /// decision and then to pi's default. Other users' decisions must survive.
+    #[test]
+    fn pi_set_project_trust_revoke_removes_only_our_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let trust = tmp.path().join("trust.json");
+        let mut map = serde_json::Map::new();
+        map.insert(canonical_key(&ws), serde_json::Value::Bool(true));
+        map.insert("/some/other".to_string(), serde_json::Value::Bool(true));
+        map.insert("/denied".to_string(), serde_json::Value::Bool(false));
+        write_json_object_pretty(&trust, &map).unwrap();
+
+        pi_write_trust_decision_at(&trust, &ws, None).unwrap();
+
+        let after = read_json_object_or_empty(&trust);
+        assert_eq!(after.get(&canonical_key(&ws)), None);
+        assert_eq!(after.get("/some/other"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(after.get("/denied"), Some(&serde_json::Value::Bool(false)));
+    }
+
+    /// Revoking a folder we never wrote (the decision is inherited) must not
+    /// create a trust file just to record an absence.
+    #[test]
+    fn pi_set_project_trust_revoke_is_a_noop_when_nothing_is_ours() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let trust = tmp.path().join("agent").join("trust.json");
+
+        pi_write_trust_decision_at(&trust, &ws, None).unwrap();
+
+        assert!(!trust.exists());
+    }
+
+    /// Drive the launch gate with an isolated pi agent dir AND an isolated codeg
+    /// home (the acknowledgement store lives there, via `CODEG_HOME`).
+    fn launch_block_for(agent_dir: &Path, codeg_home: &Path, cwd: &Path) -> Option<String> {
+        temp_env::with_var(
+            "CODEG_HOME",
+            Some(codeg_home.to_string_lossy().to_string()),
+            || pi_project_trust_launch_block(cwd, &pi_env_for(agent_dir)),
+        )
+    }
+
+    /// Build a workspace shipping `.pi/extensions`, with `trust.json` saying what
+    /// `decision` says about the exact folder.
+    fn gated_workspace(tmp: &Path, decision: Option<bool>) -> (PathBuf, PathBuf, PathBuf) {
+        let ws = tmp.join("ws");
+        fs::create_dir_all(ws.join(".pi").join("extensions")).unwrap();
+        let agent_dir = tmp.join("agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        if let Some(verdict) = decision {
+            let mut map = serde_json::Map::new();
+            map.insert(canonical_key(&ws), serde_json::Value::Bool(verdict));
+            write_json_object_pretty(&agent_dir.join("trust.json"), &map).unwrap();
+        }
+        (ws, agent_dir, tmp.join("codeg-home"))
+    }
+
+    /// THE regression this whole change exists for on an upgraded install: pi
+    /// executes `.pi/extensions` at startup, so a grant nobody here confirmed —
+    /// written by the build that auto-trusted every opened folder — must stop the
+    /// launch. A notice shown after connecting would arrive after the code ran.
+    #[test]
+    fn pi_launch_is_blocked_by_an_unacknowledged_grant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (ws, agent_dir, home) = gated_workspace(tmp.path(), Some(true));
+
+        let blocked = launch_block_for(&agent_dir, &home, &ws);
+
+        assert!(blocked.is_some(), "an unconfirmed grant must not launch pi");
+        assert!(blocked.unwrap().contains(".pi/extensions"));
+    }
+
+    /// The same grant inherited from a parent — the shape that covers a repo
+    /// cloned into a previously-opened folder long after it was seeded, which is
+    /// the case a per-folder check alone would miss entirely.
+    #[test]
+    fn pi_launch_is_blocked_by_an_unacknowledged_ancestor_grant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("projects");
+        let ws = parent.join("cloned-later");
+        fs::create_dir_all(ws.join(".pi").join("extensions")).unwrap();
+        let agent_dir = tmp.path().join("agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let mut map = serde_json::Map::new();
+        map.insert(canonical_key(&parent), serde_json::Value::Bool(true));
+        write_json_object_pretty(&agent_dir.join("trust.json"), &map).unwrap();
+
+        let blocked = launch_block_for(&agent_dir, &tmp.path().join("codeg-home"), &ws);
+
+        assert!(blocked.is_some());
+        assert!(
+            blocked.unwrap().contains("parent folder"),
+            "the message must name the inherited grant, not imply this folder was approved",
+        );
+    }
+
+    /// Once the user answers for the folder, it launches. Acknowledging records
+    /// only codeg's confirmation — pi's own grant is untouched.
+    #[test]
+    fn pi_launch_proceeds_after_the_grant_is_acknowledged() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (ws, agent_dir, home) = gated_workspace(tmp.path(), Some(true));
+        let trust_before = fs::read_to_string(agent_dir.join("trust.json")).unwrap();
+
+        pi_set_trust_acknowledged_at(&home.join("pi-project-trust-ack.json"), &ws, true).unwrap();
+
+        assert_eq!(launch_block_for(&agent_dir, &home, &ws), None);
+        assert_eq!(
+            fs::read_to_string(agent_dir.join("trust.json")).unwrap(),
+            trust_before,
+            "acknowledging must not change pi's own trust store",
+        );
+    }
+
+    /// Nothing to confirm: with no decision, or a declined one, pi already skips
+    /// the resources, so blocking would be pure friction.
+    #[test]
+    fn pi_launch_proceeds_when_no_grant_is_in_force() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for decision in [None, Some(false)] {
+            let sub = tmp.path().join(format!("case{decision:?}"));
+            fs::create_dir_all(&sub).unwrap();
+            let (ws, agent_dir, home) = gated_workspace(&sub, decision);
+            assert_eq!(
+                launch_block_for(&agent_dir, &home, &ws),
+                None,
+                "decision {decision:?} must not block the launch",
+            );
+        }
+    }
+
+    /// A repo that ships nothing trust-gated is never blocked, however the folder
+    /// came to be trusted — there is nothing for the grant to load.
+    #[test]
+    fn pi_launch_proceeds_when_the_repo_ships_no_resources() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("plain");
+        fs::create_dir_all(&ws).unwrap();
+        let agent_dir = tmp.path().join("agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let mut map = serde_json::Map::new();
+        map.insert(canonical_key(&ws), serde_json::Value::Bool(true));
+        write_json_object_pretty(&agent_dir.join("trust.json"), &map).unwrap();
+
+        assert_eq!(
+            launch_block_for(&agent_dir, &tmp.path().join("codeg-home"), &ws),
+            None,
+        );
+    }
+
+    /// Revoking must drop the confirmation too, or re-granting later would ride
+    /// on a stale "already seen" and skip the disclosure.
+    #[test]
+    fn pi_trust_acknowledgement_round_trips_and_clears() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let ack = tmp.path().join("ack.json");
+
+        assert!(!pi_trust_is_acknowledged_at(&ack, &canonical_key(&ws)));
+        pi_set_trust_acknowledged_at(&ack, &ws, true).unwrap();
+        assert!(pi_trust_is_acknowledged_at(&ack, &canonical_key(&ws)));
+        pi_set_trust_acknowledged_at(&ack, &ws, false).unwrap();
+        assert!(!pi_trust_is_acknowledged_at(&ack, &canonical_key(&ws)));
+    }
+
+    /// The write is a read-modify-write, and two codeg surfaces (the approval
+    /// banner and the settings list's revoke buttons) can fire at once. Without
+    /// serialization each writer would persist the map it read, so the last one
+    /// to land silently drops every entry added since it read — losing a grant
+    /// the user just made, or resurrecting one they just revoked.
+    #[test]
+    fn pi_trust_concurrent_writes_do_not_lose_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let trust = tmp.path().join("agent").join("trust.json");
+
+        let workspaces: Vec<PathBuf> = (0..8)
+            .map(|i| {
+                let ws = tmp.path().join(format!("ws{i}"));
+                fs::create_dir_all(&ws).unwrap();
+                ws
+            })
+            .collect();
+
+        std::thread::scope(|scope| {
+            for ws in &workspaces {
+                let trust = trust.clone();
+                scope.spawn(move || {
+                    pi_write_trust_decision_at(&trust, ws, Some(true)).expect("write");
+                });
+            }
+        });
+
+        // Every writer's entry survived, and the file is still parseable JSON —
+        // interleaved truncating writes would corrupt it.
+        let map = read_json_object_or_empty(&trust);
+        assert_eq!(map.len(), workspaces.len(), "an entry was lost: {map:?}");
+        for ws in &workspaces {
+            assert_eq!(
+                map.get(&canonical_key(ws)),
+                Some(&serde_json::Value::Bool(true)),
+            );
+        }
+    }
+
+    /// The lock must not outlive the operation, or the next decision — from codeg
+    /// or from pi, which takes the same lock — would stall until it goes stale.
+    #[test]
+    fn pi_trust_write_releases_the_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let trust = tmp.path().join("agent").join("trust.json");
+
+        pi_write_trust_decision_at(&trust, &ws, Some(true)).unwrap();
+
+        assert!(
+            !tmp.path().join("agent").join("trust.json.lock").exists(),
+            "the lock directory must be released when the write finishes",
+        );
+    }
+
+    /// pi holds this same lock while it reads or writes its store. When it is
+    /// held, codeg must back off and report it rather than write anyway — writing
+    /// through the lock is exactly the interleaving the lock exists to prevent.
+    #[test]
+    fn pi_trust_write_defers_to_a_lock_held_by_pi() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let agent_dir = tmp.path().join("agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let trust = agent_dir.join("trust.json");
+        fs::write(&trust, "{}\n").unwrap();
+        // Fresh (non-stale) lock, exactly as `proper-lockfile` leaves it.
+        fs::create_dir(agent_dir.join("trust.json.lock")).unwrap();
+
+        let err = pi_write_trust_decision_at(&trust, &ws, Some(true)).unwrap_err();
+
+        assert!(err.to_string().contains("locked by another process"));
+        assert_eq!(
+            fs::read_to_string(&trust).unwrap(),
+            "{}\n",
+            "a contended write must leave the store untouched",
+        );
+    }
+
+    /// A lock orphaned by a crash must not wedge project trust forever — pi
+    /// breaks the same tie by age, so codeg has to agree on when to steal it.
+    #[test]
+    fn pi_trust_lock_missing_or_unreadable_counts_as_stale() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(pi_trust_lock_is_stale(&tmp.path().join("nonexistent.lock")));
+        // A lock created just now is live, so it is honored rather than stolen.
+        let fresh = tmp.path().join("fresh.lock");
+        fs::create_dir(&fresh).unwrap();
+        assert!(!pi_trust_lock_is_stale(&fresh));
+    }
+
+    /// `trust.json` holds decisions the user made inside pi. If codeg can't parse
+    /// it, it must refuse loudly rather than rewrite the file from scratch.
+    #[test]
+    fn pi_set_project_trust_never_clobbers_an_unparseable_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let trust = tmp.path().join("trust.json");
+        fs::write(&trust, "not json at all").unwrap();
+
+        let err = pi_write_trust_decision_at(&trust, &ws, Some(true)).unwrap_err();
+
+        assert!(err.to_string().contains("not a JSON object"));
+        assert_eq!(fs::read_to_string(&trust).unwrap(), "not json at all");
+    }
+
+    /// The settings list surfaces decisions for review/revoke — including ones an
+    /// older codeg auto-seeded. `null` entries carry no decision, so they are not
+    /// listed.
+    #[test]
+    fn pi_trust_entries_lists_decisions_sorted_and_skips_nulls() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let trust = tmp.path().join("trust.json");
+        let mut map = serde_json::Map::new();
+        map.insert("/b/repo".to_string(), serde_json::Value::Bool(true));
+        map.insert("/a/repo".to_string(), serde_json::Value::Bool(false));
+        map.insert("/c/repo".to_string(), serde_json::Value::Null);
+        write_json_object_pretty(&trust, &map).unwrap();
+
+        let entries = pi_trust_entries_at(&trust);
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.path.as_str(), e.trusted))
+                .collect::<Vec<_>>(),
+            vec![("/a/repo", false), ("/b/repo", true)],
+        );
+    }
+
+    /// End-to-end shape of what the banner reads: a repo that ships an extension,
+    /// with nobody having decided yet, is exactly the case that must prompt.
+    #[test]
+    fn pi_project_trust_state_reports_undecided_repo_resources() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(ws.join(".pi").join("extensions")).unwrap();
+        let trust = tmp.path().join("trust.json");
+
+        let state = pi_project_trust_state_at(&trust, &tmp.path().join("ack.json"), &ws);
+
+        assert_eq!(state.decision, None, "nobody has decided yet");
+        assert_eq!(state.decided_at, None);
+        assert!(!state.acknowledged);
+        assert_eq!(
+            state.resources.iter().map(|r| &r.kind).collect::<Vec<_>>(),
+            vec![".pi/extensions"],
+        );
+        assert!(state.resources[0].executes_code);
+        assert_eq!(state.workspace, canonical_key(&ws));
+    }
+
+    // --- pi models.json: the per-model reasoning declaration -----------------
+    //
+    // A custom model written without `reasoning` gets `reasoning: false` from pi,
+    // which collapses its thinking vocabulary to `["off"]` — every level the
+    // composer sends is clamped straight back and the picker looks broken. These
+    // pin the shape pi actually reads.
+
+    fn pi_reasoning_spec(
+        reasoning: bool,
+        map: &[(&str, Option<&str>)],
+    ) -> PiModelReasoningSpec {
+        PiModelReasoningSpec {
+            reasoning,
+            thinking_level_map: map
+                .iter()
+                .map(|(level, wire)| (level.to_string(), wire.map(str::to_string)))
+                .collect(),
+        }
+    }
+
+    fn pi_models_of(entry: &serde_json::Map<String, serde_json::Value>) -> Vec<serde_json::Value> {
+        entry
+            .get("models")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn pi_custom_model_adds_a_missing_model_with_its_declaration() {
+        let mut entry = serde_json::Map::new();
+
+        apply_pi_custom_model(
+            &mut entry,
+            "gpt-5.6-sol",
+            Some(&pi_reasoning_spec(
+                true,
+                &[("off", Some("none")), ("minimal", None), ("xhigh", Some("xhigh"))],
+            )),
+        );
+
+        let models = pi_models_of(&entry);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["id"], "gpt-5.6-sol");
+        assert_eq!(models[0]["name"], "gpt-5.6-sol");
+        assert_eq!(models[0]["reasoning"], true);
+        assert_eq!(models[0]["thinkingLevelMap"]["off"], "none");
+        assert!(models[0]["thinkingLevelMap"]["minimal"].is_null());
+        assert_eq!(models[0]["thinkingLevelMap"]["xhigh"], "xhigh");
+    }
+
+    /// The older writer skipped an already-listed model entirely, so a declaration
+    /// could never reach one. Upserting must still leave every field the form has
+    /// no opinion about — including a renamed `name` — exactly as the user left it.
+    #[test]
+    fn pi_custom_model_upserts_without_clobbering_hand_tuned_fields() {
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "models".to_string(),
+            serde_json::json!([
+                { "id": "other", "name": "Other" },
+                {
+                    "id": "gpt-5.6-sol",
+                    "name": "My renamed model",
+                    "contextWindow": 400000,
+                    "cost": { "input": 5, "output": 30, "cacheRead": 0.5, "cacheWrite": 0 },
+                    "compat": { "some": "knob" },
+                },
+            ]),
+        );
+
+        apply_pi_custom_model(
+            &mut entry,
+            "gpt-5.6-sol",
+            Some(&pi_reasoning_spec(true, &[("off", Some("none"))])),
+        );
+
+        let models = pi_models_of(&entry);
+        assert_eq!(models.len(), 2, "no duplicate entry for the same id");
+        let target = models
+            .iter()
+            .find(|m| m["id"] == "gpt-5.6-sol")
+            .expect("model kept");
+        assert_eq!(target["name"], "My renamed model");
+        assert_eq!(target["contextWindow"], 400000);
+        assert_eq!(target["cost"]["input"], 5);
+        assert_eq!(target["compat"]["some"], "knob");
+        assert_eq!(target["reasoning"], true);
+        assert_eq!(models[0]["id"], "other", "untouched sibling stays put");
+    }
+
+    /// Turning the switch off only flips the flag: the level selection stays on
+    /// disk so re-enabling restores it instead of making the user re-pick.
+    #[test]
+    fn pi_custom_model_disabling_reasoning_keeps_the_level_map() {
+        let mut entry = serde_json::Map::new();
+        apply_pi_custom_model(
+            &mut entry,
+            "m",
+            Some(&pi_reasoning_spec(true, &[("minimal", None)])),
+        );
+
+        apply_pi_custom_model(
+            &mut entry,
+            "m",
+            Some(&pi_reasoning_spec(false, &[("minimal", None)])),
+        );
+
+        let models = pi_models_of(&entry);
+        assert_eq!(models[0]["reasoning"], false);
+        assert!(models[0]["thinkingLevelMap"]["minimal"].is_null());
+    }
+
+    /// `{}` would read as a declaration that constrains nothing; drop the key so
+    /// pi falls back to its own defaults.
+    #[test]
+    fn pi_custom_model_drops_an_empty_level_map() {
+        let mut entry = serde_json::Map::new();
+        apply_pi_custom_model(
+            &mut entry,
+            "m",
+            Some(&pi_reasoning_spec(true, &[("low", Some("LOW"))])),
+        );
+
+        apply_pi_custom_model(&mut entry, "m", Some(&pi_reasoning_spec(true, &[])));
+
+        let models = pi_models_of(&entry);
+        assert!(models[0].get("thinkingLevelMap").is_none());
+    }
+
+    /// pi-acp rejects a level name outside pi's fixed six with `invalidParams`, so
+    /// one must never reach disk.
+    #[test]
+    fn pi_custom_model_filters_levels_pi_does_not_know() {
+        let mut entry = serde_json::Map::new();
+
+        apply_pi_custom_model(
+            &mut entry,
+            "m",
+            Some(&pi_reasoning_spec(
+                true,
+                &[("ultra", Some("ultra")), ("high", Some("high"))],
+            )),
+        );
+
+        let models = pi_models_of(&entry);
+        let map = models[0]["thinkingLevelMap"].as_object().unwrap();
+        assert!(!map.contains_key("ultra"));
+        assert_eq!(map["high"], "high");
+    }
+
+    /// Built-in providers (and any client that predates the control) send no spec.
+    /// That must not erase a declaration already on disk.
+    #[test]
+    fn pi_custom_model_without_a_spec_leaves_the_declaration_alone() {
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "models".to_string(),
+            serde_json::json!([
+                { "id": "m", "name": "m", "reasoning": true,
+                  "thinkingLevelMap": { "off": "none" } },
+            ]),
+        );
+
+        apply_pi_custom_model(&mut entry, "m", None);
+
+        let models = pi_models_of(&entry);
+        assert_eq!(models[0]["reasoning"], true);
+        assert_eq!(models[0]["thinkingLevelMap"]["off"], "none");
+    }
+
+    /// What the writer emits has to survive the read the panel rehydrates from,
+    /// or reopening the settings would show the wrong chips.
+    #[test]
+    fn pi_custom_models_projection_reads_back_what_was_written() {
+        let mut entry = serde_json::Map::new();
+        apply_pi_custom_model(
+            &mut entry,
+            "gpt-5.6-sol",
+            Some(&pi_reasoning_spec(
+                true,
+                &[("off", Some("none")), ("minimal", None), ("low", Some("LOW"))],
+            )),
+        );
+
+        let models = pi_custom_models_from_entry(&serde_json::Value::Object(entry));
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gpt-5.6-sol");
+        assert_eq!(models[0].reasoning, Some(true));
+        assert_eq!(models[0].thinking_level_map["off"], Some("none".to_string()));
+        assert_eq!(models[0].thinking_level_map["minimal"], None);
+        assert_eq!(models[0].thinking_level_map["low"], Some("LOW".to_string()));
+    }
+
+    /// A model with no `reasoning` key must project as `None`, not `Some(false)` —
+    /// the panel distinguishes "never declared" from "declared off".
+    #[test]
+    fn pi_custom_models_projection_keeps_an_undeclared_model_undeclared() {
+        let entry = serde_json::json!({
+            "models": [
+                { "id": "b", "name": "b" },
+                { "id": "a", "name": "a", "thinkingLevelMap": { "low": 7 } },
+                { "name": "no id at all" },
+            ]
+        });
+
+        let models = pi_custom_models_from_entry(&entry);
+
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "sorted by id, entries without one skipped"
+        );
+        assert_eq!(models[0].reasoning, None);
+        assert!(
+            models[0].thinking_level_map.is_empty(),
+            "a non-string, non-null wire value is dropped rather than guessed at"
+        );
+    }
+
+    /// End to end through the files pi actually reads: the panel's rehydrate path
+    /// must find the declaration under the provider it was saved to.
+    #[test]
+    fn load_pi_config_projects_custom_provider_models() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        temp_env::with_var("PI_CODING_AGENT_DIR", Some(tmp.path()), || {
+            fs::write(
+                tmp.path().join("settings.json"),
+                r#"{"defaultProvider":"gs","defaultModel":"gpt-5.6-sol","defaultThinkingLevel":"high"}"#,
+            )
+            .unwrap();
+            fs::write(
+                tmp.path().join("models.json"),
+                r#"{"providers":{"gs":{"api":"openai-responses","baseUrl":"https://example.test/v1",
+                   "models":[{"id":"gpt-5.6-sol","name":"gpt-5.6-sol","reasoning":true,
+                   "thinkingLevelMap":{"off":"none","minimal":null,"xhigh":"xhigh"}}]}}}"#,
+            )
+            .unwrap();
+
+            let cfg = load_pi_config_core();
+
+            assert_eq!(cfg.default_provider.as_deref(), Some("gs"));
+            assert_eq!(cfg.default_thinking_level.as_deref(), Some("high"));
+            let provider = &cfg.custom_providers[0];
+            assert_eq!(provider.id, "gs");
+            assert_eq!(provider.api, "openai-responses");
+            assert_eq!(provider.models[0].id, "gpt-5.6-sol");
+            assert_eq!(provider.models[0].reasoning, Some(true));
+            assert_eq!(
+                provider.models[0].thinking_level_map["xhigh"],
+                Some("xhigh".to_string())
+            );
+        });
     }
 
     #[test]
@@ -12545,6 +14392,122 @@ wire_api = "chat"
                 ];
                 assert_eq!(spec.global_dirs, expected);
             },
+        );
+    }
+
+    #[test]
+    fn deepseek_skill_storage_spec_mirrors_dsh_skill_roots() {
+        // Both resolvers read the process-wide `$HOME` when their env override
+        // is unset, and other tests mutate HOME via `temp_env`. Pin it (and
+        // clear both overrides) so the spec and the expected paths resolve
+        // against one consistent home. `expected` comes from the same
+        // production helpers so this stays correct on Windows, where
+        // `dirs::home_dir()` ignores the pinned HOME.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        temp_env::with_vars(
+            [
+                ("HOME", Some(tmp.path())),
+                ("DSH_HOME", None::<&std::path::Path>),
+                ("DSH_AGENTS_HOME", None::<&std::path::Path>),
+            ],
+            || {
+                let spec =
+                    skill_storage_spec(AgentType::DeepSeek).expect("DeepSeek supports skills");
+                // `dsh-skill-filesystem` discovers directory bundles AND flat
+                // `.md` files, like Codex and pi.
+                assert_eq!(spec.kind, SkillStorageKind::SkillDirectoryOrMarkdownFile);
+                assert_eq!(spec.project_rel_dirs, vec![".dsh/skills", ".agents/skills"]);
+                // Harness-native dir first (preferred link target), shared
+                // cross-agent store second.
+                let expected = vec![
+                    crate::parsers::deepseek::resolve_dsh_home_dir().join("skills"),
+                    crate::parsers::deepseek::resolve_dsh_agents_home_dir().join("skills"),
+                ];
+                assert_eq!(spec.global_dirs, expected);
+                // The product CLI owns `$DSH_HOME/skills/.system` (the provider
+                // sets `skipSystem` on that root), so codeg never writes there.
+                assert!(is_read_only_skill_path(
+                    AgentType::DeepSeek,
+                    &expected[0].join(".system").join("imagegen")
+                ));
+                assert!(!is_read_only_skill_path(
+                    AgentType::DeepSeek,
+                    &expected[0].join("my-skill")
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn deepseek_project_skills_hang_off_the_git_root() {
+        // `dsh-skill-filesystem` resolves project roots by walking up to the
+        // nearest `.git`, so opening a package subdirectory must still target
+        // the repo root — otherwise codeg writes a skill the agent never scans.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let nested = repo.join("packages").join("app");
+        std::fs::create_dir_all(&nested).expect("create nested");
+        // A linked worktree records `.git` as a FILE, which upstream's
+        // `pathExists` accepts — so must this.
+        std::fs::write(repo.join(".git"), "gitdir: /elsewhere\n").expect("write .git file");
+
+        let dirs = scoped_skill_dirs(
+            AgentType::DeepSeek,
+            AgentSkillScope::Project,
+            Some(nested.to_str().expect("utf-8 path")),
+        )
+        .expect("project dirs");
+        assert_eq!(
+            dirs,
+            vec![repo.join(".dsh/skills"), repo.join(".agents/skills")]
+        );
+
+        // No `.git` anywhere above ⇒ fall back to the workspace itself.
+        let bare = tmp.path().join("bare");
+        std::fs::create_dir_all(&bare).expect("create bare");
+        let fallback = scoped_skill_dirs(
+            AgentType::DeepSeek,
+            AgentSkillScope::Project,
+            Some(bare.to_str().expect("utf-8 path")),
+        )
+        .expect("fallback dirs");
+        assert_eq!(fallback[0], bare.join(".dsh/skills"));
+
+        // Every other agent keeps the plain workspace-relative layout.
+        let codex = scoped_skill_dirs(
+            AgentType::Codex,
+            AgentSkillScope::Project,
+            Some(nested.to_str().expect("utf-8 path")),
+        )
+        .expect("codex dirs");
+        assert_eq!(codex[0], nested.join(".codex/skills"));
+
+        // ...and the LIST path must resolve the same base as the WRITE path:
+        // a skill saved from the nested workspace lands at the repo root, so
+        // listing the workspace directly would show it as missing.
+        let saved = repo.join(".dsh/skills").join("demo");
+        std::fs::create_dir_all(&saved).expect("create skill dir");
+        std::fs::write(saved.join("SKILL.md"), "---\nname: demo\n---\nbody\n")
+            .expect("write SKILL.md");
+        let listed = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(acp_list_agent_skills(
+                AgentType::DeepSeek,
+                Some(nested.to_string_lossy().to_string()),
+            ))
+            .expect("list skills");
+        assert!(
+            listed.skills.iter().any(|s| s.id == "demo"),
+            "skill saved at the git root must be listed from a nested workspace: {:?}",
+            listed.skills
+        );
+        assert!(
+            listed
+                .locations
+                .iter()
+                .any(|l| l.path == repo.join(".dsh/skills").to_string_lossy()),
+            "the listed project location must be the git root: {:?}",
+            listed.locations
         );
     }
 
@@ -12980,6 +14943,31 @@ wire_api = "chat"
             Some(&serde_json::json!(["Shell(npm run build)"]))
         );
         assert_eq!(v.pointer("/permissions/deny"), Some(&serde_json::json!([])));
+    }
+
+    #[tokio::test]
+    async fn qoder_probe_env_materializes_the_token() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+
+        // The form value wins over saved env and is trimmed.
+        let env = qoder_probe_env(&db, Some("  pat-123  ")).await;
+        assert_eq!(
+            env.get("QODER_PERSONAL_ACCESS_TOKEN").map(String::as_str),
+            Some("pat-123")
+        );
+
+        // No token on screen → present but empty, so `run_qoder_probe` strips
+        // any inherited one instead of probing a credential a launch wouldn't use.
+        let cleared = qoder_probe_env(&db, Some("")).await;
+        assert_eq!(
+            cleared.get("QODER_PERSONAL_ACCESS_TOKEN").map(String::as_str),
+            Some("")
+        );
+        let unset = qoder_probe_env(&db, None).await;
+        assert_eq!(
+            unset.get("QODER_PERSONAL_ACCESS_TOKEN").map(String::as_str),
+            Some("")
+        );
     }
 
     #[tokio::test]
@@ -14708,7 +16696,7 @@ wire_api = "chat"
                     .expect("npx recipe must pin via --package");
                 assert_eq!(
                     argv.get(pkg_idx + 1).map(String::as_str),
-                    Some("hermes-agent@0.20.0")
+                    Some("hermes-agent@0.20.4")
                 );
                 assert_eq!(argv.get(pkg_idx + 2).map(String::as_str), Some("hermes"));
             } else {
@@ -15320,7 +17308,7 @@ model = "gpt"
             )
         };
 
-        let annotated = annotate_npm_bootstrap_failure("hermes-agent@0.20.0", download());
+        let annotated = annotate_npm_bootstrap_failure("hermes-agent@0.20.4", download());
         let text = annotated.to_string();
         assert!(text.contains("fetch failed"), "keeps the original error");
         assert!(text.contains("HTTP(S)_PROXY"), "adds the proxy hint");
@@ -15332,7 +17320,7 @@ model = "gpt"
 
         // A hermes failure that isn't a download stays untouched.
         let permissions = annotate_npm_bootstrap_failure(
-            "hermes-agent@0.20.0",
+            "hermes-agent@0.20.4",
             AcpError::Protocol("failed to install npm package globally: EACCES".to_string()),
         );
         assert!(!permissions.to_string().contains("HTTP(S)_PROXY"));

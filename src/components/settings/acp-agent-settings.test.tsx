@@ -12,11 +12,17 @@ import {
   buildVersionCheck,
   configTextForClaudeSave,
   getAgentChecks,
+  hostToolsAgentModeEnabled,
+  importantEnvKeysByAgent,
+  importantFieldsFor,
   inferGrokMode,
   materializeClaudeHardeningFlags,
   patchCodexConfigTomlText,
+  patchEnvByImportantKey,
   patchImportantConfigText,
+  rebaseDeepSeekDraft,
   setClaudeEnvFlagInConfigText,
+  setHostToolsAgentMode,
 } from "./acp-agent-settings"
 import { parse as parseTomlDocument } from "smol-toml"
 import type {
@@ -41,6 +47,7 @@ function makeAgent(overrides: Partial<AcpAgentInfo>): AcpAgentInfo {
     enabled: true,
     sort_order: 0,
     installed_version: null,
+    host_tools_agent_mode: false,
     env: {},
     config_json: null,
     config_file_path: null,
@@ -1394,5 +1401,275 @@ describe("patchCodexConfigTomlText — codeg's requires_openai_auth default", ()
     const toml = [BOUND_PROVIDER, 'base_url = "unterminated'].join("\n")
     const result = patchCodexConfigTomlText(toml, ENTRY)
     expect(result).not.toContain("requires_openai_auth")
+  })
+})
+
+describe("host-tools toggle — hand the fs/terminal channels back to the agent", () => {
+  const KEY = "CODEG_ACP_HOST_TOOLS"
+
+  it("is off for an agent that has never touched the knob", () => {
+    expect(hostToolsAgentModeEnabled("")).toBe(false)
+    expect(hostToolsAgentModeEnabled("XAI_API_KEY=abc")).toBe(false)
+  })
+
+  it("round-trips on and back off", () => {
+    const on = setHostToolsAgentMode("XAI_API_KEY=abc", true)
+    expect(on).toContain(`${KEY}=agent`)
+    expect(hostToolsAgentModeEnabled(on)).toBe(true)
+
+    // Off writes an EXPLICIT `default` rather than deleting the key. Deleting
+    // would let a process-wide `CODEG_ACP_HOST_TOOLS=agent` keep winning, so
+    // the switch could not turn the mode off at all — it would read false
+    // while the next connection still withheld the channels.
+    const off = setHostToolsAgentMode(on, false)
+    expect(off).toContain(`${KEY}=default`)
+    expect(hostToolsAgentModeEnabled(off)).toBe(false)
+    expect(off).toContain("XAI_API_KEY=abc")
+  })
+
+  it("leaves the agent's other env vars alone", () => {
+    const before = "XAI_API_KEY=abc\nGROK_HOME=/tmp/grok"
+    const after = setHostToolsAgentMode(before, true)
+    expect(after).toContain("XAI_API_KEY=abc")
+    expect(after).toContain("GROK_HOME=/tmp/grok")
+  })
+
+  it("reads only the exact sentinel, matching the Rust resolver", () => {
+    // The backend fails OPEN on an unrecognized value (a typo must look like a
+    // typo, not like a silently disabled terminal), so the switch must render
+    // unchecked for anything that is not literally `agent`.
+    expect(hostToolsAgentModeEnabled(`${KEY}=default`)).toBe(false)
+    expect(hostToolsAgentModeEnabled(`${KEY}=Agent`)).toBe(false)
+    expect(hostToolsAgentModeEnabled(`${KEY}=off`)).toBe(false)
+    expect(hostToolsAgentModeEnabled(`${KEY}=`)).toBe(false)
+    // Trimmed, though — `parseEnvText` trims, and so does the backend.
+    expect(hostToolsAgentModeEnabled(`${KEY} = agent `)).toBe(true)
+  })
+
+  it("does not double up when toggled on twice", () => {
+    const once = setHostToolsAgentMode("", true)
+    const twice = setHostToolsAgentMode(once, true)
+    expect(twice).toBe(once)
+    expect(twice.match(new RegExp(KEY, "g"))).toHaveLength(1)
+  })
+
+  it("overrides an inherited value in both directions", () => {
+    // The backend resolves env_json first, then codeg's process env. Whatever
+    // the operator exported, one flip of the switch must decide the outcome —
+    // so both states write an explicit value and neither leaves the key absent.
+    const off = setHostToolsAgentMode("", false)
+    expect(off).toBe(`${KEY}=default`)
+    expect(hostToolsAgentModeEnabled(off)).toBe(false)
+    expect(hostToolsAgentModeEnabled(setHostToolsAgentMode(off, true))).toBe(
+      true
+    )
+  })
+})
+
+describe("rebaseDeepSeekDraft", () => {
+  // Only the fields this helper reads or writes; the rest of AgentDraft is
+  // spread through untouched, which the identity assertion below pins.
+  const draftOf = (envText: string) =>
+    ({
+      envText,
+      apiBaseUrl: "",
+      apiKey: "",
+      model: "",
+      enabled: true,
+      configText: "",
+    }) as unknown as Parameters<typeof rebaseDeepSeekDraft>[0]
+
+  it("folds the panel's keys in while leaving every other key alone", () => {
+    // The window's draft still holds the key it saw before another window
+    // saved a new one; the enable switch would persist this text wholesale.
+    //
+    // `DEEPSEEK_ACP_MODEL` is NOT a panel key — the panel shows no model field
+    // and never writes one, so the raw editor's line stays exactly as typed
+    // even when the persisted env disagrees with it.
+    const draft = draftOf(
+      "DEEPSEEK_API_KEY=sk-old\nDEEPSEEK_ACP_MODEL=deepseek-v4-flash\nSOMETHING_ELSE=keep-me"
+    )
+    const agent = makeAgent({
+      agent_type: "deepseek" as AgentType,
+      env: {
+        DEEPSEEK_API_KEY: "sk-new",
+        DEEPSEEK_ACP_MODEL: "deepseek-v4-pro",
+      },
+    })
+
+    const next = rebaseDeepSeekDraft(draft, agent)
+    const lines = next.envText.split("\n").sort()
+    expect(lines).toEqual([
+      "DEEPSEEK_ACP_MODEL=deepseek-v4-flash",
+      "DEEPSEEK_API_KEY=sk-new",
+      "SOMETHING_ELSE=keep-me",
+    ])
+    // The structured mirrors are recomputed from the patched text.
+    expect(next.apiKey).toBe("sk-new")
+    expect(next.model).toBe("deepseek-v4-flash")
+  })
+
+  it("does not rebase for a model-only change", () => {
+    // The model is not a panel key, so a model that moved elsewhere is not a
+    // reason to rewrite the draft (and risk a half-typed line in it).
+    const draft = draftOf("DEEPSEEK_ACP_MODEL=deepseek-v4-flash\nKEEP=1")
+    const agent = makeAgent({
+      agent_type: "deepseek" as AgentType,
+      env: { DEEPSEEK_ACP_MODEL: "deepseek-v4-pro" },
+    })
+    expect(rebaseDeepSeekDraft(draft, agent)).toBe(draft)
+  })
+
+  it("deletes a panel key the persisted env no longer has", () => {
+    const draft = draftOf("DEEPSEEK_BASE_URL=https://old.example.com\nKEEP=1")
+    const agent = makeAgent({ agent_type: "deepseek" as AgentType, env: {} })
+    expect(rebaseDeepSeekDraft(draft, agent).envText).toBe("KEEP=1")
+  })
+
+  it("returns the SAME object when nothing moved", () => {
+    // A no-op refresh must not invalidate the draft identity.
+    const draft = draftOf("DEEPSEEK_API_KEY=sk-1\nOTHER=2")
+    const agent = makeAgent({
+      agent_type: "deepseek" as AgentType,
+      env: { DEEPSEEK_API_KEY: "sk-1", OTHER: "ignored" },
+    })
+    expect(rebaseDeepSeekDraft(draft, agent)).toBe(draft)
+  })
+
+  it("keeps comments and half-typed lines when a key DID move", () => {
+    // The patch is textual: only the lines it owns are rewritten. A parse-and-
+    // reserialize would drop all three of these, and this rebase runs on the
+    // refresh that follows the panel's own save — i.e. while the user may well
+    // be typing in the raw editor next to it.
+    const draft = draftOf(
+      "# proxy for the office network\nDEEPSEEK_API_KEY=sk-old\n\nNEW_PROXY\nKEEP=1"
+    )
+    const agent = makeAgent({
+      agent_type: "deepseek" as AgentType,
+      env: { DEEPSEEK_API_KEY: "sk-new" },
+    })
+    expect(rebaseDeepSeekDraft(draft, agent).envText).toBe(
+      "# proxy for the office network\nDEEPSEEK_API_KEY=sk-new\n\nNEW_PROXY\nKEEP=1"
+    )
+  })
+
+  it("survives an env var named after an Object.prototype member", () => {
+    // `constructor`, `toString` and friends are legal env var names, and a
+    // plain object answers `in` for all of them — reading one back yields a
+    // function where a string was expected and throws mid-patch, after the
+    // backend has already committed the save this rebase follows.
+    const draft = draftOf(
+      "constructor=keep\ntoString=keep\nDEEPSEEK_API_KEY=old"
+    )
+    const agent = makeAgent({
+      agent_type: "deepseek" as AgentType,
+      env: { DEEPSEEK_API_KEY: "sk-new" },
+    })
+    expect(rebaseDeepSeekDraft(draft, agent).envText).toBe(
+      "constructor=keep\ntoString=keep\nDEEPSEEK_API_KEY=sk-new"
+    )
+  })
+
+  it("appends a new key above a trailing blank line", () => {
+    // That blank line is usually the one the user just pressed Enter on.
+    const draft = draftOf("KEEP=1\n")
+    const agent = makeAgent({
+      agent_type: "deepseek" as AgentType,
+      env: { DEEPSEEK_API_KEY: "sk-1" },
+    })
+    expect(rebaseDeepSeekDraft(draft, agent).envText).toBe(
+      "KEEP=1\nDEEPSEEK_API_KEY=sk-1\n"
+    )
+  })
+
+  it("treats a present-but-empty key as different from a missing one", () => {
+    // `patchEnvText` deletes a key whose persisted value is empty, so `KEY=`
+    // left in the draft IS a difference. The enable switch persists the draft
+    // wholesale, and an empty DEEPSEEK_BASE_URL is not "use the default" — it
+    // is an empty endpoint, which the adapter turns into an unusable URL.
+    const draft = draftOf("DEEPSEEK_BASE_URL=\nKEEP=1")
+    const agent = makeAgent({ agent_type: "deepseek" as AgentType, env: {} })
+    expect(rebaseDeepSeekDraft(draft, agent).envText).toBe("KEEP=1")
+  })
+
+  it("leaves a draft mid-edit alone when no panel key moved", () => {
+    // The rebase runs on every `refreshAgents`, including the one after an
+    // unrelated save. Folding the keys in reparses and reserializes the whole
+    // text, which drops comments, blank lines and a half-typed key — so the
+    // decision has to be made on the VALUES, before any rewrite.
+    const draft = draftOf(
+      "# proxy for the office network\nDEEPSEEK_API_KEY=sk-1\n\nNEW_PROXY"
+    )
+    const agent = makeAgent({
+      agent_type: "deepseek" as AgentType,
+      env: { DEEPSEEK_API_KEY: "sk-1" },
+    })
+    expect(rebaseDeepSeekDraft(draft, agent)).toBe(draft)
+  })
+})
+
+describe("important env keys", () => {
+  // Qoder is the only agent with an EMPTY slot (it talks solely to its own
+  // service, so there is no endpoint variable). `keys.apiBaseUrl[0]` is then
+  // `undefined`, and the writer used to hand that straight to `patchEnvText` —
+  // producing an env line literally named `undefined` and silently swallowing
+  // the value the user typed.
+  it("never writes an `undefined` key for a slot the agent has no var for", () => {
+    expect(importantEnvKeysByAgent("qoder" as AgentType).apiBaseUrl).toEqual([])
+    const before = "QODER_MODEL=qmodel_38max"
+    const after = patchEnvByImportantKey(
+      "qoder" as AgentType,
+      before,
+      "apiBaseUrl",
+      "https://example.com"
+    )
+    expect(after).toBe(before)
+    expect(after).not.toContain("undefined")
+  })
+
+  // …and the field is hidden, so the no-op above is unreachable in practice
+  // rather than a silently-ignored input the user can type into.
+  it("hides only the fields whose slot is empty", () => {
+    expect(importantFieldsFor("qoder" as AgentType)).toEqual({
+      apiBaseUrl: false,
+      apiKey: true,
+      model: true,
+    })
+    expect(importantFieldsFor("deepseek" as AgentType)).toEqual({
+      apiBaseUrl: true,
+      apiKey: true,
+      model: true,
+    })
+    // The generic fallback keeps all three for agents with no special-casing.
+    expect(importantFieldsFor("open_code" as AgentType)).toEqual({
+      apiBaseUrl: true,
+      apiKey: true,
+      model: true,
+    })
+  })
+
+  // The credential Qoder actually reads. Generic OPENAI_*/API_KEY aliases must
+  // stay out: Qoder reads neither, so listing them would let the auth panel
+  // report "configured" off a key that never reaches the agent.
+  it("writes Qoder's PAT and model to the vars the CLI documents", () => {
+    const keys = importantEnvKeysByAgent("qoder" as AgentType)
+    expect(keys.apiKey).toEqual(["QODER_PERSONAL_ACCESS_TOKEN"])
+    expect(keys.model).toEqual(["QODER_MODEL"])
+
+    const withPat = patchEnvByImportantKey(
+      "qoder" as AgentType,
+      "",
+      "apiKey",
+      "pat-123"
+    )
+    expect(withPat).toBe("QODER_PERSONAL_ACCESS_TOKEN=pat-123")
+    expect(
+      patchEnvByImportantKey(
+        "qoder" as AgentType,
+        withPat,
+        "model",
+        "qmodel_38max"
+      )
+    ).toContain("QODER_MODEL=qmodel_38max")
   })
 })

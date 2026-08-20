@@ -32,17 +32,23 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::acp::background_watch;
 use crate::acp::error::AcpError;
-use crate::acp::file_system_runtime::{FileSystemRuntime, FileSystemRuntimeError, FsAccessPolicy};
+use crate::acp::file_system_runtime::{
+    FileSystemRuntime, FileSystemRuntimeError, FsAccessPolicy, FS_POLICY_ENV,
+};
+use crate::acp::host_tools_policy::{HostToolsPolicy, HOST_TOOLS_ENV};
 use crate::acp::registry::{self, AgentDistribution};
 use crate::acp::session_state::SessionState;
 use crate::acp::stderr_tail::{summarize_parser_error, StderrTail, TailScope};
-use crate::acp::terminal_runtime::{TerminalRuntime, TerminalRuntimeError};
+use crate::acp::terminal_runtime::{
+    TerminalRuntime, TerminalRuntimeError, TerminalShellRuntimeConfig,
+};
 use crate::acp::types::{
     AcpEvent, AvailableCommandInfo, ConnectionInfo, ConnectionStatus, GrokModelSpec,
     PermissionOptionInfo, PlanEntryInfo, PromptCapabilitiesInfo, PromptInputBlock,
     SessionConfigBooleanInfo, SessionConfigKindInfo, SessionConfigOptionInfo,
     SessionConfigSelectGroupInfo, SessionConfigSelectInfo, SessionConfigSelectOptionInfo,
-    SessionModeInfo, SessionModeStateInfo, ToolCallImageInfo, UserMessageBlock,
+    SessionFailureRecord, SessionModeInfo, SessionModeStateInfo, ToolCallImageInfo,
+    UserMessageBlock,
 };
 use crate::logging::throttle::LeadingEdgeThrottle;
 use crate::models::agent::AgentType;
@@ -140,13 +146,43 @@ fn apply_grok_env_policy(merged: &mut Vec<(String, String)>, runtime_env: &BTree
 /// silently stripping codeg-mcp and with it ask_user_question / delegation /
 /// feedback / session_info. The late `retain` + `push` makes the override win
 /// over any user `runtime_env` twin, so the injection is guaranteed to survive.
-fn apply_codex_env_policy(agent_type: AgentType, merged: &mut Vec<(String, String)>) {
+/// Codex launch env policy. `initial_agent_mode` is the preset resolved from
+/// `~/.codex/config.toml` by `codex_launch_initial_agent_mode` — passed in rather
+/// than read here so this stays pure (and so its tests don't depend on whatever
+/// `~/.codex/config.toml` the developer happens to have).
+fn apply_codex_env_policy(
+    agent_type: AgentType,
+    merged: &mut Vec<(String, String)>,
+    initial_agent_mode: Option<&str>,
+) {
     if agent_type != AgentType::Codex {
         return;
     }
     let key = "DISABLE_MCP_CONFIG_FILTERING";
     merged.retain(|(k, _)| k != key);
     merged.push((key.to_string(), "true".to_string()));
+
+    // Make `~/.codex/config.toml`'s sandbox/approval choice mean something.
+    // codex-acp re-sends its own approvalPolicy + sandboxPolicy every turn from
+    // an `AgentMode` seeded once per session, so without this the user's config
+    // is silently overridden by the adapter's default `agent` preset (#442).
+    // Same shape as Grok's `--permission-mode` launch flag.
+    //
+    // A pre-existing value in the runtime env WINS: that is an explicit
+    // user-set key, a stronger signal than a config-file inference. A
+    // `preferred_mode_id` / `config_values["mode"]` still overrides this after
+    // connect via `set_config_option` — explicit choice > config inference.
+    let mode_key = "INITIAL_AGENT_MODE";
+    if merged
+        .iter()
+        .any(|(k, v)| k == mode_key && !v.trim().is_empty())
+    {
+        return;
+    }
+    if let Some(mode) = initial_agent_mode {
+        merged.retain(|(k, _)| k != mode_key);
+        merged.push((mode_key.to_string(), mode.to_string()));
+    }
 }
 
 /// Prepend `dir` to the PATH entry of `env`, seeding from `fallback_path` when
@@ -268,6 +304,12 @@ pub enum ConnectionCommand {
     },
     GoalControl {
         action: GoalControlAction,
+        /// Did the goal-control request LAND? Attached only by a caller that
+        /// intends to follow a successful control with an interrupt
+        /// (`ConnectionManager::goal_control`), because aborting the turn is
+        /// destructive and must not happen on the strength of a request the
+        /// agent rejected. `None` = fire-and-forget, nobody is listening.
+        reply: Option<tokio::sync::oneshot::Sender<bool>>,
     },
     Cancel,
     RespondPermission {
@@ -496,7 +538,7 @@ fn transcript_dir_for(agent_type: AgentType) -> Option<&'static str> {
 /// built-ins, and idempotent per session (a reconnect keeps the original
 /// header, so the session's original cwd/start time survive).
 fn record_transcript_header(agent_type: AgentType, session_id: &str, cwd: &str) {
-    record_transcript_header_continuing(agent_type, session_id, cwd, None);
+    drop(queue_transcript_header(agent_type, session_id, cwd, None));
 }
 
 /// [`record_transcript_header`] for a session that carries an existing
@@ -506,15 +548,46 @@ fn record_transcript_header(agent_type: AgentType, session_id: &str, cwd: &str) 
 /// agent session for the same conversation: the earlier turns stay where they
 /// are and this header links back to them, so the reader still sees one
 /// history. See [`crate::acp_transcript::TranscriptHeader::continues_from`].
-fn record_transcript_header_continuing(
+async fn record_transcript_header_continuing(
     agent_type: AgentType,
     session_id: &str,
     cwd: &str,
     continues_from: Option<&str>,
 ) {
-    let Some(dir) = transcript_dir_for(agent_type) else {
+    let Some(ack) = queue_transcript_header(agent_type, session_id, cwd, continues_from) else {
         return;
     };
+    // Wait for the link to be DURABLE before returning, so it is on disk before
+    // the caller emits `SessionStarted`. Same shape and same reason as
+    // `record_prompt` below: the writer is a background thread, and readers go
+    // to the file.
+    //
+    // The specific reader here is `acp::continued_session_ids`, which the
+    // session-binding guard consults to tell "this conversation continues under
+    // a new agent session" from "an unrelated session landed on this row". Emit
+    // first and a subscriber can read an empty chain, conclude the sessions are
+    // unrelated, and split the conversation in two — and nothing removes that
+    // row once the header lands, so the duplicate is permanent.
+    //
+    // Costs one disk write per continuation, i.e. per restart of a conversation
+    // whose agent forgot it. `record_prompt` accepts the same cost per TURN.
+    // A stalled writer falls back to the old racy behaviour after the timeout
+    // rather than blocking the session: the failure mode there is a duplicate
+    // row, never lost history.
+    if continues_from.is_some() {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(2000), ack).await;
+    }
+}
+
+/// Build and enqueue the header write. `None` for agents with their own store
+/// (nothing is recorded); otherwise the writer's completion ack.
+fn queue_transcript_header(
+    agent_type: AgentType,
+    session_id: &str,
+    cwd: &str,
+    continues_from: Option<&str>,
+) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    let dir = transcript_dir_for(agent_type)?;
     let mut header = crate::acp_transcript::TranscriptHeader::new(
         &agent_type.as_wire(),
         session_id,
@@ -524,7 +597,7 @@ fn record_transcript_header_continuing(
     if let Some(previous) = continues_from.filter(|p| !p.is_empty() && *p != session_id) {
         header = header.continuing(previous);
     }
-    drop(crate::acp_transcript::record_header(dir, &header));
+    Some(crate::acp_transcript::record_header(dir, &header))
 }
 
 /// Record an outgoing prompt for a custom agent, and wait (briefly) for it to
@@ -777,15 +850,40 @@ async fn build_agent(
                 if let Some(message) = pi_launch_preflight(runtime_env) {
                     return Err(AcpError::SdkNotInstalled(message));
                 }
-                // Trust the workspace codeg is launching pi into (default on, via
-                // the PI_ACP_TRUST_WORKSPACE env_json key) so pi loads the
-                // project's local config/skills without a redundant prompt. Gates
-                // config loading only, never execution; scoped, additive, and
-                // best-effort (never blocks the connect).
-                crate::commands::acp::seed_pi_workspace_trust(cwd, runtime_env);
+                // NOTE: codeg deliberately does NOT touch pi's `trust.json` here.
+                // It used to mark this workspace trusted on every launch, which
+                // made pi load the repo's own `.pi/*` — including `.pi/extensions`,
+                // JS/TS modules whose top level executes at pi startup with the
+                // user's permissions, before any prompt is sent. Because pi-acp
+                // spawns `pi --mode rpc` (no UI), pi's own default is to skip those
+                // resources, so the seeding was the sole reason they ran. Trust is
+                // now an explicit per-workspace decision surfaced in the UI
+                // (`acp_pi_set_project_trust`).
+                //
+                // Dropping the seeding does NOT retract the grants it already
+                // wrote: they persist in pi's user-level store and are inherited
+                // by every subdirectory, so a repo cloned into a folder some
+                // earlier session trusted is trusted before it is ever opened.
+                // Since pi resolves trust at startup and runs extensions
+                // immediately, an unconfirmed grant has to stop the launch here —
+                // a notice shown once the connection is up comes after the code it
+                // warns about has already run.
+                if let Some(message) =
+                    crate::commands::acp::pi_project_trust_launch_block(cwd, runtime_env)
+                {
+                    return Err(AcpError::PiProjectTrustRequired(message));
+                }
             }
             let mut merged_env = merge_agent_env(env, runtime_env);
-            apply_codex_env_policy(agent_type, &mut merged_env);
+            // Resolve the config-derived preset HERE (like Grok's
+            // `grok_launch_permission_mode` below) so the policy helper stays a
+            // pure function over the env list.
+            let codex_initial_mode = if agent_type == AgentType::Codex {
+                crate::commands::acp::codex_launch_initial_agent_mode()
+            } else {
+                None
+            };
+            apply_codex_env_policy(agent_type, &mut merged_env, codex_initial_mode.as_deref());
             // codex-acp 1.0.0 honors APP_SERVER_LOGS as a directory for its
             // adapter-side logs. Surface it only under CODEG_ACP_DEBUG so
             // default runs are unchanged; a directory-creation failure silently
@@ -1154,6 +1252,7 @@ pub async fn spawn_agent_connection(
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
+    terminal_shell_config: TerminalShellRuntimeConfig,
 ) -> Result<tokio::sync::oneshot::Receiver<()>, AcpError> {
     // Create the authoritative session state up front. Subsequent emit_with_state
     // calls write through this state and increment its seq counter so the first
@@ -1230,6 +1329,12 @@ pub async fn spawn_agent_connection(
     // relocation like `GROK_HOME` must move the allowed root along with the
     // agent's state. Uses the same `launch_cwd` the process and ACP session get.
     let fs_policy = FsAccessPolicy::from_env(&launch_cwd, agent_type, &runtime_env);
+
+    // Whether codeg hosts the `fs/*` + `terminal/*` channels at all, or hands
+    // them back to the agent so the agent's OWN sandbox covers them (#436).
+    // Resolved here for the same reason as `fs_policy`: it reads the full
+    // per-agent `runtime_env`, which does not survive into `run_connection`.
+    let host_tools = HostToolsPolicy::from_env(&runtime_env);
 
     // Forward only the codeg git credential helper keys into the terminal
     // runtime — not the agent's API tokens or model provider credentials.
@@ -1317,10 +1422,12 @@ pub async fn spawn_agent_connection(
             emitter_clone.clone(),
             Arc::clone(&state_clone),
             terminal_base_env,
+            terminal_shell_config,
             preferred_mode_id,
             preferred_config_values,
             delegation_injection,
             fs_policy,
+            host_tools,
             stderr_tail,
         )
         .await;
@@ -1422,8 +1529,19 @@ enum PendingPermission {
     },
 }
 
-impl PendingPermission {
+/// What [`PermissionQueue`] needs from a parked responder. Abstracted into a
+/// trait ONLY so the queue stays a pure state machine that unit tests can drive:
+/// sacp's `Responder` has private fields and no public constructor, so a real
+/// [`PendingPermission`] cannot be built outside a live ACP connection.
+trait PermissionResponder {
     /// Resolve with the user's chosen option id.
+    fn respond_selected(self, option_id: String);
+    /// Resolve as cancelled — the turn ended / connection tore down before the
+    /// user chose.
+    fn respond_cancelled(self);
+}
+
+impl PermissionResponder for PendingPermission {
     fn respond_selected(self, option_id: String) {
         match self {
             PendingPermission::Acp(responder) => {
@@ -1443,8 +1561,6 @@ impl PendingPermission {
         }
     }
 
-    /// Resolve as cancelled — the turn ended / connection tore down before the
-    /// user chose.
     fn respond_cancelled(self) {
         match self {
             PendingPermission::Acp(responder) => {
@@ -1462,8 +1578,336 @@ impl PendingPermission {
     }
 }
 
-/// Shared state for pending permission responders.
-type PendingPermissions = Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>;
+/// A permission card that is waiting for its turn on screen. Holds exactly the
+/// three fields `AcpEvent::PermissionRequest` carries, so promoting a queued
+/// entry is a move, not a rebuild.
+struct QueuedPermission {
+    request_id: String,
+    tool_call: serde_json::Value,
+    options: Vec<PermissionOptionInfo>,
+}
+
+/// What [`PermissionQueue::resolve`] decided.
+struct ResolvedPermission {
+    /// `false` when `request_id` was not ours (already answered, drained, or a
+    /// stale client) — the caller must then emit nothing at all.
+    answered: bool,
+    /// The card promoted onto the screen by this answer, if any.
+    next: Option<QueuedPermission>,
+}
+
+/// Per-connection permission state: the blocked responders AND the display
+/// queue, under ONE lock.
+///
+/// Why they must share a lock (#442): the responder map used to be the only
+/// state, and every `session/request_permission` emitted its card immediately.
+/// But a card is a SINGLE slot both in the snapshot
+/// (`SessionState.pending_permission`) and in the frontend reducer
+/// (`conn.pendingPermission`), so N concurrent requests collapsed to the last
+/// one — the earlier `request_id`s were no longer referenced by any client, so
+/// no `RespondPermission` could ever arrive for them and their responders sat
+/// parked until teardown, blocking the agent's tool calls forever (a work task
+/// then sat at `awaiting_input` because its outstanding-request set kept the
+/// orphan keys). Codex issues these concurrently: codex-acp forwards each
+/// `item/commandExecution/requestApproval` to its own `session/request_permission`
+/// and serializes only its notification queue, not approvals.
+///
+/// So: queue instead of overwrite — one card at a time, FIFO, nothing lost.
+/// Splitting the responder map from the queue would leave a real interleaving
+/// (the request handler runs on sacp's dispatch task, `Cancel` on the
+/// conversation task, so they interleave at every `.await`):
+///
+/// ```text
+/// handler: insert responder for P
+/// cancel : drain responders; clear queue      <- P's responder is gone
+/// handler: enqueue P; emit PermissionRequest(P)   <- clickable but inert card,
+///                                                   and `showing = P` wedges
+///                                                   every later request
+/// ```
+///
+/// Re-checking "is P still in the responder map" before emitting does NOT close
+/// that window (a drain can still land between the check and the publish). One
+/// lock covering both, with the emit performed INSIDE it (see
+/// [`admit_permission`]), makes "responder exists" and "card is on screen"
+/// atomic with respect to a drain.
+///
+/// Invariant, upheld by all three methods: every id in `showing`/`waiting` has a
+/// live entry in `responders`, and every `responders` key is either `showing` or
+/// in `waiting`. That makes "queued card whose responder is gone"
+/// unrepresentable, so promotion never has to skip dead entries.
+///
+/// LOCK ORDER: this mutex is always acquired BEFORE `SessionState`'s `RwLock`,
+/// never after. `emit_with_state` takes the state lock internally, so publishing
+/// while holding this mutex is the sanctioned direction; nothing may acquire
+/// this mutex while already holding a `SessionState` guard.
+struct PermissionQueue<R = PendingPermission> {
+    responders: HashMap<String, R>,
+    /// The card currently published to clients. `None` = nothing on screen.
+    showing: Option<String>,
+    waiting: VecDeque<QueuedPermission>,
+}
+
+// Hand-written rather than derived: `#[derive(Default)]` would demand
+// `R: Default`, which a responder never is.
+impl<R> Default for PermissionQueue<R> {
+    fn default() -> Self {
+        Self {
+            responders: HashMap::new(),
+            showing: None,
+            waiting: VecDeque::new(),
+        }
+    }
+}
+
+impl<R: PermissionResponder> PermissionQueue<R> {
+    /// Register a blocked responder and its card. Returns the card to publish
+    /// NOW — the newcomer itself when the screen was free, otherwise `None`
+    /// (it waits its turn).
+    fn admit(&mut self, responder: R, card: QueuedPermission) -> Option<QueuedPermission> {
+        self.responders.insert(card.request_id.clone(), responder);
+        if self.showing.is_none() {
+            self.showing = Some(card.request_id.clone());
+            Some(card)
+        } else {
+            self.waiting.push_back(card);
+            None
+        }
+    }
+
+    /// Answer `request_id` and advance the screen.
+    ///
+    /// Unknown / already-answered ids are an idempotent no-op (`answered:
+    /// false`) — two clients racing the same card must not double-respond to a
+    /// responder that has already been consumed.
+    fn resolve(&mut self, request_id: &str, option_id: String) -> ResolvedPermission {
+        let Some(pending) = self.responders.remove(request_id) else {
+            return ResolvedPermission {
+                answered: false,
+                next: None,
+            };
+        };
+        pending.respond_selected(option_id);
+        if self.showing.as_deref() == Some(request_id) {
+            let next = self.waiting.pop_front();
+            self.showing = next.as_ref().map(|c| c.request_id.clone());
+            ResolvedPermission {
+                answered: true,
+                next,
+            }
+        } else {
+            // Defensive: a stale client answered a card that never reached the
+            // screen. Drop its queue entry too, or promoting it later would
+            // surface a card with no responder — the state the invariant above
+            // exists to forbid.
+            self.waiting.retain(|c| c.request_id != request_id);
+            ResolvedPermission {
+                answered: true,
+                next: None,
+            }
+        }
+    }
+
+    /// Cancel every blocked responder and clear the queue. Returns the id of the
+    /// card that was on screen, which the caller MUST follow with a compensating
+    /// `PermissionResolved` — otherwise that card stays up on every client with
+    /// no live responder behind it, and a work task keeps its outstanding-request
+    /// key forever (the pre-existing idle-`Cancel` ghost, #442).
+    ///
+    /// Queued cards need no compensation: they were never published, so no
+    /// client rendered them and `track_request` never counted them.
+    fn drain(&mut self) -> Option<String> {
+        for (_, pending) in self.responders.drain() {
+            pending.respond_cancelled();
+        }
+        self.waiting.clear();
+        self.showing.take()
+    }
+
+    /// How many cards are waiting BEHIND the one on screen.
+    fn waiting_len(&self) -> usize {
+        self.waiting.len()
+    }
+}
+
+/// Shared per-connection permission state (responders + display queue).
+type PendingPermissions = Arc<tokio::sync::Mutex<PermissionQueue>>;
+
+/// `conn=<id> conv=<id>` for the permission log lines.
+///
+/// Whose permission a log line is about is not answerable from the request id
+/// alone, and the answer matters most exactly when it is a delegation
+/// sub-agent's — that connection has no tab, so a stall there is the one an
+/// operator is least able to see (#447). With the connection id here and
+/// `child_connection_id` on the `delegation_task` span, an external watchdog can
+/// join the two. `conv` is `-` until the row is bound.
+///
+/// Takes the `SessionState` read lock, so callers must hold the permission queue
+/// mutex — never the reverse (see [`PermissionQueue`]'s LOCK ORDER note).
+async fn permission_log_scope(state: &Arc<RwLock<SessionState>>) -> String {
+    let s = state.read().await;
+    match s.conversation_id {
+        Some(cid) => format!("conn={} conv={cid}", s.connection_id),
+        None => format!("conn={} conv=-", s.connection_id),
+    }
+}
+
+/// Register a blocked permission responder and publish its card if the screen is
+/// free. The emit happens INSIDE the queue lock — see [`PermissionQueue`] for why
+/// that is load-bearing rather than incidental.
+async fn admit_permission(
+    perms: &PendingPermissions,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    responder: PendingPermission,
+    card: QueuedPermission,
+) {
+    let mut queue = perms.lock().await;
+    let scope = permission_log_scope(state).await;
+    let request_id = card.request_id.clone();
+    match queue.admit(responder, card) {
+        Some(card) => {
+            tracing::info!(
+                "[ACP] permission {} shown {scope} (waiting={})",
+                card.request_id,
+                queue.waiting_len()
+            );
+            // `queued` is 0 by construction here: a card is only published when
+            // the screen was free, which means nothing was waiting.
+            emit_with_state(
+                state,
+                emitter,
+                AcpEvent::PermissionRequest {
+                    request_id: card.request_id,
+                    tool_call: card.tool_call,
+                    options: card.options,
+                    queued: 0,
+                },
+            )
+            .await;
+        }
+        None => {
+            let depth = queue.waiting_len();
+            tracing::info!(
+                "[ACP] permission {request_id} queued {scope} behind {:?} (waiting={depth})",
+                queue.showing,
+            );
+            // The visible card did not change, so nothing republishes it — send
+            // a depth-only update or its "N more waiting" hint goes stale.
+            emit_with_state(
+                state,
+                emitter,
+                AcpEvent::PermissionQueueDepth {
+                    depth: depth as u32,
+                },
+            )
+            .await;
+        }
+    }
+}
+
+/// Answer a permission card and promote the next one.
+///
+/// Publish order is deliberate: `PermissionRequest(next)` goes out BEFORE
+/// `PermissionResolved(request_id)`. Both clears are id-checked
+/// (`SessionState::apply_event`, and the frontend's `PERMISSION_CLEARED`), so the
+/// trailing resolve is a no-op against the newly-shown card rather than wiping
+/// it. It also keeps a work task's outstanding-request set from transiently
+/// emptying, which would otherwise flip the row `awaiting_input → running →
+/// awaiting_input` on every single approval.
+async fn resolve_permission(
+    perms: &PendingPermissions,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    request_id: String,
+    option_id: String,
+) {
+    let mut queue = perms.lock().await;
+    let resolved = queue.resolve(&request_id, option_id);
+    if !resolved.answered {
+        return;
+    }
+    // Pairs with the `shown` line: a watchdog reading only the raise side can't
+    // tell a permission the user answered in seconds from one that has been
+    // blocking the agent since. Resolved AFTER the idempotent no-op check, so a
+    // stale/duplicate answer costs no state read and logs nothing.
+    let scope = permission_log_scope(state).await;
+    tracing::info!("[ACP] permission {request_id} answered {scope}");
+    if let Some(card) = resolved.next {
+        let depth = queue.waiting_len();
+        tracing::info!(
+            "[ACP] permission {} promoted {scope} after {request_id} (waiting={depth})",
+            card.request_id,
+        );
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::PermissionRequest {
+                request_id: card.request_id,
+                tool_call: card.tool_call,
+                options: card.options,
+                // Unlike a fresh admit this can be non-zero: promotion happens
+                // with the rest of the queue still behind it.
+                queued: depth as u32,
+            },
+        )
+        .await;
+    }
+    emit_with_state(state, emitter, AcpEvent::PermissionResolved { request_id }).await;
+}
+
+/// Cancel every pending permission on this connection and clear the on-screen
+/// card via a compensating `PermissionResolved`.
+///
+/// Mirrors `ConnectionManager::compensate_if_question_drained`, which solves the
+/// same "broadcast card outlives its backend waiter" problem for questions.
+async fn drain_permissions(
+    perms: &PendingPermissions,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+) {
+    let mut queue = perms.lock().await;
+    drain_permissions_locked(&mut queue, state, emitter).await;
+}
+
+/// Drain, then publish `follow_up`, WITHOUT releasing the queue lock in between.
+///
+/// The two must be atomic whenever `follow_up` is `TurnComplete`, because
+/// `SessionState::apply_event` nulls `pending_permission` on that event
+/// unconditionally. With a plain drain followed by a separate emit, an
+/// `admit_permission` landing in the gap (the request handler runs on sacp's
+/// dispatch task, this on the conversation task) would publish its card and set
+/// `showing`, and then `TurnComplete` would silently un-display it on every
+/// client — leaving a live responder behind an id nobody can answer, and wedging
+/// every LATER permission behind it for the life of the connection. That is the
+/// exact failure mode this queue exists to prevent.
+///
+/// Holding the lock across both makes an in-flight admit wait until the turn has
+/// ended; its card then lands on an empty queue and displays normally as the
+/// out-of-turn request it now is.
+async fn drain_permissions_then_emit(
+    perms: &PendingPermissions,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    follow_up: AcpEvent,
+) {
+    let mut queue = perms.lock().await;
+    drain_permissions_locked(&mut queue, state, emitter).await;
+    emit_with_state(state, emitter, follow_up).await;
+}
+
+/// Shared body of the two drains above. Emits the compensating
+/// `PermissionResolved` for whatever was on screen; queued cards were never
+/// published, so they need none.
+async fn drain_permissions_locked(
+    queue: &mut PermissionQueue,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+) {
+    if let Some(request_id) = queue.drain() {
+        tracing::info!("[ACP] permission {request_id} cancelled by drain");
+        emit_with_state(state, emitter, AcpEvent::PermissionResolved { request_id }).await;
+    }
+}
 
 fn map_session_modes(mode_state: &SessionModeState) -> SessionModeStateInfo {
     SessionModeStateInfo {
@@ -2519,20 +2963,47 @@ async fn apply_and_emit_session_config_options(
     emit_session_config_options_values(state, emitter, agent_type, updated).await;
 }
 
+/// Grok's initialize still advertises `image: false` — the coding model
+/// cannot see pixels. Native ACP `image` blocks nevertheless run its
+/// image-describe sidecar. An image-mime `resource` blob does not: grok dumps
+/// it as `<file_contents type="binary">` and the model only gets a path.
+/// Advertise `image: true` so the composer sends Image blocks.
+///
+/// Measured live against 0.2.112, 1.0.0 and 1.0.3: every one of them still
+/// advertises `image: false`, accepts a native `image` block anyway, and answers
+/// correctly about the pixels — while the same bytes as a resource blob make the
+/// model invent an answer. The advertisement has simply been wrong for as long
+/// as codeg has supported grok, across every version tested, so this is
+/// deliberately NOT version-gated (and stays correct if grok ever starts
+/// advertising the truth: `image` is already true then). Deliberately no pinned
+/// version named here either — `registry.rs` moves on its own schedule, and a
+/// claim about "the pinned version" rots at the next bump.
+///
+/// This bit says only that grok takes image blocks AT ALL — it decodes just some
+/// formats, which is a per-mime question a single capability cannot answer, so
+/// [`normalize_grok_image_blocks`] settles that separately at dispatch.
+fn effective_prompt_capabilities(
+    agent_type: AgentType,
+    capabilities: &sacp::schema::PromptCapabilities,
+) -> PromptCapabilitiesInfo {
+    PromptCapabilitiesInfo {
+        image: capabilities.image || agent_type == AgentType::Grok,
+        audio: capabilities.audio,
+        embedded_context: capabilities.embedded_context,
+    }
+}
+
 async fn emit_prompt_capabilities(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
     capabilities: &sacp::schema::PromptCapabilities,
+    agent_type: AgentType,
 ) {
     emit_with_state(
         state,
         emitter,
         AcpEvent::PromptCapabilities {
-            prompt_capabilities: PromptCapabilitiesInfo {
-                image: capabilities.image,
-                audio: capabilities.audio,
-                embedded_context: capabilities.embedded_context,
-            },
+            prompt_capabilities: effective_prompt_capabilities(agent_type, capabilities),
         },
     )
     .await;
@@ -2578,7 +3049,13 @@ fn claude_raw_sdk_session_meta(
 /// gates. Extracted for testability — each gate is a documented product
 /// decision:
 ///
-/// - Everyone: filesystem read/write + terminal, for ACP tool execution.
+/// - Everyone, unless `host_tools` says otherwise: filesystem read/write +
+///   terminal, for ACP tool execution. Under
+///   [`HostToolsPolicy::Agent`] BOTH are withheld, which is not a narrowing of
+///   what the agent may do — it moves the doing back inside the agent's own
+///   process, where the agent's own OS sandbox and permission rules already
+///   apply (#436). Withholding one without the other buys nothing: the agent
+///   just reaches the same file through the channel it kept.
 /// - Codex only: form elicitation, so codex's native Plan-mode
 ///   `request_user_input` is delivered as `elicitation/create` (handled by
 ///   `handle_elicitation_request`) instead of being silently answered `{}`.
@@ -2598,19 +3075,73 @@ fn claude_raw_sdk_session_meta(
 ///   `claude_chunk_parent_tool_use_id`). The adapter checks strictly
 ///   `=== true`, and a pre-0.63 binary ignores the unknown key, so this is
 ///   inert everywhere it isn't understood.
-fn build_client_capabilities(agent_type: AgentType) -> ClientCapabilities {
-    let mut client_capabilities = ClientCapabilities::new().terminal(true).fs(
-        FileSystemCapabilities::new()
-            .read_text_file(true)
-            .write_text_file(true),
-    );
-    if agent_type == AgentType::Codex {
+fn build_client_capabilities(
+    agent_type: AgentType,
+    host_tools: HostToolsPolicy,
+) -> ClientCapabilities {
+    let mut client_capabilities = ClientCapabilities::new();
+    if host_tools.hosts_channels() {
+        client_capabilities = client_capabilities.terminal(true).fs(
+            FileSystemCapabilities::new()
+                .read_text_file(true)
+                .write_text_file(true),
+        );
+    }
+    // Form elicitation is advertised only to agents that are KNOWN to send
+    // spec-conformant `elicitation/create` forms `classify_elicitation` can
+    // bridge: codex-acp (Plan-mode `request_user_input`, MCP forms/approvals)
+    // and deepseek-acp (its `ask_user_question` + plan-review both build
+    // standard oneOf/anyOf forms, and decode a free-text answer that is not in
+    // the option set as a custom answer — the card's "Other" input round-trips
+    // cleanly). Agents without the bit fall back to their own
+    // `request_permission` button path.
+    if matches!(agent_type, AgentType::Codex | AgentType::DeepSeek) {
         client_capabilities = client_capabilities
             .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()));
     }
+    // Client `_meta` extensions, per agent. `jetbrains.air` opts codeg into
+    // JetBrains AIR typed session-failure records (claude-agent-acp 0.67+,
+    // codex-acp 1.2+) — both adapters gate publication on EXACTLY this
+    // advertisement (integer version >= 1 and "sessionFailure" in the
+    // capabilities array). Advertising REPLACES codex's legacy failure
+    // surfaces for the connection (`_meta.codex.error` → TurnRetrying,
+    // warning/config-warning text chunks), so this ships together with the
+    // `SessionFailure` consumer (`air_session_failure` + the frontend
+    // banner). Only the two known AIR speakers get it: the capability-gate
+    // convention is to advertise nothing an agent hasn't implemented.
+    let mut meta = serde_json::Map::new();
     if agent_type == AgentType::ClaudeCode {
-        let mut meta = serde_json::Map::new();
         meta.insert("subagent-transcript".to_string(), serde_json::Value::Bool(true));
+    }
+    // The capabilities array is deliberately "sessionFailure" ONLY.
+    // claude-agent-acp 0.69.0 and codex-acp 1.4.0 added a second AIR
+    // capability, "agentFileChangeReport": advertise it and every prompt may
+    // carry `_meta.jetbrains.air.agentFileChangeReportRequest = {version: 1,
+    // requestId}`, after which the agent runs an EXTRA model round-trip at the
+    // end of the turn (claude: a Stop hook plus a hidden continuation calling
+    // `mcp__claude_agent_acp__report_changed_files`; codex: an ephemeral
+    // read-only `thread/fork`) and answers on
+    // `session_info_update._meta.jetbrains.air.agentFileChangeReport`.
+    //
+    // codeg does not ask for it, and the reason is not cost alone: both
+    // adapters CLAMP the reported paths to `cwd` + `additionalDirectories`
+    // (anything outside a root is dropped as truncated), which is exactly the
+    // tree `workspace_state` already watches recursively via `notify`. So the
+    // report can only ever name a SUBSET of what the watcher sees, less
+    // reliably — it is a model self-report that declares `complete: false`
+    // when unsure and truncates at 1024 paths / 256KB. It exists for clients
+    // with no filesystem watcher; codeg is not one. Nothing else in either
+    // release depends on it, and both adapters no-op without the
+    // advertisement, so staying out costs us nothing.
+    if matches!(agent_type, AgentType::ClaudeCode | AgentType::Codex) {
+        meta.insert(
+            "jetbrains".to_string(),
+            serde_json::json!({
+                "air": { "version": 1, "capabilities": ["sessionFailure"] }
+            }),
+        );
+    }
+    if !meta.is_empty() {
         client_capabilities = client_capabilities.meta(meta);
     }
     client_capabilities
@@ -2779,9 +3310,22 @@ fn load_mcp_servers_for_agent(agent_type: AgentType) -> Vec<McpServer> {
     // wire here would double-register them — skip it. (The built-in
     // `codeg-mcp` companion is injected separately by `inject_codeg_mcp`, so
     // it still reaches them.)
+    //
+    // DeepSeek is deliberately NOT in this set: deepseek-acp reads no MCP file
+    // at all, so `$DSH_HOME/mcp.json` (codeg's own store) reaches it ONLY
+    // through the wire — skipping it would silently drop every user server.
+    //
+    // Qoder joins the skip set: the CLI reads `mcpServers` out of its own
+    // `~/.qoder/settings.json` (gemini-schema settings file) at startup, which
+    // codeg's MCP settings UI manages directly — forwarding the same servers
+    // over the wire would double-mount them.
     if matches!(
         agent_type,
-        AgentType::Hermes | AgentType::KimiCode | AgentType::Grok | AgentType::Cursor
+        AgentType::Hermes
+            | AgentType::KimiCode
+            | AgentType::Grok
+            | AgentType::Cursor
+            | AgentType::Qoder
     ) {
         return Vec::new();
     }
@@ -3065,6 +3609,7 @@ async fn inject_codeg_mcp(
     parent_connection_id: &str,
     working_dir: &Path,
     tasks_enabled: bool,
+    host_tools: HostToolsPolicy,
 ) -> Option<CompanionInjection> {
     // codeg-mcp carries BOTH the delegation tools and the live-feedback tool.
     // Inject it when EITHER feature is enabled; the `--features` arg tells the
@@ -3074,8 +3619,31 @@ async fn inject_codeg_mcp(
     // must get their reporting tools regardless of the settings toggles.
     let feedback_enabled = injection.feedback.is_enabled().await;
     let authoring = injection.authoring.snapshot().await;
+    // Delegation is a THIRD door into the same room as `fs/*` and `terminal/*`:
+    // `delegate_to_agent` has codeg spawn a second agent — in codeg's process
+    // tree, under ITS own (by default `Default`) policy — and hand its output
+    // back. A sandboxed agent that cannot read `.env` itself would just ask a
+    // sibling to read it. That defeats the boundary this switch advertises, for
+    // the same reason withholding only one of fs/terminal would, so `agent`
+    // withholds this group too. The other groups stay: they surface codeg's own
+    // state (feedback, ask, session info, task reporting), not arbitrary file
+    // or command execution on the user's machine.
+    let delegation_configured = injection.broker.config_snapshot().await.enabled;
+    let delegation_enabled = delegation_configured && host_tools.hosts_channels();
+    if delegation_configured && !delegation_enabled {
+        // The one combination that looks like a bug from the settings UI: the
+        // multi-agent switch reads "on" and the tools are still absent. Say so
+        // once per launch, naming the knob, so the log answers the question the
+        // user actually asks ("why did delegate_to_agent disappear?").
+        tracing::info!(
+            "[delegation] multi-agent delegation is enabled in settings but withheld from \
+             connection {parent_connection_id}: {HOST_TOOLS_ENV}=agent hands fs/terminal back \
+             to this agent, and delegate_to_agent would route the same work through codeg \
+             anyway. Turn that per-agent switch off to restore the delegation tools."
+        );
+    }
     let flags = CompanionFeatureFlags {
-        delegation: injection.broker.config_snapshot().await.enabled,
+        delegation: delegation_enabled,
         feedback: feedback_enabled,
         ask: injection.ask.is_enabled().await,
         sessions: injection.sessions.is_enabled().await,
@@ -3295,16 +3863,19 @@ async fn run_connection(
     emitter: EventEmitter,
     state: Arc<RwLock<SessionState>>,
     terminal_base_env: BTreeMap<String, String>,
+    terminal_shell_config: TerminalShellRuntimeConfig,
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
     fs_policy: FsAccessPolicy,
+    host_tools: HostToolsPolicy,
     // Connection-scoped agent stderr buffer, shared with the `with_debug`
     // callback installed by `build_agent`. Read only when a turn ends without
     // agent output, to attach evidence to the synthesized error.
     stderr_tail: Arc<StderrTail>,
 ) -> Result<(), AcpError> {
-    let pending_perms: PendingPermissions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let pending_perms: PendingPermissions =
+        Arc::new(tokio::sync::Mutex::new(PermissionQueue::default()));
     // `terminal_base_env` already filtered to just the credential helper
     // keys upstream — see `spawn_agent_connection` for the rationale and
     // why we don't forward the full agent runtime_env here.
@@ -3313,10 +3884,30 @@ async fn run_connection(
     // `terminal/create` without a `cwd` (e.g. CodeBuddy) runs in the folder the
     // conversation runs in rather than codeg's own process cwd.
     let terminal_runtime = Arc::new(
-        TerminalRuntime::with_base_env(terminal_base_env).with_default_cwd(Some(cwd.clone())),
+        TerminalRuntime::with_base_env(terminal_base_env)
+            .with_default_cwd(Some(cwd.clone()))
+            .with_default_shell_config(terminal_shell_config),
     );
     let cwd_string = cwd.to_string_lossy().to_string();
-    tracing::info!("[ACP] fs policy {}", fs_policy.describe());
+    // The connection's security posture in one place, so what a live session
+    // actually enforces is readable from the log rather than inferred.
+    tracing::info!(
+        "[ACP] fs policy {} | host tools {}",
+        fs_policy.describe(),
+        host_tools.describe()
+    );
+    // `strict` reads as a containment boundary and is not one while codeg also
+    // advertises `terminal`: an agent refused a read just `cat`s the file
+    // through the shell codeg runs for it (empirically what grok does). Say so
+    // rather than letting the knob's name do the promising.
+    if fs_policy.confines_reads() && host_tools.hosts_channels() {
+        tracing::warn!(
+            "[ACP] {FS_POLICY_ENV} confines the fs channel but codeg still advertises \
+             `terminal`, so an agent reaches the same paths through a shell — this is \
+             not a containment boundary. Set {HOST_TOOLS_ENV}=agent to hand file access \
+             and commands back to the agent, where its own sandbox applies."
+        );
+    }
     let file_system_runtime = Arc::new(FileSystemRuntime::with_policy(fs_policy));
 
     let conn_id = connection_id.clone();
@@ -3406,6 +3997,9 @@ async fn run_connection(
                 async move |req: ReadTextFileRequest,
                             responder: Responder<ReadTextFileResponse>,
                             _cx: ConnectionTo<Agent>| {
+                    if !host_tools.hosts_channels() {
+                        return refuse_unadvertised_channel(responder, "fs/read_text_file");
+                    }
                     respond_file_system_request(responder, runtime.read_text_file(req).await)?;
                     Ok(())
                 }
@@ -3418,6 +4012,9 @@ async fn run_connection(
                 async move |req: WriteTextFileRequest,
                             responder: Responder<WriteTextFileResponse>,
                             _cx: ConnectionTo<Agent>| {
+                    if !host_tools.hosts_channels() {
+                        return refuse_unadvertised_channel(responder, "fs/write_text_file");
+                    }
                     respond_file_system_request(responder, runtime.write_text_file(req).await)?;
                     Ok(())
                 }
@@ -3430,6 +4027,9 @@ async fn run_connection(
                 async move |req: CreateTerminalRequest,
                             responder: Responder<CreateTerminalResponse>,
                             _cx: ConnectionTo<Agent>| {
+                    if !host_tools.hosts_channels() {
+                        return refuse_unadvertised_channel(responder, "terminal/create");
+                    }
                     respond_terminal_request(responder, runtime.create_terminal(req).await)?;
                     Ok(())
                 }
@@ -3442,6 +4042,9 @@ async fn run_connection(
                 async move |req: TerminalOutputRequest,
                             responder: Responder<TerminalOutputResponse>,
                             _cx: ConnectionTo<Agent>| {
+                    if !host_tools.hosts_channels() {
+                        return refuse_unadvertised_channel(responder, "terminal/output");
+                    }
                     respond_terminal_request(responder, runtime.terminal_output(req).await)?;
                     Ok(())
                 }
@@ -3454,6 +4057,12 @@ async fn run_connection(
                 async move |req: WaitForTerminalExitRequest,
                             responder: Responder<WaitForTerminalExitResponse>,
                             cx: ConnectionTo<Agent>| {
+                    if !host_tools.hosts_channels() {
+                        // Refuse INLINE, before the spawn below: there is no
+                        // terminal to wait on, so answering immediately is
+                        // correct and keeps the refusal off the spawn path.
+                        return refuse_unadvertised_channel(responder, "terminal/wait_for_exit");
+                    }
                     // `terminal/wait_for_exit` blocks until the command exits,
                     // and sacp awaits request handlers INSIDE its single
                     // dispatch loop ("the loop awaits the handler to completion
@@ -3491,6 +4100,9 @@ async fn run_connection(
                 async move |req: KillTerminalRequest,
                             responder: Responder<KillTerminalResponse>,
                             _cx: ConnectionTo<Agent>| {
+                    if !host_tools.hosts_channels() {
+                        return refuse_unadvertised_channel(responder, "terminal/kill");
+                    }
                     respond_terminal_request(responder, runtime.kill_terminal(req).await)?;
                     Ok(())
                 }
@@ -3503,6 +4115,9 @@ async fn run_connection(
                 async move |req: ReleaseTerminalRequest,
                             responder: Responder<ReleaseTerminalResponse>,
                             _cx: ConnectionTo<Agent>| {
+                    if !host_tools.hosts_channels() {
+                        return refuse_unadvertised_channel(responder, "terminal/release");
+                    }
                     respond_terminal_request(responder, runtime.release_terminal(req).await)?;
                     Ok(())
                 }
@@ -3581,7 +4196,7 @@ async fn run_connection(
             let agent_name_for_log = registry::get_agent_meta(agent_type).name;
 
             let init_request = InitializeRequest::new(ProtocolVersion::LATEST)
-                .client_capabilities(build_client_capabilities(agent_type));
+                .client_capabilities(build_client_capabilities(agent_type, host_tools));
             // Bound the Initialize handshake so an outdated / incompatible
             // cached binary that never responds can't leave the frontend
             // stuck on "Connecting...". A healthy agent answers in <1s; we
@@ -3632,6 +4247,7 @@ async fn run_connection(
                 &state,
                 &emitter_clone,
                 &init_resp.agent_capabilities.prompt_capabilities,
+                agent_type,
             )
             .await;
 
@@ -3675,6 +4291,22 @@ async fn run_connection(
                 init_resp.agent_info.as_ref().map(|i| i.version.as_str()),
                 native_steering_available
             );
+
+            // Goal channel selection, pinned for the whole connection: an
+            // adapter advertising the provider-neutral goal extension
+            // (`_meta.goal`, claude-agent-acp 0.66+/codex-acp 1.2+) publishes
+            // goal snapshots ONLY there — and codex dropped the legacy
+            // `_meta.codex.goal` key in the same release, so honoring the
+            // advertisement is what keeps GoalCard alive across the bump (see
+            // `session_info_goal_value`).
+            let neutral_goal_channel = init_advertises_goal(init_resp.meta.as_ref());
+            if neutral_goal_channel {
+                tracing::info!("[ACP][{}] goal channel: provider-neutral (_meta.goal)", agent_type);
+            }
+            // Advertised goal-control surface (method + action vocabulary);
+            // None keeps the legacy codex method and resolves the vocabulary to
+            // the legacy pair — see the SessionState field docs.
+            let goal_control = goal_advertised_control(init_resp.meta.as_ref());
 
             // Whether this agent accepts MCP server entries over the ACP wire
             // (`session/new`'s `mcpServers`). Almost all do; OpenClaw rejects
@@ -3745,7 +4377,15 @@ async fn run_connection(
                     // task_progress / task_complete tool group.
                     let tasks_enabled =
                         { state.read().await.owner_window_label == "work_task" };
-                    inject_codeg_mcp(&mut mcp_servers, inj, &conn_id, &cwd, tasks_enabled).await
+                    inject_codeg_mcp(
+                        &mut mcp_servers,
+                        inj,
+                        &conn_id,
+                        &cwd,
+                        tasks_enabled,
+                        host_tools,
+                    )
+                    .await
                 } else {
                     None
                 }
@@ -3759,6 +4399,17 @@ async fn run_connection(
                 // that needs no tool; OpenClaw-style `supports_mcp: false`
                 // agents could ship it someday).
                 s.native_steering_available = native_steering_available;
+                s.neutral_goal_channel = neutral_goal_channel;
+                // The vocabulary is decided HERE for every adapter, advertising
+                // or not — this assignment is what flips it from "unknown" to
+                // known, and a client reading the snapshot before it lands must
+                // see `None` rather than a legacy pair it would latch (a claude
+                // session offering a Pause the adapter rejects).
+                let (goal_method, goal_actions) = resolve_goal_control(goal_control);
+                if let Some(method) = goal_method {
+                    s.goal_control_method = method;
+                }
+                s.goal_actions = Some(goal_actions);
                 if let Some(ref injected) = delegate_injection {
                     s.delegation_token = Some(injected.token.clone());
                     // The agent's actual feedback capability for this session
@@ -4038,9 +4689,19 @@ async fn run_connection(
                                     .otherwise(async |dispatch| {
                                         // Historical replay: throwaway state,
                                         // mirroring the sibling closure above.
+                                        // An ext notification that raises an
+                                        // ALERT is skipped, though — a
+                                        // compaction failure or a dropped image
+                                        // recorded in a past session is not
+                                        // happening now, and that path also
+                                        // fires an OS notification. The typed
+                                        // closure above draws the same line by
+                                        // forwarding only AvailableCommands.
                                         let mut replay_cb_state =
                                             CodeBuddyLiveState::default();
-                                        maybe_emit_ext_notification(&st, &h, agent_type, dispatch, &mut replay_cb_state).await;
+                                        if !grok_ext_notification_is_alert(&dispatch, agent_type) {
+                                            maybe_emit_ext_notification(&st, &h, agent_type, dispatch, &mut replay_cb_state).await;
+                                        }
                                         Ok(())
                                     })
                                     .await;
@@ -4224,12 +4885,17 @@ async fn run_connection(
                         // Same conversation, new agent session: link the fresh
                         // transcript to the one the failed load was for, so the
                         // turns codeg already recorded keep rendering.
+                        // Awaited: the link must be on disk before
+                        // `SessionStarted` goes out, or the session-binding
+                        // guard can read an empty chain and split this
+                        // conversation into a permanent duplicate.
                         record_transcript_header_continuing(
                             agent_type,
                             &fallback_sid,
                             &cwd.to_string_lossy(),
                             Some(sid.as_str()),
-                        );
+                        )
+                        .await;
                         emit_with_state(
                             &state,
                             &emitter_clone,
@@ -4699,17 +5365,15 @@ async fn handle_elicitation_request(
                     meta: None,
                 })
                 .collect();
-            perms.lock().await.insert(
-                request_id.clone(),
+            admit_permission(
+                perms,
+                state,
+                emitter,
                 PendingPermission::CodexElicitation {
                     responder,
                     approval,
                 },
-            );
-            emit_with_state(
-                state,
-                emitter,
-                AcpEvent::PermissionRequest {
+                QueuedPermission {
                     request_id,
                     tool_call,
                     options,
@@ -4915,15 +5579,12 @@ async fn handle_permission_request(
         }
     }
 
-    perms
-        .lock()
-        .await
-        .insert(request_id.clone(), PendingPermission::Acp(responder));
-
-    emit_with_state(
+    admit_permission(
+        perms,
         state,
         emitter,
-        AcpEvent::PermissionRequest {
+        PendingPermission::Acp(responder),
+        QueuedPermission {
             request_id,
             tool_call: tool_call_value,
             options,
@@ -4940,6 +5601,34 @@ fn respond_terminal_request<T: sacp::JsonRpcResponse>(
         Ok(response) => responder.respond(response),
         Err(error) => responder.respond_with_error(error.into_rpc_error()),
     }
+}
+
+/// Refuse a channel this launch never advertised
+/// ([`HostToolsPolicy::Agent`], #436). Withholding the capability is a
+/// DECLARATION; a non-conforming agent can still call the method, and if codeg
+/// then served it the whole switch would be a suggestion — the operation would
+/// land back in codeg's process, outside the agent's sandbox, which is exactly
+/// the bug. `method_not_found` is the honest wire answer: as far as this
+/// connection is concerned the method does not exist, which is what the agent
+/// was told on Initialize.
+fn refuse_unadvertised_channel<T: sacp::JsonRpcResponse>(
+    responder: Responder<T>,
+    method: &str,
+) -> Result<(), sacp::Error> {
+    tracing::warn!(
+        "[ACP] refusing {method}: {HOST_TOOLS_ENV}=agent, so this channel was never \
+         advertised — the agent must use its own (sandboxable) tools"
+    );
+    responder.respond_with_error(unadvertised_channel_error(method))
+}
+
+/// The error [`refuse_unadvertised_channel`] answers with. Split out because a
+/// `Responder` cannot be built outside a live connection, so this is the part
+/// of the refusal a unit test can pin; the wiring itself is covered end-to-end.
+fn unadvertised_channel_error(method: &str) -> sacp::Error {
+    sacp::Error::method_not_found().data(format!(
+        "codeg does not host {method} for this agent ({HOST_TOOLS_ENV}=agent)"
+    ))
 }
 
 fn respond_file_system_request<T: sacp::JsonRpcResponse>(
@@ -4990,9 +5679,56 @@ async fn set_session_config_option(
         .and_then(|opts| opts.iter().find(|o| o.id == config_id))
         .is_some_and(|o| matches!(o.kind, SessionConfigKindInfo::Boolean(_)));
     let value = encode_config_option_value(is_boolean, &value_id);
-    let updated = set_session_config_option_inner(cx, session_id, config_id, value).await?;
+    let updated =
+        set_session_config_option_inner(cx, session_id, config_id.clone(), value).await?;
+    // Compare BEFORE emitting: the agent's answer is the only place a request and
+    // its outcome are correlated. Once the option list is broadcast it is
+    // indistinguishable from an unsolicited update.
+    if let Some(rejection) =
+        config_option_rejection(&map_session_config_options(&updated), &config_id, &value_id)
+    {
+        emit_with_state(state, emitter, rejection).await;
+    }
     emit_session_config_options_values(state, emitter, agent_type, updated).await;
     Ok(())
+}
+
+/// Build a [`AcpEvent::ConfigOptionRejected`] when the agent's answer settled the
+/// option somewhere other than where the request asked.
+///
+/// Takes the mapped form so grouped and ungrouped selects are already flattened
+/// into one value list. Returns `None` when the pick was honoured, when the agent
+/// didn't advertise the option at all (nothing to compare against), or for a
+/// non-select kind — silence is the right default, since a spurious "your pick was
+/// changed" notice is worse than none.
+fn config_option_rejection(
+    updated: &[SessionConfigOptionInfo],
+    config_id: &str,
+    requested: &str,
+) -> Option<AcpEvent> {
+    let option = updated.iter().find(|o| o.id == config_id)?;
+    let SessionConfigKindInfo::Select(select) = &option.kind else {
+        return None;
+    };
+    if select.current_value == requested {
+        return None;
+    }
+    // Labels, not ids: the composer's dropdown shows names, so the notice has to
+    // name the same things the user was looking at.
+    let label = |value: &str| {
+        select
+            .options
+            .iter()
+            .find(|item| item.value == value)
+            .map(|item| item.name.clone())
+            .unwrap_or_else(|| value.to_string())
+    };
+    Some(AcpEvent::ConfigOptionRejected {
+        config_id: config_id.to_string(),
+        option_name: option.name.clone(),
+        requested: label(requested),
+        actual: label(&select.current_value),
+    })
 }
 
 /// Encode a selector value for `session/set_config_option`.
@@ -5050,14 +5786,21 @@ async fn set_session_config_option_inner(
     Ok(response.config_options)
 }
 
-/// Send codex's bespoke `_codex/session/goal_control` extension request to pause
-/// or clear the session's active goal (codex-acp #293, v1.1.4). Start / resume /
-/// re-objective are NOT this method — they go through the `/goal` prompt.
+/// Send the connection's goal-control extension request to pause or clear the
+/// session's active goal — the advertised `_session/goal` (claude 0.66+ / codex
+/// 1.2+) or codex's bespoke `_codex/session/goal_control` (#293, v1.1.4) it
+/// still accepts as an alias. Start / resume / re-objective are NOT this method
+/// — they go through the `/goal` prompt.
 ///
-/// codex replies with an empty object and then pushes the resulting goal
-/// snapshot as a normal `session_info_update` (`_meta.codex.goal`, or `null` for
-/// a clear), which the existing goal-card path renders — so the response value
-/// carries nothing to parse and is intentionally discarded.
+/// The agent replies with an empty object and then pushes the resulting goal
+/// snapshot as a normal `session_info_update` (`_meta.goal`, the legacy
+/// `_meta.codex.goal`, or `null` for a clear), which the existing goal-card
+/// path renders — so the response value carries nothing to parse and is
+/// intentionally discarded.
+///
+/// This request does NOT stop a running turn on either adapter; that is the
+/// manager's call (see `ConnectionManager::goal_control`), because whether an
+/// interrupt is safe depends on how the adapter delivers the control.
 ///
 /// Sent via `UntypedMessage` because `_codex/…` is a codex-private extension
 /// method with no sacp typed variant — the same escape hatch used for
@@ -5066,12 +5809,17 @@ async fn send_goal_control(
     cx: &ConnectionTo<Agent>,
     session_id: &SessionId,
     action: GoalControlAction,
+    method: &str,
 ) -> Result<(), sacp::Error> {
+    // `method` is the connection's stored `goal_control_method`: the
+    // advertised provider-neutral `_session/goal` (claude 0.66+/codex 1.2+)
+    // or the legacy `_codex/session/goal_control` default. Both take the
+    // same `{sessionId, action}` request shape.
     let params = serde_json::json!({
         "sessionId": session_id,
         "action": action,
     });
-    let untyped_req = UntypedMessage::new("_codex/session/goal_control", params).map_err(|e| {
+    let untyped_req = UntypedMessage::new(method, params).map_err(|e| {
         sacp::util::internal_error(format!("Failed to build goal_control request: {e}"))
     })?;
     cx.send_request_to(Agent, untyped_req).block_task().await?;
@@ -5428,10 +6176,32 @@ fn extract_terminal_ids(content: &[ToolCallContent]) -> Vec<String> {
     terminal_ids
 }
 
+/// Register the terminals a tool call names so `poll_tracked_terminal_tool_calls`
+/// can stream their output, returning whether the poller should run now.
+///
+/// A terminal pi hosts itself is excluded: pi names it by its own tool-call id
+/// (see `pi_terminal_meta_marks_bash`), so it can never resolve against
+/// `TerminalRuntime`. Tracking one bought a map entry plus ten 200 ms polls per
+/// bash call that could only ever miss — the misses are swallowed as
+/// `InvalidParams` in `poll_terminal_tool_call_output`, so the entry just aged
+/// out silently at `TERMINAL_POLL_MISSING_LIMIT`. pi's output arrives on its
+/// `_meta` channel instead and is bridged in `emit_conversation_update`.
+///
+/// Keyed off pi's own marker rather than off `AgentType::Pi` wholesale, so a
+/// future pi-acp that DOES delegate `terminal/*` is polled normally.
 fn track_terminal_tool_calls(
+    agent_type: AgentType,
     update: &SessionUpdate,
     tracked: &mut HashMap<String, TrackedTerminalToolCall>,
 ) -> bool {
+    let meta = match update {
+        SessionUpdate::ToolCall(tc) => tc.meta.as_ref(),
+        SessionUpdate::ToolCallUpdate(tcu) => tcu.meta.as_ref(),
+        _ => None,
+    };
+    if pi_terminal_meta_marks_bash(agent_type, meta) {
+        return false;
+    }
     match update {
         SessionUpdate::ToolCall(tc) => {
             let terminal_ids = extract_terminal_ids(&tc.content);
@@ -5730,6 +6500,85 @@ async fn journal_turn_span(
     // missing footer clock. (See `turn_timings`' module docs for the two
     // narrow accepted residuals where missing lines can shift alignment.)
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ack).await;
+}
+
+/// The image mime types grok's normalizer actually decodes — verbatim the set
+/// its own clipboard reader accepts (`xai-grok-shared/src/clipboard.rs`), and
+/// the boundary between the two carriages in [`normalize_grok_image_blocks`].
+///
+/// Measured against grok 1.0.0: png / webp / bmp / tiff round-trip through the
+/// describe sidecar (jpeg is one of the two formats grok itself re-encodes to,
+/// gif rides the same table). `image/svg+xml` does NOT — its validator answers
+/// `unsupported or unrecognised image format` and the image never reaches the
+/// model. Deliberately an allow-list, not a `image/*` prefix test: a mime we
+/// have no evidence for keeps the resource carriage, which is where it already
+/// was, so a wrong guess here can never be a regression.
+fn grok_decodes_image_mime(mime: &str) -> bool {
+    matches!(
+        mime.trim().to_ascii_lowercase().as_str(),
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp" | "image/tiff"
+    )
+}
+
+/// Whether a mime names an image at all — the outer guard on the demotion, so a
+/// malformed `Image` block carrying something else entirely is left untouched.
+/// Normalized exactly like [`grok_decodes_image_mime`]: if the two guards
+/// disagreed about the same string (`IMAGE/SVG+XML` reads as "not an image" to a
+/// case-sensitive test), an undecodable format would slip through as native.
+fn is_image_mime(mime: &str) -> bool {
+    mime.trim().to_ascii_lowercase().starts_with("image/")
+}
+
+/// Put every attached image on the carriage grok can actually read.
+///
+/// Two encodings carry the same bytes and grok treats them very differently:
+///
+/// * A native `Image` block runs its describe sidecar — the ONLY path where the
+///   model sees pixels (see [`effective_prompt_capabilities`]). But grok
+///   validates the format first and DROPS anything it cannot decode.
+/// * A `Resource` blob is saved into the session's `assets/` and announced to
+///   the model as a file path. No pixels, but for a text-shaped image (svg) the
+///   model can just read the source — measurably better than a drop.
+///
+/// So decodable images are promoted (queued drafts and work-task prompts
+/// composed before codeg advertised `image:true` still carry the old shape),
+/// and undecodable ones are demoted back — the composer only sees the single
+/// `image` capability bit and cannot make this call per mime.
+fn normalize_grok_image_blocks(blocks: Vec<PromptInputBlock>) -> Vec<PromptInputBlock> {
+    blocks
+        .into_iter()
+        .enumerate()
+        .map(|(index, block)| match block {
+            PromptInputBlock::Resource {
+                uri,
+                mime_type: Some(mime),
+                text: None,
+                blob: Some(blob),
+            } if grok_decodes_image_mime(&mime) && !blob.is_empty() => PromptInputBlock::Image {
+                data: blob,
+                mime_type: mime,
+                uri: Some(uri),
+            },
+            PromptInputBlock::Image {
+                data,
+                mime_type,
+                uri,
+            } if is_image_mime(&mime_type)
+                && !grok_decodes_image_mime(&mime_type)
+                && !data.is_empty() =>
+            {
+                PromptInputBlock::Resource {
+                    // A pasted image has no path; its position in this prompt is
+                    // the stable identifier, same as the work-task engine's.
+                    uri: uri.unwrap_or_else(|| format!("clipboard://grok-image-{index}")),
+                    mime_type: Some(mime_type),
+                    text: None,
+                    blob: Some(data),
+                }
+            }
+            other => other,
+        })
+        .collect()
 }
 
 fn map_prompt_blocks(blocks: Vec<PromptInputBlock>) -> Vec<ContentBlock> {
@@ -6048,7 +6897,8 @@ async fn handle_turn_notification(
     cb_state: &mut CodeBuddyLiveState,
     probe: &mut TurnOutputProbe,
 ) {
-    let should_poll_now = track_terminal_tool_calls(&notif.update, tracked_terminal_tool_calls);
+    let should_poll_now =
+        track_terminal_tool_calls(agent_type, &notif.update, tracked_terminal_tool_calls);
     probe.note_update(&notif.update);
     // Custom agents have no store of their own to parse later.
     record_transcript_update(agent_type, &session_id.0, &notif.update);
@@ -6524,6 +7374,16 @@ async fn run_conversation_loop<'a>(
                         .collect();
                     (crate::turn_timings::prompt_hash(&text), cursor_turn_ord)
                 });
+                // Grok: settle each image onto the carriage grok can read —
+                // decodable ones as native Image blocks (so its describe
+                // sidecar runs), the rest back as resource blobs. The last
+                // point that sees the blocks, so every producer (composer,
+                // queued draft, work task, delegation) is covered at once.
+                let blocks = if agent_type == AgentType::Grok {
+                    normalize_grok_image_blocks(blocks)
+                } else {
+                    blocks
+                };
                 let prompt_blocks = map_prompt_blocks(blocks);
                 if prompt_blocks.is_empty() {
                     // Defensive: the manager rejects empty prompts before the
@@ -6644,6 +7504,16 @@ async fn run_conversation_loop<'a>(
                 // background children legitimately span turns.
                 cb_state.grok_progress_eligible.clear();
                 cb_state.grok_pending_spawn_ids.clear();
+                // Same one-turn argument as the sub-agent sets above: a pi bash
+                // call's whole lifecycle (`tool_execution_start` → `_update`* →
+                // `_end`) happens inside one turn, so nothing here can still be
+                // owed output when the next turn opens. Without this, a turn
+                // canceled mid-command leaves an entry that never sees a final
+                // status and so lives until the connection tears down. The
+                // `session/load` replay path is unaffected: it runs on the
+                // out-of-turn pump and its calls settle on the update that
+                // immediately follows, before any turn starts.
+                cb_state.pi_terminal_calls.clear();
                 // Grok's context ring needs the active model's window paired
                 // with the cumulative token count riding each update. Resolve it
                 // once here (the model can't change mid-turn) so the per-update
@@ -6798,7 +7668,19 @@ async fn run_conversation_loop<'a>(
                                     if reason_str == "end_turn" {
                                         journal_turn_span(&mut turn_timing_probe, conn_id, &sid.0).await;
                                     }
-                                    emit_with_state(
+                                    // The turn is over, so any card still parked
+                                    // here is moot — `TurnComplete` clears
+                                    // `pending_permission` from the snapshot
+                                    // unconditionally. Drain and emit as ONE
+                                    // critical section so the queue can't keep a
+                                    // `showing` id that no `RespondPermission`
+                                    // will ever match, which would wedge the
+                                    // queue and stop every LATER permission on
+                                    // this connection from displaying. A no-op on
+                                    // the normal path (an agent blocked on
+                                    // approval does not end its turn).
+                                    drain_permissions_then_emit(
+                                        perms,
                                         state,
                                         emitter,
                                         AcpEvent::TurnComplete {
@@ -6845,7 +7727,26 @@ async fn run_conversation_loop<'a>(
                             }
                         }
                         prompt_result = &mut prompt_response => {
-                            let reason = prompt_result?.stop_reason;
+                            let response = prompt_result?;
+                            // A turn's terminal AIR failure rides on the
+                            // response `_meta` (see `response_session_failure`
+                            // — the update channel only carries the retry
+                            // warnings). Emit it BEFORE `TurnComplete`: the
+                            // same-id higher-revision severity-"error" upsert
+                            // must land before `apply_event`'s turn-boundary
+                            // settle, or the retry warnings it escalates would
+                            // be marked recovered while the failure is live.
+                            let terminal_failure =
+                                response_session_failure(response.meta.as_ref());
+                            if let Some(record) = &terminal_failure {
+                                emit_with_state(
+                                    state,
+                                    emitter,
+                                    AcpEvent::SessionFailure { record: record.clone() },
+                                )
+                                .await;
+                            }
+                            let reason = response.stop_reason;
                             if !tracked_terminal_tool_calls.is_empty() {
                                 poll_tracked_terminal_tool_calls(
                                     terminal_runtime.as_ref(),
@@ -6860,8 +7761,21 @@ async fn run_conversation_loop<'a>(
                             // Same pure helper as the StopReason-message exit,
                             // so the two can't drift. This exit keeps its own
                             // extra side effect (`record_turn_end` below).
-                            let (reason_str, empty_report) =
-                                finish_turn_reason(&probe, raw_reason_str, stderr_tail);
+                            //
+                            // Exception: a response carrying a typed terminal
+                            // ERROR is a failed turn wearing the adapters'
+                            // disguised `end_turn` — its blank output is
+                            // explained by the AIR banner, so synthesizing an
+                            // "empty" toast on top would misdiagnose a dead
+                            // connection as "the agent produced nothing".
+                            let (reason_str, empty_report) = if terminal_failure
+                                .as_ref()
+                                .is_some_and(|record| record.severity == "error")
+                            {
+                                (raw_reason_str, None)
+                            } else {
+                                finish_turn_reason(&probe, raw_reason_str, stderr_tail)
+                            };
                             if let Some(err_event) =
                                 turn_failure_error_event(reason_str, agent_type, empty_report.as_ref())
                             {
@@ -6886,7 +7800,11 @@ async fn run_conversation_loop<'a>(
                                 current_session_model_id(state).await,
                             )
                             .await;
-                            emit_with_state(
+                            // Same wedge guard as the StopReason-message exit
+                            // above — see that comment for why the drain and the
+                            // event must share one critical section.
+                            drain_permissions_then_emit(
+                                perms,
                                 state,
                                 emitter,
                                 AcpEvent::TurnComplete {
@@ -6928,15 +7846,10 @@ async fn run_conversation_loop<'a>(
                                     request_id,
                                     option_id,
                                 }) => {
-                                    if let Some(pending) = perms.lock().await.remove(&request_id) {
-                                        pending.respond_selected(option_id);
-                                        emit_with_state(
-                                            state,
-                                            emitter,
-                                            AcpEvent::PermissionResolved { request_id },
-                                        )
-                                        .await;
-                                    }
+                                    resolve_permission(
+                                        perms, state, emitter, request_id, option_id,
+                                    )
+                                    .await;
                                 }
                                 Some(ConnectionCommand::SetMode { mode_id }) => {
                                     let req = SetSessionModeRequest::new(sid.clone(), mode_id.clone());
@@ -6998,21 +7911,38 @@ async fn run_conversation_loop<'a>(
                                         .await;
                                     }
                                 }
-                                Some(ConnectionCommand::GoalControl { action }) => {
-                                    if let Err(e) = send_goal_control(&cx, &sid, action).await {
-                                        emit_with_state(
-                                            state,
-                                            emitter,
-                                            AcpEvent::Error {
-                                                message: format!("Failed to control goal: {e}"),
-                                                agent_type: agent_type.to_string(),
-                                                code: None,
-                                                details: None,
-                                                // Recoverable: a failed pause/clear leaves the turn alive.
-                                                terminal: false,
-                                            },
-                                        )
-                                        .await;
+                                Some(ConnectionCommand::GoalControl { action, reply }) => {
+                                    let method = state.read().await.goal_control_method.clone();
+                                    let landed =
+                                        match send_goal_control(&cx, &sid, action, &method).await {
+                                            Ok(()) => true,
+                                            Err(e) => {
+                                                emit_with_state(
+                                                    state,
+                                                    emitter,
+                                                    AcpEvent::Error {
+                                                        message: format!(
+                                                            "Failed to control goal: {e}"
+                                                        ),
+                                                        agent_type: agent_type.to_string(),
+                                                        code: None,
+                                                        details: None,
+                                                        // Recoverable: the goal
+                                                        // is unchanged and the
+                                                        // session is untouched.
+                                                        terminal: false,
+                                                    },
+                                                )
+                                                .await;
+                                                false
+                                            }
+                                        };
+                                    if let Some(reply) = reply {
+                                        // A dead receiver is fine — the caller
+                                        // that wanted to follow up with an
+                                        // interrupt went away, and the control
+                                        // itself already happened.
+                                        let _ = reply.send(landed);
                                     }
                                 }
                                 Some(ConnectionCommand::Steer { text, reply }) => {
@@ -7069,16 +7999,19 @@ async fn run_conversation_loop<'a>(
                                         .await;
                                     tracked_terminal_tool_calls.clear();
                                     // Also cancel any pending permission requests
-                                    let mut locked = perms.lock().await;
-                                    for (_, pending) in locked.drain() {
-                                        pending.respond_cancelled();
-                                    }
-                                    drop(locked);
-                                    // Immediately emit TurnComplete so the frontend
-                                    // transitions out of "prompting" and the user can
-                                    // send new messages.  Don't wait for the agent --
-                                    // it may be slow to respond or not respond at all.
-                                    emit_with_state(
+                                    // (queued ones included), clearing the card
+                                    // that was on screen, and immediately emit
+                                    // TurnComplete so the frontend transitions out
+                                    // of "prompting" and the user can send new
+                                    // messages. Don't wait for the agent -- it may
+                                    // be slow to respond or not respond at all.
+                                    // One critical section for the same reason as
+                                    // the turn-end exits: a request admitted
+                                    // between the two would be published and then
+                                    // silently un-displayed by TurnComplete,
+                                    // wedging the queue.
+                                    drain_permissions_then_emit(
+                                        perms,
                                         state,
                                         emitter,
                                         AcpEvent::TurnComplete {
@@ -7159,10 +8092,7 @@ async fn run_conversation_loop<'a>(
                                         .release_all_for_session(sid.0.as_ref())
                                         .await;
                                     tracked_terminal_tool_calls.clear();
-                                    let mut locked = perms.lock().await;
-                                    for (_, pending) in locked.drain() {
-                                        pending.respond_cancelled();
-                                    }
+                                    drain_permissions(perms, state, emitter).await;
                                     disconnect_requested = true;
                                     break;
                                 }
@@ -7206,11 +8136,7 @@ async fn run_conversation_loop<'a>(
                 request_id,
                 option_id,
             }) => {
-                if let Some(pending) = perms.lock().await.remove(&request_id) {
-                    pending.respond_selected(option_id);
-                    emit_with_state(state, emitter, AcpEvent::PermissionResolved { request_id })
-                        .await;
-                }
+                resolve_permission(perms, state, emitter, request_id, option_id).await;
             }
             Some(ConnectionCommand::SetMode { mode_id }) => {
                 if let Err(e) = set_session_mode(session, state, emitter, mode_id).await {
@@ -7262,24 +8188,37 @@ async fn run_conversation_loop<'a>(
                     .await;
                 }
             }
-            Some(ConnectionCommand::GoalControl { action }) => {
+            Some(ConnectionCommand::GoalControl { action, reply }) => {
                 let cx = session.connection();
                 let sid = session.session_id().clone();
-                if let Err(e) = send_goal_control(&cx, &sid, action).await {
-                    emit_with_state(
-                        state,
-                        emitter,
-                        AcpEvent::Error {
-                            message: format!("Failed to control goal: {e}"),
-                            agent_type: agent_type.to_string(),
-                            code: None,
-                            details: None,
-                            // Recoverable: an idle pause/clear failure leaves the
-                            // connection alive.
-                            terminal: false,
-                        },
-                    )
-                    .await;
+                let method = state.read().await.goal_control_method.clone();
+                let landed = match send_goal_control(&cx, &sid, action, &method).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        emit_with_state(
+                            state,
+                            emitter,
+                            AcpEvent::Error {
+                                message: format!("Failed to control goal: {e}"),
+                                agent_type: agent_type.to_string(),
+                                code: None,
+                                details: None,
+                                // Recoverable: an idle pause/clear failure leaves the
+                                // connection alive.
+                                terminal: false,
+                            },
+                        )
+                        .await;
+                        false
+                    }
+                };
+                if let Some(reply) = reply {
+                    // Reply — never drop — for the same reason the Steer arm
+                    // below does: the manager awaits this oneshot to decide
+                    // whether to follow up, and a dropped sender would hang it.
+                    // (Its follow-up is an interrupt, which this idle arm's
+                    // caller won't get anyway: there is no turn to stop.)
+                    let _ = reply.send(landed);
                 }
             }
             Some(ConnectionCommand::Steer { text: _, reply }) => {
@@ -7296,11 +8235,15 @@ async fn run_conversation_loop<'a>(
                 terminal_runtime
                     .release_all_for_session(sid.0.as_ref())
                     .await;
-                let mut locked = perms.lock().await;
-                for (_, pending) in locked.drain() {
-                    pending.respond_cancelled();
-                }
-                drop(locked);
+                // Unlike the mid-turn Cancel branch, this one does NOT emit
+                // `TurnComplete` (there is no turn), so nothing else would ever
+                // clear the on-screen permission card — before the compensating
+                // `PermissionResolved` inside `drain_permissions`, an idle Cancel
+                // left a card up on every client with its responder already
+                // cancelled (clicking it did nothing) and pinned a work task at
+                // `awaiting_input` forever, because `PermissionResolved` was only
+                // emitted from the `RespondPermission` path.
+                drain_permissions(perms, state, emitter).await;
                 // Cascade-cancel any pending delegations owned by this parent.
                 // Reached when Cancel arrives between prompts (idle path); the
                 // inner Cancel handler covers mid-prompt. Both must trigger
@@ -7487,6 +8430,27 @@ pub(crate) fn synthesize_edit_input_from_diffs(content: &[ToolCallContent]) -> O
             Some(serde_json::json!({ "changes": changes }).to_string())
         }
     }
+}
+
+/// Drop every `Terminal` block from a tool call's `content`, keeping the rest
+/// in order.
+///
+/// Used on the pi path only (see `pi_terminal_meta_marks_bash`). A
+/// `ToolCallContent::Terminal` serializes to the bare `[Terminal: <id>]`
+/// placeholder, which is meaningful ONLY while codeg's own `TerminalRuntime`
+/// owns that terminal and `poll_tracked_terminal_tool_calls` streams the real
+/// output over it (`raw_output_chunks` then wins over `content` in the
+/// frontend store). pi's terminal is agent-hosted, so nothing ever supersedes
+/// the placeholder from the terminal channel — it would be the ONLY thing on
+/// screen for the whole runtime of the command. The pi bridge supplies the
+/// output instead; strip the dead placeholder so a slow command shows an empty
+/// running card rather than an opaque id.
+fn strip_terminal_blocks(content: &[ToolCallContent]) -> Vec<ToolCallContent> {
+    content
+        .iter()
+        .filter(|item| !matches!(item, ToolCallContent::Terminal(_)))
+        .cloned()
+        .collect()
 }
 
 /// Build a minimal unified diff for a newly created file: the `--- /dev/null`
@@ -7887,27 +8851,267 @@ fn codebuddy_meta_marks_subagent(
         .is_some_and(|s| !s.is_empty())
 }
 
-/// True when a Codex live `tool_call` is a `subAgentActivity` mapping
-/// (codex-acp #304, v1.1.3+). codex-acp maps codex `subAgentActivity`
-/// notifications onto ACP `tool_call(kind:other)` carrying
-/// `_meta.codex.subagent = {threadId, path, activity}`. codeg already renders
-/// codex collaboration from the `collabAgentToolCall` path (spawnAgent/wait/
-/// closeAgent — see `collab-tool.ts`) and reconstructs the full nested
-/// transcript on history reload from `agent-<id>.jsonl` (see
-/// `parsers/codex.rs`), so this new live signal is redundant with what codeg
-/// already shows. Suppressed at the emit point (keeping live and DB-reload
-/// consistent — a suppressed event is never persisted) to preserve the current
-/// live behavior. Gated on Codex.
-fn is_codex_subagent_activity(
+/// pi-acp reports a `bash` tool call as an ACP `Terminal` content block whose
+/// `terminalId` is its OWN tool-call id, then streams the command's output over
+/// a bespoke `_meta` channel instead of the ACP terminal channel.
+///
+/// pi-acp's README says it outright: "No ACP filesystem delegation (`fs/*`) and
+/// no ACP terminal delegation (`terminal/*`). pi reads/writes and executes
+/// locally." It never calls `terminal/create`, so the id it names
+/// (`call_Q0KKW…`) can never resolve against `TerminalRuntime` — which only ever
+/// mints `term_<uuid>` ids. Codeg used to render the resulting placeholder and
+/// then poll a terminal that does not exist, so the card stayed at
+/// `[Terminal: call_…]` with no command output, ever (#519).
+///
+/// The wire, per pi-acp 0.0.33 (`emitBashToolCall` / `emitBashOutputUpdate`):
+/// - `tool_call`: `title` = the command, `kind: execute`, the `Terminal` block,
+///   `_meta.terminal_info = {terminal_id, cwd}`, and NO `rawInput`.
+/// - `tool_call_update` ×N: `_meta.terminal_output = {terminal_id, data}` where
+///   `data` is an incremental delta, plus `_meta.terminal_exit =
+///   {terminal_id, exit_code, signal}` on the final frame. No `content`, no
+///   `rawOutput` — this `_meta` is the only channel carrying the output.
+///
+/// These readers bridge that channel into the same `raw_output` stream the
+/// host-terminal poller produces, so a pi bash card reads exactly like every
+/// other agent's.
+///
+/// GATED ON `AgentType::Pi` ON PURPOSE: pi-acp's keys are unnamespaced
+/// (`terminal_output`, not `pi/terminalOutput`), so an ungated reader would be a
+/// collision waiting to happen. Known limitation: `AgentType::Pi` resolves from
+/// the built-in registry id `pi-acp`, so a user who registers pi-acp under a
+/// CUSTOM agent id gets `AgentType::Custom` and keeps the old behaviour. That is
+/// the right trade — an unnamespaced-meta bridge must not apply to arbitrary
+/// agents.
+fn pi_terminal_meta_marks_bash(
     agent_type: AgentType,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> bool {
-    if agent_type != AgentType::Codex {
+    if agent_type != AgentType::Pi {
         return false;
     }
-    meta.and_then(|m| m.get("codex"))
+    meta.is_some_and(|meta| meta.get("terminal_info").is_some_and(|v| v.is_object()))
+}
+
+/// The incremental output chunk from `_meta.terminal_output.data`, if any.
+///
+/// pi computes this delta itself as `next.startsWith(prev) ? next.slice(prev.len)
+/// : next`, so in the degenerate case where its cumulative text stops being a
+/// prefix extension (stdout still growing AFTER stderr was first folded in) it
+/// re-sends the WHOLE text as a "delta" and we append it, duplicating. Codeg
+/// cannot detect that without holding the full snapshot, which
+/// `ToolCallOutputCache` deliberately does not do (8 KB tail only). Appending is
+/// the correct reading of the wire contract; the duplication is an upstream
+/// residual.
+fn pi_terminal_output_delta(
+    agent_type: AgentType,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    if agent_type != AgentType::Pi {
+        return None;
+    }
+    meta?
+        .get("terminal_output")?
+        .get("data")?
+        .as_str()
+        .filter(|data| !data.is_empty())
+        .map(str::to_string)
+}
+
+/// The `[terminal exited: …]` line for `_meta.terminal_exit`, if present.
+///
+/// The values are read key by key and fed to `format_terminal_exit_status`, so
+/// the wording is byte-for-byte what a host-owned terminal produces and can
+/// never drift. Do NOT be tempted to `serde_json::from_value::<TerminalExitStatus>`
+/// the object instead: pi writes SNAKE_case (`exit_code`) while the schema type
+/// is `rename_all = "camelCase"`, and unknown fields are ignored — so it
+/// deserializes CLEANLY into an all-`None` status and silently prints
+/// "[terminal exited: finished]", dropping the exit code the report explicitly
+/// asks for.
+fn pi_terminal_exit_line(
+    agent_type: AgentType,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    if agent_type != AgentType::Pi {
+        return None;
+    }
+    let exit = meta?.get("terminal_exit")?.as_object()?;
+    let code = exit.get("exit_code").and_then(serde_json::Value::as_i64);
+    let signal = exit
+        .get("signal")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    // `TerminalExitStatus::exit_code` is `u32`, but pi's is a JS number and some
+    // runtimes report a signal death as a negative. Format those directly rather
+    // than dropping the only failure evidence a killed command leaves behind.
+    let formatted = match code.map(u32::try_from) {
+        Some(Err(_)) => {
+            let mut parts = vec![format!("exit code: {}", code.unwrap_or_default())];
+            if let Some(signal) = &signal {
+                parts.push(format!("signal: {signal}"));
+            }
+            parts.join(", ")
+        }
+        narrowed => format_terminal_exit_status(
+            &TerminalExitStatus::new()
+                .exit_code(narrowed.and_then(Result::ok))
+                .signal(signal),
+        ),
+    };
+    Some(format!("[terminal exited: {formatted}]"))
+}
+
+/// Bridge pi's `_meta` terminal channel onto the `raw_output` stream, returning
+/// the `(payload, append)` pair to emit — or `None` when this frame carries no
+/// terminal data (which is every frame of every other agent, since both readers
+/// are gated on `AgentType::Pi`).
+///
+/// `append` is false for a call's FIRST chunk, so it REPLACES whatever the
+/// opening frame left on the card, and true for every chunk after — the same
+/// rule `poll_terminal_tool_call_output` applies via
+/// `TrackedTerminalToolCall::has_emitted_output`. The payload goes through
+/// `build_emit_payload` for the pipeline-wide ANSI-safe single-event cap.
+///
+/// The exit line is appended on EVERY exit, `exit code: 0` included: for a
+/// command that printed nothing it is the only thing that supersedes the
+/// placeholder, and it is what a host-owned terminal shows.
+///
+/// The entry is created here rather than required up front, so a client that
+/// attached mid-turn (and so never saw the opening `terminal_info` frame) still
+/// gets the output instead of silently dropping it.
+fn pi_bash_terminal_chunk(
+    agent_type: AgentType,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    tool_call_id: &str,
+    tracked: &mut HashMap<String, bool>,
+) -> Option<(String, bool)> {
+    let mut chunk = pi_terminal_output_delta(agent_type, meta).unwrap_or_default();
+    if let Some(exit_line) = pi_terminal_exit_line(agent_type, meta) {
+        if !chunk.is_empty() && !chunk.ends_with('\n') {
+            chunk.push('\n');
+        }
+        chunk.push_str(&exit_line);
+    }
+    if chunk.is_empty() {
+        return None;
+    }
+    let has_emitted = tracked.entry(tool_call_id.to_string()).or_insert(false);
+    let append = *has_emitted;
+    *has_emitted = true;
+    Some(build_emit_payload(&chunk, append))
+}
+
+/// pi-acp titles a bash tool call `bashCommand(args) ?? toolName`. On the first
+/// `toolcall_start` frame the arguments are still partial JSON, so the title is
+/// the bare tool name `"bash"` and the real command only lands on a later frame.
+///
+/// Synthesize a canonical `{"command": …}` `raw_input` from a title that IS the
+/// command, so `inferLiveToolName` classifies the call as `bash` and it renders
+/// through the Bash card (`$ <cmd>`) — the same trick
+/// `synthesize_edit_input_from_diffs` plays for codex's input-less diffs. Without
+/// it the input shape is silent and the title fallback makes the card a generic
+/// tool literally NAMED after the command (`node --version`), which is also how
+/// it diverged from pi's own history parser (`parsers/pi.rs`, which builds a real
+/// `bash` call with `{"command": …}`).
+///
+/// Returns `None` for the bare `"bash"` title: `normalizeToolName("bash")`
+/// already resolves that frame to the Bash card, and synthesizing there would
+/// flash `$ bash` for one frame before the real command arrives.
+fn pi_bash_input_from_title(title: Option<&str>) -> Option<String> {
+    let command = title?.trim();
+    if command.is_empty() || command.eq_ignore_ascii_case("bash") {
+        return None;
+    }
+    Some(serde_json::json!({ "command": command }).to_string())
+}
+
+/// Name used when a codex sub-agent's `path` carries no usable segment. Matches
+/// the fallback codex-acp itself uses when building the activity title.
+const CODEX_SUBAGENT_FALLBACK_NAME: &str = "subagent";
+
+/// How a Codex live `subAgentActivity` (codex-acp #304) should be handled.
+///
+/// codex 0.147's native team-of-agents runs sub-agents entirely inside the codex
+/// process. Its orchestration calls (`spawn_agent` / `wait_agent`, the
+/// `collaboration` namespace) never reach the ACP wire, and the inter-agent
+/// message is an opaque encrypted envelope even in the on-disk rollout. The one
+/// thing codex-acp forwards is `subAgentActivity`, as a `tool_call(kind:other)`
+/// carrying `_meta.codex.subagent = {threadId, path, activity}`.
+///
+/// codeg used to DROP every one of these, on the premise that the
+/// `collabAgentToolCall` capsule already showed the same thing. That premise
+/// died with the team-of-agents rewrite: codex raises no `collabAgentToolCall`
+/// for a spawn any more, so dropping this left a codex sub-agent completely
+/// invisible while it ran — nothing appeared in the timeline until the session
+/// was reopened and the rollout re-parsed.
+enum CodexSubagentActivity {
+    /// Not a codex sub-agent activity — handle the call normally.
+    None,
+    /// A sub-agent was launched. Carries the Agent-card input to render it with.
+    Started(String),
+    /// A later lifecycle marker (`interacted` / `interrupted`). Still dropped:
+    /// they carry no content of their own and would each open a SECOND capsule
+    /// with the same name and no way to tell it apart from the launch.
+    Other,
+}
+
+/// Classify a live tool call's `_meta`, building the Agent-card input for a
+/// launch. The three fields are the ones `parsers/codex.rs` writes on reload, so
+/// live and history render the same capsule: the sub-agent's name is the last
+/// segment of its `path` (`/root/pnpm_build` → `pnpm_build`) and `agent_id` is
+/// its codex thread id, which the card renders as a short badge. No `prompt` —
+/// the task text is encrypted on this wire.
+///
+/// The capsule settles as soon as codex acknowledges the launch, NOT when the
+/// child finishes: the activity item's own lifecycle is the spawn's, and codex
+/// forwards nothing else about the child over ACP. A child's eventual result
+/// reaches the timeline as the parent's next message.
+fn classify_codex_subagent_activity(
+    agent_type: AgentType,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> CodexSubagentActivity {
+    if agent_type != AgentType::Codex {
+        return CodexSubagentActivity::None;
+    }
+    let Some(subagent) = meta
+        .and_then(|m| m.get("codex"))
         .and_then(|codex| codex.get("subagent"))
-        .is_some()
+    else {
+        return CodexSubagentActivity::None;
+    };
+    // A status-only follow-up carries the same meta with the same `activity`,
+    // so this classification is stable across the call's whole lifetime.
+    if subagent.get("activity").and_then(|v| v.as_str()) != Some("started") {
+        return CodexSubagentActivity::Other;
+    }
+    let name = subagent
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(CODEX_SUBAGENT_FALLBACK_NAME);
+    let mut input = serde_json::Map::new();
+    input.insert(
+        "subagent_type".to_string(),
+        serde_json::Value::String(name.to_string()),
+    );
+    if let Some(thread_id) = subagent
+        .get("threadId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        input.insert(
+            "agent_id".to_string(),
+            serde_json::Value::String(thread_id.to_string()),
+        );
+    }
+    // Say that this card stands for the LAUNCH, so its "completed" is not read
+    // as "the sub-agent finished" (see the constant's doc).
+    input.insert(
+        crate::parsers::codex::CODEX_SUBAGENT_LAUNCH_KEY.to_string(),
+        serde_json::Value::Bool(true),
+    );
+    CodexSubagentActivity::Started(serde_json::Value::Object(input).to_string())
 }
 
 /// True when a `session/request_permission` is codex's Plan-mode review gate
@@ -7921,7 +9125,7 @@ fn is_codex_subagent_activity(
 /// `tool_call_update` carrying just a status and `rawOutput`. Without seeding a
 /// tool call from this request that update lands on an unknown id and renders as
 /// an untitled generic tool card, so `handle_permission_request` emits one.
-/// Gated on Codex, mirroring [`is_codex_subagent_activity`].
+/// Gated on Codex, mirroring [`classify_codex_subagent_activity`].
 fn is_codex_plan_review(
     agent_type: AgentType,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -7948,6 +9152,207 @@ fn init_advertises_steering(meta: Option<&serde_json::Map<String, serde_json::Va
         .and_then(|s| s.get("supported"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+/// Whether the `initialize` response advertises the provider-neutral goal
+/// extension: top-level `_meta.goal = {version: <integer >= 1>, controlMethod,
+/// actions}`. Advertised ⇒ goal state arrives as
+/// `session_info_update._meta.goal` snapshots and the legacy
+/// `_meta.codex.goal` key is ignored for the WHOLE connection — codex-acp
+/// switched to the neutral key silently in 1.2.0 (legacy key gone), and
+/// claude-agent-acp speaks only the neutral form (0.66.0+). Pinning the
+/// channel here, at initialize, makes the selection independent of update
+/// arrival order, so a transitional adapter double-publishing one goal
+/// transition through both namespaces can never produce two goal cards.
+/// Non-integer or sub-1 versions fail closed onto the legacy channel.
+fn init_advertises_goal(meta: Option<&serde_json::Map<String, serde_json::Value>>) -> bool {
+    meta.and_then(|m| m.get("goal"))
+        .and_then(|g| g.get("version"))
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|version| version >= 1)
+}
+
+/// The goal-control surface an `initialize` response advertises:
+/// `(_meta.goal.controlMethod, _meta.goal.actions)` — claude 0.66+ offers
+/// `("_session/goal", ["set","clear"])`, codex 1.2+ the same method with all
+/// four actions. `None` when the neutral goal extension isn't advertised
+/// (see [`init_advertises_goal`]) or carries no usable method string — the
+/// session then keeps the legacy codex method + actions
+/// (`codex_goal::LEGACY_GOAL_CONTROL_METHOD` / `LEGACY_GOAL_ACTIONS`). An
+/// advertised-but-empty actions array is honored as "no controls": the goal
+/// card gates its buttons on this list, so only affordances the adapter
+/// actually implements are offered.
+fn goal_advertised_control(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<(String, Vec<String>)> {
+    if !init_advertises_goal(meta) {
+        return None;
+    }
+    let goal = meta?.get("goal")?;
+    let method = goal
+        .get("controlMethod")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|m| !m.is_empty())?
+        .to_string();
+    let actions = goal
+        .get("actions")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((method, actions))
+}
+
+/// Resolve [`goal_advertised_control`]'s answer into what the session state
+/// stores: an OPTIONAL method override (absent ⇒ keep the legacy codex method
+/// the state was built with) and the CONCRETE action vocabulary.
+///
+/// The legacy pair belongs here, at initialize, and not in `SessionState::new`.
+/// A client can read the snapshot during the handshake — `spawn_agent` returns
+/// with `initialize` still in flight — and it latches whatever it finds, so a
+/// construction-time legacy default hands a claude session a Pause its adapter
+/// answers with `Invalid params: goal action must be "set" or "clear"`. Keeping
+/// the field `None` until this runs is what makes "unknown" tellable from
+/// "legacy" on the wire.
+fn resolve_goal_control(
+    advertised: Option<(String, Vec<String>)>,
+) -> (Option<String>, Vec<String>) {
+    match advertised {
+        Some((method, actions)) => (Some(method), actions),
+        None => (
+            None,
+            crate::acp::codex_goal::LEGACY_GOAL_ACTIONS
+                .iter()
+                .map(|a| (*a).to_string())
+                .collect(),
+        ),
+    }
+}
+
+/// Pick the goal payload out of a `session_info_update`'s `_meta` according to
+/// the channel pinned at initialize (see [`init_advertises_goal`]): the
+/// neutral `_meta.goal` for advertising connections, the legacy
+/// `_meta.codex.goal` otherwise — never both. Pure so the either/or contract
+/// is unit-tested without the connection machinery.
+fn session_info_goal_value(
+    neutral_goal_channel: bool,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<&serde_json::Value> {
+    let meta = meta?;
+    if neutral_goal_channel {
+        meta.get("goal")
+    } else {
+        meta.get("codex").and_then(|codex| codex.get("goal"))
+    }
+}
+
+/// The raw `sessionFailure` value out of a `_meta.jetbrains.air` envelope —
+/// present only when the envelope itself is well-formed (integer
+/// `version >= 1`, mirroring the advertisement check the adapters run on
+/// codeg's `clientCapabilities._meta.jetbrains.air`). A malformed or
+/// future-incompatible envelope yields `None` and the carrier is treated as
+/// holding no failure. Records ride TWO carriers with this same envelope: the
+/// per-attempt upserts on `session_info_update._meta`, and a turn's terminal
+/// failure on the prompt RESPONSE `_meta` (see [`response_session_failure`]).
+fn air_session_failure(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<&serde_json::Value> {
+    let air = meta?.get("jetbrains")?.get("air")?;
+    let version = air.get("version").and_then(serde_json::Value::as_i64)?;
+    if version < 1 {
+        return None;
+    }
+    air.get("sessionFailure")
+}
+
+/// Validate one AIR failure upsert into a [`SessionFailureRecord`].
+///
+/// `id` (non-blank string) and `revision` (integer >= 1) are HARD
+/// requirements — without identity there is nothing to merge
+/// deterministically, so a record missing either is dropped (the caller logs
+/// it at debug). Everything else is lenient: `category`/`severity` default to
+/// `"unknown"`/`"error"` and pass through unrecognized values as plain
+/// strings (the frontend falls back per field), `title` may be blank,
+/// non-string `actions` entries are skipped. `resolved` starts `false`; the
+/// stores flip it (see the type docs).
+fn parse_session_failure_record(value: &serde_json::Value) -> Option<SessionFailureRecord> {
+    let id = value.get("id")?.as_str()?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let revision = value.get("revision")?.as_u64()?;
+    if revision < 1 {
+        return None;
+    }
+    let text = |key: &str, default: &str| -> String {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default)
+            .to_string()
+    };
+    Some(SessionFailureRecord {
+        id: id.to_string(),
+        revision,
+        category: text("category", "unknown"),
+        severity: text("severity", "error"),
+        title: text("title", ""),
+        details: value
+            .get("details")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        actions: value
+            .get("actions")
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        resolved: false,
+    })
+}
+
+/// The terminal AIR failure riding on a prompt RESPONSE's `_meta`, if any.
+///
+/// With `jetbrains.air` negotiated, BOTH adapters deliver a turn's terminal
+/// failure ON the prompt response rather than as another
+/// `session_info_update`: claude-agent-acp's `failActiveWithSessionFailure`
+/// settles the turn with a disguised `end_turn` stop reason and attaches the
+/// record here (its own comment calls the response "the canonical AIR
+/// carrier" — the update channel only ever carries the per-attempt retry
+/// warnings), and codex-acp's `terminalFailurePromptResponse` mirrors the
+/// same shape as the catch-up for a record whose update was missed (the
+/// strict revision merge de-duplicates when both arrive). Field report
+/// 2026-08-15: a mid-turn network drop on claude 0.68.0 published
+/// "Reconnecting to Claude, attempt N of 5" warnings via updates, then the
+/// `transport_lost` error escalation ONLY here — ignoring this carrier lost
+/// the terminal record entirely, so the turn-boundary settle painted the
+/// still-dead connection as a recovered warning.
+fn response_session_failure(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<SessionFailureRecord> {
+    let raw = air_session_failure(meta)?;
+    let record = parse_session_failure_record(raw);
+    if record.is_none() {
+        tracing::debug!(
+            "[ACP] dropped prompt-response AIR sessionFailure without usable id/revision: {raw:?}"
+        );
+    }
+    record
 }
 
 /// Strict SemVer floor check: true when `version >= min` by SemVer
@@ -8286,6 +9691,20 @@ struct CodeBuddyLiveState {
     /// even when the token count hasn't moved yet — otherwise the ring would
     /// keep dividing by the previous model's window.
     grok_last_usage: Option<(u64, u64)>,
+    /// pi bash tool calls whose terminal pi hosts itself → whether any output
+    /// has already been emitted for that call.
+    ///
+    /// Registered from the opening frame's `_meta.terminal_info`
+    /// (see `pi_terminal_meta_marks_bash`), because the frames that actually
+    /// CARRY the output name only the tool-call id — `terminal_info` never
+    /// repeats. The flag is what makes the first bridged chunk a replacement and
+    /// every later one an append, the same rule
+    /// `TrackedTerminalToolCall::has_emitted_output` applies on the host-terminal
+    /// path. Entries are dropped at a final status, alongside
+    /// `ToolCallOutputCache::remove_if_final`, and the whole map is cleared at
+    /// turn start — a bash call whose turn was canceled never sees a final
+    /// status, and its lifecycle cannot span turns anyway.
+    pi_terminal_calls: HashMap<String, bool>,
 }
 
 /// One announced-but-unpaired Grok `spawn_subagent` call. `description` /
@@ -8531,9 +9950,11 @@ fn grok_ext_event_id(params: &serde_json::Value) -> String {
         .unwrap_or_else(|| format!("grok-ext-{}", uuid::Uuid::new_v4().simple()))
 }
 
-/// Map grok's private context-compaction ext notifications into `AcpEvent`s.
+/// Map grok's private ext notifications — context compaction and dropped
+/// prompt images — into `AcpEvent`s.
 ///
-/// grok reports `/compact` (and auto-compaction) results on
+/// grok reports `/compact` (and auto-compaction) results, and the fate of an
+/// image it refused to send, on
 /// `_x.ai/session_notification` / `_x.ai/session/update` rather than as normal
 /// `agent_message_chunk`s. Those methods never match the typed `session/update`
 /// pipeline, so without this the whole turn is blank and `/compact` looks like
@@ -8580,6 +10001,49 @@ fn map_grok_ext_notification(
                 locations: None,
                 meta: Some(serde_json::Value::Object(meta)),
                 images: None,
+            })
+        }
+        // A prompt image was accepted on the wire but dropped before the
+        // describe sidecar (too small, oversize, decode failure). Surface it
+        // so the user isn't left wondering why Grok "can't see" the shot.
+        "image_dropped" => {
+            // `notes` is grok's own user-facing sentence, one per dropped image
+            // ("Image 1 was dropped before send: too small (1×1); images must be
+            // at least 8×8 pixels."). It already names the subject, so it is
+            // shown verbatim — prefixing it would read "Image dropped: Image 1
+            // was dropped before send: …". Only the shapeless fallbacks get a
+            // prefix, because on their own they say nothing about images.
+            let message = update
+                .get("notes")
+                .and_then(|v| v.as_array())
+                .map(|notes| {
+                    notes
+                        .iter()
+                        .filter_map(|n| n.as_str())
+                        .map(str::trim)
+                        .filter(|n| !n.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    update
+                        .get("reason")
+                        .or_else(|| update.get("message"))
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        // A blank reason would render as a bare "Image dropped: "
+                        // — worse than the generic sentence below.
+                        .filter(|d| !d.is_empty())
+                        .map(|d| format!("Image dropped: {d}"))
+                })
+                .unwrap_or_else(|| "An image was dropped before send.".to_string());
+            Some(AcpEvent::Error {
+                message,
+                agent_type: agent_type.to_string(),
+                code: None,
+                details: None,
+                terminal: false,
             })
         }
         // Compaction itself blew up (e.g. the summarizer model call failed) while
@@ -8886,18 +10350,40 @@ fn grok_subagent_meta(
 }
 
 /// Whether a dispatch is a grok ext notification that
-/// `map_grok_ext_notification` renders as visible turn output (a compaction card
-/// or a compaction error). The active-turn loop consults this BEFORE the typed
+/// `map_grok_ext_notification` renders as visible turn output (a compaction
+/// card, a compaction error, or a dropped-image error). The active-turn loop
+/// consults this BEFORE the typed
 /// pipeline to mark the turn as non-empty: a `/compact` turn emits only these
 /// ext notifications and no standard `agent_message_chunk`, so without this its
 /// `end_turn` is reclassified as `"empty"` and re-surfaced as a spurious error —
 /// the exact symptom this change removes. Reuses `map_grok_ext_notification` so
-/// the handled-variant set can never drift from what actually emits.
+/// the handled-variant set can never drift from what actually emits. A turn
+/// whose only output was a dropped image therefore reports THAT, rather than
+/// the generic empty-turn failure it used to.
 fn grok_ext_notification_is_turn_output(dispatch: &Dispatch, agent_type: AgentType) -> bool {
     match dispatch {
         Dispatch::Notification(notification) => {
             map_grok_ext_notification(notification, agent_type).is_some()
         }
+        _ => false,
+    }
+}
+
+/// Whether a grok ext notification would raise a user-facing ALERT (status-bar
+/// entry + OS notification), as opposed to rendering a card in the turn.
+///
+/// Only the historical `session/load` replay asks: those notifications describe
+/// a PAST session, so re-raising their alerts would report a compaction failure
+/// or a dropped image as if it were happening now, for a session the user is
+/// merely opening. Reuses the mapper for the same reason
+/// [`grok_ext_notification_is_turn_output`] does — the alerting set cannot drift
+/// away from what actually emits.
+fn grok_ext_notification_is_alert(dispatch: &Dispatch, agent_type: AgentType) -> bool {
+    match dispatch {
+        Dispatch::Notification(notification) => matches!(
+            map_grok_ext_notification(notification, agent_type),
+            Some(AcpEvent::Error { .. })
+        ),
         _ => false,
     }
 }
@@ -9089,13 +10575,17 @@ async fn emit_conversation_update(
             // Non-text thought chunks are currently ignored.
         }
         SessionUpdate::ToolCall(tc) => {
-            // codex-acp #304 (v1.1.3+) surfaces codex `subAgentActivity` as a
-            // live `tool_call`; suppress it — it is redundant with the collab
-            // capsule and the history reconstruction (see
-            // `is_codex_subagent_activity`).
-            if is_codex_subagent_activity(agent_type, tc.meta.as_ref()) {
-                return;
-            }
+            // codex-acp #304 surfaces codex `subAgentActivity` as a live
+            // `tool_call`. A launch becomes an Agent capsule (its own rawInput
+            // is orchestration bookkeeping, so it is replaced wholesale); the
+            // other lifecycle markers stay dropped. See
+            // `classify_codex_subagent_activity`.
+            let codex_subagent = match classify_codex_subagent_activity(agent_type, tc.meta.as_ref())
+            {
+                CodexSubagentActivity::None => None,
+                CodexSubagentActivity::Started(input) => Some(input),
+                CodexSubagentActivity::Other => return,
+            };
             let tool_call_id = tc.tool_call_id.to_string();
             // Grok emits a redundant `tool_call` for its native ask_user_question
             // alongside the blocking `_x.ai/ask_user_question` ext request codeg
@@ -9124,6 +10614,21 @@ async fn emit_conversation_update(
             } else {
                 None
             };
+            // pi hosts its own terminal and names it by this very tool-call id, so
+            // its `Terminal` block is a placeholder nothing can ever supersede from
+            // the terminal channel — strip it and let the `_meta` bridge below
+            // supply the output. Remember the call: the frames that carry the
+            // output name only the id (see `pi_terminal_meta_marks_bash`).
+            let pi_bash = pi_terminal_meta_marks_bash(agent_type, tc.meta.as_ref());
+            if pi_bash {
+                cb_state
+                    .pi_terminal_calls
+                    .entry(tool_call_id.clone())
+                    .or_insert(false);
+            }
+            let pi_stripped_content = pi_bash.then(|| strip_terminal_blocks(&tc.content));
+            let content_blocks: &[ToolCallContent] =
+                pi_stripped_content.as_deref().unwrap_or(&tc.content);
             let own_raw_input = match &grok_use_tool {
                 Some((_, inner)) => {
                     json_value_to_text(&Some(inner.clone())).filter(|t| !t.trim().is_empty())
@@ -9131,16 +10636,28 @@ async fn emit_conversation_update(
                 None => json_value_to_text(&tc.raw_input).filter(|t| !t.trim().is_empty()),
             };
             let synthesized_edit = if own_raw_input.is_none() {
-                synthesize_edit_input_from_diffs(&tc.content)
+                synthesize_edit_input_from_diffs(content_blocks)
+            } else {
+                None
+            };
+            // pi sends no `rawInput` for bash at all — its command lives in the
+            // title. Synthesize the canonical `{"command"}` shape so the call
+            // classifies as `bash` instead of a generic tool named after the
+            // command (see `pi_bash_input_from_title`).
+            let pi_bash_input = if own_raw_input.is_none() && pi_bash {
+                pi_bash_input_from_title(Some(tc.title.as_str()))
             } else {
                 None
             };
             let content =
-                serialize_tool_call_content(&tc.content, synthesized_edit.is_none())
+                serialize_tool_call_content(content_blocks, synthesized_edit.is_none())
                     .map(|c| unwrap_codebuddy_deferred_output(agent_type, &c).unwrap_or(c));
-            let images = extract_tool_call_images(&tc.content);
-            let raw_input = synthesized_edit
+            let images = extract_tool_call_images(content_blocks);
+            let codex_subagent_launch = codex_subagent.is_some();
+            let raw_input = codex_subagent
+                .or(synthesized_edit)
                 .or(own_raw_input)
+                .or(pi_bash_input)
                 .map(|text| resolve_live_tool_input(&text, cwd));
             // Initial tool_call notification — the frontend reducer
             // treats `raw_output` as a full replacement, so we bypass
@@ -9166,7 +10683,13 @@ async fn emit_conversation_update(
             // reliable signal (frame 1) that keeps the Agent pill from flickering;
             // `meta_marks_background` keeps a concurrent sub-agent out of the
             // suppression window (see fn docs).
-            let meta_marks_subagent = codebuddy_meta_marks_subagent(agent_type, tc.meta.as_ref());
+            // `codex_subagent_launch` joins the CodeBuddy meta signal here for
+            // the same reason it exists: it is what records the authoritative
+            // "agent" title, so the status-only follow-up (which carries no
+            // rawInput at all) re-asserts it instead of downgrading the capsule
+            // to a generic tool card.
+            let meta_marks_subagent = codebuddy_meta_marks_subagent(agent_type, tc.meta.as_ref())
+                || codex_subagent_launch;
             let meta_marks_background = codebuddy_meta_marks_background(agent_type, tc.meta.as_ref());
             let grok_spawn = grok_meta_marks_spawn_subagent(agent_type, tc.meta.as_ref());
             let meta = tc.meta.map(serde_json::Value::Object);
@@ -9246,12 +10769,16 @@ async fn emit_conversation_update(
             .await;
         }
         SessionUpdate::ToolCallUpdate(tcu) => {
-            // Symmetric with the `ToolCall` arm: a follow-up update for a codex
-            // `subAgentActivity` still carries `_meta.codex.subagent`, so drop
-            // it too (see `is_codex_subagent_activity`).
-            if is_codex_subagent_activity(agent_type, tcu.meta.as_ref()) {
-                return;
-            }
+            // Symmetric with the `ToolCall` arm: the follow-up carries the same
+            // `_meta.codex.subagent`, so it classifies identically — a launch's
+            // completion is forwarded (settling its capsule), any other
+            // lifecycle marker's is dropped like its opening frame was.
+            let codex_subagent =
+                match classify_codex_subagent_activity(agent_type, tcu.meta.as_ref()) {
+                    CodexSubagentActivity::None => None,
+                    CodexSubagentActivity::Started(input) => Some(input),
+                    CodexSubagentActivity::Other => return,
+                };
             let tool_call_id = tcu.tool_call_id.to_string();
             // Suppress the redundant update stream for grok's ask_user_question
             // (see the ToolCall arm): match the tracked id, or the meta on a late
@@ -9276,6 +10803,23 @@ async fn emit_conversation_update(
             } else {
                 None
             };
+            // Symmetric with the ToolCall arm. `terminal_info` only ever rides the
+            // OPENING frame, so the id set is what identifies these updates; the
+            // meta check is a cheap guard for a wire that ever reorders them.
+            let pi_bash = cb_state.pi_terminal_calls.contains_key(&tool_call_id)
+                || pi_terminal_meta_marks_bash(agent_type, tcu.meta.as_ref());
+            if pi_bash {
+                cb_state
+                    .pi_terminal_calls
+                    .entry(tool_call_id.clone())
+                    .or_insert(false);
+            }
+            let pi_stripped_content = pi_bash
+                .then(|| tcu.fields.content.as_deref().map(strip_terminal_blocks))
+                .flatten();
+            let content_blocks: Option<&[ToolCallContent]> = pi_stripped_content
+                .as_deref()
+                .or(tcu.fields.content.as_deref());
             let own_raw_input = match &grok_use_tool {
                 Some((_, inner)) => {
                     json_value_to_text(&Some(inner.clone())).filter(|t| !t.trim().is_empty())
@@ -9285,26 +10829,28 @@ async fn emit_conversation_update(
                 }
             };
             let synthesized_edit = if own_raw_input.is_none() {
-                tcu.fields
-                    .content
-                    .as_deref()
-                    .and_then(synthesize_edit_input_from_diffs)
+                content_blocks.and_then(synthesize_edit_input_from_diffs)
             } else {
                 None
             };
-            let content = tcu
-                .fields
-                .content
-                .as_deref()
+            // pi's real command usually arrives on an update, not the opening
+            // frame (its first frame's arguments are still partial JSON, so the
+            // title is the bare "bash"). Re-synthesize whenever a titled frame
+            // shows up; the reducer keeps the prior input on the title-less ones.
+            let pi_bash_input = if own_raw_input.is_none() && pi_bash {
+                pi_bash_input_from_title(tcu.fields.title.as_deref())
+            } else {
+                None
+            };
+            let content = content_blocks
                 .and_then(|c| serialize_tool_call_content(c, synthesized_edit.is_none()))
                 .map(|c| unwrap_codebuddy_deferred_output(agent_type, &c).unwrap_or(c));
-            let images = tcu
-                .fields
-                .content
-                .as_deref()
-                .and_then(extract_tool_call_images);
-            let raw_input = synthesized_edit
+            let images = content_blocks.and_then(extract_tool_call_images);
+            let codex_subagent_launch = codex_subagent.is_some();
+            let raw_input = codex_subagent
+                .or(synthesized_edit)
                 .or(own_raw_input)
+                .or(pi_bash_input)
                 .map(|text| resolve_live_tool_input(&text, cwd));
             // Diff the incoming raw_output against the last snapshot we
             // emitted for this tool call. This turns cumulative snapshots
@@ -9328,18 +10874,47 @@ async fn emit_conversation_update(
                 },
                 None => (None, None),
             };
+            // pi's bash output rides `_meta` and nothing else (no `content`, no
+            // `rawOutput`), so bridge it onto the same `raw_output` stream the
+            // host-terminal poller feeds — that channel is what supersedes the
+            // placeholder in the frontend store's output precedence. This
+            // deliberately BYPASSES `raw_output_cache`: the cache diffs cumulative
+            // snapshots, while pi already sends deltas, which is exactly why
+            // `emit_terminal_output_update` bypasses it too. pi never sends
+            // `rawOutput` for these calls, so the branch above resolved to
+            // `(None, None)` and nothing is being overwritten.
+            let (raw_output, raw_output_append) = match pi_bash_terminal_chunk(
+                agent_type,
+                tcu.meta.as_ref(),
+                &tool_call_id,
+                &mut cb_state.pi_terminal_calls,
+            ) {
+                Some((payload, append)) => (Some(payload), Some(append)),
+                None => (raw_output, raw_output_append),
+            };
             let locations = tcu
                 .fields
                 .locations
                 .as_ref()
                 .filter(|l| !l.is_empty())
                 .and_then(|l| serde_json::to_value(l).ok());
-            let meta_marks_subagent = codebuddy_meta_marks_subagent(agent_type, tcu.meta.as_ref());
+            let meta_marks_subagent = codebuddy_meta_marks_subagent(agent_type, tcu.meta.as_ref())
+                || codex_subagent_launch;
             let meta_marks_background = codebuddy_meta_marks_background(agent_type, tcu.meta.as_ref());
             let grok_spawn = grok_meta_marks_spawn_subagent(agent_type, tcu.meta.as_ref());
             let meta = tcu.meta.clone().map(serde_json::Value::Object);
             let status = tcu.fields.status.map(|s| format!("{:?}", s).to_lowercase());
             raw_output_cache.remove_if_final(&tool_call_id, status.as_deref());
+            // Same lifetime as the output cache — and deliberately NOT mirrored in
+            // the ToolCall arm: pi's `session/load` replay opens the call ALREADY
+            // `completed` and delivers the output on the update that follows, so
+            // dropping the entry on the opening frame's status would lose it.
+            if matches!(
+                status.as_deref(),
+                Some("completed" | "failed" | "cancelled" | "error")
+            ) {
+                cb_state.pi_terminal_calls.remove(&tool_call_id);
+            }
             // Symmetric with the ToolCall arm: an update may carry the terminal
             // status (and, on grok, usually re-carries the `x.ai/tool` meta).
             track_grok_spawn_call(cb_state, grok_spawn, status.as_deref(), &tool_call_id, &raw_input);
@@ -9516,20 +11091,28 @@ async fn emit_conversation_update(
         }
         SessionUpdate::SessionInfoUpdate(info) => {
             // codex-acp v1.1.0 (#263) reports `/goal` transitions as structured
-            // session metadata instead of live "Goal updated (…)" agent text:
-            // the goal object rides under `_meta.codex.goal`. Map it onto codeg's
-            // canonical create_goal/update_goal synthetic tool call so the
-            // existing goal-card pipeline (groupGoalRuns/GoalCard) renders it —
-            // byte-identical to the history path (parsers/codex.rs). Non-Codex
-            // agents don't populate the `codex` key, so this is a no-op for them.
+            // session metadata instead of live "Goal updated (…)" agent text.
+            // The goal object rides under ONE of two meta keys, selected per
+            // connection at initialize (`SessionState.neutral_goal_channel`,
+            // see `session_info_goal_value`): the provider-neutral
+            // `_meta.goal` for adapters advertising the goal extension
+            // (claude-agent-acp 0.66+, codex-acp 1.2+ — which dropped the
+            // legacy key), else the legacy `_meta.codex.goal`. Either way it
+            // maps onto codeg's canonical create_goal/update_goal synthetic
+            // tool call so the existing goal-card pipeline
+            // (groupGoalRuns/GoalCard) renders it — byte-identical to the
+            // history path (parsers/codex.rs). Agents publishing no goal meta
+            // no-op here. The neutral snapshot's status vocabulary
+            // (active|paused|blocked|limited|complete) passes through
+            // `normalize_goal_status` unchanged; its extra fields
+            // (createdAt/updatedAt/iterations/lastReason/controlMethod)
+            // survive inside the marker's raw goal object for the card.
             // (`info.title` is Codex's native thread name; it is adopted via the
             // parser auto-title path on the next conversation fetch, not here, to
             // keep this DB-agnostic emit path unchanged — see parsers/codex.rs.)
-            if let Some(goal) = info
-                .meta
-                .as_ref()
-                .and_then(|m| m.get("codex"))
-                .and_then(|codex| codex.get("goal"))
+            let neutral_goal_channel = state.read().await.neutral_goal_channel;
+            if let Some(goal) =
+                session_info_goal_value(neutral_goal_channel, info.meta.as_ref())
             {
                 if let Some(marker) =
                     crate::acp::codex_goal::next_goal_marker(&mut cb_state.codex_open_goal, goal)
@@ -9555,11 +11138,40 @@ async fn emit_conversation_update(
                     )
                     .await;
                 }
+                // Mirror "a goal run is open" (⟺ the last snapshot was active,
+                // see `next_goal_marker`) onto the session state, where
+                // `ConnectionManager::goal_control` can read it: only an ACTIVE
+                // goal justifies following a pause/clear with an interrupt. A
+                // paused goal is not driving anything, so clearing it must
+                // leave whatever the user started themselves alone.
+                state.write().await.goal_active = cb_state.codex_open_goal.is_some();
+            }
+            // JetBrains AIR typed session failure (claude-agent-acp 0.67+/
+            // codex-acp 1.2+): published only because codeg advertises
+            // `clientCapabilities._meta.jetbrains.air` (see
+            // `build_client_capabilities`). Valid upserts are forwarded
+            // verbatim — the monotonic id+revision merge runs identically in
+            // `SessionState::apply_event` and the frontend reducer, so a
+            // stale or replayed record is rejected the same way everywhere.
+            // A record without usable identity cannot merge and is dropped.
+            if let Some(raw) = air_session_failure(info.meta.as_ref()) {
+                match parse_session_failure_record(raw) {
+                    Some(record) => {
+                        emit_with_state(state, emitter, AcpEvent::SessionFailure { record })
+                            .await;
+                    }
+                    None => tracing::debug!(
+                        "[ACP] dropped AIR sessionFailure without usable id/revision: {raw:?}"
+                    ),
+                }
             }
             // codex-acp #289 (v1.1.3+): a retryable turn error rides under
             // `_meta.codex.error` (only when `willRetry == true`) and the turn
             // stays alive. Surface a transient retry indicator (the frontend
             // reuses the Claude API-retry banner); it is NOT a turn failure.
+            // With AIR advertised (above), codex 1.2+ REPLACES this channel
+            // with severity-"warning" failure records, so this indicator now
+            // serves only non-advertised/legacy paths.
             if let Some((message, error_status)) = codex_retry_indicator(info.meta.as_ref()) {
                 emit_with_state(
                     state,
@@ -9607,6 +11219,246 @@ mod tests {
             SessionConfigKindInfo::Select(sel) => sel,
             other => panic!("expected a select config option, got {other:?}"),
         }
+    }
+
+    // ── PermissionQueue (#442) ──────────────────────────────────────────────
+    //
+    // The queue is what stops N concurrent `session/request_permission`s from
+    // collapsing into the single card slot and stranding the losers' responders
+    // forever. Driven here through a stub responder because sacp's `Responder`
+    // has private fields and no public constructor.
+
+    /// How a stubbed responder was settled. `Ord` so the drain assertions can
+    /// sort — `HashMap::drain` yields an arbitrary order.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+    enum StubSettled {
+        Selected,
+        Cancelled,
+    }
+
+    /// Records `(request_id, how)` into a shared log when settled, so a test can
+    /// assert that EVERY parked responder was answered exactly once — the whole
+    /// point of the queue is that none is silently dropped.
+    struct StubResponder {
+        request_id: String,
+        log: Arc<std::sync::Mutex<Vec<(String, StubSettled)>>>,
+    }
+
+    impl PermissionResponder for StubResponder {
+        fn respond_selected(self, _option_id: String) {
+            self.log
+                .lock()
+                .unwrap()
+                .push((self.request_id, StubSettled::Selected));
+        }
+
+        fn respond_cancelled(self) {
+            self.log
+                .lock()
+                .unwrap()
+                .push((self.request_id, StubSettled::Cancelled));
+        }
+    }
+
+    type StubLog = Arc<std::sync::Mutex<Vec<(String, StubSettled)>>>;
+
+    /// Admit `id` into `queue`; returns the card the queue says to publish now.
+    fn admit_stub(
+        queue: &mut PermissionQueue<StubResponder>,
+        log: &StubLog,
+        id: &str,
+    ) -> Option<QueuedPermission> {
+        queue.admit(
+            StubResponder {
+                request_id: id.to_string(),
+                log: Arc::clone(log),
+            },
+            QueuedPermission {
+                request_id: id.to_string(),
+                tool_call: serde_json::json!({ "toolCallId": id }),
+                options: vec![],
+            },
+        )
+    }
+
+    fn stub_queue() -> (PermissionQueue<StubResponder>, StubLog) {
+        (
+            PermissionQueue::default(),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        )
+    }
+
+    #[test]
+    fn permission_queue_shows_only_the_first_of_concurrent_requests() {
+        let (mut q, log) = stub_queue();
+        // The regression itself: three approvals arrive back-to-back (codex
+        // running parallel shell commands). Before the queue, each emit
+        // overwrote the last and the first two became unanswerable.
+        let first = admit_stub(&mut q, &log, "a").expect("first request must be shown");
+        assert_eq!(first.request_id, "a");
+        assert!(
+            admit_stub(&mut q, &log, "b").is_none(),
+            "a second concurrent request must queue, not replace the visible card"
+        );
+        assert!(admit_stub(&mut q, &log, "c").is_none());
+        assert_eq!(q.waiting_len(), 2);
+        assert_eq!(q.showing.as_deref(), Some("a"));
+        assert!(log.lock().unwrap().is_empty(), "nothing settled yet");
+    }
+
+    #[test]
+    fn permission_queue_promotes_in_fifo_order_and_settles_every_responder() {
+        let (mut q, log) = stub_queue();
+        admit_stub(&mut q, &log, "a");
+        admit_stub(&mut q, &log, "b");
+        admit_stub(&mut q, &log, "c");
+
+        let after_a = q.resolve("a", "allow".into());
+        assert!(after_a.answered);
+        assert_eq!(
+            after_a.next.map(|c| c.request_id).as_deref(),
+            Some("b"),
+            "answering the visible card must promote the FIFO head"
+        );
+        let after_b = q.resolve("b", "allow".into());
+        assert_eq!(after_b.next.map(|c| c.request_id).as_deref(), Some("c"));
+        let after_c = q.resolve("c", "allow".into());
+        assert!(after_c.answered);
+        assert!(after_c.next.is_none(), "queue drained, nothing left to show");
+        assert_eq!(q.showing, None);
+        assert_eq!(q.waiting_len(), 0);
+
+        // Every one of the three agent tool calls got an answer — the bug was
+        // that two of them never did.
+        let settled = log.lock().unwrap().clone();
+        assert_eq!(
+            settled,
+            vec![
+                ("a".to_string(), StubSettled::Selected),
+                ("b".to_string(), StubSettled::Selected),
+                ("c".to_string(), StubSettled::Selected),
+            ]
+        );
+    }
+
+    #[test]
+    fn permission_queue_ignores_unknown_and_duplicate_answers() {
+        let (mut q, log) = stub_queue();
+        admit_stub(&mut q, &log, "a");
+        admit_stub(&mut q, &log, "b");
+
+        let unknown = q.resolve("nope", "allow".into());
+        assert!(
+            !unknown.answered,
+            "an unknown id must not advance the queue (the caller emits nothing)"
+        );
+        assert_eq!(q.showing.as_deref(), Some("a"));
+
+        assert!(q.resolve("a", "allow".into()).answered);
+        // Two clients racing the same card: the second answer must not consume
+        // an already-settled responder or promote a second time.
+        let again = q.resolve("a", "reject".into());
+        assert!(!again.answered);
+        assert_eq!(q.showing.as_deref(), Some("b"));
+        assert_eq!(log.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn permission_queue_answering_a_queued_card_removes_it_from_the_queue() {
+        // Defensive path: a stale client answers a card that never reached the
+        // screen. Its queue entry must go too, or promoting it later would show
+        // a card whose responder is already consumed.
+        let (mut q, log) = stub_queue();
+        admit_stub(&mut q, &log, "a");
+        admit_stub(&mut q, &log, "b");
+        admit_stub(&mut q, &log, "c");
+
+        let out = q.resolve("b", "allow".into());
+        assert!(out.answered);
+        assert!(
+            out.next.is_none(),
+            "answering a non-visible card must not change what is on screen"
+        );
+        assert_eq!(q.showing.as_deref(), Some("a"));
+        assert_eq!(q.waiting_len(), 1);
+
+        assert_eq!(
+            q.resolve("a", "allow".into()).next.map(|c| c.request_id),
+            Some("c".to_string()),
+            "the dead entry must be skipped by removal, not by a promote-time check"
+        );
+    }
+
+    #[test]
+    fn permission_queue_drain_cancels_all_and_reports_the_visible_card() {
+        let (mut q, log) = stub_queue();
+        admit_stub(&mut q, &log, "a");
+        admit_stub(&mut q, &log, "b");
+        admit_stub(&mut q, &log, "c");
+
+        assert_eq!(
+            q.drain().as_deref(),
+            Some("a"),
+            "the visible card must be reported so the caller can emit a \
+             compensating PermissionResolved — without it the card lingers on \
+             every client with no live responder (the idle-Cancel ghost)"
+        );
+        assert_eq!(q.showing, None);
+        assert_eq!(q.waiting_len(), 0);
+
+        let mut settled = log.lock().unwrap().clone();
+        settled.sort();
+        assert_eq!(
+            settled,
+            vec![
+                ("a".to_string(), StubSettled::Cancelled),
+                ("b".to_string(), StubSettled::Cancelled),
+                ("c".to_string(), StubSettled::Cancelled),
+            ],
+            "queued responders must be cancelled too, not leaked"
+        );
+    }
+
+    #[test]
+    fn permission_queue_drain_with_nothing_shown_needs_no_compensation() {
+        let (mut q, _log) = stub_queue();
+        assert!(
+            q.drain().is_none(),
+            "an empty queue must not emit a spurious PermissionResolved"
+        );
+    }
+
+    #[test]
+    fn permission_queue_admits_again_after_drain() {
+        // The TurnComplete wedge guard: if a drain left `showing` set, every
+        // later permission on this connection would queue behind a card that can
+        // never be answered — reproducing the very symptom being fixed.
+        let (mut q, log) = stub_queue();
+        admit_stub(&mut q, &log, "a");
+        admit_stub(&mut q, &log, "b");
+        q.drain();
+
+        let fresh = admit_stub(&mut q, &log, "c");
+        assert_eq!(
+            fresh.map(|c| c.request_id).as_deref(),
+            Some("c"),
+            "a post-drain request must be shown immediately"
+        );
+        assert_eq!(q.showing.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn permission_queue_admit_then_drain_never_leaves_an_inert_card() {
+        // The interleaving that motivated putting the responder map and the
+        // queue under ONE lock: admit publishes a card, a Cancel drains, and the
+        // card must be reported for compensation rather than left up.
+        let (mut q, log) = stub_queue();
+        let shown = admit_stub(&mut q, &log, "a").expect("shown");
+        assert_eq!(q.drain().as_deref(), Some(shown.request_id.as_str()));
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![("a".to_string(), StubSettled::Cancelled)]
+        );
     }
 
     #[test]
@@ -9664,24 +11516,96 @@ mod tests {
         v.as_object().expect("object").clone()
     }
 
+    fn subagent_launch_input(
+        agent_type: AgentType,
+        meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<serde_json::Value> {
+        match classify_codex_subagent_activity(agent_type, meta) {
+            CodexSubagentActivity::Started(input) => {
+                Some(serde_json::from_str(&input).expect("valid JSON"))
+            }
+            _ => None,
+        }
+    }
+
     #[test]
-    fn codex_subagent_activity_detected_only_for_codex_subagent_meta() {
-        // codex-acp #304: `_meta.codex.subagent` marks the suppressed activity.
+    fn codex_subagent_launch_becomes_an_agent_capsule_input() {
+        // codex 0.147 forwards nothing but this for a native sub-agent, so it is
+        // the whole live signal: name from the path's last segment, thread id as
+        // the card's badge, and no prompt (the task text is encrypted).
         let sub = meta_map(serde_json::json!({
+            "codex": {
+                "subagent": {
+                    "threadId": "01a0098a-7e8a",
+                    "path": "/root/pnpm_build",
+                    "activity": "started",
+                }
+            }
+        }));
+        assert_eq!(
+            subagent_launch_input(AgentType::Codex, Some(&sub)),
+            Some(serde_json::json!({
+                "subagent_type": "pnpm_build",
+                "agent_id": "01a0098a-7e8a",
+                // Says the card stands for the LAUNCH, so its "completed" is
+                // not read as "the sub-agent finished" — the parser writes the
+                // same key on reload.
+                crate::parsers::codex::CODEX_SUBAGENT_LAUNCH_KEY: true,
+            }))
+        );
+        // A trailing slash / empty path must not produce a nameless capsule, and
+        // a missing thread id just drops the badge rather than the whole card.
+        let odd = meta_map(serde_json::json!({
+            "codex": { "subagent": { "path": "/", "activity": "started" } }
+        }));
+        assert_eq!(
+            subagent_launch_input(AgentType::Codex, Some(&odd)),
+            Some(serde_json::json!({
+                "subagent_type": "subagent",
+                crate::parsers::codex::CODEX_SUBAGENT_LAUNCH_KEY: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn codex_subagent_activity_classified_only_for_codex_subagent_meta() {
+        let started = meta_map(serde_json::json!({
             "codex": { "subagent": { "threadId": "t1", "path": "/root/x", "activity": "started" } }
         }));
-        assert!(is_codex_subagent_activity(AgentType::Codex, Some(&sub)));
-        // Only Codex is gated — the same meta never suppresses another agent.
-        assert!(!is_codex_subagent_activity(AgentType::ClaudeCode, Some(&sub)));
+        // Only Codex is gated — the same meta never reshapes another agent's call.
+        assert!(matches!(
+            classify_codex_subagent_activity(AgentType::ClaudeCode, Some(&started)),
+            CodexSubagentActivity::None
+        ));
+        // Later lifecycle markers stay dropped: they carry no content and would
+        // open a second, indistinguishable capsule for the same sub-agent.
+        for kind in ["interacted", "interrupted"] {
+            let other = meta_map(serde_json::json!({
+                "codex": { "subagent": { "threadId": "t1", "path": "/root/x", "activity": kind } }
+            }));
+            assert!(matches!(
+                classify_codex_subagent_activity(AgentType::Codex, Some(&other)),
+                CodexSubagentActivity::Other
+            ));
+        }
         // Absent meta and sibling codex meta keys (goal / collaboration) are not
         // subagent activity and must render normally.
-        assert!(!is_codex_subagent_activity(AgentType::Codex, None));
+        assert!(matches!(
+            classify_codex_subagent_activity(AgentType::Codex, None),
+            CodexSubagentActivity::None
+        ));
         let goal = meta_map(serde_json::json!({ "codex": { "goal": { "objective": "x" } } }));
-        assert!(!is_codex_subagent_activity(AgentType::Codex, Some(&goal)));
+        assert!(matches!(
+            classify_codex_subagent_activity(AgentType::Codex, Some(&goal)),
+            CodexSubagentActivity::None
+        ));
         let collab = meta_map(serde_json::json!({
             "codex": { "collaboration": { "tool": "spawnAgent" } }
         }));
-        assert!(!is_codex_subagent_activity(AgentType::Codex, Some(&collab)));
+        assert!(matches!(
+            classify_codex_subagent_activity(AgentType::Codex, Some(&collab)),
+            CodexSubagentActivity::None
+        ));
     }
 
     #[test]
@@ -9785,6 +11709,318 @@ mod tests {
         let stringly = meta_map(serde_json::json!({"steering": {"supported": "true"}}));
         assert!(!init_advertises_steering(Some(&stringly)));
         assert!(!init_advertises_steering(None));
+    }
+
+    #[test]
+    fn init_advertises_goal_requires_integer_version_at_least_1() {
+        // The real advertisements: codex-acp 1.2.0+ / claude-agent-acp 0.66.0+.
+        let codex = meta_map(serde_json::json!({"goal": {
+            "version": 1,
+            "controlMethod": "_session/goal",
+            "actions": ["set", "pause", "resume", "clear"],
+        }}));
+        assert!(init_advertises_goal(Some(&codex)));
+        // Future versions must keep selecting the neutral channel.
+        let v2 = meta_map(serde_json::json!({"goal": {"version": 2}}));
+        assert!(init_advertises_goal(Some(&v2)));
+
+        // Fail closed onto the legacy channel: sub-1, non-integer, stringly,
+        // absent, or wrongly-shaped advertisements.
+        for bad in [
+            serde_json::json!({"goal": {"version": 0}}),
+            serde_json::json!({"goal": {"version": 1.5}}),
+            serde_json::json!({"goal": {"version": "1"}}),
+            serde_json::json!({"goal": {}}),
+            serde_json::json!({"goal": true}),
+            serde_json::json!({"steering": {"supported": true}}),
+        ] {
+            let meta = meta_map(bad);
+            assert!(!init_advertises_goal(Some(&meta)));
+        }
+        assert!(!init_advertises_goal(None));
+    }
+
+    #[test]
+    fn session_info_goal_value_reads_exactly_one_channel() {
+        // A transitional adapter double-publishing the same transition through
+        // both namespaces (even across separate updates) must yield the goal
+        // from exactly ONE channel — the one pinned at initialize.
+        let both = meta_map(serde_json::json!({
+            "goal": {"objective": "neutral", "status": "active"},
+            "codex": {"goal": {"objective": "legacy", "status": "active"}},
+        }));
+        let neutral = session_info_goal_value(true, Some(&both)).expect("neutral value");
+        assert_eq!(neutral.get("objective").and_then(|v| v.as_str()), Some("neutral"));
+        let legacy = session_info_goal_value(false, Some(&both)).expect("legacy value");
+        assert_eq!(legacy.get("objective").and_then(|v| v.as_str()), Some("legacy"));
+
+        // Neutral-pinned connections ignore a legacy-only update (and vice
+        // versa) — the two updates of a double-publish collapse to one marker.
+        let legacy_only = meta_map(
+            serde_json::json!({"codex": {"goal": {"objective": "legacy", "status": "active"}}}),
+        );
+        assert!(session_info_goal_value(true, Some(&legacy_only)).is_none());
+        let neutral_only = meta_map(
+            serde_json::json!({"goal": {"objective": "neutral", "status": "active"}}),
+        );
+        assert!(session_info_goal_value(false, Some(&neutral_only)).is_none());
+
+        // `goal: null` IS a value (the clear signal), not an absent key.
+        let cleared = meta_map(serde_json::json!({"goal": null}));
+        assert!(matches!(
+            session_info_goal_value(true, Some(&cleared)),
+            Some(v) if v.is_null()
+        ));
+        assert!(session_info_goal_value(false, Some(&cleared)).is_none());
+        assert!(session_info_goal_value(true, None).is_none());
+    }
+
+    #[test]
+    fn goal_advertised_control_reads_method_and_actions_or_falls_back() {
+        // claude 0.66+ / codex 1.2+ advertisements.
+        let claude = meta_map(serde_json::json!({"goal": {
+            "version": 1,
+            "controlMethod": "_session/goal",
+            "actions": ["set", "clear"],
+        }}));
+        assert_eq!(
+            goal_advertised_control(Some(&claude)),
+            Some(("_session/goal".to_string(), vec!["set".to_string(), "clear".to_string()]))
+        );
+        // Advertised-but-empty actions are honored as "no controls" — the
+        // card must not offer affordances the adapter never implemented.
+        let none_offered = meta_map(serde_json::json!({"goal": {
+            "version": 1,
+            "controlMethod": "_session/goal",
+            "actions": [],
+        }}));
+        assert_eq!(
+            goal_advertised_control(Some(&none_offered)),
+            Some(("_session/goal".to_string(), Vec::new()))
+        );
+        // No neutral advertisement / no usable method ⇒ None (legacy
+        // defaults stay in force).
+        let no_goal = meta_map(serde_json::json!({"steering": {"supported": true}}));
+        assert_eq!(goal_advertised_control(Some(&no_goal)), None);
+        let blank_method = meta_map(serde_json::json!({"goal": {
+            "version": 1,
+            "controlMethod": "   ",
+            "actions": ["clear"],
+        }}));
+        assert_eq!(goal_advertised_control(Some(&blank_method)), None);
+        assert_eq!(goal_advertised_control(None), None);
+    }
+
+    #[test]
+    fn the_legacy_vocabulary_is_resolved_at_initialize_not_at_construction() {
+        // A fresh session knows NOTHING: a snapshot read during the handshake
+        // (which happens — `spawn_agent` returns before `initialize` lands)
+        // must not hand the card a legacy pair it latches forever.
+        let fresh = SessionState::new(
+            "c-goal".to_string(),
+            AgentType::ClaudeCode,
+            None,
+            "w".to_string(),
+            None,
+        );
+        assert_eq!(fresh.goal_actions, None);
+        assert_eq!(fresh.to_snapshot().goal_actions, None);
+        // ... and `None` reaches the client as an explicit null, not as an
+        // absent field — absent is reserved for a server too old to have it,
+        // which the client still maps to the legacy pair.
+        let wire = serde_json::to_value(fresh.to_snapshot()).unwrap();
+        assert_eq!(wire.get("goal_actions"), Some(&serde_json::Value::Null));
+
+        // Initialize is where both cases are decided. Advertised wins…
+        assert_eq!(
+            resolve_goal_control(Some((
+                "_session/goal".to_string(),
+                vec!["set".to_string(), "clear".to_string()],
+            ))),
+            (
+                Some("_session/goal".to_string()),
+                vec!["set".to_string(), "clear".to_string()]
+            )
+        );
+        // …and a non-advertising adapter resolves to the legacy pair, keeping
+        // the method the state was built with.
+        assert_eq!(
+            resolve_goal_control(None),
+            (None, vec!["pause".to_string(), "clear".to_string()])
+        );
+    }
+
+    #[test]
+    fn air_session_failure_requires_wellformed_versioned_envelope() {
+        let ok = meta_map(serde_json::json!({"jetbrains": {"air": {
+            "version": 1,
+            "sessionFailure": {"id": "t1:error", "revision": 1},
+        }}}));
+        assert!(air_session_failure(Some(&ok)).is_some());
+
+        // Missing/zero/stringly version, or a failure outside the air
+        // envelope, must yield nothing.
+        for bad in [
+            serde_json::json!({"jetbrains": {"air": {"sessionFailure": {"id": "x", "revision": 1}}}}),
+            serde_json::json!({"jetbrains": {"air": {"version": 0, "sessionFailure": {}}}}),
+            serde_json::json!({"jetbrains": {"air": {"version": "1", "sessionFailure": {}}}}),
+            serde_json::json!({"jetbrains": {"sessionFailure": {"id": "x", "revision": 1}}}),
+            serde_json::json!({"air": {"version": 1, "sessionFailure": {}}}),
+        ] {
+            let meta = meta_map(bad);
+            assert!(air_session_failure(Some(&meta)).is_none());
+        }
+        assert!(air_session_failure(None).is_none());
+    }
+
+    #[test]
+    fn response_session_failure_reads_the_prompt_response_carrier() {
+        // claude `failActiveWithSessionFailure` / codex
+        // `terminalFailurePromptResponse` both attach a turn's terminal record
+        // to the prompt response `_meta` under the SAME jetbrains.air envelope
+        // the update channel uses, with a disguised `end_turn` stop reason —
+        // this carrier is the only wire delivery of claude terminal failures.
+        let meta = meta_map(serde_json::json!({"jetbrains": {"air": {
+            "version": 1,
+            "sessionFailure": {
+                "id": "prompt-1:error",
+                "revision": 6,
+                "category": "connection",
+                "severity": "error",
+                "title": "The connection to Claude was lost.",
+                "actions": ["new_session"],
+            },
+        }}}));
+        let record = response_session_failure(Some(&meta)).expect("record");
+        assert_eq!(record.id, "prompt-1:error");
+        assert_eq!(record.revision, 6);
+        assert_eq!(record.severity, "error");
+        assert_eq!(record.actions, vec!["new_session".to_string()]);
+
+        // Same gates as the update channel: malformed envelope or missing
+        // identity ⇒ no record (and no synthetic-empty suppression).
+        let unversioned = meta_map(serde_json::json!({"jetbrains": {"air": {
+            "sessionFailure": {"id": "x", "revision": 1},
+        }}}));
+        assert!(response_session_failure(Some(&unversioned)).is_none());
+        let no_identity = meta_map(serde_json::json!({"jetbrains": {"air": {
+            "version": 1,
+            "sessionFailure": {"title": "no id"},
+        }}}));
+        assert!(response_session_failure(Some(&no_identity)).is_none());
+        assert!(response_session_failure(None).is_none());
+    }
+
+    #[test]
+    fn parse_session_failure_record_requires_identity_and_stays_lenient() {
+        // The real codex shape (SESSION_FAILURE_POLICY: auth_required →
+        // access/[login]).
+        let full = serde_json::json!({
+            "id": "turn-9:error",
+            "revision": 2,
+            "category": "access",
+            "severity": "error",
+            "title": "Authentication required.",
+            "details": "Token expired",
+            "actions": ["login"],
+        });
+        let record = parse_session_failure_record(&full).expect("record");
+        assert_eq!(record.id, "turn-9:error");
+        assert_eq!(record.revision, 2);
+        assert_eq!(record.category, "access");
+        assert_eq!(record.severity, "error");
+        assert_eq!(record.title, "Authentication required.");
+        assert_eq!(record.details.as_deref(), Some("Token expired"));
+        assert_eq!(record.actions, vec!["login".to_string()]);
+        assert!(!record.resolved);
+
+        // id + revision are HARD requirements — no identity, no merge.
+        for bad in [
+            serde_json::json!({"revision": 1, "title": "x"}),
+            serde_json::json!({"id": "", "revision": 1}),
+            serde_json::json!({"id": "   ", "revision": 1}),
+            serde_json::json!({"id": "x", "title": "no revision"}),
+            serde_json::json!({"id": "x", "revision": 0}),
+            serde_json::json!({"id": "x", "revision": -1}),
+            serde_json::json!({"id": "x", "revision": "1"}),
+        ] {
+            assert!(parse_session_failure_record(&bad).is_none(), "{bad:?}");
+        }
+
+        // Everything else is lenient: unknown vocabulary passes through as
+        // strings, blanks default, non-string action entries are skipped.
+        let sparse = serde_json::json!({
+            "id": "notice-1",
+            "revision": 1,
+            "category": "quantum",
+            "actions": ["retry", 42, "sing"],
+        });
+        let record = parse_session_failure_record(&sparse).expect("record");
+        assert_eq!(record.category, "quantum");
+        assert_eq!(record.severity, "error");
+        assert_eq!(record.title, "");
+        assert_eq!(record.details, None);
+        assert_eq!(record.actions, vec!["retry".to_string(), "sing".to_string()]);
+    }
+
+    #[test]
+    fn client_capabilities_advertise_air_for_claude_and_codex_only() {
+        // Both AIR speakers must send EXACTLY the shape the adapters gate on:
+        // integer version >= 1 plus "sessionFailure" in the capabilities
+        // array (`clientSupportsTypedSessionFailures` in codex,
+        // `supportsAirSessionFailures` in claude).
+        for agent in [AgentType::ClaudeCode, AgentType::Codex] {
+            let caps =
+                serde_json::to_value(build_client_capabilities(agent, HostToolsPolicy::Default))
+                    .unwrap();
+            let air = caps
+                .get("_meta")
+                .and_then(|m| m.get("jetbrains"))
+                .and_then(|j| j.get("air"))
+                .unwrap_or_else(|| panic!("{agent:?} must advertise jetbrains.air"));
+            assert_eq!(air.get("version").and_then(|v| v.as_i64()), Some(1));
+            let capabilities = air
+                .get("capabilities")
+                .and_then(|c| c.as_array())
+                .unwrap_or_else(|| panic!("{agent:?} must advertise an AIR capabilities array"));
+            assert!(capabilities
+                .iter()
+                .any(|v| v.as_str() == Some("sessionFailure")));
+            // And nothing else. Adding a capability here is not free: it is
+            // what turns a per-prompt request on, and "agentFileChangeReport"
+            // (claude-agent-acp 0.69.0 / codex-acp 1.4.0) buys an extra model
+            // round-trip per turn for a clamped, self-reported subset of what
+            // the `workspace_state` watcher already sees. See the reasoning at
+            // the advertisement site before relaxing this.
+            assert_eq!(
+                capabilities,
+                &vec![serde_json::Value::String("sessionFailure".to_string())],
+                "{agent:?} must advertise ONLY sessionFailure"
+            );
+        }
+        // Claude keeps its subagent-transcript flag alongside.
+        let claude = serde_json::to_value(build_client_capabilities(
+            AgentType::ClaudeCode,
+            HostToolsPolicy::Default,
+        ))
+        .unwrap();
+        assert_eq!(
+            claude
+                .get("_meta")
+                .and_then(|m| m.get("subagent-transcript"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        // Non-AIR agents advertise nothing under jetbrains.
+        for agent in [AgentType::Gemini, AgentType::Grok, AgentType::OpenCode] {
+            let caps =
+                serde_json::to_value(build_client_capabilities(agent, HostToolsPolicy::Default))
+                    .unwrap();
+            assert!(caps
+                .get("_meta")
+                .and_then(|m| m.get("jetbrains"))
+                .is_none());
+        }
     }
 
     #[test]
@@ -10123,7 +12359,7 @@ mod tests {
         // Codex gets the flag injected so codex-acp never drops the injected
         // `codeg-mcp` server on a config.toml name collision.
         let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
-        apply_codex_env_policy(AgentType::Codex, &mut env);
+        apply_codex_env_policy(AgentType::Codex, &mut env, None);
         assert!(env
             .iter()
             .any(|(k, v)| k == "DISABLE_MCP_CONFIG_FILTERING" && v == "true"));
@@ -10133,7 +12369,7 @@ mod tests {
             "DISABLE_MCP_CONFIG_FILTERING".to_string(),
             "false".to_string(),
         )];
-        apply_codex_env_policy(AgentType::Codex, &mut with_twin);
+        apply_codex_env_policy(AgentType::Codex, &mut with_twin, None);
         let hits: Vec<_> = with_twin
             .iter()
             .filter(|(k, _)| k == "DISABLE_MCP_CONFIG_FILTERING")
@@ -10146,12 +12382,61 @@ mod tests {
     fn codex_env_policy_is_noop_for_other_agents() {
         for agent in [AgentType::Grok, AgentType::ClaudeCode, AgentType::Gemini] {
             let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
-            apply_codex_env_policy(agent, &mut env);
+            apply_codex_env_policy(agent, &mut env, Some("read-only"));
             assert!(
                 !env.iter().any(|(k, _)| k == "DISABLE_MCP_CONFIG_FILTERING"),
                 "{agent:?} must not receive the codex-only flag"
             );
+            assert!(
+                !env.iter().any(|(k, _)| k == "INITIAL_AGENT_MODE"),
+                "{agent:?} must not receive codex's approval preset"
+            );
         }
+    }
+
+    #[test]
+    fn codex_env_policy_injects_the_config_derived_approval_preset() {
+        // Without this, codex-acp seeds its default `agent` preset and re-sends
+        // that approvalPolicy every turn, so the user's ~/.codex/config.toml
+        // sandbox/approval choice is dead (#442).
+        let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        apply_codex_env_policy(AgentType::Codex, &mut env, Some("read-only"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "INITIAL_AGENT_MODE" && v == "read-only"));
+
+        // Nothing mappable → stay out of the way entirely, leaving codex-acp's
+        // own default rather than pinning a preset the user never chose.
+        let mut none = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        apply_codex_env_policy(AgentType::Codex, &mut none, None);
+        assert!(!none.iter().any(|(k, _)| k == "INITIAL_AGENT_MODE"));
+    }
+
+    #[test]
+    fn codex_env_policy_lets_an_explicit_env_preset_win_over_the_config() {
+        // An explicit runtime-env key is a stronger signal than a config-file
+        // inference, so it must NOT be clobbered (and must not be duplicated).
+        let mut env = vec![(
+            "INITIAL_AGENT_MODE".to_string(),
+            "agent-full-access".to_string(),
+        )];
+        apply_codex_env_policy(AgentType::Codex, &mut env, Some("read-only"));
+        let hits: Vec<_> = env
+            .iter()
+            .filter(|(k, _)| k == "INITIAL_AGENT_MODE")
+            .collect();
+        assert_eq!(hits.len(), 1, "no duplicate key");
+        assert_eq!(hits[0].1, "agent-full-access");
+
+        // A blank twin carries no intent, so the config-derived value fills it.
+        let mut blank = vec![("INITIAL_AGENT_MODE".to_string(), "  ".to_string())];
+        apply_codex_env_policy(AgentType::Codex, &mut blank, Some("read-only"));
+        let hits: Vec<_> = blank
+            .iter()
+            .filter(|(k, _)| k == "INITIAL_AGENT_MODE")
+            .collect();
+        assert_eq!(hits.len(), 1, "blank twin replaced, not duplicated");
+        assert_eq!(hits[0].1, "read-only");
     }
 
     #[test]
@@ -10333,7 +12618,8 @@ mod tests {
         // Serialize to inspect the wire shape — `_meta` is the serde rename
         // and the exact key path the adapters read.
         let caps_of = |agent: AgentType| {
-            serde_json::to_value(build_client_capabilities(agent)).expect("caps serialize")
+            serde_json::to_value(build_client_capabilities(agent, HostToolsPolicy::Default))
+                .expect("caps serialize")
         };
 
         // Claude Code: subagent-transcript opt-in (strict boolean true), and
@@ -10345,10 +12631,19 @@ mod tests {
         );
         assert!(claude.get("elicitation").is_none());
 
-        // Codex: form elicitation, no subagent-transcript meta.
+        // Codex: form elicitation; its `_meta` carries ONLY the AIR
+        // advertisement (no subagent-transcript, which is claude's opt-in).
         let codex = caps_of(AgentType::Codex);
         assert!(codex.get("elicitation").is_some());
-        assert!(codex.get("_meta").is_none());
+        assert!(codex["_meta"].get("subagent-transcript").is_none());
+        assert!(codex["_meta"].get("jetbrains").is_some());
+
+        // DeepSeek: form elicitation too — deepseek-acp routes its
+        // ask_user_question + plan review through `elicitation/create` forms
+        // when the bit is advertised (button fallback otherwise).
+        let deepseek = caps_of(AgentType::DeepSeek);
+        assert!(deepseek.get("elicitation").is_some());
+        assert!(deepseek.get("_meta").is_none());
 
         // Everyone else: neither gate; fs + terminal always advertised.
         let other = caps_of(AgentType::Gemini);
@@ -10356,6 +12651,99 @@ mod tests {
         assert!(other.get("elicitation").is_none());
         assert_eq!(other["terminal"], serde_json::Value::Bool(true));
         assert_eq!(other["fs"]["readTextFile"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn host_tools_agent_withholds_both_execution_channels() {
+        let caps_of = |agent: AgentType, host_tools: HostToolsPolicy| {
+            serde_json::to_value(build_client_capabilities(agent, host_tools))
+                .expect("caps serialize")
+        };
+
+        // #436: the whole point. An agent told codeg hosts neither channel
+        // does its own reads and runs its own shell, so its OS sandbox — the
+        // only control still working under `grok agent stdio` — covers them.
+        // BOTH must go: leaving either advertised hands the agent a way back
+        // into codeg's unsandboxed process for the same file.
+        //
+        // `ClientCapabilities` serializes its unset fields as explicit `false`
+        // rather than omitting them, so assert THAT shape — not absence. The
+        // two are equivalent on the wire, verified against grok 1.0.0 under a
+        // kernel `deny`: sending `{fs:{readTextFile:false,…},terminal:false}`
+        // produced the same outcome as omitting the keys entirely (local read →
+        // `EPERM`, every shell fallback blocked, `FsViolation` audited).
+        let withheld = caps_of(AgentType::Grok, HostToolsPolicy::Agent);
+        assert_eq!(withheld["terminal"], serde_json::Value::Bool(false));
+        assert_eq!(withheld["fs"]["readTextFile"], serde_json::Value::Bool(false));
+        assert_eq!(
+            withheld["fs"]["writeTextFile"],
+            serde_json::Value::Bool(false)
+        );
+
+        // Default is untouched — this is opt-in, and a regression here would
+        // silently break every agent's terminal.
+        let hosted = caps_of(AgentType::Grok, HostToolsPolicy::Default);
+        assert_eq!(hosted["terminal"], serde_json::Value::Bool(true));
+        assert_eq!(hosted["fs"]["readTextFile"], serde_json::Value::Bool(true));
+        assert_eq!(hosted["fs"]["writeTextFile"], serde_json::Value::Bool(true));
+
+        // The per-agent gates are about a DIFFERENT axis (which optional
+        // protocol surfaces each adapter understands) and must survive the
+        // withholding — dropping codex's elicitation would strand its Plan-mode
+        // `request_user_input`, and dropping claude's `_meta` would silently
+        // turn subagent transcripts back off.
+        let codex = caps_of(AgentType::Codex, HostToolsPolicy::Agent);
+        assert!(codex.get("elicitation").is_some());
+        assert_eq!(codex["terminal"], serde_json::Value::Bool(false));
+        let claude = caps_of(AgentType::ClaudeCode, HostToolsPolicy::Agent);
+        assert_eq!(
+            claude["_meta"]["subagent-transcript"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(claude["fs"]["readTextFile"], serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn a_withheld_channel_is_refused_as_method_not_found() {
+        // Every channel codeg stops advertising must also stop being SERVED.
+        // Advertisement is a declaration; an agent that calls the method anyway
+        // (or a future adapter that ignores client capabilities) would otherwise
+        // land the operation back in codeg's unsandboxed process — the bug.
+        for method in [
+            "fs/read_text_file",
+            "fs/write_text_file",
+            "terminal/create",
+            "terminal/output",
+            "terminal/wait_for_exit",
+            "terminal/kill",
+            "terminal/release",
+        ] {
+            let error = unadvertised_channel_error(method);
+            assert_eq!(error.code, sacp::Error::method_not_found().code);
+            let text = error.to_string();
+            // The knob has to be named: a bare "Method not found" on a channel
+            // that worked yesterday reads as a codeg bug, not as a setting.
+            assert!(text.contains(method), "{text}");
+            assert!(text.contains(HOST_TOOLS_ENV), "{text}");
+        }
+    }
+
+    #[test]
+    fn strict_fs_policy_is_only_a_boundary_once_the_terminal_is_withheld() {
+        // Pins the condition behind the connect-time warning: `strict` gates
+        // reads, but that gate is walkable through a shell for as long as codeg
+        // serves one. The two knobs are orthogonal — this asserts the predicate
+        // pair the warning keys off, so the warning can't silently stop firing.
+        let strict = FsAccessPolicy::strict(Path::new("/workspace"));
+        assert!(strict.confines_reads());
+        assert!(HostToolsPolicy::Default.hosts_channels());
+        assert!(!HostToolsPolicy::Agent.hosts_channels());
+
+        // The default policy leaves reads open, so there is no false promise to
+        // warn about — only writes are rooted.
+        let permissive =
+            FsAccessPolicy::permissive(Path::new("/workspace"), AgentType::Grok, &BTreeMap::new());
+        assert!(!permissive.confines_reads());
     }
 
     #[test]
@@ -10505,6 +12893,221 @@ mod tests {
             map_grok_ext_notification(&raw, AgentType::Grok),
             Some(AcpEvent::ToolCall { .. })
         ));
+    }
+
+    #[test]
+    fn map_grok_ext_notification_image_dropped_surfaces_error() {
+        let raw = UntypedMessage::new(
+            "_x.ai/session_notification",
+            serde_json::json!({
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "image_dropped",
+                    "notes": [
+                        "Image 1 was dropped before send: too small (1×1); images must be at least 8×8 pixels."
+                    ]
+                }
+            }),
+        )
+        .unwrap();
+        match map_grok_ext_notification(&raw, AgentType::Grok) {
+            Some(AcpEvent::Error {
+                message, terminal, ..
+            }) => {
+                assert!(
+                    message.contains("too small"),
+                    "error should carry grok's drop reason; got: {message}"
+                );
+                // grok's note already opens with "Image 1 was dropped before
+                // send"; a prefix here would stutter it back at the user.
+                assert!(
+                    message.starts_with("Image 1 was dropped"),
+                    "grok's own sentence must be shown verbatim; got: {message}"
+                );
+                assert!(!terminal, "a dropped image must not kill the connection");
+            }
+            other => panic!("expected non-terminal Error, got {other:?}"),
+        }
+    }
+
+    /// Without `notes` there is no sentence to show, so the fallback has to
+    /// supply the subject itself.
+    #[test]
+    fn map_grok_ext_notification_image_dropped_without_notes_still_names_the_subject() {
+        let raw = UntypedMessage::new(
+            "_x.ai/session_notification",
+            serde_json::json!({
+                "sessionId": "s",
+                "update": { "sessionUpdate": "image_dropped", "reason": "decode failed" }
+            }),
+        )
+        .unwrap();
+        match map_grok_ext_notification(&raw, AgentType::Grok) {
+            Some(AcpEvent::Error { message, .. }) => {
+                assert_eq!(message, "Image dropped: decode failed");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        let bare = UntypedMessage::new(
+            "_x.ai/session_notification",
+            serde_json::json!({
+                "sessionId": "s",
+                "update": { "sessionUpdate": "image_dropped", "notes": [] }
+            }),
+        )
+        .unwrap();
+        match map_grok_ext_notification(&bare, AgentType::Grok) {
+            Some(AcpEvent::Error { message, .. }) => {
+                assert!(
+                    message.to_lowercase().contains("image"),
+                    "a note-less drop must still say what happened; got: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_grok_image_blocks_lifts_decodable_image_blobs_only() {
+        let blocks = vec![
+            PromptInputBlock::Text {
+                text: "see this".into(),
+            },
+            PromptInputBlock::Resource {
+                uri: "clipboard://shot.png-abc".into(),
+                mime_type: Some("image/png".into()),
+                text: None,
+                blob: Some("aGk=".into()),
+            },
+            PromptInputBlock::Resource {
+                uri: "clipboard://notes.md".into(),
+                mime_type: Some("text/markdown".into()),
+                text: Some("hi".into()),
+                blob: None,
+            },
+            PromptInputBlock::Image {
+                data: "already".into(),
+                mime_type: "image/jpeg".into(),
+                uri: None,
+            },
+        ];
+        let out = normalize_grok_image_blocks(blocks);
+        assert!(matches!(&out[0], PromptInputBlock::Text { text } if text == "see this"));
+        assert!(
+            matches!(
+                &out[1],
+                PromptInputBlock::Image { data, mime_type, uri: Some(u) }
+                    if data == "aGk="
+                        && mime_type == "image/png"
+                        && u == "clipboard://shot.png-abc"
+            ),
+            "{:?}",
+            out[1]
+        );
+        assert!(matches!(
+            &out[2],
+            PromptInputBlock::Resource {
+                mime_type: Some(m),
+                ..
+            } if m == "text/markdown"
+        ));
+        assert!(matches!(
+            &out[3],
+            PromptInputBlock::Image { data, .. } if data == "already"
+        ));
+    }
+
+    /// grok's validator rejects `image/svg+xml` outright ("unsupported or
+    /// unrecognised image format") and the model then sees nothing at all. As a
+    /// resource blob the same file lands in the session's assets, where the
+    /// model can read the source — so an undecodable mime must NOT ride the
+    /// native carriage, whichever producer built the block.
+    #[test]
+    fn normalize_grok_image_blocks_demotes_mimes_grok_cannot_decode() {
+        let blocks = vec![
+            PromptInputBlock::Image {
+                data: "PHN2Zy8+".into(),
+                mime_type: "image/svg+xml".into(),
+                uri: Some("file:///tmp/diagram.svg".into()),
+            },
+            // Path-less (pasted): the demotion has to invent a stable uri.
+            // Upper-cased on purpose — the "is it an image at all" guard and the
+            // allow-list must read the same string the same way, or an
+            // undecodable format sails through as native.
+            PromptInputBlock::Image {
+                data: "PHN2Zy8+".into(),
+                mime_type: "IMAGE/SVG+XML".into(),
+                uri: None,
+            },
+            // Already on the resource carriage and undecodable — left alone,
+            // never promoted.
+            PromptInputBlock::Resource {
+                uri: "clipboard://icon.svg".into(),
+                mime_type: Some("image/svg+xml".into()),
+                text: None,
+                blob: Some("PHN2Zy8+".into()),
+            },
+        ];
+        let out = normalize_grok_image_blocks(blocks);
+        assert!(
+            matches!(
+                &out[0],
+                PromptInputBlock::Resource { uri, mime_type: Some(m), text: None, blob: Some(b) }
+                    if uri == "file:///tmp/diagram.svg"
+                        && m == "image/svg+xml"
+                        && b == "PHN2Zy8+"
+            ),
+            "{:?}",
+            out[0]
+        );
+        assert!(
+            matches!(
+                &out[1],
+                PromptInputBlock::Resource { uri, blob: Some(b), .. }
+                    if uri == "clipboard://grok-image-1" && b == "PHN2Zy8+"
+            ),
+            "{:?}",
+            out[1]
+        );
+        assert!(
+            matches!(
+                &out[2],
+                PromptInputBlock::Resource { mime_type: Some(m), .. } if m == "image/svg+xml"
+            ),
+            "{:?}",
+            out[2]
+        );
+    }
+
+    /// The allow-list is the boundary between the two carriages, so pin it:
+    /// grok's own raster set in, everything else out.
+    #[test]
+    fn grok_decodes_image_mime_covers_groks_raster_set_only() {
+        for mime in [
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp",
+            "image/bmp",
+            "image/tiff",
+            "IMAGE/PNG",
+        ] {
+            assert!(grok_decodes_image_mime(mime), "{mime} should be decodable");
+        }
+        for mime in [
+            "image/svg+xml",
+            "image/avif",
+            "image/heic",
+            "image/x-icon",
+            "text/markdown",
+            "",
+        ] {
+            assert!(
+                !grok_decodes_image_mime(mime),
+                "{mime} must keep the resource carriage"
+            );
+        }
     }
 
     #[test]
@@ -10900,6 +13503,54 @@ mod tests {
         // Never fires for a non-grok agent.
         assert!(!grok_ext_notification_is_turn_output(
             &notif("auto_compact_completed"),
+            AgentType::Codex
+        ));
+    }
+
+    /// The `session/load` replay drains a PAST session, so anything that would
+    /// raise an alert (status-bar entry + OS notification) has to be recognised
+    /// and skipped there — otherwise opening an old conversation reports its
+    /// historical failures as if they were happening now.
+    #[test]
+    fn grok_ext_notification_is_alert_matches_only_the_error_outcomes() {
+        let notif = |variant: &str| {
+            Dispatch::Notification(
+                UntypedMessage::new(
+                    "_x.ai/session_notification",
+                    serde_json::json!({
+                        "sessionId": "s",
+                        "update": {
+                            "sessionUpdate": variant,
+                            "tokens_before": 9, "tokens_after": 8, "reason": "x",
+                            "notes": ["Image 1 was dropped before send: too small."]
+                        }
+                    }),
+                )
+                .unwrap(),
+            )
+        };
+        // Both map to a non-terminal Error, so both alert.
+        assert!(grok_ext_notification_is_alert(
+            &notif("image_dropped"),
+            AgentType::Grok
+        ));
+        assert!(grok_ext_notification_is_alert(
+            &notif("auto_compact_failed"),
+            AgentType::Grok
+        ));
+        // A successful compaction renders a CARD, not an alert — it stays
+        // replayable, so the loaded transcript still shows what happened.
+        assert!(!grok_ext_notification_is_alert(
+            &notif("auto_compact_completed"),
+            AgentType::Grok
+        ));
+        // Unmapped variants and non-grok agents never alert.
+        assert!(!grok_ext_notification_is_alert(
+            &notif("turn_completed"),
+            AgentType::Grok
+        ));
+        assert!(!grok_ext_notification_is_alert(
+            &notif("image_dropped"),
             AgentType::Codex
         ));
     }
@@ -11748,6 +14399,132 @@ mod tests {
         assert_eq!(p["_meta"]["reasoningEffort"], "high");
     }
 
+    // ── config-option verdicts ──────────────────────────────────────────────
+    //
+    // `session/set_config_option` is advisory: the agent answers with the option
+    // list it adopted, and codeg renders that verbatim — so a refused pick reads
+    // in the composer as the selector springing back for no reason. Only this
+    // side can tell a request's answer from an unsolicited update, so the
+    // comparison has to be exactly right here.
+
+    fn rejection_fixture(current: &str) -> Vec<SessionConfigOptionInfo> {
+        vec![SessionConfigOptionInfo {
+            id: "thought_level".to_string(),
+            name: "Thinking".to_string(),
+            description: None,
+            category: Some("thought_level".to_string()),
+            kind: SessionConfigKindInfo::Select(SessionConfigSelectInfo {
+                current_value: current.to_string(),
+                options: vec![
+                    SessionConfigSelectOptionInfo {
+                        value: "off".to_string(),
+                        name: "Thinking: off".to_string(),
+                        description: None,
+                    },
+                    SessionConfigSelectOptionInfo {
+                        value: "high".to_string(),
+                        name: "Thinking: high".to_string(),
+                        description: None,
+                    },
+                ],
+                groups: vec![],
+            }),
+        }]
+    }
+
+    #[test]
+    fn config_option_rejection_reports_a_clamped_pick_with_labels() {
+        // pi clamps every level to `off` for a model that never declared
+        // `reasoning` — the bug that made the picker look broken.
+        let event = config_option_rejection(&rejection_fixture("off"), "thought_level", "high")
+            .expect("a clamped pick is a rejection");
+        match event {
+            AcpEvent::ConfigOptionRejected {
+                config_id,
+                option_name,
+                requested,
+                actual,
+            } => {
+                assert_eq!(config_id, "thought_level");
+                assert_eq!(option_name, "Thinking");
+                // Labels, not ids: the dropdown showed these strings.
+                assert_eq!(requested, "Thinking: high");
+                assert_eq!(actual, "Thinking: off");
+            }
+            other => panic!("expected ConfigOptionRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_option_rejection_is_silent_when_the_pick_landed() {
+        assert!(config_option_rejection(&rejection_fixture("high"), "thought_level", "high").is_none());
+    }
+
+    #[test]
+    fn config_option_rejection_falls_back_to_the_raw_id_without_a_label() {
+        // An agent may settle on a value it never advertised; naming the raw id
+        // beats naming nothing.
+        let event = config_option_rejection(&rejection_fixture("medium"), "thought_level", "high")
+            .expect("still a rejection");
+        match event {
+            AcpEvent::ConfigOptionRejected { actual, .. } => assert_eq!(actual, "medium"),
+            other => panic!("expected ConfigOptionRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_option_rejection_stays_silent_when_there_is_nothing_to_compare() {
+        let options = rejection_fixture("off");
+        // Option absent from the answer → nothing to compare against.
+        assert!(config_option_rejection(&options, "model", "grok-4.5").is_none());
+        // A kind with no comparable id → leave it to the agent. A false "your
+        // pick was changed" notice is worse than none.
+        let toggle = vec![SessionConfigOptionInfo {
+            id: "auto_approve".to_string(),
+            name: "Auto-approve tools".to_string(),
+            description: None,
+            category: None,
+            kind: SessionConfigKindInfo::Boolean(SessionConfigBooleanInfo {
+                current_value: false,
+            }),
+        }];
+        assert!(config_option_rejection(&toggle, "auto_approve", "true").is_none());
+    }
+
+    #[test]
+    fn config_option_rejection_reads_a_grouped_select() {
+        // Grouped options are flattened by `map_session_config_options` before the
+        // comparison, so a grouped model picker resolves its labels too.
+        let raw = serde_json::json!([{
+            "id": "model",
+            "name": "Model",
+            "type": "select",
+            "currentValue": "openai/gpt-5",
+            "options": [{
+                "group": "openai",
+                "name": "OpenAI",
+                "options": [
+                    {"value": "openai/gpt-5", "name": "GPT-5"},
+                    {"value": "openai/gpt-5-mini", "name": "GPT-5 Mini"}
+                ]
+            }]
+        }]);
+        let parsed: Vec<SessionConfigOption> = serde_json::from_value(raw).expect("parses");
+        let mapped = map_session_config_options(&parsed);
+
+        let event = config_option_rejection(&mapped, "model", "openai/gpt-5-mini")
+            .expect("the agent kept a different model");
+        match event {
+            AcpEvent::ConfigOptionRejected {
+                requested, actual, ..
+            } => {
+                assert_eq!(requested, "GPT-5 Mini");
+                assert_eq!(actual, "GPT-5");
+            }
+            other => panic!("expected ConfigOptionRejected, got {other:?}"),
+        }
+    }
+
     #[test]
     fn synthesize_grok_config_options_none_without_sessionconfig() {
         let empty: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
@@ -12220,6 +14997,346 @@ mod tests {
             raw_output.is_some(),
             "non-Grok agents keep the existing json_value_to_text behavior"
         );
+    }
+
+    /// Drive one `SessionUpdate` through `emit_conversation_update` and return
+    /// the tool-call event fields the pi bridge tests assert on. Shared so each
+    /// case reads as wire-in / card-out.
+    async fn pi_emit(
+        agent_type: AgentType,
+        cache: &mut ToolCallOutputCache,
+        cb: &mut CodeBuddyLiveState,
+        wire: serde_json::Value,
+    ) -> (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<bool>,
+    ) {
+        let st = SessionState::new(
+            "conn-pi".to_string(),
+            agent_type,
+            None,
+            "win".to_string(),
+            None,
+        );
+        let state = Arc::new(RwLock::new(st));
+        let emitter = EventEmitter::Noop;
+        let update: SessionUpdate =
+            serde_json::from_value(wire).expect("valid tool-call wire shape");
+
+        emit_conversation_update(&state, &emitter, agent_type, update, None, cache, cb).await;
+
+        let guard = state.read().await;
+        let events = guard.recent_events_after(0).expect("events recorded");
+        events
+            .iter()
+            .find_map(|e| match &e.payload {
+                AcpEvent::ToolCall {
+                    content,
+                    raw_input,
+                    raw_output,
+                    ..
+                } => Some((
+                    content.clone(),
+                    raw_input.clone(),
+                    raw_output.clone(),
+                    None,
+                )),
+                AcpEvent::ToolCallUpdate {
+                    content,
+                    raw_input,
+                    raw_output,
+                    raw_output_append,
+                    ..
+                } => Some((
+                    content.clone(),
+                    raw_input.clone(),
+                    raw_output.clone(),
+                    *raw_output_append,
+                )),
+                _ => None,
+            })
+            .expect("a tool-call event is emitted")
+    }
+
+    fn pi_open_bash(tool_call_id: &str, title: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": tool_call_id,
+            "title": title,
+            "kind": "execute",
+            "status": "pending",
+            "content": [{"type": "terminal", "terminalId": tool_call_id}],
+            "_meta": {"terminal_info": {"terminal_id": tool_call_id, "cwd": "/w"}},
+        })
+    }
+
+    /// #519: pi hosts its own terminal, so the `[Terminal: <id>]` placeholder can
+    /// never be superseded from the terminal channel — it must not be rendered.
+    /// And pi sends no `rawInput`, so the command has to be synthesized from the
+    /// title or the card becomes a generic tool literally NAMED `node --version`.
+    #[tokio::test]
+    async fn pi_bash_open_strips_placeholder_and_synthesizes_command_input() {
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let (content, raw_input, _, _) = pi_emit(
+            AgentType::Pi,
+            &mut cache,
+            &mut cb,
+            pi_open_bash("call_Q0KKW", "node --version"),
+        )
+        .await;
+
+        assert!(
+            content.is_none(),
+            "the dead [Terminal: …] placeholder must not reach the card: {content:?}"
+        );
+        assert_eq!(
+            raw_input.as_deref(),
+            Some(r#"{"command":"node --version"}"#),
+            "the command is synthesized so the call classifies as bash"
+        );
+        assert!(
+            cb.pi_terminal_calls.contains_key("call_Q0KKW"),
+            "the call is registered for the later output frames, which carry only its id"
+        );
+    }
+
+    /// pi's first frame titles the call with the bare tool name (its arguments
+    /// are still partial JSON). Synthesizing there would flash `$ bash`.
+    #[tokio::test]
+    async fn pi_bash_open_titled_bash_synthesizes_no_input() {
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let (_, raw_input, _, _) = pi_emit(
+            AgentType::Pi,
+            &mut cache,
+            &mut cb,
+            pi_open_bash("call_1", "bash"),
+        )
+        .await;
+        assert!(
+            raw_input.is_none(),
+            "the bare tool-name title is not a command: {raw_input:?}"
+        );
+    }
+
+    /// The whole point of #519: the output lives ONLY in `_meta.terminal_output`,
+    /// and has to reach the card's `raw_output` stream — first chunk replacing,
+    /// later chunks appending.
+    #[tokio::test]
+    async fn pi_terminal_output_meta_streams_as_raw_output() {
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let _ = pi_emit(
+            AgentType::Pi,
+            &mut cache,
+            &mut cb,
+            pi_open_bash("call_1", "node --version"),
+        )
+        .await;
+
+        let (_, _, first, first_append) = pi_emit(
+            AgentType::Pi,
+            &mut cache,
+            &mut cb,
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "in_progress",
+                "_meta": {"terminal_output": {"terminal_id": "call_1", "data": "v24.14.0\n"}},
+            }),
+        )
+        .await;
+        assert_eq!(first.as_deref(), Some("v24.14.0\n"));
+        assert_eq!(
+            first_append,
+            Some(false),
+            "the first chunk replaces whatever the opening frame left on the card"
+        );
+
+        let (_, _, second, second_append) = pi_emit(
+            AgentType::Pi,
+            &mut cache,
+            &mut cb,
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "in_progress",
+                "_meta": {"terminal_output": {"terminal_id": "call_1", "data": "more\n"}},
+            }),
+        )
+        .await;
+        assert_eq!(second.as_deref(), Some("more\n"));
+        assert_eq!(second_append, Some(true), "later chunks append");
+    }
+
+    /// A failing command must show its stderr AND its exit code, and the final
+    /// frame must release the tracking entry.
+    #[tokio::test]
+    async fn pi_terminal_exit_meta_appends_exit_line_and_releases_entry() {
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let _ = pi_emit(
+            AgentType::Pi,
+            &mut cache,
+            &mut cb,
+            pi_open_bash("call_1", "some-command"),
+        )
+        .await;
+
+        let (_, _, raw_output, append) = pi_emit(
+            AgentType::Pi,
+            &mut cache,
+            &mut cb,
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "failed",
+                "_meta": {
+                    "terminal_output": {"terminal_id": "call_1", "data": "command not found"},
+                    "terminal_exit": {"terminal_id": "call_1", "exit_code": 127, "signal": null},
+                },
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            raw_output.as_deref(),
+            Some("command not found\n[terminal exited: exit code: 127]"),
+            "stderr and the exit code both reach the card"
+        );
+        assert_eq!(append, Some(false));
+        assert!(
+            !cb.pi_terminal_calls.contains_key("call_1"),
+            "a final status releases the entry"
+        );
+    }
+
+    /// A command that prints nothing still has to supersede the placeholder,
+    /// otherwise the card would sit on `[Terminal: …]` forever.
+    #[tokio::test]
+    async fn pi_silent_command_still_emits_the_exit_line() {
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let _ = pi_emit(
+            AgentType::Pi,
+            &mut cache,
+            &mut cb,
+            pi_open_bash("call_1", "mkdir out"),
+        )
+        .await;
+
+        let (_, _, raw_output, _) = pi_emit(
+            AgentType::Pi,
+            &mut cache,
+            &mut cb,
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "completed",
+                "_meta": {
+                    "terminal_exit": {"terminal_id": "call_1", "exit_code": 0, "signal": null},
+                },
+            }),
+        )
+        .await;
+        assert_eq!(
+            raw_output.as_deref(),
+            Some("[terminal exited: exit code: 0]")
+        );
+    }
+
+    /// pi's terminal ids are its own tool-call ids — `TerminalRuntime` only ever
+    /// mints `term_<uuid>`, so registering them bought ten guaranteed-miss polls
+    /// per bash call. Every other agent must keep being tracked, and so must a pi
+    /// terminal that arrives WITHOUT the self-hosted marker (a future pi-acp that
+    /// delegates `terminal/*` for real).
+    #[test]
+    fn pi_virtual_terminals_are_not_registered_for_host_polling() {
+        let wire = pi_open_bash("call_1", "pwd");
+        let update: SessionUpdate =
+            serde_json::from_value(wire.clone()).expect("valid tool_call wire shape");
+        let mut tracked = HashMap::new();
+        assert!(!track_terminal_tool_calls(
+            AgentType::Pi,
+            &update,
+            &mut tracked
+        ));
+        assert!(tracked.is_empty(), "pi's terminals are not host-owned");
+
+        let update: SessionUpdate =
+            serde_json::from_value(wire).expect("valid tool_call wire shape");
+        let mut tracked = HashMap::new();
+        assert!(track_terminal_tool_calls(
+            AgentType::ClaudeCode,
+            &update,
+            &mut tracked
+        ));
+        assert!(
+            tracked.contains_key("call_1"),
+            "a host-owned terminal is still polled"
+        );
+
+        let mut host_owned = pi_open_bash("call_1", "pwd");
+        host_owned
+            .as_object_mut()
+            .expect("wire object")
+            .remove("_meta");
+        let update: SessionUpdate =
+            serde_json::from_value(host_owned).expect("valid tool_call wire shape");
+        let mut tracked = HashMap::new();
+        assert!(track_terminal_tool_calls(
+            AgentType::Pi,
+            &update,
+            &mut tracked
+        ));
+        assert!(
+            tracked.contains_key("call_1"),
+            "an unmarked terminal is polled even on pi — the gate is the marker, not the agent"
+        );
+    }
+
+    /// Collision guard: pi-acp's meta keys are UNNAMESPACED (`terminal_output`,
+    /// not `pi/terminalOutput`), so the bridge must be inert on every other agent.
+    #[tokio::test]
+    async fn non_pi_agents_ignore_the_unnamespaced_terminal_meta() {
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+        let (content, raw_input, raw_output, _) = pi_emit(
+            AgentType::ClaudeCode,
+            &mut cache,
+            &mut cb,
+            pi_open_bash("call_1", "node --version"),
+        )
+        .await;
+
+        assert_eq!(
+            content.as_deref(),
+            Some("[Terminal: call_1]"),
+            "a host-owned terminal keeps its placeholder until the poller supersedes it"
+        );
+        assert!(raw_input.is_none(), "no command is synthesized for non-pi");
+        assert!(raw_output.is_none());
+
+        let (_, _, raw_output, _) = pi_emit(
+            AgentType::ClaudeCode,
+            &mut cache,
+            &mut cb,
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1",
+                "status": "completed",
+                "_meta": {"terminal_output": {"terminal_id": "call_1", "data": "leak"}},
+            }),
+        )
+        .await;
+        assert!(
+            raw_output.is_none(),
+            "another agent's identically-named meta must not stream: {raw_output:?}"
+        );
+        assert!(cb.pi_terminal_calls.is_empty());
     }
 
     #[test]
@@ -13384,6 +16501,7 @@ mod tests {
             "parent-conn",
             std::path::Path::new("/tmp"),
             false,
+            HostToolsPolicy::Default,
         )
         .await;
 
@@ -13460,6 +16578,43 @@ mod tests {
         assert!(disabled_builtins.is_empty());
 
         hydrate(&[]);
+    }
+
+    #[test]
+    fn host_tools_agent_also_withholds_the_delegation_group() {
+        // `delegate_to_agent` is the third door into the room `fs/*` and
+        // `terminal/*` open: it has codeg spawn a SECOND agent, in codeg's
+        // process tree under that agent's own policy, and relays its output
+        // back. Without this gate a sandboxed agent that cannot read `.env`
+        // itself just asks a sibling to read it, and the switch's promise is
+        // false. This pins the exact boolean `inject_codeg_mcp` computes.
+        let delegation_for = |broker_enabled: bool, host_tools: HostToolsPolicy| {
+            broker_enabled && host_tools.hosts_channels()
+        };
+        assert!(delegation_for(true, HostToolsPolicy::Default));
+        assert!(!delegation_for(true, HostToolsPolicy::Agent));
+        // The settings toggle still wins when it is the one saying no.
+        assert!(!delegation_for(false, HostToolsPolicy::Default));
+
+        // With delegation the only enabled group, withholding it must skip the
+        // companion entirely rather than launch it with an empty `--features`
+        // (which `CompanionFeatures::parse` would see as absent and default
+        // back to delegation-only — re-opening the hole).
+        let mut flags = CompanionFeatureFlags {
+            delegation: delegation_for(true, HostToolsPolicy::Agent),
+            ..CompanionFeatureFlags::default()
+        };
+        assert_eq!(companion_features_arg(flags), None);
+
+        // But the groups that only surface codeg's OWN state keep working —
+        // they execute nothing on the user's machine, so withholding them
+        // would cost function for no boundary.
+        flags.ask = true;
+        flags.feedback = true;
+        assert_eq!(
+            companion_features_arg(flags),
+            Some("feedback,ask".to_string())
+        );
     }
 
     // ─── companion_features_arg: inject/skip decision + --features value ──

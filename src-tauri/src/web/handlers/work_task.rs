@@ -223,9 +223,15 @@ pub async fn work_task_update(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<UpdateParams>,
 ) -> Result<Json<WorkTaskInfo>, AppCommandError> {
-    let result = core::work_task_update_core(&state.emitter, &state.db, params.id, params.draft)
-        .await
-        .map_err(AppCommandError::from)?;
+    let result = core::work_task_update_core(
+        &state.emitter,
+        &state.db,
+        &state.chat_channel_manager,
+        params.id,
+        params.draft,
+    )
+    .await
+    .map_err(AppCommandError::from)?;
     Ok(Json(result))
 }
 
@@ -325,10 +331,22 @@ pub async fn work_task_cancel(
     Ok(Json(()))
 }
 
+/// `true` = the merge was queued behind another landing of the same project
+/// rather than started now.
 pub async fn work_task_merge(
     Json(params): Json<MergeParams>,
+) -> Result<Json<bool>, AppCommandError> {
+    let queued = core::work_task_merge_core(params.id, params.message, params.delete_worktree)
+        .await
+        .map_err(AppCommandError::from)?;
+    Ok(Json(queued))
+}
+
+pub async fn work_task_merge_unqueue(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<IdParams>,
 ) -> Result<Json<()>, AppCommandError> {
-    core::work_task_merge_core(params.id, params.message, params.delete_worktree)
+    core::work_task_merge_unqueue_core(&state.emitter, &state.db, params.id)
         .await
         .map_err(AppCommandError::from)?;
     Ok(Json(()))

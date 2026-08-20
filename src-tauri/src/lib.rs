@@ -212,6 +212,40 @@ mod tauri_app {
             .plugin(tauri_plugin_updater::Builder::new().build())
             .plugin(tauri_plugin_process::init())
             .plugin(tauri_plugin_notification::init())
+            // "Launch at login". LaunchAgent rather than AppleScript on macOS:
+            // writing `~/Library/LaunchAgents/codeg.plist` needs no Automation
+            // consent prompt, where scripting System Events does. No extra
+            // startup args — an auto-started codeg is the same app the user
+            // would have launched by hand.
+            //
+            // Nothing rewrites the registration at startup, deliberately. The
+            // entry records an absolute path that no backend re-validates, so a
+            // refresh would repair a moved app — but `is_enabled()` only knows
+            // whether the *file* is there, and the desktop environments disable
+            // an entry in place: GNOME sets `X-GNOME-Autostart-enabled=false`
+            // inside the .desktop file the plugin would overwrite from a fixed
+            // template. Refreshing would therefore silently undo a disable the
+            // user made outside codeg. Re-toggling the setting rewrites the
+            // path, which is the same repair with consent attached.
+            //
+            // Two accepted defects live in `auto-launch`, which this plugin
+            // wraps, and are still unfixed as of its 0.6 line — so there is no
+            // version to upgrade to, and pinning past `auto-launch ^0.5` (what
+            // the plugin requires) would not help:
+            //   * Windows writes the Run value as `{app_path} {args}` with the
+            //     path unquoted. Per-user installs land under
+            //     `C:\Users\<name>\AppData\Local\codeg\`, so a username with a
+            //     space produces the classic unquoted-path value. Windows'
+            //     successive-prefix parsing still resolves it; the residual
+            //     risk is the usual hijack, which already requires the attacker
+            //     to be able to write `C:\Users\<first>.exe`.
+            //   * macOS builds the plist with a bare `<string>{path}</string>`
+            //     and no XML escaping, so an install path containing `&`, `<`
+            //     or `>` yields a malformed plist and autostart silently fails.
+            .plugin(tauri_plugin_autostart::init(
+                tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+                None,
+            ))
             .manage(ConnectionManager::new())
             .manage(TerminalManager::new())
             .manage(ChatChannelManager::new())
@@ -442,6 +476,46 @@ mod tauri_app {
                             Err(err) => {
                                 tracing::error!("[conversations] chat-dir GC failed: {err}")
                             }
+                        }
+                    });
+                }
+
+                // Push the persisted default shell into the ACP terminal
+                // runtime BEFORE any background task that can spawn an agent
+                // (the chat-channel dispatcher below is one). The handle is
+                // read at terminal-create time, so a late seed would only ever
+                // be a narrow race — but "seeded before anything can connect"
+                // is cheap to guarantee here and matches server startup, which
+                // seeds before it binds.
+                {
+                    let db_for_shell = app.state::<db::AppDatabase>().conn.clone();
+                    let shell_config = app.state::<ConnectionManager>().terminal_shell_config();
+                    tauri::async_runtime::block_on(async move {
+                        crate::commands::system_settings::apply_persisted_terminal_shell_config(
+                            &db_for_shell,
+                            &shell_config,
+                        )
+                        .await;
+                    });
+                }
+
+                // Label worktree folders registered before aliases were seeded at
+                // creation with the branch they have checked out, so the sidebar
+                // names them by branch rather than by their (long, derived)
+                // directory. Background, non-blocking; changed folders are
+                // broadcast, so a client that already fetched its folder list
+                // still picks them up.
+                {
+                    let db = db::AppDatabase {
+                        conn: app.state::<db::AppDatabase>().conn.clone(),
+                    };
+                    let emitter = web::event_bridge::EventEmitter::Tauri(app.handle().clone());
+                    tauri::async_runtime::spawn(async move {
+                        let n =
+                            crate::commands::folders::backfill_worktree_folder_aliases(&emitter, &db)
+                                .await;
+                        if n > 0 {
+                            tracing::info!("[folders] labeled {n} worktree folder(s) by branch");
                         }
                     });
                 }
@@ -1138,6 +1212,8 @@ mod tauri_app {
                 system_settings::probe_terminal_shell_path,
                 system_settings::get_system_rendering_settings,
                 system_settings::update_system_rendering_settings,
+                system_settings::get_system_autostart_settings,
+                system_settings::update_system_autostart_settings,
                 logging_commands::get_log_settings,
                 logging_commands::set_log_settings,
                 logging_commands::get_recent_logs,
@@ -1167,6 +1243,7 @@ mod tauri_app {
                 acp_commands::acp_preflight,
                 acp_commands::acp_cursor_auth_status,
                 acp_commands::acp_cursor_list_models,
+                acp_commands::acp_qoder_auth_status,
                 acp_commands::acp_connect,
                 acp_commands::acp_prompt,
                 acp_commands::acp_set_mode,
@@ -1202,6 +1279,10 @@ mod tauri_app {
                 acp_commands::acp_update_pi_config,
                 acp_commands::acp_load_pi_config,
                 acp_commands::acp_validate_pi_command,
+                acp_commands::acp_pi_project_trust_state,
+                acp_commands::acp_pi_set_project_trust,
+                acp_commands::acp_pi_acknowledge_project_trust,
+                acp_commands::acp_pi_list_trust_entries,
                 acp_commands::acp_install_pi_binary,
                 acp_commands::acp_uninstall_pi_binary,
                 acp_commands::acp_open_hermes_setup_terminal,
@@ -1306,6 +1387,7 @@ mod tauri_app {
                 work_task_commands::work_task_return,
                 work_task_commands::work_task_cancel,
                 work_task_commands::work_task_merge,
+                work_task_commands::work_task_merge_unqueue,
                 work_task_commands::work_task_complete,
                 work_task_commands::work_task_archive,
                 work_task_commands::work_task_cleanup,
