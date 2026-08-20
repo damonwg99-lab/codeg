@@ -17,12 +17,18 @@ import type { FolderDetail } from "@/lib/types"
 export function useAutoCreateProject() {
   const { projects, loadProjects } = usePlatform()
 
+  const normalizeForCompare = (p: string) => {
+    let s = p.replace(/\\/g, "/")
+    if (s.length > 1) s = s.replace(/\/+$/, "")
+    return s
+  }
+
   const autoCreateProject = useCallback(
     async (folderDetail: FolderDetail) => {
       // Check if a project already exists with this rootDir
-      const normalizedPath = folderDetail.path.replace(/\\/g, "/")
+      const normalizedPath = normalizeForCompare(folderDetail.path)
       const existing = projects.find((p) => {
-        const projPath = p.rootDir.replace(/\\/g, "/")
+        const projPath = normalizeForCompare(p.rootDir)
         // Exact match: the path itself is a project rootDir
         if (projPath === normalizedPath) return true
         // Parent-directory match: the path is a subdirectory of a project
@@ -42,10 +48,14 @@ export function useAutoCreateProject() {
       const segments = normalizedPath.split("/")
       const projectName = segments.filter(Boolean).pop() ?? folderDetail.name
 
+      // Store without a trailing separator so `D:\Foo\` cannot later appear as
+      // a second row distinct from `D:\Foo` (visible as duplicate targets).
+      const cleanRootDir = folderDetail.path.replace(/[/\\]+$/, "") || folderDetail.path
+
       try {
         await createProject({
           name: projectName,
-          rootDir: folderDetail.path,
+          rootDir: cleanRootDir,
         })
         // Refresh PlatformContext's project list so ProjectList and
         // ProjectSwitcher both update.

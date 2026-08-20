@@ -62,6 +62,15 @@ pub async fn get_by_folder_id(
     Ok(row.map(to_info))
 }
 
+fn normalize_root_dir(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() || t == "/" || t == "\\" || t == "//" || t == "\\\\" {
+        return t.to_string();
+    }
+    let s = t.trim_end_matches(|c| c == '/' || c == '\\').to_string();
+    if s.is_empty() { "/".to_string() } else { s }
+}
+
 pub async fn create(
     conn: &DatabaseConnection,
     name: &str,
@@ -71,6 +80,7 @@ pub async fn create(
     client_name: Option<String>,
     default_agent_type: Option<String>,
 ) -> Result<ProjectInfo, DbError> {
+    let root_dir = normalize_root_dir(root_dir);
     let now = Utc::now();
     let model = platform_project::ActiveModel {
         id: NotSet,
@@ -78,7 +88,7 @@ pub async fn create(
         description: Set(description),
         client_name: Set(client_name),
         status: Set("planning".to_string()),
-        root_dir: Set(root_dir.to_string()),
+        root_dir: Set(root_dir),
         folder_id: Set(folder_id),
         zentao_project_id: Set(None),
         zentao_product_id: Set(None),
