@@ -70,6 +70,7 @@ import type {
   FolderLinkStatus,
 } from "@/lib/types"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
+import { useAutoCreateProject } from "@/hooks/use-auto-create-project"
 
 type View = "pick-root" | "links" | "add-targets"
 
@@ -104,6 +105,7 @@ export function WorkspaceFolderDialog({
   const t = useTranslations("Folder.workspaceDialog")
   const tBrowser = useTranslations("DirectoryBrowser")
   const openFolder = useAppWorkspaceStore((s) => s.openFolder)
+  const { autoCreateProject } = useAutoCreateProject()
 
   const manageMode = !!folder
   const [view, setView] = useState<View>(manageMode ? "links" : "pick-root")
@@ -181,6 +183,9 @@ export function WorkspaceFolderDialog({
       setOpeningRoot(true)
       try {
         const detail = await openFolder(path)
+        // Opportunistic: create a platform project if none covers this path.
+        // Guarded by useAutoCreateProject (exact + parent-dir match, normalized).
+        void autoCreateProject(detail)
         setRootFolder(detail)
         onFolderOpened?.(detail)
         setView("links")
@@ -190,7 +195,7 @@ export function WorkspaceFolderDialog({
         setOpeningRoot(false)
       }
     },
-    [openFolder, onFolderOpened, t]
+    [openFolder, autoCreateProject, onFolderOpened, t]
   )
 
   const handleConfirmRoot = useCallback(async () => {
