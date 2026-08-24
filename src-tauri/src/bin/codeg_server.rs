@@ -295,6 +295,9 @@ async fn async_main() -> ExitCode {
         update_state: codeg_lib::app_state::default_update_state(),
         platform_manager: codeg_lib::app_state::default_platform_manager(),
     });
+    state
+        .connection_manager
+        .install_chat_channel(state.chat_channel_manager.clone_ref());
 
     // Logging phase 3: wire the emitter so the Logs viewer's live tail
     // (`logs://appended`) reaches WS clients.

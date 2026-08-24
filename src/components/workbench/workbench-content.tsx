@@ -23,6 +23,8 @@ import {
   AutomationsPage,
   AutomationsPageTitle,
 } from "@/components/automations/automations-page"
+import { ForgeChromeActions } from "@/components/forge/forge-chrome-actions"
+import { ForgePage, ForgePageTitle } from "@/components/forge/forge-page"
 import { TasksChromeActions } from "@/components/tasks/tasks-chrome-actions"
 import { TasksPage, TasksPageTitle } from "@/components/tasks/tasks-page"
 import {
@@ -90,6 +92,7 @@ const WORKBENCH_ROUTES: Partial<Record<WorkbenchRouteId, ComponentType>> = {
   "create-release": CreateReleaseFormRoute,
   "archive-view": ArchiveViewRoute,
   tasks: TasksPage,
+  forge: ForgePage,
   tokenUsage: TokenUsagePage,
 }
 
@@ -99,6 +102,7 @@ const WORKBENCH_ROUTE_STRIPS: Partial<Record<WorkbenchRouteId, ComponentType>> =
   {
     automations: AutomationsPageTitle,
     tasks: TasksPageTitle,
+    forge: ForgePageTitle,
     tokenUsage: TokenUsagePageTitle,
     "project-list": ProjectListTitle,
     "project-detail": ProjectDetailTitle,
@@ -152,6 +156,7 @@ function PlatformBackAction({
 const WORKBENCH_ROUTE_CHROME_ACTIONS: Partial<
   Record<WorkbenchRouteId, ComponentType<WorkbenchChromeActionsProps>>
 > = {
+  forge: ForgeChromeActions,
   tasks: TasksChromeActions,
   "project-list": PlatformBackAction,
   "project-detail": PlatformBackAction,

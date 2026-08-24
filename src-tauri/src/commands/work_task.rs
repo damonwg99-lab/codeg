@@ -28,7 +28,7 @@ fn engine() -> Result<std::sync::Arc<crate::work_task::TaskEngine>, DbError> {
 /// requeues and settings changes without waiting for the reconcile tick. A
 /// process not holding the engine lock skips it — the owning process's tick
 /// picks the change up from the DB.
-fn nudge_pump(folder_id: i32) {
+pub(crate) fn nudge_pump(folder_id: i32) {
     if let Some(engine) = crate::work_task::engine() {
         tokio::spawn(async move { engine.pump_folder(folder_id).await });
     }
@@ -436,9 +436,10 @@ pub async fn work_task_retry_core(
     id: i32,
     note: Option<String>,
     blocks: Vec<serde_json::Value>,
+    allow_duplicate_source: bool,
 ) -> Result<(), DbError> {
     engine()?
-        .retry(id, note, blocks)
+        .retry(id, note, blocks, allow_duplicate_source)
         .await
         .map_err(DbError::Validation)
 }
@@ -452,8 +453,17 @@ pub async fn work_task_requeue_core(
     id: i32,
     note: Option<String>,
     blocks: Vec<serde_json::Value>,
+    allow_duplicate_source: bool,
 ) -> Result<(), DbError> {
-    if !work_task_service::requeue_canceled(&db.conn, id, note.as_deref(), &blocks).await? {
+    if !work_task_service::requeue_canceled(
+        &db.conn,
+        id,
+        note.as_deref(),
+        &blocks,
+        allow_duplicate_source,
+    )
+    .await?
+    {
         return Err(DbError::Validation("task is not canceled".to_string()));
     }
     emit_event(
@@ -535,7 +545,8 @@ pub async fn work_task_cancel_core(id: i32, reason: Option<String>) -> Result<()
 /// the outcome rides the `task://changed` events (merging → done, or back to
 /// review with a readable error). This awaits only the dispatch (validation +
 /// agent spawn), so refused merges surface directly in the dialog.
-/// `message: None` = the agent writes the commit message itself.
+/// `message: None` = the agent writes the commit message itself;
+/// `instructions: None` = the user added nothing beyond the standing recipe.
 ///
 /// Returns `true` when the merge was QUEUED instead of started — the folder was
 /// already landing another task, and this one goes in as soon as that finishes.
@@ -543,9 +554,10 @@ pub async fn work_task_merge_core(
     id: i32,
     message: Option<String>,
     delete_worktree: bool,
+    instructions: Option<String>,
 ) -> Result<bool, DbError> {
     engine()?
-        .merge_task(id, message, delete_worktree, false)
+        .merge_task(id, message, delete_worktree, instructions, false)
         .await
         .map(|dispatch| dispatch.is_queued())
         .map_err(DbError::Validation)
@@ -570,6 +582,26 @@ pub async fn work_task_merge_unqueue_core(
         WorkTaskChange::Upsert { id },
     );
     Ok(())
+}
+
+/// Accept a reviewed forge-sourced task by pushing it back to the repository
+/// it came from: an issue's task opens (or adopts) a pull request for its own
+/// branch, a pull request's task pushes onto that pull request's branch.
+/// Returns the pull request URL.
+///
+/// Unlike the merge dispatch this awaits the WHOLE operation — a push plus two
+/// REST calls, no agent — so both success and failure land in the caller's
+/// dialog. Every gate is inside the engine, where a direct API call cannot
+/// route around it.
+pub async fn work_task_deliver_pr_core(
+    id: i32,
+    pr_title: Option<String>,
+    draft: bool,
+) -> Result<String, DbError> {
+    engine()?
+        .deliver_pr(id, pr_title, draft)
+        .await
+        .map_err(DbError::Validation)
 }
 
 /// Finish a reviewed task that has nothing to land (review → done, no merge),
@@ -845,8 +877,15 @@ pub async fn work_task_retry(
     id: i32,
     note: Option<String>,
     blocks: Option<Vec<serde_json::Value>>,
+    allow_duplicate_source: Option<bool>,
 ) -> Result<(), DbError> {
-    work_task_retry_core(id, note, blocks.unwrap_or_default()).await
+    work_task_retry_core(
+        id,
+        note,
+        blocks.unwrap_or_default(),
+        allow_duplicate_source.unwrap_or(false),
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -857,6 +896,7 @@ pub async fn work_task_requeue(
     id: i32,
     note: Option<String>,
     blocks: Option<Vec<serde_json::Value>>,
+    allow_duplicate_source: Option<bool>,
 ) -> Result<(), DbError> {
     work_task_requeue_core(
         &EventEmitter::Tauri(app),
@@ -864,6 +904,7 @@ pub async fn work_task_requeue(
         id,
         note,
         blocks.unwrap_or_default(),
+        allow_duplicate_source.unwrap_or(false),
     )
     .await
 }
@@ -902,8 +943,9 @@ pub async fn work_task_merge(
     id: i32,
     message: Option<String>,
     delete_worktree: bool,
+    instructions: Option<String>,
 ) -> Result<bool, DbError> {
-    work_task_merge_core(id, message, delete_worktree).await
+    work_task_merge_core(id, message, delete_worktree, instructions).await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -914,6 +956,16 @@ pub async fn work_task_merge_unqueue(
     id: i32,
 ) -> Result<(), DbError> {
     work_task_merge_unqueue_core(&EventEmitter::Tauri(app), &db, id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_deliver_pr(
+    id: i32,
+    pr_title: Option<String>,
+    draft: bool,
+) -> Result<String, DbError> {
+    work_task_deliver_pr_core(id, pr_title, draft).await
 }
 
 #[cfg(feature = "tauri-runtime")]

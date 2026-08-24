@@ -1,7 +1,7 @@
 /**
  * Shared geometry for the desktop window-chrome corner overlays.
  *
- * The sidebar toggle / remote (top-left) and terminal / aux / settings
+ * The sidebar toggle / search (top-left) and terminal / aux / settings
  * (top-right) clusters are pinned to fixed overlays at the window's corners so
  * they never move — and never re-mount — when the side panels open or close
  * (that re-parenting is what used to make them flicker). Because the overlays
