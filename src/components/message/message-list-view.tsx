@@ -31,6 +31,7 @@ import { UserResourceLinks } from "./user-resource-links"
 import { UserImageAttachments } from "./user-image-attachments"
 import { AgentPlanOverlay } from "@/components/chat/agent-plan-overlay"
 import { SubAgentOverlay } from "@/components/chat/sub-agent-overlay"
+import { normalizeToolName } from "@/lib/tool-call-normalization"
 import { SessionViewerHost } from "@/components/message/session-viewer-host"
 import { isDelegateToAgentToolName } from "@/lib/delegation-card"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
@@ -661,15 +662,6 @@ export function MessageListView({
   const timelineTurns = useConversationRuntimeStore((s) =>
     selectTimelineTurns(s, conversationId)
   )
-  // Project the timeline turns to plain MessageTurn[] so the platform
-  // decomposition bridge can scan them for proposal fences without touching
-  // the runtime store contract. Memoized so the bridge's detector hook sees
-  // a stable reference across renders.
-  const localTurns = useMemo(
-    () => timelineTurns.map((item) => item.turn),
-    [timelineTurns]
-  )
-
   // Reverse infinite scroll: older history exists above the loaded window
   // (windowed detail with a non-zero offset). Legacy full responses never
   // report an offset, so the loader row and near-top trigger stay off.
@@ -1178,6 +1170,5 @@ export function MessageListView({
         />
       </div>
     </SessionViewerHost>
-    </PlatformDecompositionBridge>
   )
 }

@@ -16,33 +16,45 @@ import {
   type DecompositionOverlayStatus,
 } from "@/components/chat/decomposition-overlay-context"
 import { createDecomposition, createTask } from "@/lib/platform/api"
-import type { MessageTurn } from "@/lib/types"
+import {
+  useConversationRuntimeStore,
+  selectTimelineTurns,
+} from "@/stores/conversation-runtime-store"
 import type { ProposedSubTask } from "@/lib/platform/decomposition-parser"
 
 /**
  * Decoupled Phase 4 mount (D32): owns the decomposition-detection + overlay
- * orchestration that the二开 inlined into `MessageListView`. Wraps the main
- * list view JSX so the inline `DecompositionCard`s (rendered via
- * `ContentPartsRenderer`) can read the overlay status through the context,
- * without touching the main message-list-view implementation beyond a single
- * mount-line.
+ * orchestration for a conversation. Mount it around any subtree that renders
+ * `DecompositionCard`s (via `ContentPartsRenderer`) — typically the message
+ * list node in `conversation-detail-panel` — so the cards can read the overlay
+ * status through the context. It derives the turns it scans straight from the
+ * runtime store, keeping `MessageListView` itself free of platform mounts
+ * (which used to conflict on every main refactor of that file).
  *
  * The dialog itself is rendered as the last child of the provider so the
  * caller's tree is otherwise unchanged.
  */
 export function PlatformDecompositionBridge({
   conversationId,
-  localTurns,
   children,
 }: {
   conversationId: number
-  localTurns: MessageTurn[]
   children: ReactNode
 }) {
   const t = useTranslations("Platform.task")
   const { activeProject, projects } = usePlatform()
   const activeProjectId = activeProject?.id ?? null
   const { linkedTask } = useLinkedTask(conversationId)
+
+  // Same projection `MessageListView` uses: timeline turns to plain
+  // MessageTurn[], memoized so the detector hook sees a stable reference.
+  const timelineTurns = useConversationRuntimeStore((s) =>
+    selectTimelineTurns(s, conversationId)
+  )
+  const localTurns = useMemo(
+    () => timelineTurns.map((item) => item.turn),
+    [timelineTurns]
+  )
 
   const {
     proposedSubTasks: decompSubTasks,

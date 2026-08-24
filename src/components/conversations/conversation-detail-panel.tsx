@@ -144,6 +144,7 @@ import {
 import { useExportLabels } from "@/lib/use-export-labels"
 import { resolveActiveSessionDetails } from "./active-session-details"
 import { ConversationDetailHeader } from "./conversation-detail-header"
+import { PlatformDecompositionBridge } from "@/components/chat/platform-decomposition-bridge"
 import { SessionDetailsDialog } from "./session-details-dialog"
 
 interface ConversationTabViewProps {
@@ -1766,24 +1767,28 @@ const ConversationTabView = memo(function ConversationTabView({
   const composerAvailable = !isWelcomeMode && !acpLoadError
 
   const messageListNode = (
-    <GoalControlProvider value={goalControlValue}>
-      <MessageListView
-        conversationId={effectiveConversationId}
-        agentType={selectedAgent}
-        connStatus={connStatus}
-        isActive={isActive}
-        sendSignal={sendSignal}
-        detailLoading={detailLoading}
-        detailError={detailError}
-        acpLoadError={acpLoadError}
-        hideEmptyState={!hasPersistedConversation || hasSentMessage}
-        onReload={canShowDetailErrorActions ? handleReloadDetail : undefined}
-        onNewSession={
-          canShowDetailErrorActions ? handleOpenNewSession : undefined
-        }
-        onQuoteSelection={composerAvailable ? handleQuoteSelection : undefined}
-      />
-    </GoalControlProvider>
+    <PlatformDecompositionBridge conversationId={effectiveConversationId}>
+      <GoalControlProvider value={goalControlValue}>
+        <MessageListView
+          conversationId={effectiveConversationId}
+          agentType={selectedAgent}
+          connStatus={connStatus}
+          isActive={isActive}
+          sendSignal={sendSignal}
+          detailLoading={detailLoading}
+          detailError={detailError}
+          acpLoadError={acpLoadError}
+          hideEmptyState={!hasPersistedConversation || hasSentMessage}
+          onReload={canShowDetailErrorActions ? handleReloadDetail : undefined}
+          onNewSession={
+            canShowDetailErrorActions ? handleOpenNewSession : undefined
+          }
+          onQuoteSelection={
+            composerAvailable ? handleQuoteSelection : undefined
+          }
+        />
+      </GoalControlProvider>
+    </PlatformDecompositionBridge>
   )
 
   // Live-feedback bar gating + the "agent never read your note" resend fallback.
