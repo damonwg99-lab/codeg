@@ -33,7 +33,7 @@ export function useComposerMentionLabels(): ComposerMentionLabels {
       session: t("mentionGroupSession"),
       commit: t("mentionGroupCommit"),
       skill: t("mentionGroupSkill"),
-      context: "Context",
+      context: "知识库文档",
     }),
     [t]
   )

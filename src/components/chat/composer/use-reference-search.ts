@@ -10,6 +10,8 @@ import type {
   DbConversationSummary,
   GitLogEntry,
 } from "@/lib/types"
+import type { KnowledgeDocInfo } from "@/lib/platform/types"
+import { kbDocToSuggestion, matchesKbDoc } from "@/lib/platform/kb-suggestion"
 
 import {
   agentToSuggestion,
@@ -69,6 +71,7 @@ export interface ReferenceSearchSources {
   commits: GitLogEntry[]
   /** Repo identity for commit URIs; null disables the commit group. */
   repoKey: string | null
+  kbDocs?: KnowledgeDocInfo[]
 }
 
 /** Case-insensitive substring match against an adapted item's searchable text. */
@@ -145,7 +148,19 @@ export function buildReferenceGroups(
     }
   }
 
+  // Knowledge base documents (refType: "context")
+  const kbMatches = (sources.kbDocs ?? [])
+    .filter((doc) => matchesKbDoc(doc, q))
+    .map((doc) => kbDocToSuggestion(doc))
+  const kbItems = kbMatches.slice(0, MAX_PER_GROUP)
+
   return [
+    {
+      kind: "context",
+      label: labels.context || "Knowledge Docs",
+      items: kbItems,
+      truncated: kbMatches.length > MAX_PER_GROUP,
+    },
     {
       kind: "file",
       label: labels.file,
@@ -187,6 +202,7 @@ export interface UseReferenceSearchOptions {
   enabled?: boolean
   /** Localized group headings; English fallbacks when omitted. */
   labels?: ReferenceGroupLabels
+  kbDocs?: KnowledgeDocInfo[] | null
 }
 
 /**
@@ -211,6 +227,7 @@ export function useReferenceSearch({
   defaultPath,
   enabled = true,
   labels,
+  kbDocs,
 }: UseReferenceSearchOptions): ReferenceSearch {
   const path = defaultPath || null
 
@@ -231,6 +248,7 @@ export function useReferenceSearch({
   const pathRef = useRef(path)
   const enabledRef = useRef(enabled)
   const labelsRef = useRef(labels)
+  const kbDocsRef = useRef(kbDocs)
 
   // `pathRef` and `enabledRef` gate the post-await freshness check in `search`,
   // so they must reflect the *committed* folder/enabled state synchronously at
@@ -253,7 +271,8 @@ export function useReferenceSearch({
         : { root: null, files: [] }
     agentsRef.current = agents
     labelsRef.current = labels
-  }, [allFiles, loaded, path, agents, labels])
+    kbDocsRef.current = kbDocs ?? undefined
+  }, [allFiles, loaded, path, agents, labels, kbDocs])
 
   // Lazily-fetched network sources, key-cached so repeat searches reuse the
   // in-flight/resolved promise while a folder switch refetches.
@@ -345,6 +364,7 @@ export function useReferenceSearch({
         sessions,
         commits,
         repoKey: path,
+        kbDocs: kbDocsRef.current ?? undefined,
       },
       labelsRef.current ?? DEFAULT_GROUP_LABELS
     )

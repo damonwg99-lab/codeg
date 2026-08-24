@@ -129,6 +129,8 @@ import {
   usePendingInitialDrafts,
   usePlatformInjectHandler,
 } from "@/hooks/use-platform-composer"
+import { usePlatformOptional } from "@/contexts/platform-context"
+import { usePlatformKbDocs } from "@/hooks/use-platform-kb-docs"
 import { sessionToSuggestion } from "@/components/chat/composer/suggestion/adapters"
 import { editorHasReference } from "@/components/chat/composer/attachment-files"
 import type { ReferenceAttrs } from "@/components/chat/composer/types"
@@ -445,10 +447,18 @@ export function MessageInput({
 
   // Live data sources for the unified `@` mention panel. Pre-warmed only while
   // this composer is the active one (`enabled`). Referentially stable.
+  const platform = usePlatformOptional()
+  const activeProjectId = platform?.activeProject?.id ?? null
+  const { kbDocs } = usePlatformKbDocs({
+    projectId: activeProjectId,
+    enabled: isActive && activeProjectId != null,
+  })
+
   const referenceSearch = useReferenceSearch({
     defaultPath: defaultPath ?? null,
     enabled: isActive,
     labels: referenceGroupLabels,
+    kbDocs,
   })
 
   // Debounced v2 draft persistence. We snapshot the Tiptap *document* (JSON, not

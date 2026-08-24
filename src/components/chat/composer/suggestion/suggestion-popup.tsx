@@ -34,6 +34,7 @@ const FETCH_DEBOUNCE_MS = 150
 // and `$` triggers, not the `@` panel.
 const TAB_ORDER: readonly ReferenceKind[] = [
   "agent",
+  "context",
   "file",
   "session",
   "commit",
@@ -42,12 +43,12 @@ const TAB_ORDER: readonly ReferenceKind[] = [
 // English fallbacks for the tab labels; the host injects localized ones. `skill`
 // is kept for type completeness (`ReferenceKind`) though it is not a shown tab.
 const DEFAULT_TAB_LABELS: Record<ReferenceKind, string> = {
-  agent: "Agents",
-  file: "Files",
-  session: "Sessions",
-  commit: "Commits",
-  skill: "Skills",
-  context: "Context",
+  agent: "智能体",
+  context: "知识库",
+  file: "文件",
+  session: "会话",
+  commit: "提交",
+  skill: "技能",
 }
 
 // Commit-synchronous in the browser so the panel is positioned before paint (no

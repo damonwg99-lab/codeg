@@ -3,13 +3,13 @@
 import { useMemo } from "react"
 import { BookOpen, FileText, MessageSquare, Paperclip } from "lucide-react"
 import { Checkbox } from "@/components/ui/checkbox"
-import { Input } from "@/components/ui/input"
 import { cn } from "@/lib/utils"
 import {
   type InjectOption,
   type InjectOptionGroup,
   type OptionId,
 } from "@/components/platform/context-inject-panel-utils"
+import { KbTreePicker } from "@/components/platform/kb-tree-picker"
 
 /** Ordered groups for rendering. Attachments placed immediately after
  *  task info (basic) rather than after knowledge docs. */
@@ -85,15 +85,40 @@ export function InjectOptionList({
         const emptyMsg = emptyMessages?.[group]
         const isCardGroup = CARD_GROUPS.includes(group)
 
+        // Knowledge docs gets dedicated tree picker
+        if (group === "kb_docs") {
+          return (
+            <section
+              key={group}
+              className="space-y-1.5 flex flex-col min-h-0 max-h-[360px]"
+            >
+              <h3
+                className={cn(
+                  "font-medium uppercase text-muted-foreground",
+                  isCompact ? "text-[0.6875rem]" : "text-xs"
+                )}
+              >
+                {groupLabelResolver(group)}
+              </h3>
+              <KbTreePicker
+                options={items ?? []}
+                checked={checked}
+                onToggle={onToggle}
+                variant={variant}
+                searchQuery={kbDocSearchQuery}
+                onSearchChange={onKbDocSearchChange}
+                emptyMsg={emptyMsg}
+              />
+            </section>
+          )
+        }
+
         // Groups that should always render a bordered card area
         if (isCardGroup) {
           return (
             <section
               key={group}
-              className={cn(
-                "space-y-1.5",
-                group === "kb_docs" && "flex flex-col min-h-0 max-h-[320px]"
-              )}
+              className="space-y-1.5"
             >
               <h3
                 className={cn(
@@ -104,31 +129,10 @@ export function InjectOptionList({
                 {groupLabelResolver(group)}
               </h3>
 
-              {/* KB doc search input — above the card container */}
-              {group === "kb_docs" &&
-                kbDocSearchQuery !== undefined &&
-                onKbDocSearchChange && (
-                  <div className="relative">
-                    <BookOpen className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                    <Input
-                      className={cn(
-                        "pl-7",
-                        isCompact ? "h-7 text-xs" : "h-8 text-sm"
-                      )}
-                      placeholder={groupLabelResolver("kb_docs")}
-                      value={kbDocSearchQuery}
-                      onChange={(e) => onKbDocSearchChange(e.target.value)}
-                    />
-                  </div>
-                )}
-
               <div
                 className={cn(
                   "rounded-md border",
-                  isEmpty ? "bg-muted/30 p-3" : "",
-                  !isEmpty &&
-                    group === "kb_docs" &&
-                    "overflow-y-auto min-h-0 flex-1"
+                  isEmpty ? "bg-muted/30 p-3" : ""
                 )}
               >
                 {isEmpty ? (
@@ -163,35 +167,40 @@ export function InjectOptionList({
                             onCheckedChange={(value) =>
                               onToggle(option.id, value === true)
                             }
-                            className={cn("mt-0.5", isCompact && "h-3.5 w-3.5")}
+                            className="mt-0.5 h-3.5 w-3.5"
                           />
-                          <span className="flex min-w-0 flex-1 gap-2">
-                            {OptIcon && (
-                              <OptIcon
-                                className={cn(
-                                  "mt-0.5 shrink-0 text-muted-foreground",
-                                  isCompact ? "h-3.5 w-3.5" : "h-4 w-4"
-                                )}
-                              />
-                            )}
-                            <span className="min-w-0">
+                          <span className="min-w-0">
+                            <span className="flex items-center gap-1.5">
+                              {OptIcon && (
+                                <OptIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                              )}
                               <span
                                 className={cn(
                                   "block truncate font-medium",
-                                  isCompact ? "text-[0.8125rem]" : "text-sm"
+                                  isCompact ? "text-xs" : "text-sm"
                                 )}
                               >
                                 {option.label}
                               </span>
+                            </span>
+                            <span
+                              className={cn(
+                                "mt-0.5 block text-muted-foreground",
+                                isCompact ? "text-[0.6875rem]" : "text-xs"
+                              )}
+                            >
+                              {option.description}
+                            </span>
+                            {option.docPath && (
                               <span
                                 className={cn(
-                                  "mt-0.5 block text-muted-foreground",
-                                  isCompact ? "text-[0.6875rem]" : "text-xs"
+                                  "mt-0.5 block truncate text-muted-foreground/70 font-mono",
+                                  isCompact ? "text-[0.625rem]" : "text-xs"
                                 )}
                               >
-                                {option.description}
+                                {option.docPath}
                               </span>
-                            </span>
+                            )}
                           </span>
                         </label>
                       )
@@ -203,33 +212,7 @@ export function InjectOptionList({
           )
         }
 
-        // Non-card groups: hide when empty unless there's an emptyMsg
-        if (isEmpty) {
-          if (emptyMsg) {
-            return (
-              <section key={group}>
-                <h3
-                  className={cn(
-                    "font-medium uppercase text-muted-foreground",
-                    isCompact ? "text-[0.6875rem]" : "text-xs"
-                  )}
-                >
-                  {groupLabelResolver(group)}
-                </h3>
-                <p
-                  className={cn(
-                    "text-muted-foreground",
-                    isCompact ? "text-[0.6875rem]" : "text-xs"
-                  )}
-                >
-                  {emptyMsg}
-                </p>
-              </section>
-            )
-          }
-          return null
-        }
-
+        // Basic / conversations
         return (
           <section key={group} className="space-y-1.5">
             <h3
@@ -241,47 +224,53 @@ export function InjectOptionList({
               {groupLabelResolver(group)}
             </h3>
 
-            <div
-              className={cn(
-                "space-y-1",
-                isCompact ? "space-y-0.5" : "space-y-1.5"
-              )}
-            >
-              {items.map((option) => {
-                const OptIcon = optionIcon(option)
-                return (
-                  <label
-                    key={option.id}
-                    className={cn(
-                      "flex cursor-pointer items-start rounded-md border",
-                      "hover:bg-accent/50",
-                      isCompact ? "gap-2 p-2" : "gap-3 p-3"
-                    )}
-                  >
-                    <Checkbox
-                      checked={checked.has(option.id)}
-                      onCheckedChange={(value) =>
-                        onToggle(option.id, value === true)
-                      }
-                      className={cn("mt-0.5", isCompact && "h-3.5 w-3.5")}
-                    />
-                    <span className="flex min-w-0 flex-1 gap-2">
-                      {OptIcon && (
-                        <OptIcon
-                          className={cn(
-                            "mt-0.5 shrink-0 text-muted-foreground",
-                            isCompact ? "h-3.5 w-3.5" : "h-4 w-4"
-                          )}
-                        />
+            {isEmpty ? (
+              <p
+                className={cn(
+                  "py-2 text-center text-muted-foreground",
+                  isCompact ? "text-[0.6875rem]" : "text-xs"
+                )}
+              >
+                {emptyMsg ?? ""}
+              </p>
+            ) : (
+              <div
+                className={cn(
+                  "space-y-1",
+                  isCompact ? "space-y-0.5" : "space-y-1.5"
+                )}
+              >
+                {items.map((option) => {
+                  const OptIcon = optionIcon(option)
+                  return (
+                    <label
+                      key={option.id}
+                      className={cn(
+                        "flex cursor-pointer items-start rounded-md border",
+                        "hover:bg-accent/50",
+                        isCompact ? "gap-2 p-2" : "gap-3 p-3"
                       )}
+                    >
+                      <Checkbox
+                        checked={checked.has(option.id)}
+                        onCheckedChange={(value) =>
+                          onToggle(option.id, value === true)
+                        }
+                        className="mt-0.5 h-3.5 w-3.5"
+                      />
                       <span className="min-w-0">
-                        <span
-                          className={cn(
-                            "block truncate font-medium",
-                            isCompact ? "text-[0.8125rem]" : "text-sm"
+                        <span className="flex items-center gap-1.5">
+                          {OptIcon && (
+                            <OptIcon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                           )}
-                        >
-                          {option.label}
+                          <span
+                            className={cn(
+                              "block truncate font-medium",
+                              isCompact ? "text-xs" : "text-sm"
+                            )}
+                          >
+                            {option.label}
+                          </span>
                         </span>
                         <span
                           className={cn(
@@ -292,11 +281,11 @@ export function InjectOptionList({
                           {option.description}
                         </span>
                       </span>
-                    </span>
-                  </label>
-                )
-              })}
-            </div>
+                    </label>
+                  )
+                })}
+              </div>
+            )}
           </section>
         )
       })}
