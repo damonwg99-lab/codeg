@@ -695,36 +695,15 @@ async fn build_tools_call_spawn(
             register_and_spawn(inflight, id, None, round_trip, render_session_result).await
         }
         "create_task_decomposition" => {
-            // Local-only: no broker round-trip. Parse & validate the input,
-            // then return a confirmation the LLM sees as the tool result.
-            // The front-end detects the tool_call block on the ACP stream
-            // and synthesises a DecompositionCard directly.
-            let sub_tasks = match arguments.get("subTasks") {
-                Some(v) => v,
-                None => {
-                    return LineAction::Respond(err(
-                        id,
-                        -32602,
-                        "create_task_decomposition requires a non-empty subTasks array",
-                    ));
-                }
-            };
-            let arr: Vec<&Value> = match sub_tasks.as_array() {
-                Some(arr) if !arr.is_empty() => arr.iter().collect(),
-                _ => {
-                    return LineAction::Respond(err(
-                        id,
-                        -32602,
-                        "create_task_decomposition requires a non-empty subTasks array",
-                    ));
-                }
-            };
-            let count = arr.len();
-            let msg = format!(
-                "Decomposition proposal received ({count} sub-tasks). \
-                 The user can review and confirm them in the CodeG interface."
-            );
-            LineAction::Respond(ok(id, Value::String(msg)))
+            // Local-only: no broker round-trip. Validate the input via the
+            // decomposition module, then return a confirmation the LLM sees
+            // as the tool result. The front-end detects the tool_call block
+            // on the ACP stream and synthesises a DecompositionCard directly.
+            match crate::acp::decomposition::build_decomposition_confirmation(&arguments)
+            {
+                Ok(msg) => LineAction::Respond(ok(id, Value::String(msg))),
+                Err(e) => LineAction::Respond(err(id, -32602, e)),
+            }
         }
         "task_progress" => {
             let message = arguments
