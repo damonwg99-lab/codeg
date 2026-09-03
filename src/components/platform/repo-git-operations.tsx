@@ -45,6 +45,7 @@ import {
   buildBranchTree,
   buildRemoteBranchSections,
   localBranchItems,
+  worktreeBranchNodes,
 } from "@/lib/branch-tree"
 import { BranchSelectorList } from "@/components/layout/branch-selector-list"
 import type {
@@ -521,6 +522,14 @@ export function RepoGitBranchPanel({
     () => new Set(branchList.worktree_branches),
     [branchList.worktree_branches]
   )
+  const worktreeNodes = useMemo(
+    () =>
+      worktreeBranchNodes(
+        branchList.worktree_branches,
+        branchList.main_worktree_branch
+      ),
+    [branchList.worktree_branches, branchList.main_worktree_branch]
+  )
   const localNodes = useMemo(
     () => buildBranchTree(localBranchItems(branchList.local), "local"),
     [branchList.local]
@@ -593,6 +602,7 @@ export function RepoGitBranchPanel({
     <BranchSelectorList
       mainWorktreeBranch={branchList.main_worktree_branch}
       operations={operations}
+      worktreeNodes={worktreeNodes}
       localNodes={localNodes}
       remoteSections={remoteSections}
       localCount={branchList.local.length}

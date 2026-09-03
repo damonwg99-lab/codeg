@@ -99,13 +99,10 @@ pub async fn build_first_prompt_injection(
 ) -> Option<PromptInputBlock> {
     // Only inject for conversations linked to a task. A plain (non-task)
     // conversation must not receive the KB rules / task context block.
-    if platform_task_conversation_service::get_by_conversation(conn, conversation_id)
+    platform_task_conversation_service::get_by_conversation(conn, conversation_id)
         .await
         .ok()?
-        .is_none()
-    {
-        return None;
-    }
+        .as_ref()?;
 
     let mut parts: Vec<String> = Vec::new();
 

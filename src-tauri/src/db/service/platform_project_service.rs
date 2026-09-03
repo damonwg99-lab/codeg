@@ -67,7 +67,7 @@ fn normalize_root_dir(raw: &str) -> String {
     if t.is_empty() || t == "/" || t == "\\" || t == "//" || t == "\\\\" {
         return t.to_string();
     }
-    let s = t.trim_end_matches(|c| c == '/' || c == '\\').to_string();
+    let s = t.trim_end_matches(['/', '\\']).to_string();
     if s.is_empty() { "/".to_string() } else { s }
 }
 
