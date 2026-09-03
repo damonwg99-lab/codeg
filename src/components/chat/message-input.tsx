@@ -126,7 +126,10 @@ import {
 } from "@/components/chat/composer/invocation-reference"
 import { cutSelectionToClipboard } from "@/components/chat/composer/clipboard-actions"
 import { PlatformComposerToolbar } from "./platform-composer-toolbar"
-import { usePlatformTabSlice } from "@/stores/platform-tab-slice"
+import {
+  usePendingInitialDrafts,
+  usePlatformInjectHandler,
+} from "@/hooks/use-platform-composer"
 import { sessionToSuggestion } from "@/components/chat/composer/suggestion/adapters"
 import { editorHasReference } from "@/components/chat/composer/attachment-files"
 import type { ReferenceAttrs } from "@/components/chat/composer/types"
@@ -362,13 +365,9 @@ export function MessageInput({
   // Flips true once the RichComposer's async (immediatelyRender:false) editor has
   // mounted, so the hydration effect can use the imperative handle.
   const [composerReady, setComposerReady] = useState(false)
-  // Cluster A — pending initial drafts from task→conversation flow
-  const pendingInitialDrafts = usePlatformTabSlice(
-    (s) => s.pendingInitialDrafts
-  )
-  const clearPendingInitialDraft = usePlatformTabSlice(
-    (s) => s.clearPendingInitialDraft
-  )
+  // Cluster A — pending initial drafts from task→conversation flow, consumed
+  // by the platform hook below (all consume/guard/rAF logic lives there).
+  usePendingInitialDrafts(composerReady, attachmentTabId, editorRef)
 
   const syncComposerEmpty = useCallback(() => {
     const ed = editorRef.current?.getEditor()
@@ -425,12 +424,6 @@ export function MessageInput({
   const [contextSelectionActive, setContextSelectionActive] = useState(false)
   const isPromptingRef = useRef(isPrompting)
   const hydratedRef = useRef(false)
-  // One-time guard for pending draft consumption. When a flushSync re-render
-  // (triggered by insertReference NodeViewRenderer) re-runs the effect, the
-  // guard prevents duplicate badge insertion. Cleared after successful rAF
-  // execution; if the editor is unavailable, the guard is removed so the
-  // next effect run can retry.
-  const draftConsumedRef = useRef(new Set<string>())
   // Tracks the last queue-item id hydrated, so a re-edit of the *same* item
   // doesn't clobber the user's in-progress changes — keyed on id, not display
   // text (two attachment-only items share the text "Attached 1 attachment").
@@ -1157,60 +1150,6 @@ export function MessageInput({
     }
   }, [attachmentTabId])
 
-  // ─── Consume pending initial draft (from task→conversation flow) ───
-  // Keyed by tabId (attachmentTabId), not conversationId, to prevent badge
-  // drafts from leaking into other tab's editors. Only the tab whose id
-  // matches the draft key will consume and insert the badges.
-  useEffect(() => {
-    if (!composerReady || !attachmentTabId) return
-    const pending = pendingInitialDrafts.get(attachmentTabId)
-    if (!pending) return
-    // One-time ref guard prevents duplicate insertions: when insertReference
-    // triggers a synchronous flushSync re-render (NodeViewRenderer), this
-    // effect re-runs. The ref already contains this tabId, so the re-run
-    // skips — breaking the cascade that caused triple duplication.
-    if (draftConsumedRef.current.has(attachmentTabId)) return
-    draftConsumedRef.current.add(attachmentTabId)
-
-    // Parse refs now (synchronous) — data is captured in the rAF closure.
-    let refs: ReferenceAttrs[]
-    let isLegacyMarkdown = false
-    try {
-      refs = JSON.parse(pending) as ReferenceAttrs[]
-    } catch {
-      isLegacyMarkdown = true
-    }
-
-    // Defer editor mutations to the next animation frame to avoid flushSync
-    // warnings during the commit phase. Same rAF pattern used by the
-    // hydration and inject effects elsewhere in this component.
-    const raf = requestAnimationFrame(() => {
-      const editor = editorRef.current?.getEditor()
-      if (!editor) {
-        // Editor unavailable — remove the guard so a future effect run
-        // (when the editor is ready) can retry.
-        draftConsumedRef.current.delete(attachmentTabId)
-        return
-      }
-      if (isLegacyMarkdown) {
-        editorRef.current?.insertTextAtCursor(pending)
-      } else {
-        for (const ref of refs) {
-          editor.chain().insertReference(ref).insertContent(" ").run()
-        }
-      }
-      // Clear the draft after successful insertion. This triggers a state
-      // update, but the ref guard already prevents any re-trigger, and the
-      // rAF has completed so cancelAnimationFrame cleanup is a no-op.
-      clearPendingInitialDraft(attachmentTabId)
-    })
-    return () => cancelAnimationFrame(raf)
-  }, [
-    composerReady,
-    attachmentTabId,
-    pendingInitialDrafts,
-    clearPendingInitialDraft,
-  ])
   const buildDraft = useCallback((): PromptDraft | null => {
     const editor = editorRef.current?.getEditor()
     // Authoritative prefix normalization at the send boundary. A skill / expert
@@ -1697,15 +1636,7 @@ export function MessageInput({
 
   // Platform composer toolbar callback — converts InjectOption[] selections
   // from ProjectResourcePicker into inline reference badges in the composer.
-  const handlePlatformInject = useCallback((refs: ReferenceAttrs[]) => {
-    const editor = editorRef.current?.getEditor()
-    if (!editor) return
-    let chain = editor.chain().focus("end")
-    for (const ref of refs) {
-      chain = chain.insertReference(ref).insertContent(" ")
-    }
-    chain.run()
-  }, [])
+  const handlePlatformInject = usePlatformInjectHandler(editorRef)
 
   const actionButtons = isEditingQueueItem ? (
     <div className="flex items-center gap-1">
