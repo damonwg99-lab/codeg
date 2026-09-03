@@ -34,8 +34,7 @@ import {
 import { FolderAliasLabel } from "@/components/conversations/folder-alias-label"
 import { FolderOptionItem } from "@/components/shared/folder-select"
 import { BranchDropdown } from "@/components/layout/branch-dropdown"
-import { usePlatform } from "@/contexts/platform-context"
-import { computeScopedTopLevelFolders } from "@/lib/folder-scoping"
+import { ScopedFolderPicker } from "@/components/platform/scoped-folder-picker"
 
 interface ConversationContextBarProps {
   extraContent?: React.ReactNode
@@ -268,16 +267,7 @@ export const ConversationFolderBranchPicker = memo(
     const tabs = useTabStore((s) => s.tabs)
     const activeTabId = useTabStore((s) => s.activeTabId)
     const { openNewConversationTab, openChatModeTab } = useTabActions()
-    const folders = useAppWorkspaceStore((s) => s.folders)
     const allFolders = useAppWorkspaceStore((s) => s.allFolders)
-
-    // Platform (Cluster A) — when an active project exists, the picker is
-    // SCOPED to that project's repos (root folder + sub-repos) and folds down
-    // to just the branch picker when the project has <=1 repo. With no active
-    // project, falls back to main's default (top-level non-chat repos), with
-    // platform_repo sub-repo folders additionally excluded so they don't leak
-    // a project's hidden repos into the unscoped list (D3).
-    const { activeProject, activeProjectRepos } = usePlatform()
 
     const ownTab = useMemo(() => {
       if (override) return null
@@ -295,26 +285,6 @@ export const ConversationFolderBranchPicker = memo(
         ? (allFolders.find((f) => f.id === ownTab.folderId) ?? null)
         : null
     }, [override, ownTab, allFolders])
-
-    // Scoped picker list: when a project is active, scope to the project's
-    // repos (root folder + sub-repos) with path-aware dedup; otherwise fall
-    // back to main's default top-level non-chat repos. All logic lives in
-    // `@/lib/folder-scoping` so main's component refactors never touch it.
-    const pickerFolders = useMemo(
-      () =>
-        computeScopedTopLevelFolders({
-          folders,
-          allFolders,
-          activeProject,
-          activeProjectRepos,
-        }),
-      [folders, allFolders, activeProject, activeProjectRepos]
-    )
-    // Show the folder picker whenever there is at least one folder to switch
-    // to. (A scoped single-repo project that surfaces two rows for the same
-    // directory collapses to one after path-dedup, but the dropdown must stay
-    // so the folder list AND the pinned "no-folder / chat mode" footer remain
-    // reachable — dedup must never hide the picker.)
 
     if (!override && !ownTab) return null
     // Chat mode: either a draft flagged `isChat` (no folder yet) or a bound
@@ -344,66 +314,63 @@ export const ConversationFolderBranchPicker = memo(
 
     return (
       <>
-        {pickerFolders.length >= 1 && (
-          <FolderPicker
-            folders={pickerFolders}
-            currentFolderId={pickerSelectedId}
-            currentFolderName={displayFolderName}
-            title={`${t("folderTitle")}: ${displayFolderName}`}
-            editable={isNewConversation}
-            onSelect={async (folderId) => {
-              const target = allFolders.find((f) => f.id === folderId)
-              if (!target) return
-              if (override) {
-                // The surface owns what "switch folder" means for it — a canvas
-                // card retargets its own draft rather than opening a tab.
-                override.onSelectFolder(target.id, target.path)
-                toast.success(t("toasts.folderChanged", { name: target.name }))
-                return
-              }
-              try {
-                // Route through openNewConversationTab so the target folder's
-                // saved default agent is applied. The function's existing-
-                // draft branch reuses ownTab via the singleton invariant and
-                // runs the disconnect-then-patch dance for folder+agent
-                // changes. `inheritFromActive: true` preserves the user's
-                // current agent when the target folder has no pinned default
-                // — "I'm switching folders, keep my workflow".
-                openNewConversationTab(target.id, target.path, {
-                  inheritFromActive: true,
-                })
-                toast.success(t("toasts.folderChanged", { name: target.name }))
-              } catch (err) {
-                console.error(
-                  "[ConversationFolderBranchPicker] switch folder failed:",
-                  err
-                )
-                toast.error(t("toasts.openFolderFailed"))
-              }
-            }}
-            labelEmpty={t("noFolders")}
-            labelSearch={t("searchFolder")}
-            labelChatMode={t("chatModeLabel")}
-            isChatMode={isChatMode}
-            onSelectChatMode={() => {
-              if (override) {
-                override.onSelectChatMode()
-                toast.success(t("toasts.switchedToChatMode"))
-                return
-              }
-              try {
-                openChatModeTab()
-                toast.success(t("toasts.switchedToChatMode"))
-              } catch (err) {
-                console.error(
-                  "[ConversationFolderBranchPicker] switch to chat mode failed:",
-                  err
-                )
-                toast.error(t("toasts.openFolderFailed"))
-              }
-            }}
-          />
-        )}
+        <ScopedFolderPicker
+          currentFolderId={pickerSelectedId}
+          currentFolderName={displayFolderName}
+          title={`${t("folderTitle")}: ${displayFolderName}`}
+          editable={isNewConversation}
+          onSelect={async (folderId) => {
+            const target = allFolders.find((f) => f.id === folderId)
+            if (!target) return
+            if (override) {
+              // The surface owns what "switch folder" means for it — a canvas
+              // card retargets its own draft rather than opening a tab.
+              override.onSelectFolder(target.id, target.path)
+              toast.success(t("toasts.folderChanged", { name: target.name }))
+              return
+            }
+            try {
+              // Route through openNewConversationTab so the target folder's
+              // saved default agent is applied. The function's existing-
+              // draft branch reuses ownTab via the singleton invariant and
+              // runs the disconnect-then-patch dance for folder+agent
+              // changes. `inheritFromActive: true` preserves the user's
+              // current agent when the target folder has no pinned default
+              // — "I'm switching folders, keep my workflow".
+              openNewConversationTab(target.id, target.path, {
+                inheritFromActive: true,
+              })
+              toast.success(t("toasts.folderChanged", { name: target.name }))
+            } catch (err) {
+              console.error(
+                "[ConversationFolderBranchPicker] switch folder failed:",
+                err
+              )
+              toast.error(t("toasts.openFolderFailed"))
+            }
+          }}
+          labelEmpty={t("noFolders")}
+          labelSearch={t("searchFolder")}
+          labelChatMode={t("chatModeLabel")}
+          isChatMode={isChatMode}
+          onSelectChatMode={() => {
+            if (override) {
+              override.onSelectChatMode()
+              toast.success(t("toasts.switchedToChatMode"))
+              return
+            }
+            try {
+              openChatModeTab()
+              toast.success(t("toasts.switchedToChatMode"))
+            } catch (err) {
+              console.error(
+                "[ConversationFolderBranchPicker] switch to chat mode failed:",
+                err
+              )
+              toast.error(t("toasts.openFolderFailed"))
+            }
+          }}
+        />
 
         {/* Branch selector — the rich BranchDropdown (pull / commit / push /
             new branch / worktree / stash / merge / rebase / … + branch tree).
@@ -455,7 +422,7 @@ export function useConversationFolderBranchPickerVisible(
 // FolderPicker
 // ============================================================================
 
-interface FolderPickerProps {
+export interface FolderPickerProps {
   folders: { id: number; name: string; path: string; alias?: string | null }[]
   currentFolderId: number
   currentFolderName: string
@@ -480,7 +447,7 @@ interface FolderPickerProps {
   alias?: string | null
 }
 
-const FolderPicker = memo(function FolderPicker({
+export const FolderPicker = memo(function FolderPicker({
   folders,
   currentFolderId,
   currentFolderName,
