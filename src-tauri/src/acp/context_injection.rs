@@ -267,6 +267,75 @@ pub fn re_injection_interval_from_env() -> usize {
         .unwrap_or(DEFAULT_RE_INJECTION_INTERVAL)
 }
 
+/// The single per-prompt entry point used by the connection manager.
+///
+/// Decides and builds the context injection for ONE user prompt, from the
+/// connection's identity and turn counter alone — the manager only feeds this
+/// the pieces and advances its counter afterwards. The policy, in order:
+///
+/// - **First prompt on the connection** (`prompt_turn_count == 0`): full
+///   KB-rules/task-context injection (task-linked conversations only), plus
+///   the decomposition instruction when the user's own message expresses
+///   decomposition intent. Gating on the message (rather than injecting
+///   unconditionally on every turn) keeps the agent from being primed to
+///   decompose of its own accord when it merely echoes "分解/拆分".
+/// - **Follow-up prompts**: compact re-injection preamble when due per
+///   [`should_reinject`], so long-running sessions keep their file-storage /
+///   branch-tracking rules. Fires for ALL sessions (task-linked or not) so
+///   the decomposition rule is periodically refreshed against long-context
+///   forgetting.
+/// - Otherwise the blocks pass through unchanged.
+///
+/// The conversation row's `message_count` is deliberately NOT used: it is
+/// only ever set at creation (0) and stays 0 for a live session.
+pub async fn inject_for_prompt(
+    conn: &DatabaseConnection,
+    conversation_id: Option<i32>,
+    folder_id: Option<i32>,
+    prompt_turn_count: usize,
+    blocks: Vec<PromptInputBlock>,
+) -> Vec<PromptInputBlock> {
+    // Inject the decomposition instruction only when the user's own message
+    // expresses decomposition intent (see doc comment above).
+    let use_decomp_injection = has_decomposition_intent_in_blocks(&blocks);
+
+    if prompt_turn_count == 0 {
+        // First prompt on this connection — full context injection.
+        let mut injected_blocks = Vec::new();
+        if let (Some(cid), Some(fid)) = (conversation_id, folder_id) {
+            if let Some(block) = build_first_prompt_injection(conn, cid, fid).await {
+                injected_blocks.push(block);
+            }
+        }
+        if use_decomp_injection {
+            injected_blocks.push(build_decomposition_instruction_block());
+        }
+        if injected_blocks.is_empty() {
+            blocks
+        } else {
+            injected_blocks.extend(blocks);
+            injected_blocks
+        }
+    } else if let Some(cid) = conversation_id {
+        // Follow-up prompt — compact re-injection when due.
+        if should_reinject(prompt_turn_count, 0, 0, re_injection_interval_from_env()) {
+            let mut reinjected = Vec::with_capacity(blocks.len() + 2);
+            if use_decomp_injection {
+                reinjected.push(build_decomposition_instruction_block());
+            }
+            if let Some(block) = build_reinjection_block(conn, cid).await {
+                reinjected.push(block);
+            }
+            reinjected.extend(blocks);
+            reinjected
+        } else {
+            blocks
+        }
+    } else {
+        blocks
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

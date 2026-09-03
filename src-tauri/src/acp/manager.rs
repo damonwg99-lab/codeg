@@ -1257,84 +1257,23 @@ impl ConnectionManager {
         }
 
         // ─── Context injection: KB Rules + Task Context ───
-        // Context is built in `acp::context_injection` and wrapped in markers
-        // so the frontend can hide it from the user while the agent's LLM
-        // still sees it. The original `!already_linked` gate checked whether a
-        // conversation row already existed, which ALWAYS skipped injection for
-        // task-created conversations (create_conversation_for_task creates the
-        // row before the first prompt). We instead track a per-connection
-        // `prompt_turn_count` (incremented below, under the prompt lock): the
-        // first prompt on this connection (count == 0) gets the full
-        // KB-rules/task-context injection; later prompts get a compact
-        // re-injection preamble every `CODEG_REINJECTION_INTERVAL` turns so a
-        // long-running session keeps its file-storage / branch-tracking rules.
-        // The conversation row's `message_count` is deliberately NOT used: it
-        // is only ever set at creation (0) and stays 0 for a live session.
+        // All injection policy (first-prompt full injection, decomposition
+        // intent gating, interval-based re-injection) lives in
+        // `acp::context_injection::inject_for_prompt`; this call site only
+        // feeds it the connection's identity + turn counter, then advances
+        // the counter so the NEXT send is a follow-up turn.
         let (cid, fid, prompt_turn_count) = {
             let s = state_arc.read().await;
             (s.conversation_id, s.folder_id, s.prompt_turn_count)
         };
-        // Inject the decomposition instruction only when the user's own message
-        // expresses decomposition intent. Injecting unconditionally on follow-up
-        // turns keeps the agent primed to decompose on its own, so its own
-        // mentions of "分解/拆分" would trigger the flow. Gate on the current
-        // user message instead.
-        let use_decomp_injection =
-            crate::acp::context_injection::has_decomposition_intent_in_blocks(&blocks);
-
-        let blocks = if prompt_turn_count == 0 {
-            // First prompt on this connection → full context injection.
-            let mut injected_blocks = Vec::new();
-            if let (Some(cid), Some(fid)) = (cid, fid) {
-                if let Some(block) =
-                    crate::acp::context_injection::build_first_prompt_injection(
-                        &db.conn, cid, fid,
-                    )
-                    .await
-                {
-                    injected_blocks.push(block);
-                }
-            }
-            if use_decomp_injection {
-                injected_blocks
-                    .push(crate::acp::context_injection::build_decomposition_instruction_block());
-            }
-            if injected_blocks.is_empty() {
-                blocks
-            } else {
-                injected_blocks.extend(blocks);
-                injected_blocks
-            }
-        } else if let Some(cid) = cid {
-            // Follow-up prompt → compact re-injection when due. This fires for
-            // ALL sessions (task-linked or not), so the decomposition rule is
-            // periodically refreshed to counter long-context forgetting.
-            if crate::acp::context_injection::should_reinject(
-                prompt_turn_count,
-                0,
-                0,
-                crate::acp::context_injection::re_injection_interval_from_env(),
-            ) {
-                let mut reinjected = Vec::with_capacity(blocks.len() + 2);
-                if use_decomp_injection {
-                    reinjected
-                        .push(crate::acp::context_injection::build_decomposition_instruction_block());
-                }
-                if let Some(block) =
-                    crate::acp::context_injection::build_reinjection_block(&db.conn, cid).await
-                {
-                    reinjected.push(block);
-                }
-                reinjected.extend(blocks);
-                reinjected
-            } else {
-                blocks
-            }
-        } else {
-            blocks
-        };
-        // Mark this prompt as consumed so the NEXT send is a follow-up turn
-        // (first-prompt injection fires once per connection).
+        let blocks = crate::acp::context_injection::inject_for_prompt(
+            &db.conn,
+            cid,
+            fid,
+            prompt_turn_count,
+            blocks,
+        )
+        .await;
         state_arc.write().await.prompt_turn_count += 1;
 
         // Capture a bounded preview of the user's message BEFORE `blocks` is
