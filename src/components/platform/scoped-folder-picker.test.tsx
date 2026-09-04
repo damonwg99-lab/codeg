@@ -52,7 +52,7 @@ const subRepo = mkFolder({
   id: 2,
   name: "sub",
   path: "/proj/sub",
-  kind: "platform_repo",
+  kind: "platform_repo" as never,
 })
 const chatFolder = mkFolder({ id: 3, name: "chat", path: "/chat", kind: "chat" })
 

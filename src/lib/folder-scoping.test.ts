@@ -20,6 +20,7 @@ function folder(
     parent_id: null,
     kind: "regular",
     alias: null,
+    group_id: null,
     ...rest,
   }
   // Folders backed by a platform repo carry a kind the narrow TS union does
