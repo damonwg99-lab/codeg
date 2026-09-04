@@ -11,7 +11,6 @@ import {
   ClipboardPaste,
   Cog,
   Copy,
-  GitFork,
   MessageSquareText,
   Scissors,
   Send,
@@ -215,10 +214,6 @@ interface MessageInputProps {
   isEditingQueueItem?: boolean
   onSaveQueueEdit?: (draft: PromptDraft) => void
   onCancelQueueEdit?: () => void
-  /** Fork the session and send `draft`. Fire-and-forget: the input consumes the
-   *  draft synchronously (clears on click); the parent re-queues it if the fork
-   *  can't run, so it is never lost. */
-  onForkSend?: (draft: PromptDraft, modeId?: string | null) => void
   /** Inject the draft's TEXT into the RUNNING turn (native live-feedback
    *  steering). Present only on sessions whose feedback channel is native —
    *  when absent, the prompting branch renders its historical Stop-only form.
@@ -330,7 +325,6 @@ export function MessageInput({
   isEditingQueueItem = false,
   onSaveQueueEdit,
   onCancelQueueEdit,
-  onForkSend,
   onSteer,
   onAddFeedback,
   feedbackAddDisabled,
@@ -1266,41 +1260,15 @@ export function MessageInput({
     resetComposer,
   ])
 
-  const handleForkSendClick = useCallback(() => {
-    if (!onForkSend) return
-    // Same uploading gate as `handleSend`: a fork-send consumes the draft
-    // (and its blocks) immediately, so an unsettled upload would strip to
-    // nothing on the wire.
-    if (hasUploadingImage) {
-      toast.error(tAttach("attachUploadInProgress"))
-      return
-    }
-    const draft = buildDraft()
-    if (!draft) return
-    // Fork-send consumes the draft synchronously, exactly like a normal send:
-    // fire-and-forget and clear the input immediately, so there is no in-flight
-    // editable window. If the fork can't run (queue non-empty / disconnected /
-    // failure) the parent re-queues the draft, so it is never lost.
-    onForkSend(draft, showModeSelector ? effectiveModeId : null)
-    if (effectiveDraftStorageKey) {
-      clearMessageInputDraftV2(effectiveDraftStorageKey)
-    }
-    resetComposer()
-  }, [
-    onForkSend,
-    hasUploadingImage,
-    tAttach,
-    buildDraft,
-    effectiveModeId,
-    showModeSelector,
-    effectiveDraftStorageKey,
-    resetComposer,
-  ])
-
-  // Mid-turn insert into current turn (native steering). Draft-only path: the
-  // text of a draft with non-text blocks (file badges) can't be reconstructed,
-  // so those drafts are queued whole instead of being silently stripped.
-  // Image attachments disable the menu entry at render.
+  // Mid-turn "insert into current turn" (native steering). Awaited, unlike
+  // the synchronous send/enqueue/fork paths: the draft clears ONLY once the
+  // backend confirms the injection was recorded — a turn-end race falls back
+  // to the queue (the note is never lost), any other failure keeps the draft
+  // for retry. Steering is text-only: a draft carrying non-text blocks (file
+  // badges) is queued whole instead of being silently stripped; image
+  // attachments disable the menu entry at render (which also keeps unsettled
+  // uploads out of this path — the enqueue fallback below bypasses
+  // `handleSend`'s uploading gate).
   const [steering, setSteering] = useState(false)
   const handleSteerClick = useCallback(async () => {
     if (!onSteer || steering) return
@@ -1725,36 +1693,6 @@ export function MessageInput({
         <Square className="size-4" />
       </Button>
     )
-  ) : onForkSend ? (
-    <div className="flex items-center">
-      <Button
-        onClick={handleSend}
-        disabled={disabled || !hasSendableContent}
-        size="icon"
-        className="h-8 w-8 rounded-r-none"
-        title={t("send")}
-      >
-        <Send className="size-4" />
-      </Button>
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            disabled={disabled || !hasSendableContent}
-            size="icon"
-            className="h-8 w-5 rounded-l-none border-l border-primary-foreground/20"
-            aria-label={t("forkAndSend")}
-          >
-            <ChevronUp className="size-4" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" side="top">
-          <DropdownMenuItem onSelect={handleForkSendClick}>
-            <GitFork className="h-4 w-4" />
-            {t("forkAndSend")}
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
-    </div>
   ) : (
     <Button
       onClick={handleSend}

@@ -64,7 +64,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
-# Host IANA zone name (e.g. `Asia/Shanghai`) �?chrono only exposes the offset.
+# Host IANA zone name (e.g. `Asia/Shanghai`) 锟?chrono only exposes the offset.
 # Already in the tree as a chrono/clock dependency; named here so the
 # chat-authoring default timezone can use it directly.
 iana-time-zone = "0.1"
