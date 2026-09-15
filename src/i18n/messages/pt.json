@@ -5481,6 +5481,9 @@
     }
   },
   "Platform": {
+    "common": {
+      "cancel": "Cancelar"
+    },
     "nav": {
       "projectList": "Projetos",
       "taskKanban": "Tarefas",

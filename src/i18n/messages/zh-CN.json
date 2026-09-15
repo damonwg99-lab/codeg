@@ -5481,6 +5481,9 @@
     }
   },
   "Platform": {
+    "common": {
+      "cancel": "取消"
+    },
     "nav": {
       "projectList": "项目",
       "taskKanban": "任务",

@@ -5481,6 +5481,9 @@
     }
   },
   "Platform": {
+    "common": {
+      "cancel": "キャンセル"
+    },
     "nav": {
       "projectList": "プロジェクト",
       "taskKanban": "タスク",

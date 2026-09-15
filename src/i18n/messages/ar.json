@@ -5481,6 +5481,9 @@
     }
   },
   "Platform": {
+    "common": {
+      "cancel": "إلغاء"
+    },
     "nav": {
       "projectList": "المشاريع",
       "taskKanban": "المهام",

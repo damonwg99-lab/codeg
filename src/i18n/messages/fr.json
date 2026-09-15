@@ -5481,6 +5481,9 @@
     }
   },
   "Platform": {
+    "common": {
+      "cancel": "Annuler"
+    },
     "nav": {
       "projectList": "Projets",
       "taskKanban": "Tâches",
