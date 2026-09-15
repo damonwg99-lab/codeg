@@ -1560,6 +1560,7 @@ mod tauri_app {
                 knowledge_commands::scan_knowledge_repo,
                 knowledge_commands::list_knowledge_docs,
                 knowledge_commands::search_knowledge_docs,
+                knowledge_commands::search_knowledge_docs_fts,
                 knowledge_commands::get_knowledge_doc,
                 knowledge_commands::update_knowledge_doc,
                 knowledge_commands::delete_knowledge_doc,

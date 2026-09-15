@@ -14,6 +14,7 @@ import type {
   GlobalConfigInfo,
   CredentialInfo,
   KnowledgeDocInfo,
+  KnowledgeDocFtsResult,
   ScanResultInfo,
   SkillInfo,
   KbInitResult,
@@ -404,6 +405,16 @@ export async function searchKnowledgeDocs(params: {
   query: string
 }): Promise<KnowledgeDocInfo[]> {
   return getTransport().call("search_knowledge_docs", {
+    projectId: params.projectId,
+    query: params.query,
+  })
+}
+
+export async function searchKnowledgeDocsFts(params: {
+  projectId: number
+  query: string
+}): Promise<KnowledgeDocFtsResult[]> {
+  return getTransport().call("search_knowledge_docs_fts", {
     projectId: params.projectId,
     query: params.query,
   })

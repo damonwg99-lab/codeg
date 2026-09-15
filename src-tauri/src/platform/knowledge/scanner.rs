@@ -276,15 +276,19 @@ fn scan_recursive(
                 .map(|e| e.to_string_lossy().to_string())
                 .unwrap_or_default();
 
-            let (title, tags_json, description) = if MD_EXTENSIONS.contains(&ext.as_str()) {
+            let (title, tags_json, description, file_content) = if MD_EXTENSIONS.contains(&ext.as_str()) {
                 // Parse frontmatter
                 let content = std::fs::read_to_string(&path).map_err(AppCommandError::io)?;
                 let (fm_tags, fm_desc) = parse_frontmatter(&content);
                 // Title: prefer frontmatter title if present, else use filename
                 let fm_title = extract_frontmatter_title(&content);
-                (fm_title.unwrap_or_else(|| title_from_filename(&path)), fm_tags, fm_desc)
+                let body = strip_frontmatter(&content);
+                (fm_title.unwrap_or_else(|| title_from_filename(&path)), fm_tags, fm_desc, Some(body))
+            } else if matches!(ext.as_str(), "txt" | "json" | "yaml" | "yml") {
+                let content = std::fs::read_to_string(&path).ok();
+                (title_from_filename(&path), None, None, content)
             } else {
-                (title_from_filename(&path), None, None)
+                (title_from_filename(&path), None, None, None)
             };
 
             results.push(ScannedDoc {
@@ -295,6 +299,7 @@ fn scan_recursive(
                 tags_json,
                 description,
                 skill_name,
+                content: file_content,
             });
         }
     }
@@ -303,6 +308,22 @@ fn scan_recursive(
 }
 
 /// Extract `title` field from YAML frontmatter if present.
+/// Strip YAML frontmatter from Markdown content to get clean body text for FTS indexing.
+fn strip_frontmatter(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return content.to_string();
+    }
+    let after_first = &trimmed[3..];
+    let rest = after_first.trim_start_matches('\n').trim_start_matches("\r\n");
+    if let Some(end_idx) = rest.find("---") {
+        let after_closing = &rest[end_idx + 3..];
+        after_closing.trim_start_matches('\n').trim_start_matches("\r\n").to_string()
+    } else {
+        content.to_string()
+    }
+}
+
 fn extract_frontmatter_title(content: &str) -> Option<String> {
     let content = content.trim_start();
     if !content.starts_with("---") {

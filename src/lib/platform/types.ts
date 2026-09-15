@@ -279,6 +279,12 @@ export type KbDocType =
   | "ai_intermediate"
   | "task_attachment"
 
+export interface KnowledgeDocFtsResult {
+  doc: KnowledgeDocInfo
+  snippet: string
+  rank: number
+}
+
 export interface KnowledgeDocInfo {
   id: number
   projectId: number

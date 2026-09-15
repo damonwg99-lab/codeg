@@ -14,6 +14,7 @@ use serde::Deserialize;
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::knowledge as knowledge_commands;
+use crate::platform::knowledge::fts::KnowledgeDocFtsResult;
 use crate::models::{
     KnowledgeDocInfo, KbInitResult, ScanResultInfo, SkillInfo, UpdateKnowledgeDocDraft,
 };
@@ -126,6 +127,16 @@ pub async fn search_knowledge_docs(
 ) -> Result<Json<Vec<KnowledgeDocInfo>>, AppCommandError> {
     Ok(Json(
         knowledge_commands::search_knowledge_docs_core(&state.db, params.project_id, params.query)
+            .await?,
+    ))
+}
+
+pub async fn search_knowledge_docs_fts(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<SearchKnowledgeDocsParams>,
+) -> Result<Json<Vec<KnowledgeDocFtsResult>>, AppCommandError> {
+    Ok(Json(
+        knowledge_commands::search_knowledge_docs_fts_core(&state.db, params.project_id, &params.query)
             .await?,
     ))
 }

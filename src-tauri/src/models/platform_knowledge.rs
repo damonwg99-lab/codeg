@@ -48,6 +48,8 @@ pub struct ScannedDoc {
     pub description: Option<String>,
     /// Associated skill name (if under `skills/`).
     pub skill_name: Option<String>,
+    /// File content for full-text search indexing.
+    pub content: Option<String>,
 }
 
 /// Result of scanning a knowledge base directory.

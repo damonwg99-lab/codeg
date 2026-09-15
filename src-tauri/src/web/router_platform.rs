@@ -137,6 +137,10 @@ pub fn platform_routes() -> Router {
             "/search_knowledge_docs",
             post(handlers::knowledge::search_knowledge_docs),
         )
+        .route(
+            "/search_knowledge_docs_fts",
+            post(handlers::knowledge::search_knowledge_docs_fts),
+        )
         .route("/get_knowledge_doc", post(handlers::knowledge::get_knowledge_doc))
         .route(
             "/update_knowledge_doc",

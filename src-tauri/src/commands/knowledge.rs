@@ -9,6 +9,7 @@ use crate::db::service::{
     platform_task_service,
 };
 use crate::db::AppDatabase;
+use crate::platform::knowledge::fts::{self, KnowledgeDocFtsResult};
 use crate::models::{
     KnowledgeDocInfo, KbInitResult, ScanResultInfo, SkillInfo,
     UpdateKnowledgeDocDraft, UpsertKnowledgeDocDraft,
@@ -156,9 +157,22 @@ pub async fn scan_knowledge_repo_core(
             task_id: preserved_task_id,
         };
 
-        let _result = platform_knowledge_doc_service::upsert_by_path(conn, draft)
+        let upserted = platform_knowledge_doc_service::upsert_by_path(conn, draft)
             .await
             .map_err(AppCommandError::from)?;
+
+        let content_str = doc.content.as_deref().unwrap_or("");
+        let tags_str = doc.tags_json.as_deref().unwrap_or("");
+        let desc_str = doc.description.as_deref().unwrap_or("");
+        let _ = fts::sync_doc_fts(
+            conn,
+            upserted.id,
+            project_id,
+            &upserted.title,
+            tags_str,
+            desc_str,
+            content_str,
+        ).await;
 
         if existing_paths.contains(&doc.file_path) {
             updated_count += 1;
@@ -238,6 +252,7 @@ pub async fn scan_knowledge_repo_core(
             platform_knowledge_doc_service::delete(conn, existing.id)
                 .await
                 .map_err(AppCommandError::from)?;
+            let _ = fts::delete_doc_fts(conn, existing.id).await;
             deleted_count += 1;
         }
     }
@@ -284,6 +299,15 @@ pub async fn search_knowledge_docs_core(
         .map_err(AppCommandError::from)
 }
 
+pub async fn search_knowledge_docs_fts_core(
+    db: &AppDatabase,
+    project_id: i32,
+    query: &str,
+) -> Result<Vec<KnowledgeDocFtsResult>, AppCommandError> {
+    let conn = &db.conn;
+    fts::search_fts(conn, project_id, query).await
+}
+
 pub async fn get_knowledge_doc_core(
     db: &AppDatabase,
     id: i32,
@@ -319,6 +343,22 @@ pub async fn delete_knowledge_doc_core(
 
     let kb_dir = ensure_kb_dir(db, doc.project_id).await?;
     let abs_path = Path::new(&kb_dir).join(&doc.file_path);
+
+    let ext = abs_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+
+    if matches!(
+        ext.as_str(),
+        "docx" | "xlsx" | "pptx" | "xls" | "pdf" | "zip" | "tar" | "gz" | "png" | "jpg" | "jpeg" | "gif" | "exe"
+    ) {
+        return Err(AppCommandError::invalid_input(format!(
+            "Binary file cannot be read as text: {}",
+            doc.file_path
+        )));
+    }
 
     // Delete the actual file if it exists; ignore errors (file may already be
     // gone e.g. manually removed from disk).
@@ -619,6 +659,16 @@ pub async fn search_knowledge_docs(
     query: String,
 ) -> Result<Vec<KnowledgeDocInfo>, AppCommandError> {
     search_knowledge_docs_core(&db, project_id, query).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn search_knowledge_docs_fts(
+    db: State<'_, AppDatabase>,
+    project_id: i32,
+    query: String,
+) -> Result<Vec<KnowledgeDocFtsResult>, AppCommandError> {
+    search_knowledge_docs_fts_core(&db, project_id, &query).await
 }
 
 #[cfg(feature = "tauri-runtime")]
