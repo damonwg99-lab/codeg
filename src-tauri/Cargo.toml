@@ -1,6 +1,6 @@
 [package]
 name = "codeg"
-version = "1.1.8"
+version = "1.2.0"
 description = "Agent Code Generation App"
 authors = ["feitao"]
 edition = "2021"
@@ -28,6 +28,7 @@ tauri-runtime = [
     "dep:tauri-plugin-process",
     "dep:tauri-plugin-notification",
     "dep:tauri-plugin-single-instance",
+    "dep:tauri-plugin-deep-link",
     "dep:tauri-plugin-autostart",
     "dep:keyring",
 ]
@@ -105,7 +106,10 @@ sea-orm-migration = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio
 # trait, where sqlx's async pool doesn't fit). Pinned to the rusqlite line
 # whose libsqlite3-sys (0.30) matches sqlx-sqlite's, so both link the same
 # bundled SQLite.
-rusqlite = "0.32"
+# `backup` = the online page-copy API, used to snapshot a third-party agent's
+# session store into a self-contained single file. Pure Rust-side feature; it
+# does not move libsqlite3-sys off the version sqlx-sqlite links.
+rusqlite = { version = "0.32", features = ["backup"] }
 toml = "0.8"
 # Format-preserving TOML editing for surgical scalar merges into user config
 # files (e.g. the Grok settings panel writing [ui]/[models] keys without
@@ -149,6 +153,7 @@ tauri-plugin-updater = { version = "2", optional = true }
 tauri-plugin-process = { version = "2", optional = true }
 tauri-plugin-notification = { version = "2", optional = true }
 tauri-plugin-single-instance = { version = "2", optional = true }
+tauri-plugin-deep-link = { version = "2", optional = true }
 # "Launch at login" toggle. Desktop-only: registry Run key on Windows, a
 # LaunchAgent plist on macOS, an XDG autostart .desktop entry on Linux.
 tauri-plugin-autostart = { version = "2", optional = true }

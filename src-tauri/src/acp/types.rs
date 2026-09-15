@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PromptInputBlock {
     Text {
@@ -108,11 +108,11 @@ pub struct AsyncTaskUsage {
     pub duration_ms: u64,
 }
 
-/// One JetBrains AIR async task — Claude's non-agent background work
-/// (background shells, workflows, monitors), merged from the three
-/// `session/update` variants that describe it (claude-agent-acp 0.73+,
-/// published only because `build_client_capabilities` advertises the
-/// `asyncTasks` AIR capability).
+/// One JetBrains AIR async task — an agent's non-agent background work, merged
+/// from the three `session/update` variants that describe it (claude-agent-acp
+/// 0.73+: background shells, workflows, monitors; codex-acp 1.10+: background
+/// terminals). Published only because `build_client_capabilities` advertises the
+/// `asyncTasks` AIR capability.
 ///
 /// This is the MERGED projection, not a wire frame: the adapter announces a
 /// task once with its full identity (`async_task_spawned`) and then revises it
@@ -126,13 +126,16 @@ pub struct AsyncTaskUsage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AsyncTaskRecord {
     pub task_id: String,
-    /// Adapter-authored label — the workflow name, else the description.
+    /// Adapter-authored label — claude: the workflow name, else the
+    /// description; codex: the launching tool call's title, else the raw
+    /// command.
     pub name: String,
-    /// Already FRIENDLY, not the SDK's raw type: the adapter maps
+    /// Already FRIENDLY, not the SDK's raw type: claude maps
     /// `local_bash`→`"shell"`, `local_workflow`→`"workflow"`,
-    /// `local_monitor`/`mcp`→`"monitor"`, and anything else to `"task"`. Kept a
-    /// plain string so an unmapped future type renders as itself instead of
-    /// failing to deserialize.
+    /// `local_monitor`/`mcp`→`"monitor"`, and anything else to `"task"`; codex
+    /// publishes `"shell"` for every background terminal. Kept a plain string so
+    /// an unmapped future type renders as itself instead of failing to
+    /// deserialize.
     pub task_type: String,
     pub description: String,
     /// Whether this task earns its own transcript card upstream. codeg renders
@@ -435,6 +438,17 @@ pub enum AcpEvent {
         /// (resolved against the option's own value list), not raw ids.
         requested: String,
         actual: String,
+        /// The same two, as the RAW value ids.
+        ///
+        /// Carried beside the labels because a client that localises an agent's
+        /// hardcoded vocabulary (see `lib/agent-label-vocabulary.ts`) keys on
+        /// the id, and the labels above have already been resolved away from
+        /// it. It cannot recover them by matching the label back against the
+        /// live option list either: this event is emitted BEFORE the
+        /// `SessionConfigOptions` carrying the value the agent adopted, so that
+        /// list is still the pre-update one.
+        requested_value: String,
+        actual_value: String,
     },
     /// Initial selector payloads (modes/config options) have been emitted
     SelectorsReady,
@@ -545,9 +559,9 @@ pub enum AcpEvent {
     /// from) and the frontend reducer, so a mid-session attach and a client that
     /// saw every delta agree.
     ///
-    /// Claude-only today: `build_client_capabilities` advertises `asyncTasks`
-    /// to claude-agent-acp alone, because codex-acp 1.8.0 does not implement
-    /// the channel.
+    /// Reaches codeg from the two adapters `build_client_capabilities`
+    /// advertises `asyncTasks` to: claude-agent-acp (0.73+) and codex-acp
+    /// (1.10+).
     AsyncTask { delta: AsyncTaskDelta },
     /// `session/load` failed in a way codeg cannot paper over — the agent has
     /// no record of this `session_id`, the session/process died, or it is
@@ -770,7 +784,9 @@ pub enum ConfigStaleKind {
 /// `Resource` (how an `image:false` / `embedded_context:true` agent carries a
 /// pasted image — and still how a format the agent cannot decode travels) is
 /// promoted to `Image` so the viewer renders a thumbnail, not a link.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// `Eq` because `FeedbackItem` carries these and derives it; every field is a
+// `String`, so the bound costs nothing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UserMessageBlock {
     Text { text: String },

@@ -258,6 +258,26 @@ function hasAnyKey(obj: Record<string, unknown>, keys: string[]): boolean {
 }
 
 /**
+ * Codex ACP uses human titles for web-search follow-up actions. Those frames
+ * keep `kind: "search"` (the same kind used by local fuzzy-file search), so
+ * the title is the only identity signal when the raw-input type is omitted on
+ * session replay.
+ */
+function isCodexWebSearchTitle(input: string | null | undefined): boolean {
+  const title = input?.trim()
+  if (!title) return false
+  return /^(?:web\s+search|open\s+page|find\s+in\s+page)(?:\s*:|\s|$)/i.test(
+    title
+  )
+}
+
+/** Codex's raw-input marker is camelCase on the ACP wire (`webSearch`). */
+function isCodexWebSearchType(input: unknown): boolean {
+  if (typeof input !== "string") return false
+  return canonicalizeToolName(input).replace(/_/g, "") === "websearch"
+}
+
+/**
  * Wire spellings that mean the same argument as one of the canonical
  * (snake_case) keys every tool card reads. OpenCode names its tool arguments in
  * camelCase and its ACP adapter forwards them verbatim, so the LIVE stream
@@ -389,7 +409,23 @@ function inferFromInput(
     return "edit"
   if (hasAnyKey(parsed, ["changes"])) return "edit"
   if (hasAnyKey(parsed, ["todos"])) return "todowrite"
-  if (hasAnyKey(parsed, ["query"])) return "websearch"
+  // `query` is a common MCP argument (for example CodeGraph's
+  // `codegraph_explore` and Context7's query tools), not a web-search
+  // discriminator. Only classify it as websearch when the wire also names a
+  // web-search tool, or when Codex's action title/type identifies the call;
+  // otherwise `inferLiveToolName` can preserve the explicit tool title instead
+  // of showing every query-bearing MCP call as "WebSearch". Codex's generic
+  // `kind: "search"` intentionally remains a local file search (`grep`).
+  if (
+    hasAnyKey(parsed, ["query"]) &&
+    (normalizedTitle === "websearch" ||
+      normalizedTitle === "web_search" ||
+      normalizedKind === "websearch" ||
+      normalizedKind === "web_search" ||
+      isCodexWebSearchTitle(title) ||
+      isCodexWebSearchType(parsed.type))
+  )
+    return "websearch"
   if (hasAnyKey(parsed, ["url"])) return "webfetch"
 
   const hasPattern = hasAnyKey(parsed, ["pattern"])
@@ -835,6 +871,39 @@ export function extractClaudeCodeSkillName(
   if (typeof skill !== "string") return null
   const trimmed = skill.trim()
   return trimmed.length > 0 ? trimmed : null
+}
+
+/**
+ * Whether the agent has moved this tool call's process into the background —
+ * JetBrains AIR's `_meta.jetbrains.air.asyncTasks.backgrounded` marker
+ * (codex-acp 1.10+, published only because `build_client_capabilities`
+ * advertises the `asyncTasks` capability).
+ *
+ * It arrives on a `tool_call_update` that carries NOTHING else: no status, no
+ * content, no output — just the id and this flag, immediately before the
+ * matching `async_task_spawned`. That is the point of reading it: the launching
+ * `execute` call stays `in_progress` for the rest of the connection (codex only
+ * completes it when the process finally exits or a stop lands), so without the
+ * marker the card is indistinguishable from a command that hung.
+ *
+ * Two shape notes, both load-bearing:
+ *   - there is NO `version` key inside this `air` block — unlike its
+ *     `sessionFailure` sibling — so nothing here may gate on one;
+ *   - the flag is only ever published as `true`; the adapter withdraws it by
+ *     settling the tool call, never by sending `false`. Strict equality anyway,
+ *     so a future `false` reads as "not backgrounded" rather than truthy.
+ */
+export function toolCallMovedToBackground(
+  meta: Record<string, unknown> | null | undefined
+): boolean {
+  if (!meta || typeof meta !== "object") return false
+  const jetbrains = (meta as Record<string, unknown>).jetbrains
+  if (!jetbrains || typeof jetbrains !== "object") return false
+  const air = (jetbrains as Record<string, unknown>).air
+  if (!air || typeof air !== "object") return false
+  const asyncTasks = (air as Record<string, unknown>).asyncTasks
+  if (!asyncTasks || typeof asyncTasks !== "object") return false
+  return (asyncTasks as Record<string, unknown>).backgrounded === true
 }
 
 /**

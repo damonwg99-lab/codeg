@@ -8,6 +8,7 @@ import {
   extractClaudeCodeSkillName,
   inferLiveToolName,
   normalizeToolName,
+  toolCallMovedToBackground,
 } from "./tool-call-normalization"
 
 describe("aliasToolInputKeys", () => {
@@ -374,6 +375,95 @@ describe("inferLiveToolName meta.claudeCode.toolName override", () => {
         meta: { claudeCode: { toolName: "   " } },
       })
     ).not.toBe("memory_recall")
+  })
+})
+
+describe("inferLiveToolName query-bearing MCP calls", () => {
+  it("keeps an explicit OpenCode MCP tool title", () => {
+    expect(
+      inferLiveToolName({
+        title: "codegraph_explore",
+        kind: "other",
+        rawInput: JSON.stringify({ query: "find the auth flow" }),
+      })
+    ).toBe("codegraph_explore")
+  })
+
+  it("still classifies a query as websearch when the wire names websearch", () => {
+    expect(
+      inferLiveToolName({
+        title: "web_search",
+        kind: "other",
+        rawInput: JSON.stringify({ query: "Codeg" }),
+      })
+    ).toBe("websearch")
+
+    expect(
+      inferLiveToolName({
+        title: "Search",
+        kind: "websearch",
+        rawInput: JSON.stringify({ query: "Codeg" }),
+      })
+    ).toBe("websearch")
+  })
+
+  it("recognizes Codex web-search action frames", () => {
+    expect(
+      inferLiveToolName({
+        title: "Open page: https://example.com",
+        kind: "search",
+        rawInput: JSON.stringify({
+          query: "Codeg",
+          action: { type: "openPage", url: "https://example.com" },
+        }),
+      })
+    ).toBe("websearch")
+
+    // session/load replay omits the `type` marker, but keeps the action title
+    // and payload. `kind: "search"` must not be enough on its own because
+    // local fuzzy-file searches use the same ACP kind.
+    expect(
+      inferLiveToolName({
+        title: "Find in page for 'ACP' in https://example.com",
+        kind: "search",
+        rawInput: JSON.stringify({
+          query: "Codeg",
+          action: {
+            type: "findInPage",
+            pattern: "ACP",
+            url: "https://example.com",
+          },
+        }),
+      })
+    ).toBe("websearch")
+
+    // The marker is also sufficient when a title is too generic to identify
+    // the action on its own.
+    expect(
+      inferLiveToolName({
+        title: "Search",
+        kind: "other",
+        rawInput: JSON.stringify({ type: "webSearch", query: "Codeg" }),
+      })
+    ).toBe("websearch")
+  })
+
+  it("does not infer websearch from a query field alone", () => {
+    expect(
+      inferLiveToolName({
+        title: "MCP: tool",
+        kind: "other",
+        rawInput: JSON.stringify({ query: "find usages" }),
+      })
+    ).not.toBe("websearch")
+
+    expect(
+      inferLiveToolName({
+        title: "Search for 'find usages'",
+        kind: "search",
+        rawInput: JSON.stringify({ query: "find usages" }),
+      })
+    ).toBe("grep")
   })
 })
 
@@ -1108,6 +1198,50 @@ describe("inferLiveToolName resolves Qoder's authoritative _meta.qoder.toolName"
           meta,
         })
       ).toBe("whatever")
+    }
+  })
+})
+
+describe("toolCallMovedToBackground", () => {
+  it("reads the codex-acp 1.10 marker verbatim off the wire", () => {
+    // The whole `tool_call_update` codex sends when a command goes background —
+    // no status, no content, no output, and crucially NO `version` key inside
+    // `air` (its `sessionFailure` sibling has one; gating on it here would make
+    // the badge never appear).
+    expect(
+      toolCallMovedToBackground({
+        jetbrains: { air: { asyncTasks: { backgrounded: true } } },
+      })
+    ).toBe(true)
+    // A `version` alongside it must not break the read either, in case the
+    // adapter ever starts stamping one.
+    expect(
+      toolCallMovedToBackground({
+        jetbrains: { air: { version: 1, asyncTasks: { backgrounded: true } } },
+      })
+    ).toBe(true)
+  })
+
+  it("stays false for every other meta shape", () => {
+    for (const meta of [
+      null,
+      undefined,
+      {},
+      // The AIR sibling that DOES ride this envelope — reading it as a
+      // background marker would badge every failing turn's tool calls.
+      { jetbrains: { air: { version: 1, sessionFailure: { id: "x" } } } },
+      { jetbrains: { air: { asyncTasks: {} } } },
+      // Strict equality: only a literal `true` counts.
+      { jetbrains: { air: { asyncTasks: { backgrounded: false } } } },
+      { jetbrains: { air: { asyncTasks: { backgrounded: "true" } } } },
+      { jetbrains: { air: { asyncTasks: { backgrounded: 1 } } } },
+      // Missing a level, or the wrong nesting.
+      { air: { asyncTasks: { backgrounded: true } } },
+      { jetbrains: { asyncTasks: { backgrounded: true } } },
+      { asyncTasks: { backgrounded: true } },
+      { jetbrains: { air: "backgrounded" } },
+    ] as (Record<string, unknown> | null | undefined)[]) {
+      expect(toolCallMovedToBackground(meta)).toBe(false)
     }
   })
 })
