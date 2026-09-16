@@ -3056,6 +3056,7 @@
         "searchModel": "Search models...",
         "searchModelAria": "Search models",
         "modelListLabel": "Models",
+        "recommendedBadge": "Recommended",
         "noModels": "No models found",
         "cancel": "Cancel",
         "send": "Send",
@@ -3324,6 +3325,7 @@
       "messageList": {
         "attachedResources": "Attached resources",
         "loading": "Loading...",
+        "loadBackgroundActivity": "Load background activity",
         "loadEarlier": "Load earlier messages",
         "loadingEarlier": "Loading earlier messages…",
         "error": "Error: {message}",

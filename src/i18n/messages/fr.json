@@ -3054,6 +3054,7 @@
         "searchModel": "Rechercher des modèles...",
         "searchModelAria": "Rechercher des modèles",
         "modelListLabel": "Modèles",
+        "recommendedBadge": "Recommandé",
         "noModels": "Aucun modèle trouvé",
         "cancel": "Annuler",
         "send": "Envoyer",
@@ -3324,6 +3325,7 @@
       "messageList": {
         "attachedResources": "Ressources jointes",
         "loading": "Chargement...",
+        "loadBackgroundActivity": "Charger l'activité en arrière-plan",
         "loadEarlier": "Charger les messages précédents",
         "loadingEarlier": "Chargement des messages précédents…",
         "error": "Erreur : {message}",

@@ -3054,6 +3054,7 @@
         "searchModel": "모델 검색...",
         "searchModelAria": "모델 검색",
         "modelListLabel": "모델",
+        "recommendedBadge": "권장",
         "noModels": "모델을 찾을 수 없습니다",
         "cancel": "취소",
         "send": "보내기",
@@ -3324,6 +3325,7 @@
       "messageList": {
         "attachedResources": "첨부된 리소스",
         "loading": "불러오는 중...",
+        "loadBackgroundActivity": "백그라운드 활동 불러오기",
         "loadEarlier": "이전 메시지 불러오기",
         "loadingEarlier": "이전 메시지를 불러오는 중…",
         "error": "오류: {message}",

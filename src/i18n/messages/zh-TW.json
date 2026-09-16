@@ -3054,6 +3054,7 @@
         "searchModel": "搜尋模型...",
         "searchModelAria": "搜尋模型",
         "modelListLabel": "模型",
+        "recommendedBadge": "推薦",
         "noModels": "找不到模型",
         "cancel": "取消",
         "send": "傳送",
@@ -3324,6 +3325,7 @@
       "messageList": {
         "attachedResources": "附加資源",
         "loading": "載入中...",
+        "loadBackgroundActivity": "載入背景活動",
         "loadEarlier": "載入更早的訊息",
         "loadingEarlier": "正在載入更早的訊息…",
         "error": "錯誤：{message}",
