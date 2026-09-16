@@ -4,12 +4,7 @@ import { useEffect, useState, useCallback, useMemo, useRef } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import { Plus, GripVertical, Trash2, Search } from "lucide-react"
-import {
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-} from "@/components/ui/tabs"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   DndContext,
   closestCorners,
@@ -431,17 +426,24 @@ export function TaskKanban({ projectId }: { projectId: number }) {
   if (loading) {
     return (
       <div className="flex items-center justify-center py-16 text-muted-foreground">
-        {t("task.loading")}</div>
+        {t("task.loading")}
+      </div>
     )
   }
 
   return (
-    <Tabs value={activeTab} onValueChange={setActiveTab} className="flex h-full flex-col min-h-0 gap-0">
+    <Tabs
+      value={activeTab}
+      onValueChange={setActiveTab}
+      className="flex h-full flex-col min-h-0 gap-0"
+    >
       {/* Toolbar header */}
       <div className="flex items-center justify-between px-4 py-3 shrink-0 border-b gap-3">
         <TabsList className="shrink-0">
           <TabsTrigger value="kanban">{t("task.kanban")}</TabsTrigger>
-          <TabsTrigger value="release">{t("task.releaseManagement")}</TabsTrigger>
+          <TabsTrigger value="release">
+            {t("task.releaseManagement")}
+          </TabsTrigger>
           <TabsTrigger value="archive">{t("task.archivedTasks")}</TabsTrigger>
         </TabsList>
         <div className="flex items-center gap-2">
@@ -468,7 +470,9 @@ export function TaskKanban({ projectId }: { projectId: number }) {
                   <SelectValue placeholder={t("task.taskType" as never)} />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="all">{t("task.taskType" as never)}</SelectItem>
+                  <SelectItem value="all">
+                    {t("task.taskType" as never)}
+                  </SelectItem>
                   <SelectItem value="bug">
                     {t("task.taskTypeOptions.bug" as never)}
                   </SelectItem>
@@ -488,7 +492,9 @@ export function TaskKanban({ projectId }: { projectId: number }) {
                   <SelectValue placeholder={t("task.priority" as never)} />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="all">{t("task.priority" as never)}</SelectItem>
+                  <SelectItem value="all">
+                    {t("task.priority" as never)}
+                  </SelectItem>
                   <SelectItem value="low">
                     {t("task.priorityOptions.low" as never)}
                   </SelectItem>
@@ -552,7 +558,9 @@ export function TaskKanban({ projectId }: { projectId: number }) {
                   <SelectValue placeholder={t("task.taskType" as never)} />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="all">{t("task.taskType" as never)}</SelectItem>
+                  <SelectItem value="all">
+                    {t("task.taskType" as never)}
+                  </SelectItem>
                   <SelectItem value="bug">
                     {t("task.taskTypeOptions.bug" as never)}
                   </SelectItem>
@@ -572,7 +580,9 @@ export function TaskKanban({ projectId }: { projectId: number }) {
                   <SelectValue placeholder={t("task.priority" as never)} />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="all">{t("task.priority" as never)}</SelectItem>
+                  <SelectItem value="all">
+                    {t("task.priority" as never)}
+                  </SelectItem>
                   <SelectItem value="low">
                     {t("task.priorityOptions.low" as never)}
                   </SelectItem>
@@ -594,69 +604,83 @@ export function TaskKanban({ projectId }: { projectId: number }) {
 
       {/* Kanban board */}
       <TabsContent value="kanban" className="flex flex-col flex-1 min-h-0">
-      <DndContext collisionDetection={closestCorners} onDragEnd={handleDragEnd}>
-        <div className="hidden md:flex flex-1 min-h-0 gap-0 divide-x">
-          {KANBAN_STATUS_LIST.map((status) => (
-            <KanbanColumn
-              key={status}
-              status={status}
-              tasks={tasks.filter((task) => task.status === status)}
-              projectId={projectId}
-              onDeleteTask={handleDeleteTask}
-            />
-          ))}
-        </div>
-        <div className="md:hidden h-full overflow-auto p-2 space-y-2">
-          {tasks.length === 0 ? (
-            <p className="text-sm text-muted-foreground p-4 text-center">
-              {t("task.noTasks" as never)}
-            </p>
-          ) : (
-            tasks.map((task) => (
-              <div key={task.id} className="rounded border p-3">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs text-muted-foreground">
-                    {resolveStatusLabel(t, task.status)}
-                  </span>
-                  <span
-                    className="flex-1 truncate text-sm font-medium cursor-pointer hover:underline"
-                    onClick={() =>
-                      setRoute(
-                        "task-detail",
-                        {
-                          taskId: task.id,
-                          projectId,
-                        },
-                        { routeId: "task-kanban", params: { projectId } }
-                      )
-                    }
-                  >
-                    {task.title}
-                  </span>
-                </div>
-                <div className="mt-1 flex items-center gap-1 text-[0.625rem] text-muted-foreground">
-                  <Badge variant="outline" className="text-[0.625rem]">
-                    {resolveTypeLabel(t, task.taskType)}
-                  </Badge>
-                  {task.priority && (
+        <DndContext
+          collisionDetection={closestCorners}
+          onDragEnd={handleDragEnd}
+        >
+          <div className="hidden md:flex flex-1 min-h-0 gap-0 divide-x">
+            {KANBAN_STATUS_LIST.map((status) => (
+              <KanbanColumn
+                key={status}
+                status={status}
+                tasks={tasks.filter((task) => task.status === status)}
+                projectId={projectId}
+                onDeleteTask={handleDeleteTask}
+              />
+            ))}
+          </div>
+          <div className="md:hidden h-full overflow-auto p-2 space-y-2">
+            {tasks.length === 0 ? (
+              <p className="text-sm text-muted-foreground p-4 text-center">
+                {t("task.noTasks" as never)}
+              </p>
+            ) : (
+              tasks.map((task) => (
+                <div key={task.id} className="rounded border p-3">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-muted-foreground">
+                      {resolveStatusLabel(t, task.status)}
+                    </span>
+                    <span
+                      className="flex-1 truncate text-sm font-medium cursor-pointer hover:underline"
+                      onClick={() =>
+                        setRoute(
+                          "task-detail",
+                          {
+                            taskId: task.id,
+                            projectId,
+                          },
+                          { routeId: "task-kanban", params: { projectId } }
+                        )
+                      }
+                    >
+                      {task.title}
+                    </span>
+                  </div>
+                  <div className="mt-1 flex items-center gap-1 text-[0.625rem] text-muted-foreground">
                     <Badge variant="outline" className="text-[0.625rem]">
-                      {resolvePriorityLabel(t, task.priority)}
+                      {resolveTypeLabel(t, task.taskType)}
                     </Badge>
-                  )}
-                  {task.branchCount > 0 && (
-                    <span>{t("task.branchesCount")}: {task.branchCount}</span>
-                  )}
+                    {task.priority && (
+                      <Badge variant="outline" className="text-[0.625rem]">
+                        {resolvePriorityLabel(t, task.priority)}
+                      </Badge>
+                    )}
+                    {task.branchCount > 0 && (
+                      <span>
+                        {t("task.branchesCount")}: {task.branchCount}
+                      </span>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))
-          )}
-        </div>
-      </DndContext>
+              ))
+            )}
+          </div>
+        </DndContext>
       </TabsContent>
-      <TabsContent value="release" className="flex flex-col flex-1 min-h-0 overflow-auto">
-        <ReleaseList projectId={projectId} setRoute={setRoute as (id: string) => void} />
+      <TabsContent
+        value="release"
+        className="flex flex-col flex-1 min-h-0 overflow-auto"
+      >
+        <ReleaseList
+          projectId={projectId}
+          setRoute={setRoute as (id: string) => void}
+        />
       </TabsContent>
-      <TabsContent value="archive" className="flex flex-col flex-1 min-h-0 overflow-auto">
+      <TabsContent
+        value="archive"
+        className="flex flex-col flex-1 min-h-0 overflow-auto"
+      >
         <ArchiveView
           projectId={projectId}
           searchKeyword={searchKeyword}

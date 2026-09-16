@@ -109,9 +109,9 @@ export function WorkbenchRouteProvider({ children }: { children: ReactNode }) {
     Record<string, string | number>
   >({})
   const [fromRoute, setFromRoute] = useState<WorkbenchRouteId | null>(null)
-  const [fromParams, setFromParams] = useState<
-    Record<string, string | number>
-  >({})
+  const [fromParams, setFromParams] = useState<Record<string, string | number>>(
+    {}
+  )
 
   const openConversations = useCallback(() => {
     setRouteId("conversations")

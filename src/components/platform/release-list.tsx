@@ -23,7 +23,10 @@ interface Props {
   setRoute: (
     id: WorkbenchRouteId,
     params?: Record<string, string | number>,
-    back?: { routeId: WorkbenchRouteId; params?: Record<string, string | number> }
+    back?: {
+      routeId: WorkbenchRouteId
+      params?: Record<string, string | number>
+    }
   ) => void
 }
 
@@ -71,9 +74,7 @@ export function ReleaseList({ projectId, setRoute }: Props) {
 
   if (loading) {
     return (
-      <p className="p-4 text-sm text-muted-foreground">
-        {t("task.loading")}
-      </p>
+      <p className="p-4 text-sm text-muted-foreground">{t("task.loading")}</p>
     )
   }
 
@@ -125,9 +126,7 @@ export function ReleaseList({ projectId, setRoute }: Props) {
                   {new Date(r.closedAt).toLocaleDateString()}
                 </p>
               )}
-              {r.title && (
-                <p className="text-sm">{r.title}</p>
-              )}
+              {r.title && <p className="text-sm">{r.title}</p>}
               <div className="flex gap-2">
                 <Button
                   variant="outline"

@@ -2079,101 +2079,104 @@ describe("ForgePage writes from a panel with no row", () => {
     "keeps both comments when two land on an item the list no longer shows",
     { timeout: 30_000 },
     async () => {
-    const user = userEvent.setup()
-    const resolvers: ((comment: ForgeComment) => void)[] = []
-    vi.mocked(forgeListComments).mockResolvedValue({
-      comments: [],
-      page: 1,
-      per_page: 20,
-      has_next: false,
-    })
-    vi.mocked(forgeCreateComment).mockImplementation(
-      () =>
-        new Promise<ForgeComment>((resolve) => {
-          resolvers.push(resolve)
-        })
-    )
-    const listed = { ...issue(1, "a row"), comments: 4 }
-    vi.mocked(forgeListIssues).mockResolvedValue(listOf([listed]))
-    mount()
-    await user.click(await screen.findByRole("button", { name: "a row" }))
-    await screen.findByPlaceholderText("Leave a comment…")
-
-    // The row leaves the page: a search narrows the list to nothing, and the
-    // panel stays open on the item it was reading.
-    vi.mocked(forgeListIssues).mockResolvedValue(listOf([]))
-    await user.type(
-      screen.getByPlaceholderText("Search title and description…"),
-      "zzz"
-    )
-    await waitFor(
-      () =>
-        expect(
-          screen.queryByRole("button", { name: "a row" })
-        ).not.toBeInTheDocument(),
-      // Explicit, because this wait is gated on a delay the page means to take:
-      // `SEARCH_DEBOUNCE_MS` (350) has to elapse after the last keystroke before
-      // the request even goes out. The default 1000ms budget leaves ~600ms for
-      // typing, the round trip and the re-render, which is enough right up until
-      // it is not — and then it fails as a function of how much ran BEFORE it,
-      // in a test that has nothing to do with any of that.
-      //
-      // Kept well under vitest's 5000ms testTimeout on purpose: at or above it
-      // the TEST dies first, which reports a bare timeout instead of the
-      // assertion, and hides whatever the row was actually still doing.
-      { timeout: 2500 }
-    )
-
-    // A list request goes out that WILL come back holding the item again —
-    // and is left in flight across both comments. One promise PER call, so
-    // releasing it resolves that request and not a later one: a request issued
-    // after a write is the user asking again, and its answer is meant to
-    // supersede the write (see `reconcile`), which is not what is under test.
-    const listResolvers: ((page: ForgeIssueList) => void)[] = []
-    vi.mocked(forgeListIssues).mockImplementation(
-      () =>
-        new Promise<ForgeIssueList>((resolve) => {
-          listResolvers.push(resolve)
-        })
-    )
-    await user.clear(
-      screen.getByPlaceholderText("Search title and description…")
-    )
-    await waitFor(() => expect(listResolvers.length).toBeGreaterThan(0))
-
-    const post = async (body: string) => {
-      await user.type(screen.getByPlaceholderText("Leave a comment…"), body)
-      await user.click(screen.getByRole("button", { name: "Comment" }))
-      await waitFor(() => expect(resolvers.length).toBeGreaterThan(0))
-      const resolve = resolvers.shift()!
-      await act(async () => {
-        resolve({
-          id: body,
-          author: "octocat",
-          author_avatar: null,
-          body,
-          created_at: null,
-          updated_at: null,
-          html_url: null,
-        })
+      const user = userEvent.setup()
+      const resolvers: ((comment: ForgeComment) => void)[] = []
+      vi.mocked(forgeListComments).mockResolvedValue({
+        comments: [],
+        page: 1,
+        per_page: 20,
+        has_next: false,
       })
+      vi.mocked(forgeCreateComment).mockImplementation(
+        () =>
+          new Promise<ForgeComment>((resolve) => {
+            resolvers.push(resolve)
+          })
+      )
+      const listed = { ...issue(1, "a row"), comments: 4 }
+      vi.mocked(forgeListIssues).mockResolvedValue(listOf([listed]))
+      mount()
+      await user.click(await screen.findByRole("button", { name: "a row" }))
+      await screen.findByPlaceholderText("Leave a comment…")
+
+      // The row leaves the page: a search narrows the list to nothing, and the
+      // panel stays open on the item it was reading.
+      vi.mocked(forgeListIssues).mockResolvedValue(listOf([]))
+      await user.type(
+        screen.getByPlaceholderText("Search title and description…"),
+        "zzz"
+      )
+      await waitFor(
+        () =>
+          expect(
+            screen.queryByRole("button", { name: "a row" })
+          ).not.toBeInTheDocument(),
+        // Explicit, because this wait is gated on a delay the page means to take:
+        // `SEARCH_DEBOUNCE_MS` (350) has to elapse after the last keystroke before
+        // the request even goes out. The default 1000ms budget leaves ~600ms for
+        // typing, the round trip and the re-render, which is enough right up until
+        // it is not — and then it fails as a function of how much ran BEFORE it,
+        // in a test that has nothing to do with any of that.
+        //
+        // Kept well under vitest's 5000ms testTimeout on purpose: at or above it
+        // the TEST dies first, which reports a bare timeout instead of the
+        // assertion, and hides whatever the row was actually still doing.
+        { timeout: 2500 }
+      )
+
+      // A list request goes out that WILL come back holding the item again —
+      // and is left in flight across both comments. One promise PER call, so
+      // releasing it resolves that request and not a later one: a request issued
+      // after a write is the user asking again, and its answer is meant to
+      // supersede the write (see `reconcile`), which is not what is under test.
+      const listResolvers: ((page: ForgeIssueList) => void)[] = []
+      vi.mocked(forgeListIssues).mockImplementation(
+        () =>
+          new Promise<ForgeIssueList>((resolve) => {
+            listResolvers.push(resolve)
+          })
+      )
+      await user.clear(
+        screen.getByPlaceholderText("Search title and description…")
+      )
+      await waitFor(() => expect(listResolvers.length).toBeGreaterThan(0))
+
+      const post = async (body: string) => {
+        await user.type(screen.getByPlaceholderText("Leave a comment…"), body)
+        await user.click(screen.getByRole("button", { name: "Comment" }))
+        await waitFor(() => expect(resolvers.length).toBeGreaterThan(0))
+        const resolve = resolvers.shift()!
+        await act(async () => {
+          resolve({
+            id: body,
+            author: "octocat",
+            author_avatar: null,
+            body,
+            created_at: null,
+            updated_at: null,
+            html_url: null,
+          })
+        })
+      }
+      await post("one")
+      await post("two")
+
+      const panel = screen.getByRole("dialog")
+      expect(within(panel).getByText("6 comments")).toBeInTheDocument()
+
+      // The stale response lands, still counting four. Reconciliation owes it
+      // BOTH increments — recording only the first would roll the panel back.
+      await act(async () => {
+        listResolvers[listResolvers.length - 1](listOf([listed]))
+      })
+      await waitFor(() =>
+        expect(
+          screen.getByRole("button", { name: "a row" })
+        ).toBeInTheDocument()
+      )
+      expect(
+        within(screen.getByRole("dialog")).getByText("6 comments")
+      ).toBeInTheDocument()
     }
-    await post("one")
-    await post("two")
-
-    const panel = screen.getByRole("dialog")
-    expect(within(panel).getByText("6 comments")).toBeInTheDocument()
-
-    // The stale response lands, still counting four. Reconciliation owes it
-    // BOTH increments — recording only the first would roll the panel back.
-    await act(async () => {
-      listResolvers[listResolvers.length - 1](listOf([listed]))
-    })
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "a row" })).toBeInTheDocument()
-    )
-    expect(
-      within(screen.getByRole("dialog")).getByText("6 comments")
-    ).toBeInTheDocument()
-  })
+  )
 })

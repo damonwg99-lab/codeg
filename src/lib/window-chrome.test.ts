@@ -45,5 +45,6 @@ describe("window-chrome zoom scaling", () => {
     // 116 * 0.9 = 104.4 → 104 (rounded).
     expect(rightChromeClusterWidth(90)).toBe(104)
     // 260 * 0.5 = 130, plus the fixed 76 inset.
-    expect(leftChromeReserve(true, 50)).toBe(MAC_TRAFFIC_LIGHT_INSET + 130)  })
+    expect(leftChromeReserve(true, 50)).toBe(MAC_TRAFFIC_LIGHT_INSET + 130)
+  })
 })

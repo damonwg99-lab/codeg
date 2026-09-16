@@ -49,11 +49,14 @@ export function usePlatformKbDocs({
         const { getTransport, isDesktop } = await import("@/lib/transport")
         if (isDesktop()) {
           const { listen } = await import("@tauri-apps/api/event")
-          unsub = await listen<ScanResultInfo>("knowledge://index-changed", (event) => {
-            if (event.payload?.projectId === projectId) {
-              void reload()
+          unsub = await listen<ScanResultInfo>(
+            "knowledge://index-changed",
+            (event) => {
+              if (event.payload?.projectId === projectId) {
+                void reload()
+              }
             }
-          })
+          )
         } else {
           unsub = await getTransport().subscribe<ScanResultInfo>(
             "knowledge://index-changed",

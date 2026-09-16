@@ -76,12 +76,17 @@ export function kbDocToSuggestion(
  * Pure matcher: check whether a KB doc matches the user's query string.
  * Supports matching on title, path, tags, and description.
  */
-export function matchesKbDoc(doc: KnowledgeDocInfo, lowerQuery: string): boolean {
+export function matchesKbDoc(
+  doc: KnowledgeDocInfo,
+  lowerQuery: string
+): boolean {
   if (!lowerQuery) return true
   if (doc.title.toLowerCase().includes(lowerQuery)) return true
   if (doc.filePath.toLowerCase().includes(lowerQuery)) return true
-  if (doc.description && doc.description.toLowerCase().includes(lowerQuery)) return true
+  if (doc.description && doc.description.toLowerCase().includes(lowerQuery))
+    return true
   if (doc.docType.toLowerCase().includes(lowerQuery)) return true
-  if (doc.tagsJson && doc.tagsJson.toLowerCase().includes(lowerQuery)) return true
+  if (doc.tagsJson && doc.tagsJson.toLowerCase().includes(lowerQuery))
+    return true
   return false
 }

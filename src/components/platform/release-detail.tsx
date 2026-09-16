@@ -64,9 +64,15 @@ export function ReleaseDetail() {
   }
 
   if (loading)
-    return <p className="p-4 text-sm text-muted-foreground">{t("task.loading")}</p>
+    return (
+      <p className="p-4 text-sm text-muted-foreground">{t("task.loading")}</p>
+    )
   if (!detail)
-    return <p className="px-4 pb-4 pt-4 text-sm text-destructive">{t("task.releaseNotFound")}</p>
+    return (
+      <p className="px-4 pb-4 pt-4 text-sm text-destructive">
+        {t("task.releaseNotFound")}
+      </p>
+    )
 
   const { release, items } = detail
 

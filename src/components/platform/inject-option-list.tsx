@@ -116,10 +116,7 @@ export function InjectOptionList({
         // Groups that should always render a bordered card area
         if (isCardGroup) {
           return (
-            <section
-              key={group}
-              className="space-y-1.5"
-            >
+            <section key={group} className="space-y-1.5">
               <h3
                 className={cn(
                   "font-medium uppercase text-muted-foreground",

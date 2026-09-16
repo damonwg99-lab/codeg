@@ -138,8 +138,7 @@ export function TaskDetail({ taskId }: { taskId: number }) {
   const { setRoute, routeParams, fromRoute, back, openConversations } =
     useWorkbenchRoute()
   const { activeProject } = usePlatform()
-  const { openTab, closeConversationTab } =
-    useTabContext()
+  const { openTab, closeConversationTab } = useTabContext()
   const { conversations: allConversations, refreshConversations } =
     useAppWorkspace()
   const { openFilePreview } = useWorkspaceContext()
@@ -660,7 +659,9 @@ export function TaskDetail({ taskId }: { taskId: number }) {
           <Tabs defaultValue="info">
             <TabsList>
               <TabsTrigger value="info">{t("task.taskDetail")}</TabsTrigger>
-              <TabsTrigger value="changes">{t("task.changesAndRelease")}</TabsTrigger>
+              <TabsTrigger value="changes">
+                {t("task.changesAndRelease")}
+              </TabsTrigger>
             </TabsList>
             <TabsContent value="info" className="flex flex-col gap-6">
               {/* ─── Basic Info ─── */}
@@ -958,16 +959,16 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                               variant="ghost"
                               size="icon"
                               className="h-6 w-6"
-                                onClick={(e) => {
-                                  e.stopPropagation()
-                                  void openFilePreview(
-                                    kbDocAbsPath(
-                                      activeProject?.kbLocalDir ?? null,
-                                      activeProject?.rootDir ?? "",
-                                      doc.filePath
-                                    )
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                void openFilePreview(
+                                  kbDocAbsPath(
+                                    activeProject?.kbLocalDir ?? null,
+                                    activeProject?.rootDir ?? "",
+                                    doc.filePath
                                   )
-                                }}
+                                )
+                              }}
                             >
                               <Eye className="h-3.5 w-3.5" />
                             </Button>

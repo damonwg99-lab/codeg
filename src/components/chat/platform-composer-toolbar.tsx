@@ -44,12 +44,13 @@ export function PlatformComposerToolbar({
   const hasPersistedConversation =
     ownTab?.conversationId != null && ownTab.conversationId > 0
 
-  const { linkedTaskInfo, linkedTask, refresh: refreshLinkedTask } =
-    useLinkedTask(conversationId)
+  const {
+    linkedTaskInfo,
+    linkedTask,
+    refresh: refreshLinkedTask,
+  } = useLinkedTask(conversationId)
   const { activeFolder } = useActiveFolder()
-  const setPendingTaskLink = usePlatformTabSlice(
-    (s) => s.setPendingTaskLink
-  )
+  const setPendingTaskLink = usePlatformTabSlice((s) => s.setPendingTaskLink)
 
   useEffect(() => {
     if (!taskPopoverOpen || !activeProject) return
@@ -60,9 +61,7 @@ export function PlatformComposerToolbar({
         const projectId = activeProject!.id
         const allDocs = await listKnowledgeDocs({ projectId })
         if (cancelled) return
-        setPopoverKbDocs(
-          allDocs.filter((d) => d.docType !== "task_attachment")
-        )
+        setPopoverKbDocs(allDocs.filter((d) => d.docType !== "task_attachment"))
         const taskAttachments = allDocs.filter(
           (d) => d.docType === "task_attachment"
         )
@@ -132,11 +131,7 @@ export function PlatformComposerToolbar({
   if (!activeProject) return null
 
   return (
-    <Popover
-      modal
-      open={taskPopoverOpen}
-      onOpenChange={setTaskPopoverOpen}
-    >
+    <Popover modal open={taskPopoverOpen} onOpenChange={setTaskPopoverOpen}>
       <PopoverTrigger asChild>
         <Button
           variant="ghost"

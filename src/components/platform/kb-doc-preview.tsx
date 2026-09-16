@@ -22,7 +22,11 @@ import {
   FileText,
 } from "lucide-react"
 import { readKbDocContent } from "@/lib/platform/api"
-import type { KnowledgeDocInfo, ProjectInfo, KbDocType } from "@/lib/platform/types"
+import type {
+  KnowledgeDocInfo,
+  ProjectInfo,
+  KbDocType,
+} from "@/lib/platform/types"
 import { KB_DOC_TYPE_LABELS } from "@/lib/platform/types"
 import { useWorkspaceContext } from "@/contexts/workspace-context"
 import { kbDocAbsPath } from "@/lib/kb-doc-path"
@@ -65,7 +69,9 @@ export function KbDocPreview({ doc, project, onDelete }: KbDocPreviewProps) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
-  const [jsonViewMode, setJsonViewMode] = useState<"formatted" | "tree" | "raw">("formatted")
+  const [jsonViewMode, setJsonViewMode] = useState<
+    "formatted" | "tree" | "raw"
+  >("formatted")
 
   // Target paths
   const absPath = useMemo(() => {
@@ -139,9 +145,7 @@ export function KbDocPreview({ doc, project, onDelete }: KbDocPreviewProps) {
         if (!cancelled) {
           console.error("Failed to read doc content:", err)
           setError(
-            err?.message ||
-              t("kb.contentFailed" as never) ||
-              "无法读取文件内容"
+            err?.message || t("kb.contentFailed" as never) || "无法读取文件内容"
           )
           setLoading(false)
         }
@@ -158,8 +162,7 @@ export function KbDocPreview({ doc, project, onDelete }: KbDocPreviewProps) {
     if (isOffice) {
       textToCopy = absPath || doc?.filePath || ""
     } else if (isJson && parsedJsonResult?.parsed) {
-      textToCopy =
-        jsonViewMode === "raw" ? content : parsedJsonResult.formatted
+      textToCopy = jsonViewMode === "raw" ? content : parsedJsonResult.formatted
     }
 
     if (!textToCopy) return
@@ -210,17 +213,27 @@ export function KbDocPreview({ doc, project, onDelete }: KbDocPreviewProps) {
             <h3 className="text-sm font-semibold truncate leading-tight">
               {doc.title}
             </h3>
-            <Badge variant="outline" className="text-[0.6875rem] shrink-0 font-normal">
-              {resolveKbDocTypeLabel(t, doc.docType as KbDocType) ?? doc.docType}
+            <Badge
+              variant="outline"
+              className="text-[0.6875rem] shrink-0 font-normal"
+            >
+              {resolveKbDocTypeLabel(t, doc.docType as KbDocType) ??
+                doc.docType}
             </Badge>
             {isOffice && (
-              <Badge variant="secondary" className="text-[0.625rem] gap-1 bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/30">
+              <Badge
+                variant="secondary"
+                className="text-[0.625rem] gap-1 bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/30"
+              >
                 <FileSpreadsheet className="h-3 w-3" />
                 Office 预览
               </Badge>
             )}
             {isJson && (
-              <Badge variant="secondary" className="text-[0.625rem] gap-1 bg-blue-500/15 text-blue-700 dark:text-blue-400 border-blue-500/30">
+              <Badge
+                variant="secondary"
+                className="text-[0.625rem] gap-1 bg-blue-500/15 text-blue-700 dark:text-blue-400 border-blue-500/30"
+              >
                 <Braces className="h-3 w-3" />
                 JSON
               </Badge>
@@ -295,8 +308,8 @@ export function KbDocPreview({ doc, project, onDelete }: KbDocPreviewProps) {
               isOffice
                 ? "复制文件绝对路径"
                 : isJson
-                ? "复制 JSON 内容"
-                : "复制正文 Markdown"
+                  ? "复制 JSON 内容"
+                  : "复制正文 Markdown"
             }
           >
             {copied ? (
@@ -308,10 +321,10 @@ export function KbDocPreview({ doc, project, onDelete }: KbDocPreviewProps) {
               {copied
                 ? "已复制"
                 : isOffice
-                ? "复制路径"
-                : isJson && jsonViewMode !== "raw"
-                ? "复制 JSON"
-                : "复制"}
+                  ? "复制路径"
+                  : isJson && jsonViewMode !== "raw"
+                    ? "复制 JSON"
+                    : "复制"}
             </span>
           </Button>
           <Button
@@ -337,7 +350,10 @@ export function KbDocPreview({ doc, project, onDelete }: KbDocPreviewProps) {
       </div>
 
       {/* Frontmatter Metadata Bar (if present) */}
-      {(tags.length > 0 || doc.description || doc.skillName || doc.updatedAt) && (
+      {(tags.length > 0 ||
+        doc.description ||
+        doc.skillName ||
+        doc.updatedAt) && (
         <div className="flex flex-col gap-1.5 px-4 py-2 border-b bg-muted/20 text-xs shrink-0">
           {doc.description && (
             <p className="text-muted-foreground italic leading-relaxed text-[0.75rem]">
@@ -363,7 +379,9 @@ export function KbDocPreview({ doc, project, onDelete }: KbDocPreviewProps) {
             {doc.skillName && (
               <div className="flex items-center gap-1">
                 <Sparkles className="h-3 w-3 text-amber-500" />
-                <span className="font-mono text-[0.6875rem]">{doc.skillName}</span>
+                <span className="font-mono text-[0.6875rem]">
+                  {doc.skillName}
+                </span>
               </div>
             )}
 
@@ -397,7 +415,9 @@ export function KbDocPreview({ doc, project, onDelete }: KbDocPreviewProps) {
       ) : loading ? (
         <div className="flex-1 flex items-center justify-center py-16 text-muted-foreground">
           <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-          <span className="text-xs">{t("kb.contentLoading" as never) || "加载文档正文…"}</span>
+          <span className="text-xs">
+            {t("kb.contentLoading" as never) || "加载文档正文…"}
+          </span>
         </div>
       ) : error ? (
         <div className="p-6">
@@ -431,11 +451,7 @@ export function KbDocPreview({ doc, project, onDelete }: KbDocPreviewProps) {
             </div>
           ) : (
             <div className="rounded-md border overflow-hidden">
-              <CodeBlock
-                code={content}
-                language="json"
-                showLineNumbers
-              />
+              <CodeBlock code={content} language="json" showLineNumbers />
             </div>
           )}
         </div>
@@ -478,7 +494,10 @@ export function KbDocPreview({ doc, project, onDelete }: KbDocPreviewProps) {
           <div className="rounded-md border overflow-hidden">
             <CodeBlock
               code={content || ""}
-              language={(languageFromPath(doc.filePath) || "plaintext") as BundledLanguage}
+              language={
+                (languageFromPath(doc.filePath) ||
+                  "plaintext") as BundledLanguage
+              }
               showLineNumbers
             />
           </div>

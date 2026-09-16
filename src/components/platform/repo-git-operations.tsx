@@ -60,7 +60,14 @@ import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { useGitCredential } from "@/contexts/git-credential-context"
 
 type ConfirmAction = {
-  type: "merge" | "rebase" | "delete" | "forceDelete" | "deleteRemote" | "deleteWorktree" | "deleteWorktreeAndBranch"
+  type:
+    | "merge"
+    | "rebase"
+    | "delete"
+    | "forceDelete"
+    | "deleteRemote"
+    | "deleteWorktree"
+    | "deleteWorktreeAndBranch"
   branchName: string
 }
 
@@ -508,7 +515,12 @@ export function RepoGitBranchPanel({
       })
       .catch(() => {
         if (!cancelled)
-          setBranchList({ local: [], remote: [], worktree_branches: [], main_worktree_branch: null })
+          setBranchList({
+            local: [],
+            remote: [],
+            worktree_branches: [],
+            main_worktree_branch: null,
+          })
       })
       .finally(() => {
         if (!cancelled) setBranchLoading(false)

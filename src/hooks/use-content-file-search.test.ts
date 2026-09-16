@@ -37,7 +37,12 @@ function match(partial: Partial<FileContentMatch>): FileContentMatch {
   } as FileContentMatch
 }
 
-const baseParams = { open: true, enabled: true, query: "needle", folderPath: "/repo" }
+const baseParams = {
+  open: true,
+  enabled: true,
+  query: "needle",
+  folderPath: "/repo",
+}
 
 beforeEach(() => {
   // shouldAdvanceTime lets waitFor's real-timer polling coexist with the

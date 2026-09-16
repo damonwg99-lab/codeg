@@ -300,9 +300,7 @@ export function buildPayloadFromOptions(
  * All inject options use `refType: "context"` so they render as platform badges;
  * docPath/kbDocId/prefixLine are carried in `meta` for serialization.
  */
-export function optionToReferenceAttrs(
-  option: InjectOption
-): ReferenceAttrs {
+export function optionToReferenceAttrs(option: InjectOption): ReferenceAttrs {
   return {
     refType: "context",
     id: String(option.id),

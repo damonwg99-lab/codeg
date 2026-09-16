@@ -30,11 +30,7 @@ export function ContentSearchResults({
     <CommandGroup heading={headingLabel}>
       {searching ? (
         <div className="flex items-center gap-2 px-2 py-3 text-sm text-muted-foreground">
-          <svg
-            className="w-3 h-3 animate-spin"
-            viewBox="0 0 24 24"
-            fill="none"
-          >
+          <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none">
             <circle
               className="opacity-25"
               cx="12"

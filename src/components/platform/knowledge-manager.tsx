@@ -94,7 +94,9 @@ export function KnowledgeManager({
   const [scanning, setScanning] = useState(false)
   const [scanResult, setScanResult] = useState<ScanResultInfo | null>(null)
   const [searchQuery, setSearchQuery] = useState("")
-  const [ftsResults, setFtsResults] = useState<KnowledgeDocFtsResult[] | null>(null)
+  const [ftsResults, setFtsResults] = useState<KnowledgeDocFtsResult[] | null>(
+    null
+  )
   const [searching, setSearching] = useState(false)
   const [docTypeFilter, setDocTypeFilter] = useState<DocTypeFilter>("all")
   const [selectedTag, setSelectedTag] = useState<string | null>(null)
@@ -102,7 +104,9 @@ export function KnowledgeManager({
   const [uploadOpen, setUploadOpen] = useState(false)
 
   // Delete dialog state
-  const [deleteTarget, setDeleteTarget] = useState<KnowledgeDocInfo | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<KnowledgeDocInfo | null>(
+    null
+  )
   const [deleting, setDeleting] = useState(false)
 
   // ─── Data loading ───
@@ -188,7 +192,10 @@ export function KnowledgeManager({
           query: trimmed,
         })
         setFtsResults(results)
-        if (results.length > 0 && (!selectedDocId || !results.some(r => r.doc.id === selectedDocId))) {
+        if (
+          results.length > 0 &&
+          (!selectedDocId || !results.some((r) => r.doc.id === selectedDocId))
+        ) {
           setSelectedDocId(results[0].doc.id)
         }
       } catch (e) {
@@ -204,7 +211,11 @@ export function KnowledgeManager({
             rank: 999,
           }))
           setFtsResults(transformed)
-          if (transformed.length > 0 && (!selectedDocId || !transformed.some(r => r.doc.id === selectedDocId))) {
+          if (
+            transformed.length > 0 &&
+            (!selectedDocId ||
+              !transformed.some((r) => r.doc.id === selectedDocId))
+          ) {
             setSelectedDocId(transformed[0].doc.id)
           }
         } catch (err) {
@@ -455,7 +466,9 @@ export function KnowledgeManager({
                   <button
                     key={tag}
                     type="button"
-                    onClick={() => setSelectedTag(selectedTag === tag ? null : tag)}
+                    onClick={() =>
+                      setSelectedTag(selectedTag === tag ? null : tag)
+                    }
                     className={cn(
                       "inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[0.625rem] font-medium transition-colors shrink-0",
                       selectedTag === tag
@@ -501,7 +514,10 @@ export function KnowledgeManager({
                           <span className="text-xs font-semibold truncate leading-tight">
                             {item.doc.title}
                           </span>
-                          <Badge variant="outline" className="text-[0.5625rem] shrink-0 font-normal px-1 py-0">
+                          <Badge
+                            variant="outline"
+                            className="text-[0.5625rem] shrink-0 font-normal px-1 py-0"
+                          >
                             {item.doc.docType}
                           </Badge>
                         </div>
@@ -510,7 +526,8 @@ export function KnowledgeManager({
                           dangerouslySetInnerHTML={{ __html: item.snippet }}
                         />
                         <div className="text-[0.625rem] text-muted-foreground font-mono truncate opacity-70 mt-0.5">
-                          {getRelativeDocPath(item.doc.filePath) || item.doc.filePath}
+                          {getRelativeDocPath(item.doc.filePath) ||
+                            item.doc.filePath}
                         </div>
                       </button>
                     )
@@ -527,7 +544,8 @@ export function KnowledgeManager({
                 ) : (
                   filteredDocs.map((doc) => {
                     const isSelected = selectedDocId === doc.id
-                    const relPath = getRelativeDocPath(doc.filePath) || doc.filePath
+                    const relPath =
+                      getRelativeDocPath(doc.filePath) || doc.filePath
                     return (
                       <button
                         key={doc.id}
@@ -540,7 +558,14 @@ export function KnowledgeManager({
                             : "border-transparent hover:bg-muted/50 text-foreground"
                         )}
                       >
-                        <FileText className={cn("h-4 w-4 shrink-0", isSelected ? "text-primary" : "text-muted-foreground")} />
+                        <FileText
+                          className={cn(
+                            "h-4 w-4 shrink-0",
+                            isSelected
+                              ? "text-primary"
+                              : "text-muted-foreground"
+                          )}
+                        />
                         <div className="flex flex-col min-w-0 flex-1">
                           <span className="text-xs truncate leading-snug font-medium">
                             {doc.title}
@@ -553,7 +578,8 @@ export function KnowledgeManager({
                           variant="outline"
                           className="text-[0.5625rem] shrink-0 font-normal px-1 py-0 ml-1"
                         >
-                          {resolveKbDocTypeLabel(t, doc.docType as KbDocType) ?? doc.docType}
+                          {resolveKbDocTypeLabel(t, doc.docType as KbDocType) ??
+                            doc.docType}
                         </Badge>
                       </button>
                     )

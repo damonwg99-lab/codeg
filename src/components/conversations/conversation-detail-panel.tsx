@@ -2023,7 +2023,9 @@ const ConversationTabView = memo(function ConversationTabView({
           onNewSession={
             canShowDetailErrorActions ? handleOpenNewSession : undefined
           }
-          onQuoteSelection={composerAvailable ? handleQuoteSelection : undefined}
+          onQuoteSelection={
+            composerAvailable ? handleQuoteSelection : undefined
+          }
           // Asking opens its own conversation, so it needs a folder to open it in
           // rather than a usable composer here — a transcript whose composer is
           // blocked (session/load failure) can still spawn the question elsewhere.

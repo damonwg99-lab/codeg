@@ -13,7 +13,10 @@ import {
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { cn } from "@/lib/utils"
-import type { InjectOption, OptionId } from "@/components/platform/context-inject-panel-utils"
+import type {
+  InjectOption,
+  OptionId,
+} from "@/components/platform/context-inject-panel-utils"
 
 interface KbTreePickerProps {
   options: InjectOption[]
@@ -42,7 +45,7 @@ const DOC_TYPE_LABELS: Record<string, string> = {
 /** Helper to strip base directory / knowledge root from docPath to get clean relative path */
 export function getRelativeDocPath(docPath?: string): string {
   if (!docPath) return ""
-  let p = docPath.replace(/\\/g, "/")
+  const p = docPath.replace(/\\/g, "/")
 
   // 1. If path contains "/_knowledge/", take everything after it
   const kbIdx = p.indexOf("/_knowledge/")
@@ -111,7 +114,9 @@ export function KbTreePicker({
 }: KbTreePickerProps) {
   const isCompact = variant === "compact"
   const [selectedTag, setSelectedTag] = useState<string | null>(null)
-  const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set())
+  const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(
+    new Set()
+  )
 
   // Collect all available tags across options
   const allTags = useMemo(() => {
@@ -160,7 +165,10 @@ export function KbTreePicker({
     return groups
   }, [filteredOptions])
 
-  const categoryKeys = useMemo(() => Object.keys(groupedByCategory), [groupedByCategory])
+  const categoryKeys = useMemo(
+    () => Object.keys(groupedByCategory),
+    [groupedByCategory]
+  )
 
   const toggleCategory = (cat: string) => {
     setCollapsedCategories((prev) => {
@@ -246,7 +254,8 @@ export function KbTreePicker({
             const isCollapsed = collapsedCategories.has(catKey)
             const catLabel = DOC_TYPE_LABELS[catKey] || catKey
             const checkedCount = items.filter((it) => checked.has(it.id)).length
-            const isAllChecked = checkedCount === items.length && items.length > 0
+            const isAllChecked =
+              checkedCount === items.length && items.length > 0
 
             return (
               <div key={catKey} className="group/cat">
@@ -298,7 +307,9 @@ export function KbTreePicker({
                         >
                           <Checkbox
                             checked={isItemChecked}
-                            onCheckedChange={(val) => onToggle(option.id, val === true)}
+                            onCheckedChange={(val) =>
+                              onToggle(option.id, val === true)
+                            }
                             className="mt-0.5 h-3.5 w-3.5 shrink-0"
                           />
                           <div className="min-w-0 flex-1">

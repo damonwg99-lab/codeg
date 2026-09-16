@@ -47,8 +47,7 @@ export function ArchiveView({
         !task.title.toLowerCase().includes(searchKeyword.toLowerCase())
       )
         return false
-      if (filterType !== "all" && task.taskType !== filterType)
-        return false
+      if (filterType !== "all" && task.taskType !== filterType) return false
       if (filterPriority !== "all" && task.priority !== filterPriority)
         return false
       if (
@@ -89,9 +88,7 @@ export function ArchiveView({
 
   if (loading) {
     return (
-      <p className="p-4 text-sm text-muted-foreground">
-        {t("task.loading")}
-      </p>
+      <p className="p-4 text-sm text-muted-foreground">{t("task.loading")}</p>
     )
   }
 
@@ -114,32 +111,17 @@ export function ArchiveView({
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b text-left text-[0.75rem] text-muted-foreground">
-                <th className="pb-2 font-medium">
-                  {t("task.title")}
-                </th>
-                <th className="pb-2 font-medium">
-                  {t("task.taskType")}
-                </th>
-                <th className="pb-2 font-medium">
-                  {t("task.statusLabel")}
-                </th>
-                <th className="pb-2 font-medium">
-                  {t("task.branchesCount")}
-                </th>
-                <th className="pb-2 font-medium">
-                  {t("task.scriptsCount")}
-                </th>
-                <th className="pb-2 font-medium">
-                  {t("task.archiveRelease")}
-                </th>
+                <th className="pb-2 font-medium">{t("task.title")}</th>
+                <th className="pb-2 font-medium">{t("task.taskType")}</th>
+                <th className="pb-2 font-medium">{t("task.statusLabel")}</th>
+                <th className="pb-2 font-medium">{t("task.branchesCount")}</th>
+                <th className="pb-2 font-medium">{t("task.scriptsCount")}</th>
+                <th className="pb-2 font-medium">{t("task.archiveRelease")}</th>
               </tr>
             </thead>
             <tbody>
               {filtered.map((task) => (
-                <tr
-                  key={task.id}
-                  className="border-b hover:bg-accent/50"
-                >
+                <tr key={task.id} className="border-b hover:bg-accent/50">
                   <td className="py-2 pr-4">
                     <button
                       className="text-left hover:underline text-[0.875rem]"
@@ -147,7 +129,10 @@ export function ArchiveView({
                         setRoute(
                           "task-detail",
                           { taskId: task.id, projectId },
-                          { routeId: "task-kanban", params: { projectId, tab: "archive" } }
+                          {
+                            routeId: "task-kanban",
+                            params: { projectId, tab: "archive" },
+                          }
                         )
                       }
                     >

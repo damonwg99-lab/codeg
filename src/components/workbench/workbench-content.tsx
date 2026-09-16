@@ -136,7 +136,10 @@ function PlatformBackAction({
 }: WorkbenchChromeActionsProps) {
   const tTitleBar = useTranslations("Folder.folderTitleBar")
   const { openConversations } = useWorkbenchRoute()
-  const handleClick = useCallback(() => openConversations(), [openConversations])
+  const handleClick = useCallback(
+    () => openConversations(),
+    [openConversations]
+  )
 
   return (
     <Button
@@ -222,7 +225,9 @@ function ProjectDetailRoute() {
 function TaskKanbanRoute() {
   const { routeParams } = useWorkbenchRoute()
   const projectId = Number(routeParams.projectId)
-  return Number.isFinite(projectId) ? <TaskKanban projectId={projectId} /> : null
+  return Number.isFinite(projectId) ? (
+    <TaskKanban projectId={projectId} />
+  ) : null
 }
 
 function TaskDetailRoute() {
@@ -234,7 +239,9 @@ function TaskDetailRoute() {
 function CreateTaskFormRoute() {
   const { routeParams } = useWorkbenchRoute()
   const projectId = Number(routeParams.projectId)
-  return Number.isFinite(projectId) ? <CreateTaskForm projectId={projectId} /> : null
+  return Number.isFinite(projectId) ? (
+    <CreateTaskForm projectId={projectId} />
+  ) : null
 }
 
 function ReleaseListRoute() {

@@ -50,7 +50,8 @@ export function useAutoCreateProject() {
 
       // Store without a trailing separator so `D:\Foo\` cannot later appear as
       // a second row distinct from `D:\Foo` (visible as duplicate targets).
-      const cleanRootDir = folderDetail.path.replace(/[/\\]+$/, "") || folderDetail.path
+      const cleanRootDir =
+        folderDetail.path.replace(/[/\\]+$/, "") || folderDetail.path
 
       try {
         await createProject({

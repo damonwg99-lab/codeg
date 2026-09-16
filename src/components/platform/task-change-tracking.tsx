@@ -36,7 +36,11 @@ import { openFileDialog } from "@/lib/platform"
 import { gitListAllBranches } from "@/lib/api"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { usePlatform } from "@/contexts/platform-context"
-import type { TaskBranchInfo, ProjectRepoInfo, ReleaseInfo } from "@/lib/platform/types"
+import type {
+  TaskBranchInfo,
+  ProjectRepoInfo,
+  ReleaseInfo,
+} from "@/lib/platform/types"
 import type { GitBranchList } from "@/lib/types"
 import {
   linkTaskBranch,
@@ -86,8 +90,9 @@ export function TaskChangeTracking({
   const [saving, setSaving] = useState(false)
 
   // Delete confirmation
-  const [deleteBranchTarget, setDeleteBranchTarget] =
-    useState<number | null>(null)
+  const [deleteBranchTarget, setDeleteBranchTarget] = useState<number | null>(
+    null
+  )
   const [deleteScriptIndex, setDeleteScriptIndex] = useState<string | null>(
     null
   )
@@ -318,9 +323,7 @@ export function TaskChangeTracking({
             {t("task.addBranch")}
           </Button>
         </CardHeader>
-        <CardContent
-          className={branchList.length === 0 ? "pb-3" : undefined}
-        >
+        <CardContent className={branchList.length === 0 ? "pb-3" : undefined}>
           {branchList.length === 0 ? (
             <p className="text-[0.75rem] text-muted-foreground">
               {t("task.noBranches")}
@@ -337,7 +340,10 @@ export function TaskChangeTracking({
                       <span className="font-mono text-[0.875rem] truncate">
                         {b.repoName}:{b.branch}
                       </span>
-                      <Badge variant="outline" className="text-[0.625rem] px-1.5 py-0">
+                      <Badge
+                        variant="outline"
+                        className="text-[0.625rem] px-1.5 py-0"
+                      >
                         {branchStatusLabel(b.status)}
                       </Badge>
                       {b.createdAt && (
@@ -431,8 +437,7 @@ export function TaskChangeTracking({
                           : t("task.releaseStatusClosed")}
                     </Badge>
                     <span className="text-[0.625rem] text-muted-foreground shrink-0">
-                      {r.branchCount}{" "}
-                      {t("task.linkedBranches").toLowerCase()}
+                      {r.branchCount} {t("task.linkedBranches").toLowerCase()}
                     </span>
                   </div>
                 </div>
@@ -571,10 +576,7 @@ export function TaskChangeTracking({
                   {t("task.loading")}
                 </div>
               ) : (
-                <Select
-                  value={selectedRepoId}
-                  onValueChange={handleRepoSelect}
-                >
+                <Select value={selectedRepoId} onValueChange={handleRepoSelect}>
                   <SelectTrigger>
                     <SelectValue placeholder={t("task.selectRepo")} />
                   </SelectTrigger>
@@ -669,7 +671,10 @@ export function TaskChangeTracking({
                 </Button>
               </div>
             </div>
-            <Button onClick={handleAddScript} disabled={!scriptPath || isScriptDuplicate}>
+            <Button
+              onClick={handleAddScript}
+              disabled={!scriptPath || isScriptDuplicate}
+            >
               {isScriptDuplicate
                 ? t("task.scriptAlreadyAdded")
                 : t("task.confirm")}

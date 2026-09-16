@@ -73,9 +73,9 @@ describe("filterFileEntriesForSearch", () => {
     it("returns empty for a whitespace-only query via browse mode, not match", () => {
       const files = [entry("zebra.ts")]
       // "   " trims to empty → browse mode → zebra survives (no dotfile/json)
-      expect(filterFileEntriesForSearch("   ", files).map((f) => f.name)).toEqual(
-        ["zebra.ts"]
-      )
+      expect(
+        filterFileEntriesForSearch("   ", files).map((f) => f.name)
+      ).toEqual(["zebra.ts"])
     })
   })
 })

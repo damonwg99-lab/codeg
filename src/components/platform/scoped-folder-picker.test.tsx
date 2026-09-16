@@ -54,7 +54,12 @@ const subRepo = mkFolder({
   path: "/proj/sub",
   kind: "platform_repo" as never,
 })
-const chatFolder = mkFolder({ id: 3, name: "chat", path: "/chat", kind: "chat" })
+const chatFolder = mkFolder({
+  id: 3,
+  name: "chat",
+  path: "/chat",
+  kind: "chat",
+})
 
 const baseProps = {
   currentFolderId: 1,
@@ -88,7 +93,10 @@ describe("ScopedFolderPicker", () => {
   it("scopes to the project's root + sub-repos when a project is active", () => {
     activeProject = { folderId: 1 }
     activeProjectRepos = [{ folderId: 2 }]
-    useAppWorkspaceStore.setState({ folders: [root], allFolders: [root, subRepo] })
+    useAppWorkspaceStore.setState({
+      folders: [root],
+      allFolders: [root, subRepo],
+    })
 
     render(<ScopedFolderPicker {...baseProps} />)
 

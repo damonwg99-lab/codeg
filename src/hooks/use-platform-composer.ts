@@ -98,15 +98,18 @@ export function usePendingInitialDrafts(
 export function usePlatformInjectHandler(
   editorRef: React.RefObject<RichComposerHandle | null>
 ): (refs: ReferenceAttrs[]) => void {
-  return useCallback((refs: ReferenceAttrs[]) => {
-    const editor = editorRef.current?.getEditor()
-    if (!editor) return
-    let chain = editor.chain().focus("end")
-    for (const ref of refs) {
-      chain = chain.insertReference(ref).insertContent(" ")
-    }
-    chain.run()
-  }, [editorRef])
+  return useCallback(
+    (refs: ReferenceAttrs[]) => {
+      const editor = editorRef.current?.getEditor()
+      if (!editor) return
+      let chain = editor.chain().focus("end")
+      for (const ref of refs) {
+        chain = chain.insertReference(ref).insertContent(" ")
+      }
+      chain.run()
+    },
+    [editorRef]
+  )
 }
 
 /**
@@ -123,8 +126,9 @@ export async function flushPendingTaskLink(
   tabId: string,
   conversationId: number
 ): Promise<void> {
-  const pendingLink: PendingTaskLink | null | undefined =
-    usePlatformTabSlice.getState().pendingTaskLink.get(tabId)
+  const pendingLink: PendingTaskLink | null | undefined = usePlatformTabSlice
+    .getState()
+    .pendingTaskLink.get(tabId)
   if (!pendingLink) return
   try {
     await linkConversation({

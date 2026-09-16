@@ -55,9 +55,7 @@ export function CreateReleaseForm({ projectId }: { projectId: number }) {
         </div>
 
         <div className="flex flex-col gap-1.5">
-          <Label htmlFor="release-title">
-            {t("task.title")}
-          </Label>
+          <Label htmlFor="release-title">{t("task.title")}</Label>
           <Input
             id="release-title"
             value={title}
@@ -67,9 +65,7 @@ export function CreateReleaseForm({ projectId }: { projectId: number }) {
         </div>
 
         <div className="flex flex-col gap-1.5">
-          <Label htmlFor="release-notes">
-            {t("task.description")}
-          </Label>
+          <Label htmlFor="release-notes">{t("task.description")}</Label>
           <Textarea
             id="release-notes"
             value={notes}
@@ -79,9 +75,7 @@ export function CreateReleaseForm({ projectId }: { projectId: number }) {
         </div>
 
         <div className="flex flex-col gap-1.5">
-          <Label htmlFor="release-deployer">
-            {t("task.deployer")}
-          </Label>
+          <Label htmlFor="release-deployer">{t("task.deployer")}</Label>
           <Input
             id="release-deployer"
             value={deployer}
@@ -90,16 +84,14 @@ export function CreateReleaseForm({ projectId }: { projectId: number }) {
           />
         </div>
 
-        {error && (
-          <p className="text-sm text-destructive">
-            {error}
-          </p>
-        )}
+        {error && <p className="text-sm text-destructive">{error}</p>}
 
-        <Button onClick={handleSubmit} disabled={submitting} className="self-start">
-          {submitting
-            ? t("task.creating")
-            : t("task.createRelease")}
+        <Button
+          onClick={handleSubmit}
+          disabled={submitting}
+          className="self-start"
+        >
+          {submitting ? t("task.creating") : t("task.createRelease")}
         </Button>
       </div>
     </ScrollArea>
