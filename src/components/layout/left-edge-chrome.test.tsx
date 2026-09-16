@@ -29,6 +29,9 @@ vi.mock("@/hooks/use-appearance", () => ({
   useZoomLevel: () => ({ zoomLevel: 100, setZoomLevel: () => {} }),
 }))
 vi.mock("@/lib/platform", () => ({ isDesktop: () => true }))
+vi.mock("@/components/platform/platform-top-bar", () => ({
+  PlatformTopBar: () => null,
+}))
 
 function renderChrome() {
   return render(

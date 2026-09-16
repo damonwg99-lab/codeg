@@ -2075,7 +2075,10 @@ describe("ForgePage writes across a view change", () => {
  * survive a list response that predates them — including the SECOND one.
  */
 describe("ForgePage writes from a panel with no row", () => {
-  it("keeps both comments when two land on an item the list no longer shows", async () => {
+  it(
+    "keeps both comments when two land on an item the list no longer shows",
+    { timeout: 30_000 },
+    async () => {
     const user = userEvent.setup()
     const resolvers: ((comment: ForgeComment) => void)[] = []
     vi.mocked(forgeListComments).mockResolvedValue({

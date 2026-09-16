@@ -93,9 +93,10 @@ const itemsOf = (groups: SuggestionGroup[], kind: ReferenceKind) =>
 // --- pure builder -----------------------------------------------------------
 
 describe("buildReferenceGroups", () => {
-  it("returns the four groups in a fixed order (no skill group)", () => {
+  it("returns the five groups in a fixed order (no skill group)", () => {
     const groups = buildReferenceGroups("", emptySources())
     expect(groups.map((g) => g.kind)).toEqual([
+      "context",
       "file",
       "agent",
       "session",
@@ -105,13 +106,14 @@ describe("buildReferenceGroups", () => {
 
   it("keeps every group present (empty groups are not dropped)", () => {
     const groups = buildReferenceGroups("", emptySources())
-    expect(groups).toHaveLength(4)
+    expect(groups).toHaveLength(5)
     expect(groups.every((g) => g.items.length === 0)).toBe(true)
   })
 
   it("defaults the group headings to the English labels", () => {
     const groups = buildReferenceGroups("", emptySources())
     expect(groups.map((g) => g.label)).toEqual([
+      DEFAULT_GROUP_LABELS.context,
       DEFAULT_GROUP_LABELS.file,
       DEFAULT_GROUP_LABELS.agent,
       DEFAULT_GROUP_LABELS.session,

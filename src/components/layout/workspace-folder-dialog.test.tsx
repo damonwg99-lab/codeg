@@ -37,6 +37,12 @@ vi.mock("@/lib/platform", () => ({
 vi.mock("@/lib/transport", () => ({
   getActiveRemoteConnectionId: () => null,
 }))
+vi.mock("@/components/platform/platform-top-bar", () => ({
+  PlatformTopBar: () => null,
+}))
+vi.mock("@/contexts/platform-context", () => ({
+  usePlatform: () => ({ projects: [], loadProjects: vi.fn() }),
+}))
 
 const openFolder = vi.hoisted(() => vi.fn())
 vi.mock("@/stores/app-workspace-store", () => ({

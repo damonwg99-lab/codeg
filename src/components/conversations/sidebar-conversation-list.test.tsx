@@ -249,6 +249,9 @@ vi.mock("@/hooks/use-subsession-sync", () => ({ useSubsessionSync: () => {} }))
 vi.mock("@/components/shared/directory-browser-dialog", () => ({
   DirectoryBrowserDialog: () => null,
 }))
+vi.mock("@/contexts/platform-context", () => ({
+  usePlatform: () => ({ projects: [], loadProjects: vi.fn() }),
+}))
 
 const MINUTE = 60_000
 const FIXED = 1_700_000_000_000

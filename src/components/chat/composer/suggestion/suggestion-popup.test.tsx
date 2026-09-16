@@ -242,17 +242,17 @@ describe("SuggestionPopup", () => {
     await waitFor(() => expect(popupLayer().style.left).toBe("300px"))
   })
 
-  it("renders the active (agent-first) tab's options plus a four-tab strip", async () => {
+  it("renders the active (agent-first) tab's options plus a five-tab strip", async () => {
     mountPopup()
     // Agent is the first non-empty tab, so its options show by default.
     expect(await screen.findByText("Codex Helper")).toBeInTheDocument()
     expect(screen.getByText("Claude Helper")).toBeInTheDocument()
     // The file tab's option is hidden until that tab is active.
     expect(screen.queryByText("alpha.md")).toBeNull()
-    // Four fixed tabs (no skill tab), agent selected.
-    expect(screen.getAllByRole("tab")).toHaveLength(4)
+    // Five fixed tabs (no skill tab), agent selected.
+    expect(screen.getAllByRole("tab")).toHaveLength(5)
     expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
-      /Agents/
+      /智能体/
     )
   })
 
@@ -287,7 +287,7 @@ describe("SuggestionPopup", () => {
     mountPopup({ search: emptySearch, emptyLabel: "Nothing" })
     const panel = screen.getByTestId("mention-popup")
     expect(await within(panel).findByText("Nothing")).toBeInTheDocument()
-    expect(screen.getAllByRole("tab")).toHaveLength(4)
+    expect(screen.getAllByRole("tab")).toHaveLength(5)
   })
 
   it("selects the active tab's highlighted row on Enter (default = first agent)", async () => {
@@ -321,11 +321,12 @@ describe("SuggestionPopup", () => {
     act(() => {
       expect(ref.current?.onKeyDown(key("Tab"))).toBe(true)
     })
-    // agent → file; the file option appears and the agent options are gone.
+    // agent → context (知识库 tab, empty in this fixture); one more Tab reaches file.
+    act(() => ref.current?.onKeyDown(key("Tab")))
     expect(await screen.findByText("alpha.md")).toBeInTheDocument()
     expect(screen.queryByText("Codex Helper")).toBeNull()
     expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
-      /Files/
+      /文件/
     )
     // Tab does not select.
     expect(onSelect).not.toHaveBeenCalled()
@@ -337,14 +338,14 @@ describe("SuggestionPopup", () => {
     act(() => ref.current?.onKeyDown(key("Tab", true)))
     // agent (first) wraps backwards to commit (last in tab order); it's empty.
     expect(screen.getByRole("tab", { selected: true })).toHaveAccessibleName(
-      /Commits/
+      /提交/
     )
   })
 
   it("switches tabs on click, preventing default on mousedown to keep editor focus", async () => {
     mountPopup()
     await screen.findByText("Codex Helper")
-    const filesTab = screen.getByRole("tab", { name: /Files/ })
+    const filesTab = screen.getByRole("tab", { name: /文件/ })
     // mousedown preventDefault keeps focus in the editor (no blur)...
     const down = new MouseEvent("mousedown", {
       bubbles: true,
@@ -568,7 +569,7 @@ describe("SuggestionPopup", () => {
     mountPopup({ listboxLabel: "Mentions" })
     await screen.findByText("Codex Helper")
     // The listbox names the active tab and owns only that tab's options.
-    const listbox = screen.getByRole("listbox", { name: "Mentions: Agents" })
+    const listbox = screen.getByRole("listbox", { name: "Mentions: 智能体" })
     expect(listbox).toHaveAttribute("id", "mention-listbox")
     const options = within(listbox).getAllByRole("option")
     expect(options).toHaveLength(2)
@@ -604,7 +605,7 @@ describe("SuggestionPopup", () => {
     await screen.findByText("Codex Helper")
     const status = screen.getByRole("status")
     expect(status).toHaveAttribute("aria-live", "polite")
-    expect(status).toHaveTextContent("Agents: 2 results")
+    expect(status).toHaveTextContent("智能体: 2 results")
   })
 
   it("reports the active option id to the host for aria-activedescendant", async () => {
