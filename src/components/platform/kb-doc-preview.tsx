@@ -114,42 +114,49 @@ export function KbDocPreview({ doc, project, onDelete }: KbDocPreviewProps) {
     }
   }, [isJson, content])
 
-  // Load document text content (only when not office)
+  // Load document text content (only when not office). State resets run one
+  // microtask out of the synchronous effect pass (react-hooks/set-state-in-effect
+  // warns on cascade-rendering setState; the fetch below is async anyway).
   useEffect(() => {
-    if (!doc) {
-      setContent("")
-      setError(null)
-      return
-    }
-
-    if (isOffice) {
-      // Office documents are rendered via OfficePreview / officecli watch
-      setContent("")
-      setLoading(false)
-      setError(null)
-      return
-    }
-
     let cancelled = false
-    setLoading(true)
-    setError(null)
+    void Promise.resolve().then(() => {
+      if (cancelled) return
+      if (!doc) {
+        setContent("")
+        setError(null)
+        return
+      }
 
-    readKbDocContent(doc.id)
-      .then((data) => {
-        if (!cancelled) {
-          setContent(data)
-          setLoading(false)
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          console.error("Failed to read doc content:", err)
-          setError(
-            err?.message || t("kb.contentFailed" as never) || "无法读取文件内容"
-          )
-          setLoading(false)
-        }
-      })
+      if (isOffice) {
+        // Office documents are rendered via OfficePreview / officecli watch
+        setContent("")
+        setLoading(false)
+        setError(null)
+        return
+      }
+
+      setLoading(true)
+      setError(null)
+
+      readKbDocContent(doc.id)
+        .then((data) => {
+          if (!cancelled) {
+            setContent(data)
+            setLoading(false)
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            console.error("Failed to read doc content:", err)
+            setError(
+              err?.message ||
+                t("kb.contentFailed" as never) ||
+                "无法读取文件内容"
+            )
+            setLoading(false)
+          }
+        })
+    })
 
     return () => {
       cancelled = true

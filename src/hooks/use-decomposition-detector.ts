@@ -320,7 +320,7 @@ export function useDecompositionDetector(
       })
     }
     setEditedScoped(null)
-  }, [userEditedSubTasks, detectedSubTasks, conversationId, dismissedScoped])
+  }, [detectedSubTasks, conversationId, dismissedScoped])
 
   const reopenProposal = useCallback(() => {
     setDismissedScoped(null)

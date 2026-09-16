@@ -55,7 +55,6 @@ export function PlatformComposerToolbar({
   useEffect(() => {
     if (!taskPopoverOpen || !activeProject) return
     let cancelled = false
-    setPopoverKbLoading(true)
     async function loadKBData() {
       try {
         const projectId = activeProject!.id
@@ -118,6 +117,15 @@ export function PlatformComposerToolbar({
     ]
   )
 
+  // Start the spinner in the popover's own change handler rather than a
+  // synchronous setState inside the load effect (react-hooks/set-state-in-effect):
+  // the effect re-runs while the popover stays open (e.g. linkedTask changes)
+  // and only refills data, so the spinner belongs to the open transition.
+  const handlePopoverOpenChange = useCallback((open: boolean) => {
+    setTaskPopoverOpen(open)
+    if (open) setPopoverKbLoading(true)
+  }, [])
+
   const kbDirPrefix = useMemo(() => {
     const kbDir = (
       activeProject?.kbLocalDir ??
@@ -131,7 +139,11 @@ export function PlatformComposerToolbar({
   if (!activeProject) return null
 
   return (
-    <Popover modal open={taskPopoverOpen} onOpenChange={setTaskPopoverOpen}>
+    <Popover
+      modal
+      open={taskPopoverOpen}
+      onOpenChange={handlePopoverOpenChange}
+    >
       <PopoverTrigger asChild>
         <Button
           variant="ghost"
