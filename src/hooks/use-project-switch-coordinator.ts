@@ -7,91 +7,146 @@ import { useTabContext } from "@/contexts/tab-context"
 import { usePlatform } from "@/contexts/platform-context"
 import { useAppWorkspace } from "@/contexts/app-workspace-shim"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
+import {
+  buildFolderProjectIndex,
+  pickProjectAnchorFolder,
+  resolveProjectForFolder,
+} from "@/lib/folder-project-mapping"
+import {
+  clearExplicitProjectSwitch,
+  getProjectReposSnapshot,
+  markExplicitProjectSwitch,
+} from "@/hooks/use-tab-project-follow"
 
 /**
- * Coordinates project switching with tab management.
+ * Coordinates project switching WITHOUT destroying the current session.
  *
- * When the user switches projects:
- * - Draft tab (no conversationId): retargeted to the new project root folder
- * - Existing conversation: closed, then a new draft is created in the new project root
- * - Task kanban page: route params updated to the new projectId so data refreshes
- * - A bottom-right toast confirms the switch, matching the folder picker below
- *   the chat input (single source of truth for the "current workspace").
+ * Switching projects is non-destructive:
+ * - An existing tab of the target project is activated when one exists.
+ * - Otherwise a new draft tab is opened in the target project's root folder
+ *   (deferred to the effect below when the root folder is not open yet).
+ * - Full-page task routes are re-pointed at the new projectId.
+ * - A toast confirms the switch, matching the folder picker below the chat
+ *   input (single source of truth for the "current workspace").
  *
- * The pending-switch ref ensures this only fires on explicit user action
- * (not on initial hydration from localStorage).
+ * The active project state itself is also followed back: focusing a tab of
+ * another project pulls the active project along (see useTabProjectFollow), so
+ * tab strips can freely mix projects without the header/workspace disagreeing.
  */
 export function useProjectSwitchCoordinator() {
   const t = useTranslations("Platform.switcher")
-  const { tabs, activeTabId, closeTab, openNewConversationTab } =
+  const { tabs, activeTabId, switchTab, openNewConversationTab } =
     useTabContext()
-  const { setActiveProjectId, activeProject, projects } = usePlatform()
+  const { activeProjectId, setActiveProjectId, activeProject, projects } =
+    usePlatform()
   const { allFolders } = useAppWorkspace()
   const { routeId, setRoute } = useWorkbenchRoute()
   const pendingSwitchRef = useRef<number | null>(null)
 
   const switchProject = useCallback(
     (newId: number) => {
-      // Check the active tab BEFORE switching — is it a draft or existing?
-      const activeTab = tabs.find((t) => t.id === activeTabId)
-      const isDraft = activeTab?.conversationId == null
+      if (newId === activeProjectId) return
 
-      // Existing conversation → close it first
-      if (!isDraft && activeTab && activeTabId) {
-        closeTab(activeTabId)
-      }
-
-      // When switching project from a project-specific page, navigate to
-      // the corresponding list/kanban view so the page data is consistent
-      // with the new project.
-      if (routeId === "project-detail" || routeId === "create-project") {
-        setRoute("project-list")
-      } else if (routeId === "task-detail" || routeId === "create-task") {
-        setRoute("task-kanban", { projectId: newId })
-      } else if (routeId === "task-kanban") {
-        // Kanban already project-specific — just update projectId
-        setRoute("task-kanban", { projectId: newId })
-      }
-
-      // Mark pending so the effect knows to create/retarget a draft after
-      // the project detail loads
-      pendingSwitchRef.current = newId
+      // Gate the tab-follow hook while the explicit switch materializes.
+      markExplicitProjectSwitch(newId)
       setActiveProjectId(newId)
 
-      // Confirm the switch with the same bottom-right toast the folder picker
-      // below the chat input uses, so top project switching and bottom
-      // folder/workspace switching stay visibly consistent.
+      const index = buildFolderProjectIndex(projects, getProjectReposSnapshot())
+      const targetProject = projects.find((p) => p.id === newId)
+
+      // Activate an existing tab of the target project when one is open;
+      // only fall back to opening a fresh draft in the root folder.
+      const targetTab = tabs.find((tab) => {
+        if (tab.isChat === true) return false
+        const folder = allFolders.find((f) => f.id === tab.folderId)
+        return (
+          folder != null &&
+          resolveProjectForFolder(folder, allFolders, index) === newId
+        )
+      })
+      if (targetTab) {
+        switchTab(targetTab.id)
+      } else {
+        const anchor = targetProject
+          ? pickProjectAnchorFolder(targetProject, allFolders, index)
+          : null
+        if (anchor) {
+          openNewConversationTab(anchor.id, anchor.path, {
+            inheritFromActive: true,
+          })
+        } else {
+          // Root folder not open yet — platform-context adds it while loading
+          // the project detail; the effect below opens the draft then.
+          pendingSwitchRef.current = newId
+        }
+      }
+
+      // When switching from a project-specific page, navigate to the
+      // corresponding view so the page data matches the new project.
+      if (routeId === "project-detail" || routeId === "create-project") {
+        setRoute("project-list")
+      } else if (
+        routeId === "task-detail" ||
+        routeId === "create-task" ||
+        routeId === "task-kanban"
+      ) {
+        setRoute("task-kanban", { projectId: newId })
+      }
+
       const target = projects.find((p) => p.id === newId)
       toast.success(t("toasts.switchedToProject", { name: target?.name ?? "" }))
     },
     [
       tabs,
-      activeTabId,
-      closeTab,
+      activeProjectId,
+      switchTab,
+      openNewConversationTab,
       setActiveProjectId,
       routeId,
       setRoute,
       projects,
+      allFolders,
       t,
     ]
   )
 
-  // After the project detail loads, create or retarget a draft tab in the
-  // new project's root folder.
+  // The root folder was not open at switch time — once the project detail
+  // loads (platform-context auto-opens the root folder) open a draft in it.
+  // Skipped when a tab of the target project became active meanwhile.
   useEffect(() => {
     if (pendingSwitchRef.current === null) return
     if (activeProject?.id !== pendingSwitchRef.current) return
+    const pendingId = pendingSwitchRef.current
     pendingSwitchRef.current = null
 
-    if (activeProject.folderId) {
-      const rootFolder = allFolders.find((f) => f.id === activeProject.folderId)
-      if (rootFolder) {
-        openNewConversationTab(rootFolder.id, rootFolder.path, {
-          inheritFromActive: true,
-        })
-      }
+    const index = buildFolderProjectIndex(projects, getProjectReposSnapshot())
+    const activeTab = tabs.find((t) => t.id === activeTabId)
+    const activeFolder =
+      activeTab != null
+        ? allFolders.find((f) => f.id === activeTab.folderId)
+        : null
+    if (
+      activeFolder != null &&
+      resolveProjectForFolder(activeFolder, allFolders, index) === pendingId
+    ) {
+      return
     }
-  }, [activeProject, allFolders, openNewConversationTab])
+
+    const anchor = pickProjectAnchorFolder(activeProject, allFolders, index)
+    if (!anchor) {
+      // Project has no openable folder — resume tab-following.
+      clearExplicitProjectSwitch()
+      return
+    }
+    openNewConversationTab(anchor.id, anchor.path, { inheritFromActive: true })
+  }, [
+    activeProject,
+    allFolders,
+    tabs,
+    activeTabId,
+    projects,
+    openNewConversationTab,
+  ])
 
   return { switchProject }
 }
