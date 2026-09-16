@@ -16,6 +16,7 @@ import {
   stopKbWatch,
 } from "@/lib/platform/api"
 import { useAppWorkspace } from "@/contexts/app-workspace-shim"
+import { useTabProjectFollow } from "@/hooks/use-tab-project-follow"
 import type {
   ProjectInfo,
   ProjectDetail,
@@ -83,6 +84,15 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
   const [projects, setProjects] = useState<ProjectInfo[]>([])
   const [loadingProjects, setLoadingProjects] = useState(true)
   const [viewMode, setViewMode] = useState<ViewMode>("kanban")
+
+  // Keep the active project following the focused conversation tab
+  // (tab-driven project switching; see use-tab-project-follow.ts).
+  useTabProjectFollow({
+    activeProjectId,
+    setActiveProjectId,
+    activeProject,
+    projects,
+  })
 
   // Hydrate activeProjectId from localStorage on mount
   useEffect(() => {
