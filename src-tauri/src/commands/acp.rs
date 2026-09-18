@@ -2910,6 +2910,22 @@ fn cline_provider_is_keyless(provider: &str) -> bool {
     matches!(provider, "ollama" | "lmstudio")
 }
 
+/// Cline's own sign-in providers — the three `authMethods` its ACP `initialize`
+/// advertises, and the only three its auth gate inspects.
+///
+/// Their credential is an OAuth token cline obtains through a device-code flow
+/// (`cline auth <id>`, or the ACP `authenticate` request, which prints a code
+/// and a `authkit.cline.bot/device` URL and blocks until the browser half
+/// finishes) and stores itself. codeg neither holds nor refreshes it, which has
+/// two consequences it must respect: never write over these entries' secrets,
+/// and never export `CLINE_PROVIDER`/`CLINE_API_KEY` for them — the env would
+/// shadow the very credential `tryRestoreAuth` is meant to find, and would
+/// additionally freeze the provider selector (see
+/// `env_pinned_config_option_ids`).
+fn cline_provider_is_agent_managed(provider: &str) -> bool {
+    matches!(provider, "cline" | "cline-pass" | "openai-codex")
+}
+
 /// `providers.json` rejects a `settings.baseUrl` that is not a `z.string().url()`,
 /// and a rejected file reads back EMPTY — so a typo in this field would silently
 /// cost the user every provider they had configured. Fail the save instead.
@@ -3206,16 +3222,30 @@ fn persist_cline_provider_settings_at(
         "provider".to_string(),
         serde_json::Value::String(provider.to_string()),
     );
+    // Credentials for a sign-in provider belong to `cline auth`, not to codeg:
+    // the panel offers no key or endpoint field for them, so there is no user
+    // intent to write — and clearing what is not shown would log the user out.
+    // `tokenSource: "oauth"` is the same statement made by an entry codeg does
+    // not otherwise recognize, and is honoured for the same reason.
+    let agent_managed_credential =
+        cline_provider_is_agent_managed(provider) || token_source == "oauth";
     for (key, value) in [
         ("apiKey", api_key),
         ("model", model),
         ("baseUrl", base_url),
     ] {
+        let credential = key != "model";
         match value {
             Some(value) => {
+                if credential && agent_managed_credential {
+                    continue;
+                }
                 settings.insert(key.to_string(), serde_json::Value::String(value.to_string()));
             }
             None => {
+                if credential && agent_managed_credential {
+                    continue;
+                }
                 settings.remove(key);
             }
         }
@@ -4772,6 +4802,16 @@ const KIMI_SYNTHETIC_TOKEN_ACCESS: &str = "codeg-local-gate";
 /// kimi discard the whole model block ("Ignored invalid config … models.codeg-managed"),
 /// which leaves `default_model` dangling and every prompt ends with no reply. So we
 /// always write one, defaulting to the kimi-k2 256K window when the user leaves it blank.
+///
+/// This deliberately does NOT track `parsers::infer_context_window_max_tokens`, which
+/// puts `kimi-k3` on a 1M lane. The two answer different questions: that one reads a
+/// past session's model id to draw a gauge, while this one is the budget codeg DECLARES
+/// for a bring-your-own provider whose model is unknown — the managed block routes to
+/// any of the six interface types, so the model behind it may be GPT or Claude, not a
+/// Kimi model at all. Kimi spends the declared number rather than checking it (a live
+/// run with this default emits `llm.request.maxTokens = 262144` and
+/// `usage_update {size: 262144}`), so it is the compaction budget, not a fact about the
+/// model. Users on a bigger window raise it in the config panel.
 const KIMI_DEFAULT_MAX_CONTEXT_SIZE: i64 = 262_144;
 /// The six native provider `type` values Kimi accepts in `[providers.<name>]`.
 const KIMI_INTERFACE_TYPES: &[&str] = &[
@@ -8359,14 +8399,28 @@ pub(crate) fn skill_storage_spec(agent_type: AgentType) -> Option<SkillStorageSp
             global_dirs: vec![home_dir_or_default().join(".codebuddy").join("skills")],
             project_rel_dirs: vec![".codebuddy/skills"],
         }),
-        // Kimi Code reads skills from `<KIMI_CODE_HOME>/skills/` (default
-        // `~/.kimi-code/skills/`) and project-local `<root>/.kimi-code/skills/`.
+        // Kimi Code scans four roots, not two (`features/skill/catalog/
+        // skillRoots.ts`): a user pair of `<KIMI_CODE_HOME>/skills` +
+        // `<osHome>/.agents/skills`, and a project pair of `.kimi-code/skills`
+        // + `.agents/skills`. Note the two bases differ — the brand dir hangs
+        // off the DATA home (so `KIMI_CODE_HOME` moves it) while the shared
+        // store hangs off the OS home (so it does not), which is why only the
+        // first goes through `resolve_kimi_code_home_dir`. The kimi-native dir
+        // stays first so codeg links into Kimi's own store by default and
+        // toggling Kimi does not move a skill out from under pi/cline/codex,
+        // which share `~/.agents/skills` too.
+        //
+        // Verified live rather than read off the source: with `KIMI_CODE_HOME`
+        // pointed at an empty temp dir, `kimi acp` still advertised this
+        // machine's `~/.agents/skills` entries as `skill:<name>` in
+        // `available_commands_update`.
         AgentType::KimiCode => Some(SkillStorageSpec {
             kind: SkillStorageKind::SkillDirectoryOnly,
             global_dirs: vec![
                 crate::parsers::kimi_code::resolve_kimi_code_home_dir().join("skills"),
+                home_dir_or_default().join(".agents").join("skills"),
             ],
-            project_rel_dirs: vec![".kimi-code/skills"],
+            project_rel_dirs: vec![".kimi-code/skills", ".agents/skills"],
         }),
         // pi auto-loads skills from `~/.pi/agent/skills` and the shared
         // `~/.agents/skills` store (both global), plus project-local
@@ -8599,21 +8653,27 @@ pub(crate) fn scoped_skill_dirs(
 
 /// The directory an agent's PROJECT-relative skill dirs hang off.
 ///
-/// Normally the workspace itself. DeepSeek is the exception: its provider
-/// (`dsh-skill-filesystem`'s `findProjectRoot`) walks up from the session cwd
-/// to the nearest ancestor containing `.git` before joining `.dsh/skills` /
-/// `.agents/skills`, falling back to the cwd when it reaches the filesystem
-/// root. Opening a subdirectory of a repo as the workspace would otherwise
-/// make codeg create and list `<subdir>/.dsh/skills` — a directory the agent
-/// never scans, so the skill would simply never load, with nothing on screen
-/// saying so.
+/// Normally the workspace itself. DeepSeek and Kimi Code are the exceptions:
+/// both walk up from the session cwd to the nearest ancestor containing `.git`
+/// before joining their project-relative skill dirs, falling back to the cwd
+/// when they reach the filesystem root — DeepSeek in `dsh-skill-filesystem`'s
+/// `findProjectRoot`, Kimi in `features/skill/catalog/skillRoots.ts`'s
+/// `projectRoots` → `findUpwardRoot(workDir, ".git", exists)`. Opening a
+/// subdirectory of a repo as the workspace would otherwise make codeg create
+/// and list `<subdir>/.dsh/skills` / `<subdir>/.kimi-code/skills` — a directory
+/// the agent never scans, so the skill would simply never load, with nothing on
+/// screen saying so.
+///
+/// Kimi's half was confirmed live: `kimi acp` launched with `cwd` at
+/// `<repo>/sub` advertised the skills under `<repo>/.kimi-code/skills` and
+/// `<repo>/.agents/skills` and ignored the ones under `<repo>/sub/...`.
 ///
 /// `.git` is matched as a plain path, file or directory: in a linked worktree
-/// (which codeg creates routinely) it is a FILE, and upstream's `pathExists`
-/// accepts that too.
+/// (which codeg creates routinely) it is a FILE, and both upstreams' existence
+/// probes (`pathExists` / `stat`) accept that too.
 fn project_skill_base(agent_type: AgentType, workspace: &str) -> PathBuf {
     let workspace = PathBuf::from(workspace);
-    if agent_type != AgentType::DeepSeek {
+    if !matches!(agent_type, AgentType::DeepSeek | AgentType::KimiCode) {
         return workspace;
     }
     let mut current = workspace.as_path();
@@ -9686,6 +9746,32 @@ fn apply_cline_launch_env(config_json: Option<&str>, merged: &mut BTreeMap<Strin
             .unwrap_or_default(),
     );
 
+    // A sign-in provider must be left to `tryRestoreAuth`, and either half of
+    // the pair in the way breaks it:
+    //
+    //   * a non-empty `CLINE_API_KEY` SHORT-CIRCUITS the gate without
+    //     populating `authResult`, so `newSession` resolves
+    //     `CLINE_PROVIDER ?? authResult?.providerId ?? "cline"` and a ClinePass
+    //     or ChatGPT account silently runs as plain Cline billing;
+    //   * a stale `CLINE_PROVIDER` — an `env_json` row, or one exported in the
+    //     shell codeg was launched from — overrides the account entirely and
+    //     freezes a selector these three are entitled to use.
+    //
+    // Both are cleared by writing an EMPTY value, which the spawn layer turns
+    // into `env_remove` (see the codeg convention in vendor/sacp-tokio) — so
+    // this strips an inherited value rather than merely declining to add one.
+    // Removal, not `""`, is what the agent needs: `??` does not fall through on
+    // an empty string, so an actually-empty `CLINE_PROVIDER` would become the
+    // provider id. Mirrors Cursor/Grok subscription mode.
+    //
+    // Re-applied after every later env overlay (see `build_session_runtime_env`),
+    // because a model-provider binding writes the same two keys.
+    if cline_provider_is_agent_managed(&provider) {
+        merged.insert("CLINE_API_KEY".to_string(), String::new());
+        merged.insert("CLINE_PROVIDER".to_string(), String::new());
+        return;
+    }
+
     if !merged.contains_key("CLINE_API_KEY") {
         // Local providers authenticate with no key at all, but the gate only
         // tests `CLINE_API_KEY` for emptiness — it never validates it, and
@@ -10288,6 +10374,15 @@ pub(crate) async fn build_session_runtime_env(
     let mut runtime_env =
         build_runtime_env_from_setting(agent_type, setting.as_ref(), local_config_json.as_deref());
     apply_model_provider_env(agent_type, setting.as_ref(), &mut runtime_env, &db.conn).await;
+    // `apply_model_provider_env` writes this agent's generic credential trio —
+    // for cline that is `CLINE_BASE_URL`/`CLINE_API_KEY`/`CLINE_MODEL` — so a
+    // model-provider binding left over from a BYO setup would put a key back
+    // after the sign-in scrub already cleared it, silently rerouting a ClinePass
+    // or ChatGPT session onto Cline's own billing. Run cline's policy last; it
+    // is idempotent, so the BYO path is unchanged.
+    if agent_type == AgentType::Cline {
+        apply_cline_launch_env(local_config_json.as_deref(), &mut runtime_env);
+    }
 
     // codex resume no longer needs a `MODEL_PROVIDER` pin: codex-acp 1.0.1
     // (#224) resolves the resumed provider from `~/.codex/config.toml` via
@@ -13033,9 +13128,10 @@ pub async fn acp_list_agent_skills(
     if let Some(workspace) = workspace_path.as_deref().map(str::trim) {
         if !workspace.is_empty() {
             // Same base the WRITE path resolves through `scoped_skill_dirs` —
-            // for DeepSeek that is the repo root, not the workspace. Joining
-            // onto the workspace here instead would make a skill saved from a
-            // nested workspace vanish from the list that is meant to show it.
+            // for DeepSeek and Kimi Code that is the repo root, not the
+            // workspace. Joining onto the workspace here instead would make a
+            // skill saved from a nested workspace vanish from the list that is
+            // meant to show it.
             let base = project_skill_base(agent_type, workspace);
             for relative in &spec.project_rel_dirs {
                 let project_dir = base.join(relative);
@@ -15559,10 +15655,50 @@ wire_api = "chat"
                 let spec =
                     skill_storage_spec(AgentType::KimiCode).expect("Kimi Code supports skills");
                 assert_eq!(spec.kind, SkillStorageKind::SkillDirectoryOnly);
-                assert_eq!(spec.project_rel_dirs, vec![".kimi-code/skills"]);
-                let expected =
-                    crate::parsers::kimi_code::resolve_kimi_code_home_dir().join("skills");
-                assert_eq!(spec.global_dirs, vec![expected]);
+                assert_eq!(
+                    spec.project_rel_dirs,
+                    vec![".kimi-code/skills", ".agents/skills"]
+                );
+                // Kimi-native dir first (preferred link target), shared
+                // cross-agent store second. The two hang off DIFFERENT bases:
+                // the brand dir off the data home `KIMI_CODE_HOME` moves, the
+                // shared store off the OS home it does not.
+                let expected = vec![
+                    crate::parsers::kimi_code::resolve_kimi_code_home_dir().join("skills"),
+                    home_dir_or_default().join(".agents").join("skills"),
+                ];
+                assert_eq!(spec.global_dirs, expected);
+            },
+        );
+    }
+
+    #[test]
+    fn kimi_code_skill_storage_spec_shared_store_ignores_kimi_code_home() {
+        // `KIMI_CODE_HOME` relocates Kimi's own `skills/` dir but NOT the
+        // shared `~/.agents/skills` store: upstream's `userRoots(homeDir,
+        // osHomeDir)` joins the brand dirs onto the data home and the generic
+        // dirs onto the OS home. Getting this backwards would silently point
+        // the shared column at a directory nothing reads.
+        let home = tempfile::tempdir().expect("tempdir");
+        let kimi_home = tempfile::tempdir().expect("tempdir");
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.path())),
+                ("KIMI_CODE_HOME", Some(kimi_home.path())),
+            ],
+            || {
+                let spec =
+                    skill_storage_spec(AgentType::KimiCode).expect("Kimi Code supports skills");
+                assert_eq!(
+                    spec.global_dirs[0],
+                    kimi_home.path().join("skills"),
+                    "the brand dir follows KIMI_CODE_HOME"
+                );
+                assert_eq!(
+                    spec.global_dirs[1],
+                    home_dir_or_default().join(".agents").join("skills"),
+                    "the shared store follows the OS home, not KIMI_CODE_HOME"
+                );
             },
         );
     }
@@ -15708,6 +15844,72 @@ wire_api = "chat"
                 .locations
                 .iter()
                 .any(|l| l.path == repo.join(".dsh/skills").to_string_lossy()),
+            "the listed project location must be the git root: {:?}",
+            listed.locations
+        );
+    }
+
+    #[test]
+    fn kimi_code_project_skills_hang_off_the_git_root() {
+        // Kimi's `skillRoots.projectRoots` walks up to the nearest `.git`
+        // exactly like DeepSeek's, so opening a package subdirectory must still
+        // target the repo root. Confirmed live: `kimi acp` with `cwd` at
+        // `<repo>/sub` advertised `<repo>/.kimi-code/skills` and
+        // `<repo>/.agents/skills` and ignored both `<repo>/sub` copies.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let nested = repo.join("packages").join("app");
+        std::fs::create_dir_all(&nested).expect("create nested");
+        // A linked worktree records `.git` as a FILE, and upstream probes it
+        // with a bare `stat`, which accepts that — so must this.
+        std::fs::write(repo.join(".git"), "gitdir: /elsewhere\n").expect("write .git file");
+
+        let dirs = scoped_skill_dirs(
+            AgentType::KimiCode,
+            AgentSkillScope::Project,
+            Some(nested.to_str().expect("utf-8 path")),
+        )
+        .expect("project dirs");
+        assert_eq!(
+            dirs,
+            vec![repo.join(".kimi-code/skills"), repo.join(".agents/skills")]
+        );
+
+        // No `.git` anywhere above ⇒ fall back to the workspace itself, which
+        // is also what `findUpwardRoot` does when it reaches the filesystem
+        // root.
+        let bare = tmp.path().join("bare");
+        std::fs::create_dir_all(&bare).expect("create bare");
+        let fallback = scoped_skill_dirs(
+            AgentType::KimiCode,
+            AgentSkillScope::Project,
+            Some(bare.to_str().expect("utf-8 path")),
+        )
+        .expect("fallback dirs");
+        assert_eq!(fallback[0], bare.join(".kimi-code/skills"));
+
+        // The LIST path must resolve the same base as the WRITE path.
+        let saved = repo.join(".kimi-code/skills").join("demo");
+        std::fs::create_dir_all(&saved).expect("create skill dir");
+        std::fs::write(saved.join("SKILL.md"), "---\nname: demo\n---\nbody\n")
+            .expect("write SKILL.md");
+        let listed = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(acp_list_agent_skills(
+                AgentType::KimiCode,
+                Some(nested.to_string_lossy().to_string()),
+            ))
+            .expect("list skills");
+        assert!(
+            listed.skills.iter().any(|s| s.id == "demo"),
+            "skill saved at the git root must be listed from a nested workspace: {:?}",
+            listed.skills
+        );
+        assert!(
+            listed
+                .locations
+                .iter()
+                .any(|l| l.path == repo.join(".kimi-code/skills").to_string_lossy()),
             "the listed project location must be the git root: {:?}",
             listed.locations
         );
@@ -19165,11 +19367,134 @@ model = "gpt"
         assert_eq!(loaded["apiProvider"], "cline");
         assert!(loaded.get("apiKey").is_none());
 
-        // …and the launch env stays empty, so `tryRestoreAuth` finds the login
-        // instead of codeg forcing a half-filled BYO provider over it.
+        // …and the launch carries no credential of its own, so `tryRestoreAuth`
+        // finds the login instead of codeg forcing a half-filled BYO provider
+        // over it. Both keys are blanked rather than merely omitted: the spawn
+        // layer reads an empty value as `env_remove`, which is the only way to
+        // strip one the child would otherwise inherit.
         let env = cline_launch_env(serde_json::Value::Object(loaded));
-        assert!(!env.contains_key("CLINE_API_KEY"));
-        assert!(!env.contains_key("CLINE_PROVIDER"));
+        assert_eq!(env.get("CLINE_API_KEY").map(String::as_str), Some(""));
+        assert_eq!(env.get("CLINE_PROVIDER").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn the_sign_in_scrub_survives_a_leftover_model_provider_binding() {
+        // `apply_model_provider_env` writes the agent's generic credential trio
+        // for ANY agent with a `model_provider_id`, so a binding left from a BYO
+        // setup used to put `CLINE_API_KEY` back after the scrub — short-circuiting
+        // the gate and billing a ClinePass account as plain Cline. Running cline's
+        // policy last has to win, and has to stay idempotent for BYO.
+        let signed_in = serde_json::json!({ "apiProvider": "cline-pass" }).to_string();
+        let mut env: BTreeMap<String, String> = BTreeMap::new();
+        apply_cline_launch_env(Some(&signed_in), &mut env);
+        // The binding lands after the first pass…
+        env.insert("CLINE_API_KEY".to_string(), "sk-from-provider".to_string());
+        env.insert(
+            "CLINE_BASE_URL".to_string(),
+            "https://proxy.example/v1".to_string(),
+        );
+        // …and the re-application scrubs it again.
+        apply_cline_launch_env(Some(&signed_in), &mut env);
+        assert_eq!(env.get("CLINE_API_KEY").map(String::as_str), Some(""));
+        assert_eq!(env.get("CLINE_PROVIDER").map(String::as_str), Some(""));
+
+        // Idempotent for BYO: running it twice changes nothing.
+        let byo = serde_json::json!({
+            "apiProvider": "openai-compatible",
+            "apiKey": "sk-byo",
+        })
+        .to_string();
+        let mut byo_env: BTreeMap<String, String> = BTreeMap::new();
+        apply_cline_launch_env(Some(&byo), &mut byo_env);
+        let once = byo_env.clone();
+        apply_cline_launch_env(Some(&byo), &mut byo_env);
+        assert_eq!(byo_env, once);
+    }
+
+    #[test]
+    fn a_stray_key_cannot_hijack_a_cline_sign_in() {
+        // The failure this prevents is silent and expensive: a non-empty
+        // `CLINE_API_KEY` opens the gate WITHOUT setting `authResult`, so
+        // `newSession` falls back to `"cline"` and a ClinePass or ChatGPT
+        // subscription quietly bills as plain Cline.
+        for provider in ["cline", "cline-pass", "openai-codex"] {
+            let env = cline_launch_env(serde_json::json!({
+                "apiProvider": provider,
+                // Left over from a BYO provider the user configured earlier.
+                "apiKey": "sk-stale",
+                "model": "claude-sonnet-5",
+            }));
+            assert_eq!(
+                env.get("CLINE_API_KEY").map(String::as_str),
+                Some(""),
+                "{provider}: a stale key must not short-circuit the gate"
+            );
+            assert_eq!(
+                env.get("CLINE_PROVIDER").map(String::as_str),
+                Some(""),
+                "{provider}: an empty value is the spawn layer's `env_remove`, which is what \
+                 strips a stale row or one exported in the launching shell"
+            );
+            // The model still travels — `newSession` reads CLINE_MODEL for
+            // every provider, sign-in included.
+            assert_eq!(
+                env.get("CLINE_MODEL").map(String::as_str),
+                Some("claude-sonnet-5")
+            );
+        }
+    }
+
+    #[test]
+    fn saving_a_sign_in_provider_leaves_its_credential_alone() {
+        // The panel shows no key or endpoint field for these, so an empty draft
+        // is the absence of an opinion — not an instruction to log the user out.
+        let store = ClineStore::new();
+        std::fs::create_dir_all(store.providers.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &store.providers,
+            serde_json::json!({
+                "version": 1,
+                "lastUsedProvider": "openai-compatible",
+                "modes": {},
+                "providers": {
+                    "cline": {
+                        "settings": {
+                            "provider": "cline",
+                            "apiKey": "account-key",
+                            "auth": { "accessToken": "oauth-token" },
+                        },
+                        "updatedAt": "2026-01-01T00:00:00.000Z",
+                        "tokenSource": "oauth",
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .expect("seed");
+
+        persist_cline_provider_settings_at(
+            &store.providers,
+            &store.models,
+            "cline",
+            None,
+            Some("claude-sonnet-5"),
+            None,
+        )
+        .expect("save");
+
+        let root = read_json_object(&store.providers).expect("read back");
+        assert_valid_cline_provider_store(&root);
+        let entry = &root["providers"]["cline"];
+        assert_eq!(entry["tokenSource"], "oauth");
+        assert_eq!(
+            entry["settings"]["apiKey"], "account-key",
+            "clearing a field the panel never showed would end the session"
+        );
+        assert_eq!(entry["settings"]["auth"]["accessToken"], "oauth-token");
+        // The model IS the panel's to set, and switching providers is the point
+        // of the save.
+        assert_eq!(entry["settings"]["model"], "claude-sonnet-5");
+        assert_eq!(root["lastUsedProvider"], "cline");
     }
 
     #[test]
