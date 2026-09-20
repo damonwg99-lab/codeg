@@ -51,7 +51,7 @@ pub async fn list_tasks_core(
     status: Option<String>,
 ) -> Result<Vec<TaskInfo>, AppCommandError> {
     let conn = &db.conn;
-    let mut tasks = platform_task_service::list_by_project(
+    let tasks = platform_task_service::list_by_project(
         conn,
         project_id,
         keyword.as_deref(),

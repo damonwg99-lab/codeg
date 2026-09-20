@@ -81,8 +81,3 @@ pub use platform_knowledge_doc::{
 };
 pub mod platform_knowledge;
 pub use platform_knowledge::{KbInitResult, ScanResultInfo, ScannedDoc, SkillInfo};
-// ─── Release/Branch models (Cluster B) ───
-pub mod platform_release;
-pub use platform_release::{
-    BranchInfo, CreateReleaseParams, ReleaseDetail, ReleaseInfo, ReleaseItemInfo,
-};

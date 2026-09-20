@@ -40,7 +40,6 @@ pub mod project_boot;
 pub mod file_search;
 pub mod knowledge;
 pub mod project;
-pub mod release;
 pub mod task;
 pub mod question;
 pub mod quick_messages;

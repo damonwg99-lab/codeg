@@ -13,7 +13,7 @@
 
 use axum::{
     extract::DefaultBodyLimit,
-    routing::{get, post},
+    routing::post,
     Json, Router,
 };
 use serde::Deserialize;
@@ -113,13 +113,6 @@ pub fn platform_routes() -> Router {
             "/create_decomposition",
             post(handlers::task::create_decomposition),
         )
-        // ─── Releases (Cluster B) ────────────────────────────────────────────
-        .route("/create_release", post(handlers::release::create_release))
-        .route("/list_releases", post(handlers::release::list_releases))
-        .route("/releases/for_task", get(handlers::release::list_releases_for_task))
-        .route("/get_release", post(handlers::release::get_release))
-        .route("/update_release", post(handlers::release::update_release))
-        .route("/delete_release", post(handlers::release::delete_release))
         // ─── Knowledge Base: scan / docs / skills / upload / watcher (Cluster C) ─
         .route(
             "/scan_knowledge_repo",

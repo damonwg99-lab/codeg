@@ -33,7 +33,6 @@ pub mod project_boot;
 // ─── Platform handlers (Cluster A/B/C) ───
 pub mod knowledge;
 pub mod project;
-pub mod release;
 pub mod task;
 pub mod question;
 pub mod quick_messages;

@@ -99,7 +99,6 @@ mod tauri_app {
         model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
         project as project_commands,
         question as question_commands, quick_messages as quick_messages_commands,
-        release as release_commands,
         remote_proxy as remote_proxy_commands,
         remote_workspace as remote_workspace_commands, science as science_commands,
         session_info as session_info_commands,
@@ -2079,13 +2078,6 @@ mod tauri_app {
                 task_commands::update_task_type_mapping,
                 task_commands::delete_task_type_mapping,
                 task_commands::create_decomposition,
-
-                // Releases (Cluster B).
-                release_commands::create_release,
-                release_commands::list_releases,
-                release_commands::get_release,
-                release_commands::update_release,
-                release_commands::delete_release,
 
                 // Knowledge Base: scan / docs / skills / upload / watcher (Cluster C).
                 knowledge_commands::scan_knowledge_repo,
