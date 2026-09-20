@@ -171,29 +171,18 @@ pub async fn build_first_prompt_injection(
 }
 
 /// Build a compact re-injection preamble for long-running conversations.
-/// Only contains the critical file-storage and branch-tracking rules to
-/// prevent exceeding token budgets. Branch-tracking instructions are omitted
-/// when the project root is not a git repository.
-pub fn build_reinjection_preamble(kb_dir: &str, task_id: i32, has_git: bool) -> String {
+/// Only contains the critical file-storage rules to prevent exceeding token
+/// budgets.
+pub fn build_reinjection_preamble(kb_dir: &str, task_id: i32, _has_git: bool) -> String {
     let task_dir = format!("{kb_dir}/.private/tasks/{task_id}/ai-intermediate/");
 
-    let mut reminder = format!(
+    format!(
         "{}\n=== Task Reminder ===\n\
          Task ID: {task_id}\n\
-         - Save generated documents to: `{task_dir}`\n",
-        INJECTION_MARKER_START,
-    );
-
-    if has_git {
-        let branch_log = format!("{kb_dir}/.private/tasks/{task_id}/.branch-log.md");
-        reminder.push_str(&format!(
-            "- Record new git branches in: `{branch_log}`\n\
-             Format per branch: `- {{repo_name}}: {{branch_name}}`\n",
-        ));
-    }
-
-    reminder.push_str(&format!("=== End Reminder ===\n{}", INJECTION_MARKER_END));
-    reminder
+         - Save generated documents to: `{task_dir}`\n\
+         === End Reminder ===\n{}",
+        INJECTION_MARKER_START, INJECTION_MARKER_END,
+    )
 }
 
 /// Whether the current session should receive a re-injection.
@@ -370,19 +359,7 @@ mod tests {
         assert!(text.contains(INJECTION_MARKER_END));
         assert!(is_injected_block(&text));
         assert!(text.contains("/repo/_knowledge/.private/tasks/42/ai-intermediate/"));
-        assert!(text.contains(".branch-log.md"));
         assert!(text.contains("Task ID: 42"));
-    }
-
-    #[test]
-    fn reinjection_preamble_omits_branch_log_when_no_git() {
-        let text = build_reinjection_preamble("/repo/_knowledge", 42, false);
-        assert!(text.starts_with(INJECTION_MARKER_START));
-        assert!(text.contains(INJECTION_MARKER_END));
-        assert!(text.contains("Task ID: 42"));
-        assert!(text.contains("ai-intermediate/"));
-        assert!(!text.contains(".branch-log.md"));
-        assert!(!text.contains("Record new git branches"));
     }
 
     #[test]
