@@ -66,6 +66,15 @@ pub struct AppState {
     /// updated by the chat-authoring settings command on save. Populated at
     /// startup by `apply_persisted_chat_authoring_config`.
     pub chat_authoring_config: crate::acp::chat_authoring::ChatAuthoringRuntimeConfig,
+    /// Hot-swappable browser-tools (`browser_list_tabs` / `browser_snapshot`)
+    /// enable flag. Shared with the `DelegationInjection` so MCP injection
+    /// reads it, and re-read at call time by the access impl so switching it
+    /// off reaches sessions that are already running. Populated at startup by
+    /// `apply_persisted_browser_tools_config`. Carried in both runtimes even
+    /// though only the desktop one has a browser: the status popover lists
+    /// every group, and a flag that existed in one build only would be a
+    /// second shape of `AppState` to keep in step.
+    pub browser_tools_config: crate::acp::browser_tools::BrowserToolsRuntimeConfig,
     /// Serializes mutually-exclusive system operations — in-place
     /// self-update, restart, rollback — so a second click can't race a
     /// download/swap already in flight. Handlers `try_lock` and reject when
@@ -129,6 +138,7 @@ pub fn build_delegation_stack(
     crate::acp::question::QuestionRuntimeConfig,
     crate::acp::session_info::SessionInfoRuntimeConfig,
     crate::acp::chat_authoring::ChatAuthoringRuntimeConfig,
+    crate::acp::browser_tools::BrowserToolsRuntimeConfig,
 ) {
     use crate::acp::connection::DelegationInjection;
     use crate::acp::delegation::broker::{
@@ -185,6 +195,7 @@ pub fn build_delegation_stack(
     // is cloned into the injection so MCP injection reads the same Arc<RwLock>.
     let decomposition = crate::acp::decomposition::DecompositionRuntimeConfig::new();
     let authoring = crate::acp::chat_authoring::ChatAuthoringRuntimeConfig::new();
+    let browser = crate::acp::browser_tools::BrowserToolsRuntimeConfig::new();
 
     // Install the injection on the manager so spawn_agent picks it up
     // without an extra parameter at every call site.
@@ -198,6 +209,7 @@ pub fn build_delegation_stack(
         sessions: sessions.clone(),
         decomposition: decomposition.clone(),
         authoring: authoring.clone(),
+        browser: browser.clone(),
         // Same backing manager as the listener's question lookup; used only by
         // the run_connection teardown guard to reclaim a parked ask.
         questions: Arc::new(crate::acp::manager::ConnectionManagerQuestionLookup {
@@ -210,8 +222,9 @@ pub fn build_delegation_stack(
         }) as Arc<dyn crate::acp::plan_approval::SessionPlanApprovalAccess>,
     });
 
-    let _ = decomposition; // keep the local alive until after install_delegation
-    (broker, tokens, socket_path, feedback, ask, sessions, authoring)
+    (
+        broker, tokens, socket_path, feedback, ask, sessions, authoring, browser,
+    )
 }
 
 impl AppState {
@@ -240,6 +253,7 @@ impl AppState {
             question_config,
             session_info_config,
             chat_authoring_config,
+            browser_tools_config,
         ) = build_delegation_stack(&connection_manager, db.conn.clone(), data_dir.clone());
 
         Self {
@@ -265,6 +279,7 @@ impl AppState {
             question_config,
             session_info_config,
             chat_authoring_config,
+            browser_tools_config,
             system_op_lock: default_system_op_lock(),
             update_state: default_update_state(),
             platform_manager: default_platform_manager(),
