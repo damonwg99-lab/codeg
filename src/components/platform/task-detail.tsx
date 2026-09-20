@@ -67,7 +67,6 @@ import { useWorkspaceContext } from "@/contexts/workspace-context"
 import { kbDocAbsPath } from "@/lib/kb-doc-path"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { ContextInjectPanel } from "@/components/platform/context-inject-panel"
-import { TaskChangeTracking } from "@/components/platform/task-change-tracking"
 import {
   optionToReferenceAttrs,
   type ContextInjectPayload,
@@ -659,9 +658,6 @@ export function TaskDetail({ taskId }: { taskId: number }) {
           <Tabs defaultValue="info">
             <TabsList>
               <TabsTrigger value="info">{t("task.taskDetail")}</TabsTrigger>
-              <TabsTrigger value="changes">
-                {t("task.changesAndRelease")}
-              </TabsTrigger>
             </TabsList>
             <TabsContent value="info" className="flex flex-col gap-6">
               {/* ─── Basic Info ─── */}
@@ -1150,14 +1146,6 @@ export function TaskDetail({ taskId }: { taskId: number }) {
                   </CardContent>
                 </Card>
               )}
-            </TabsContent>
-            <TabsContent value="changes" className="flex flex-col gap-6">
-              <TaskChangeTracking
-                taskId={task.id}
-                projectId={task.projectId}
-                branches={detail.branches || []}
-                relatedDbScriptsJson={task.relatedDbScriptsJson}
-              />
             </TabsContent>
           </Tabs>
         ) : (

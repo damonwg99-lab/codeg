@@ -5,7 +5,6 @@ import { useTranslations } from "next-intl"
 import type { TaskInfo, TaskStatus } from "@/lib/platform/types"
 import { listTasks } from "@/lib/platform/api"
 import { Badge } from "@/components/ui/badge"
-import { Input } from "@/components/ui/input"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { TASK_STATUS_COLORS } from "@/lib/platform/types"
 
@@ -26,7 +25,6 @@ export function ArchiveView({
   const { setRoute } = useWorkbenchRoute()
   const [tasks, setTasks] = useState<TaskInfo[]>([])
   const [loading, setLoading] = useState(true)
-  const [releaseCodeFilter, setReleaseCodeFilter] = useState("")
 
   useEffect(() => {
     if (!projectId) return
@@ -50,17 +48,9 @@ export function ArchiveView({
       if (filterType !== "all" && task.taskType !== filterType) return false
       if (filterPriority !== "all" && task.priority !== filterPriority)
         return false
-      if (
-        releaseCodeFilter &&
-        (!task.archivedReleaseCode ||
-          !task.archivedReleaseCode
-            .toLowerCase()
-            .includes(releaseCodeFilter.toLowerCase()))
-      )
-        return false
       return true
     })
-  }, [tasks, searchKeyword, filterType, filterPriority, releaseCodeFilter])
+  }, [tasks, searchKeyword, filterType, filterPriority])
 
   const resolveStatusLabel = (status: string) => {
     const keyMap: Record<string, string> = {
@@ -94,14 +84,6 @@ export function ArchiveView({
 
   return (
     <div className="h-full overflow-auto px-4 pb-4 pt-4">
-      <div className="mb-3">
-        <Input
-          placeholder={t("task.archiveRelease")}
-          value={releaseCodeFilter}
-          onChange={(e) => setReleaseCodeFilter(e.target.value)}
-          className="max-w-[240px]"
-        />
-      </div>
       {filtered.length === 0 ? (
         <p className="text-sm text-muted-foreground">
           {t("task.noArchivedTasks")}
@@ -114,9 +96,6 @@ export function ArchiveView({
                 <th className="pb-2 font-medium">{t("task.title")}</th>
                 <th className="pb-2 font-medium">{t("task.taskType")}</th>
                 <th className="pb-2 font-medium">{t("task.statusLabel")}</th>
-                <th className="pb-2 font-medium">{t("task.branchesCount")}</th>
-                <th className="pb-2 font-medium">{t("task.scriptsCount")}</th>
-                <th className="pb-2 font-medium">{t("task.archiveRelease")}</th>
               </tr>
             </thead>
             <tbody>
@@ -152,15 +131,6 @@ export function ArchiveView({
                     >
                       {resolveStatusLabel(task.status)}
                     </span>
-                  </td>
-                  <td className="py-2 pr-4 text-muted-foreground">
-                    {task.branchCount ?? 0}
-                  </td>
-                  <td className="py-2 pr-4 text-muted-foreground">
-                    {task.dbScriptCount ?? 0}
-                  </td>
-                  <td className="py-2 pr-4 text-muted-foreground">
-                    {task.archivedReleaseCode ?? "—"}
                   </td>
                 </tr>
               ))}

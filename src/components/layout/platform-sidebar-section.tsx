@@ -42,9 +42,6 @@ export function PlatformSidebarSection() {
             routeId === "task-kanban" ||
             routeId === "task-detail" ||
             routeId === "create-task" ||
-            routeId === "release-list" ||
-            routeId === "release-detail" ||
-            routeId === "create-release" ||
             routeId === "archive-view"
           }
           onClick={() => {

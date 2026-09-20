@@ -19,10 +19,6 @@ import type {
   SkillInfo,
   KbInitResult,
   KbDocType,
-  TaskBranchInfo,
-  ReleaseInfo,
-  ReleaseDetail,
-  CreateReleaseParams,
 } from "./types"
 
 // ─── Project ───
@@ -614,113 +610,5 @@ function getUploadBaseUrl(): string {
   return window.location.origin
 }
 
-// ─── Release ───
+// ─── (release/branch API removed with the legacy release feature) ───
 
-export async function createRelease(
-  params: CreateReleaseParams
-): Promise<ReleaseDetail> {
-  return getTransport().call<ReleaseDetail>(
-    "create_release",
-    params as unknown as Record<string, unknown>
-  )
-}
-
-export async function listReleases(projectId: number): Promise<ReleaseInfo[]> {
-  return getTransport().call<ReleaseInfo[]>("list_releases", {
-    project_id: projectId,
-  })
-}
-
-export async function listReleasesForTask(
-  _projectId: number,
-  taskId: number
-): Promise<ReleaseInfo[]> {
-  const transport = getTransport()
-
-  if (transport.isDesktop()) {
-    return transport.call<ReleaseInfo[]>("list_releases_for_task", {
-      taskId,
-    })
-  }
-
-  const token = getCodegToken()
-  const baseUrl = window.location.origin
-  const res = await fetch(
-    `${baseUrl}/api/releases/for_task?task_id=${taskId}`,
-    {
-      method: "GET",
-      headers: { Authorization: `Bearer ${token}` },
-    }
-  )
-  if (!res.ok) {
-    const error = await res
-      .json()
-      .catch(() => ({ message: `HTTP ${res.status}` }))
-    throw error
-  }
-  return res.json()
-}
-
-export async function getRelease(id: number): Promise<ReleaseDetail> {
-  return getTransport().call<ReleaseDetail>("get_release", { id })
-}
-
-export async function updateRelease(
-  id: number,
-  status: string,
-  deployer?: string
-): Promise<ReleaseInfo> {
-  return getTransport().call<ReleaseInfo>("update_release", {
-    id,
-    status,
-    deployer,
-  })
-}
-
-export async function deleteRelease(id: number): Promise<void> {
-  return getTransport().call<void>("delete_release", { id })
-}
-
-export async function linkTaskBranch(
-  taskId: number,
-  projectId: number,
-  repoName: string,
-  branch: string
-): Promise<TaskBranchInfo> {
-  return getTransport().call<TaskBranchInfo>("link_task_branch", {
-    taskId,
-    projectId,
-    repoName,
-    branch,
-  })
-}
-
-export async function updateTaskBranchStatus(
-  branchId: number,
-  status: string
-): Promise<TaskBranchInfo> {
-  return getTransport().call<TaskBranchInfo>("update_task_branch", {
-    branchId,
-    status,
-  })
-}
-
-export async function updateTaskDbScripts(
-  taskId: number,
-  scriptsJson: string
-): Promise<void> {
-  return getTransport().call<void>("update_task_db_scripts", {
-    taskId,
-    scriptsJson,
-  })
-}
-
-export async function unlinkTaskBranch(
-  taskId: number,
-  branchId: number
-): Promise<void> {
-  return getTransport().call<void>("unlink_task_branch", {
-    taskId,
-    branchId,
-  })
-}

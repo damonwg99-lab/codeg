@@ -46,7 +46,6 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { cn } from "@/lib/utils"
-import { ReleaseList } from "@/components/platform/release-list"
 import { ArchiveView } from "@/components/platform/archive-view"
 
 // 鈹€鈹€ Relative date helper 鈹€鈹€
@@ -206,33 +205,6 @@ function TaskCard({
               )}
               <span className="ml-auto">{relativeDate}</span>
             </div>
-            {(task.branchCount > 0 || task.dbScriptCount > 0) && (
-              <div className="flex items-center gap-1 text-[0.625rem] text-muted-foreground">
-                {task.branchCount > 0 && (
-                  <Badge variant="outline" className="text-[0.625rem]">
-                    {t("task.branchesCount")}: {task.branchCount}
-                  </Badge>
-                )}
-                {task.dbScriptCount > 0 && (
-                  <Badge variant="outline" className="text-[0.625rem]">
-                    {t("task.scriptsCount")}: {task.dbScriptCount}
-                  </Badge>
-                )}
-              </div>
-            )}
-            {task.branchStatuses && task.branchStatuses.length > 0 && (
-              <div className="flex flex-wrap items-center gap-1 text-[0.625rem]">
-                {task.branchStatuses.map((bs, i) => (
-                  <Badge
-                    key={i}
-                    variant="secondary"
-                    className="text-[0.625rem]"
-                  >
-                    {bs}
-                  </Badge>
-                ))}
-              </div>
-            )}
           </div>
         </CardContent>
       </Card>
@@ -333,9 +305,7 @@ export function TaskKanban({ projectId }: { projectId: number }) {
   const [tasks, setTasks] = useState<TaskInfo[]>([])
   const [loading, setLoading] = useState(true)
   const initialTab =
-    routeParams.tab === "archive" || routeParams.tab === "release"
-      ? routeParams.tab
-      : "kanban"
+    routeParams.tab === "archive" ? routeParams.tab : "kanban"
   const [activeTab, setActiveTab] = useState(initialTab)
 
   const [searchInput, setSearchInput] = useState("")
@@ -441,9 +411,6 @@ export function TaskKanban({ projectId }: { projectId: number }) {
       <div className="flex items-center justify-between px-4 py-3 shrink-0 border-b gap-3">
         <TabsList className="shrink-0">
           <TabsTrigger value="kanban">{t("task.kanban")}</TabsTrigger>
-          <TabsTrigger value="release">
-            {t("task.releaseManagement")}
-          </TabsTrigger>
           <TabsTrigger value="archive">{t("task.archivedTasks")}</TabsTrigger>
         </TabsList>
         <div className="flex items-center gap-2">
@@ -524,16 +491,6 @@ export function TaskKanban({ projectId }: { projectId: number }) {
                 {t("task.create")}
               </Button>
             </>
-          )}
-          {activeTab === "release" && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setRoute("create-release", { projectId })}
-            >
-              <Plus className="mr-1 h-3.5 w-3.5" />
-              {t("task.createRelease")}
-            </Button>
           )}
           {activeTab === "archive" && (
             <>
@@ -656,26 +613,12 @@ export function TaskKanban({ projectId }: { projectId: number }) {
                         {resolvePriorityLabel(t, task.priority)}
                       </Badge>
                     )}
-                    {task.branchCount > 0 && (
-                      <span>
-                        {t("task.branchesCount")}: {task.branchCount}
-                      </span>
-                    )}
                   </div>
                 </div>
               ))
             )}
           </div>
         </DndContext>
-      </TabsContent>
-      <TabsContent
-        value="release"
-        className="flex flex-col flex-1 min-h-0 overflow-auto"
-      >
-        <ReleaseList
-          projectId={projectId}
-          setRoute={setRoute as (id: string) => void}
-        />
       </TabsContent>
       <TabsContent
         value="archive"

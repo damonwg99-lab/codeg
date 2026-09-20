@@ -10,8 +10,6 @@ import {
   KanbanSquare,
   ListTodo,
   MessagesSquare,
-  PackagePlus,
-  Rocket,
   type LucideIcon,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
@@ -38,9 +36,6 @@ import { CreateProjectForm } from "@/components/platform/create-project-form"
 import { TaskKanban } from "@/components/platform/task-kanban"
 import { TaskDetail } from "@/components/platform/task-detail"
 import { CreateTaskForm } from "@/components/platform/create-task-form"
-import { ReleaseList } from "@/components/platform/release-list"
-import { ReleaseDetail } from "@/components/platform/release-detail"
-import { CreateReleaseForm } from "@/components/platform/create-release-form"
 import { ArchiveView } from "@/components/platform/archive-view"
 
 /**
@@ -76,9 +71,6 @@ const CreateProjectTitle = makePlatformTitle(FolderPlus, "nav.createProject")
 const TaskKanbanTitle = makePlatformTitle(KanbanSquare, "nav.taskKanban")
 const TaskDetailTitle = makePlatformTitle(ListTodo, "task.detail")
 const CreateTaskTitle = makePlatformTitle(FilePlus, "task.create")
-const ReleaseListTitle = makePlatformTitle(Rocket, "task.releaseManagement")
-const ReleaseDetailTitle = makePlatformTitle(Rocket, "task.releaseManagement")
-const CreateReleaseTitle = makePlatformTitle(PackagePlus, "task.createRelease")
 const ArchiveViewTitle = makePlatformTitle(Archive, "task.archivedTasks")
 const WORKBENCH_ROUTES: Partial<Record<WorkbenchRouteId, ComponentType>> = {
   automations: AutomationsPage,
@@ -88,9 +80,6 @@ const WORKBENCH_ROUTES: Partial<Record<WorkbenchRouteId, ComponentType>> = {
   "task-kanban": TaskKanbanRoute,
   "task-detail": TaskDetailRoute,
   "create-task": CreateTaskFormRoute,
-  "release-list": ReleaseListRoute,
-  "release-detail": ReleaseDetail,
-  "create-release": CreateReleaseFormRoute,
   "archive-view": ArchiveViewRoute,
   tasks: TasksPage,
   forge: ForgePage,
@@ -113,9 +102,6 @@ const WORKBENCH_ROUTE_STRIPS: Partial<Record<WorkbenchRouteId, ComponentType>> =
     "task-kanban": TaskKanbanTitle,
     "task-detail": TaskDetailTitle,
     "create-task": CreateTaskTitle,
-    "release-list": ReleaseListTitle,
-    "release-detail": ReleaseDetailTitle,
-    "create-release": CreateReleaseTitle,
     "archive-view": ArchiveViewTitle,
   }
 
@@ -170,9 +156,6 @@ const WORKBENCH_ROUTE_CHROME_ACTIONS: Partial<
   "task-kanban": PlatformBackAction,
   "task-detail": PlatformBackAction,
   "create-task": PlatformBackAction,
-  "release-list": PlatformBackAction,
-  "release-detail": PlatformBackAction,
-  "create-release": PlatformBackAction,
   "archive-view": PlatformBackAction,
 }
 
@@ -211,10 +194,10 @@ export function useHasWorkbenchRouteStrip(): boolean {
   return WORKBENCH_ROUTE_STRIPS[routeId] != null
 }
 
-// ─── Platform route wrappers (Cluster A/B Release) ───────────────────────────
+// ─── Platform route wrappers ─────────────────────────────────────────────────
 // Each wrapper reads route params from useWorkbenchRoute() and forwards them to
-// the underlying page component. Plain components (ProjectList, CreateProjectForm,
-// ReleaseDetail) register directly because they don't take params.
+// the underlying page component. Plain components (ProjectList, CreateProjectForm)
+// register directly because they don't take params.
 
 function ProjectDetailRoute() {
   const { routeParams } = useWorkbenchRoute()
@@ -241,22 +224,6 @@ function CreateTaskFormRoute() {
   const projectId = Number(routeParams.projectId)
   return Number.isFinite(projectId) ? (
     <CreateTaskForm projectId={projectId} />
-  ) : null
-}
-
-function ReleaseListRoute() {
-  const { routeParams, setRoute } = useWorkbenchRoute()
-  const projectId = Number(routeParams.projectId)
-  return Number.isFinite(projectId) ? (
-    <ReleaseList projectId={projectId} setRoute={setRoute} />
-  ) : null
-}
-
-function CreateReleaseFormRoute() {
-  const { routeParams } = useWorkbenchRoute()
-  const projectId = Number(routeParams.projectId)
-  return Number.isFinite(projectId) ? (
-    <CreateReleaseForm projectId={projectId} />
   ) : null
 }
 

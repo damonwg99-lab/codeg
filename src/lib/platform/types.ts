@@ -144,11 +144,6 @@ export interface TaskInfo {
   kbRefsJson: string | null
   affectedReposJson: string | null
   delegationConfig: string | null
-  relatedDbScriptsJson: string | null
-  branchCount: number
-  dbScriptCount: number
-  branchStatuses: string[]
-  archivedReleaseCode: string | null
   createdAt: string
   updatedAt: string
 }
@@ -159,58 +154,6 @@ export interface TaskDetail {
   subTasks: TaskInfo[]
   attachments: KnowledgeDocInfo[]
   aiIntermediateDocs: KnowledgeDocInfo[]
-  branches: TaskBranchInfo[]
-}
-
-export interface TaskBranchInfo {
-  branchId: number
-  repoName: string
-  branch: string
-  status: "open" | "uat" | "prd"
-  createdAt: string
-}
-
-export interface ReleaseInfo {
-  id: number
-  projectId: number
-  releaseCode: string
-  title: string | null
-  notes: string | null
-  status: "draft" | "prd_deployed" | "closed"
-  deployer: string | null
-  branchCount: number
-  prdDeployedAt: string | null
-  closedAt: string | null
-  ciJobId: string | null
-  ciWebhookUrl: string | null
-  createdAt: string
-  updatedAt: string
-}
-
-export interface ReleaseItemInfo {
-  id: number
-  releaseId: number
-  branchId: number
-  repoName: string
-  branch: string
-  branchStatus: string
-  taskId: number | null
-  taskTitle: string | null
-  externalRefJson: string | null
-}
-
-export interface ReleaseDetail {
-  release: ReleaseInfo
-  items: ReleaseItemInfo[]
-}
-
-export interface CreateReleaseParams {
-  projectId: number
-  title?: string
-  notes?: string
-  deployer?: string
-  branchIds: number[]
-  externalRefsJson?: string
 }
 
 export interface TaskConversationInfo {
