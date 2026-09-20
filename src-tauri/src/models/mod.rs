@@ -72,7 +72,7 @@ pub use platform_project::{
     GitRepoScanResult, ProjectDetail, ProjectInfo, ProjectRepoInfo, TaskCountByStatus,
 };
 pub use platform_task::{
-    TaskBranchInfo, TaskConversationInfo, TaskConversationLaunchInfo, TaskDecompositionInfo,
+    TaskConversationInfo, TaskConversationLaunchInfo, TaskDecompositionInfo,
     TaskDetail, TaskInfo, TaskTypeMappingInfo,
 };
 pub use platform_config::{CredentialInfo, GlobalConfigInfo};

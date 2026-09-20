@@ -29,11 +29,6 @@ fn to_info(m: platform_task::Model) -> TaskInfo {
         zentao_module: m.zentao_module,
         kb_refs_json: m.kb_refs_json,
         affected_repos_json: m.affected_repos_json,
-        related_db_scripts_json: m.related_db_scripts_json,
-        branch_count: 0,
-        db_script_count: 0,
-        branch_statuses: Vec::new(),
-        archived_release_code: None,
         delegation_config: m.delegation_config,
         created_at: m.created_at,
         updated_at: m.updated_at,
@@ -129,7 +124,6 @@ pub async fn create<C: ConnectionTrait>(
         zentao_module: Set(None),
         kb_refs_json: Set(None),
         affected_repos_json: Set(None),
-        related_db_scripts_json: Set(None),
         delegation_config: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
@@ -292,21 +286,4 @@ pub async fn update_status<C: ConnectionTrait>(
     active.updated_at = Set(Utc::now());
     let result = active.update(conn).await?;
     Ok(to_info(result))
-}
-
-pub async fn update_related_db_scripts<C: ConnectionTrait>(
-    conn: &C,
-    task_id: i32,
-    scripts_json: &str,
-) -> Result<platform_task::Model, DbError> {
-    let row = platform_task::Entity::find_by_id(task_id)
-        .filter(platform_task::Column::DeletedAt.is_null())
-        .one(conn)
-        .await?
-        .ok_or_else(|| DbError::NotFound(format!("Task not found: {task_id}")))?;
-
-    let mut active = row.into_active_model();
-    active.related_db_scripts_json = Set(Some(scripts_json.to_string()));
-    active.updated_at = Set(Utc::now());
-    active.update(conn).await.map_err(DbError::from)
 }

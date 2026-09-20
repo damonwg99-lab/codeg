@@ -2079,10 +2079,6 @@ mod tauri_app {
                 task_commands::update_task_type_mapping,
                 task_commands::delete_task_type_mapping,
                 task_commands::create_decomposition,
-                task_commands::link_task_branch,
-                task_commands::update_task_branch,
-                task_commands::update_task_db_scripts,
-                task_commands::unlink_task_branch,
 
                 // Releases (Cluster B).
                 release_commands::create_release,

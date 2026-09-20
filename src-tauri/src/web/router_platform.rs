@@ -113,10 +113,6 @@ pub fn platform_routes() -> Router {
             "/create_decomposition",
             post(handlers::task::create_decomposition),
         )
-        .route("/link_task_branch", post(handlers::task::link_task_branch))
-        .route("/update_task_branch", post(handlers::task::update_task_branch))
-        .route("/update_task_db_scripts", post(handlers::task::update_task_db_scripts))
-        .route("/unlink_task_branch", post(handlers::task::unlink_task_branch))
         // ─── Releases (Cluster B) ────────────────────────────────────────────
         .route("/create_release", post(handlers::release::create_release))
         .route("/list_releases", post(handlers::release::list_releases))
