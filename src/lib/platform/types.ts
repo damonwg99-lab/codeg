@@ -66,6 +66,47 @@ export interface GitRepoScanResult {
   hasClaudeMd: boolean
 }
 
+// ─── Branch Board ───
+
+export type EnvKey = "dev" | "uat" | "prd"
+
+export interface EnvMergeStatus {
+  env: EnvKey
+  merged: boolean
+  mergeVia: "merge" | "fast_forward" | null
+  mergeDate: string | null
+  ahead: number
+  behind: number
+}
+
+export interface BranchRow {
+  branch: string
+  createdAt: string | null
+  createdAtSource: "reflog" | "first_commit" | null
+  isEnvBranch: boolean
+  lastCommitAt: string | null
+  envs: EnvMergeStatus[]
+}
+
+export interface RepoBranchMatrix {
+  repoId: number
+  repoName: string
+  repoPath: string
+  configured: boolean
+  branches: BranchRow[]
+}
+
+export interface BranchStateInfo {
+  id: number
+  repoId: number
+  branch: string
+  isArchived: boolean
+  archivedAt: string | null
+  description: string | null
+  createdAt: string
+  updatedAt: string
+}
+
 // ─── Task ───
 
 export type TaskStatus =

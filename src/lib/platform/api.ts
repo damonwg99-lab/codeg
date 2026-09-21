@@ -19,6 +19,8 @@ import type {
   SkillInfo,
   KbInitResult,
   KbDocType,
+  RepoBranchMatrix,
+  BranchStateInfo,
 } from "./types"
 
 // ─── Project ───
@@ -153,6 +155,59 @@ export async function updateProjectRepo(params: {
 
 export async function removeProjectRepo(id: number): Promise<void> {
   return getTransport().call("remove_project_repo", { id })
+}
+
+// ─── Branch Board ───
+
+export async function getProjectBranchMatrix(
+  projectId: number
+): Promise<RepoBranchMatrix[]> {
+  return getTransport().call<RepoBranchMatrix[]>("git_project_branch_matrix", {
+    project_id: projectId,
+  })
+}
+
+export async function addExistingWorktree(
+  path: string,
+  worktreePath: string,
+  branch: string
+): Promise<void> {
+  return getTransport().call<void>("git_worktree_add_existing", {
+    path,
+    worktreePath,
+    branch,
+  })
+}
+
+export async function removeTempWorktree(
+  path: string,
+  worktreePath: string
+): Promise<void> {
+  return getTransport().call<void>("git_worktree_remove_temp", {
+    path,
+    worktreePath,
+  })
+}
+
+export async function listBranchStates(
+  projectId: number
+): Promise<BranchStateInfo[]> {
+  return getTransport().call<BranchStateInfo[]>("list_branch_states", {
+    project_id: projectId,
+  })
+}
+
+export async function upsertBranchState(
+  repoId: number,
+  branch: string,
+  params: { isArchived?: boolean; description?: string | null }
+): Promise<BranchStateInfo> {
+  return getTransport().call<BranchStateInfo>("upsert_branch_state", {
+    repoId,
+    branch,
+    isArchived: params.isArchived,
+    description: params.description,
+  })
 }
 
 // ─── Git Scan ───
