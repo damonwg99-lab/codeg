@@ -35,6 +35,7 @@ mod m20260622_platform_000002_create_config_tables;
 mod m20260622_platform_000003_create_activity_log;
 mod m20260627_platform_000004_create_knowledge_doc;
 mod m20260703_platform_000005_normalize_knowledge_doc_path;
+mod m20260718_platform_000006_create_branch_and_release;
 mod m20260801_000001_work_task;
 mod m20260801_000002_work_task_p2;
 mod m20260801_000003_work_task_template;
@@ -109,6 +110,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260831_000001_canvas_node_group_grid::Migration),
             Box::new(m20260905_000001_knowledge_doc_fts::Migration),
             Box::new(m20260907_000001_canvas_node_path::Migration),
+            Box::new(m20260718_platform_000006_create_branch_and_release::Migration),
             Box::new(m20260920_platform_000007_drop_branch_and_release::Migration),
         ]
     }
