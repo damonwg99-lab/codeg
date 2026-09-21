@@ -62,6 +62,7 @@ pub fn platform_routes() -> Router {
         .route("/delete_project", post(handlers::project::delete_project))
         .route("/list_project_repos", post(handlers::project::list_project_repos))
         .route("/add_project_repo", post(handlers::project::add_project_repo))
+        .route("/update_project_repo", post(handlers::project::update_project_repo))
         .route("/remove_project_repo", post(handlers::project::remove_project_repo))
         .route("/scan_git_repos", post(handlers::project::scan_git_repos))
         .route("/get_global_config", post(handlers::project::get_global_config))

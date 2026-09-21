@@ -62,6 +62,9 @@ export async function updateProject(params: {
   defaultAgentType?: string | null
   delegationConfig?: string | null
   agentConfigJson?: string | null
+  devBranch?: string | null
+  uatBranch?: string | null
+  prdBranch?: string | null
 }): Promise<ProjectInfo> {
   return getTransport().call("update_project", {
     id: params.id,
@@ -78,6 +81,9 @@ export async function updateProject(params: {
     defaultAgentType: params.defaultAgentType ?? null,
     delegationConfig: params.delegationConfig ?? null,
     agentConfigJson: params.agentConfigJson ?? null,
+    devBranch: params.devBranch ?? null,
+    uatBranch: params.uatBranch ?? null,
+    prdBranch: params.prdBranch ?? null,
   })
 }
 
@@ -98,7 +104,10 @@ export async function addProjectRepo(params: {
   name: string
   gitUrl: string
   localDir: string
-  branch?: string
+  branch?: string | null
+  devBranch?: string | null
+  uatBranch?: string | null
+  prdBranch?: string | null
   hasClaudeMd: boolean
   folderId?: number | null
 }): Promise<ProjectRepoInfo> {
@@ -108,6 +117,35 @@ export async function addProjectRepo(params: {
     gitUrl: params.gitUrl,
     localDir: params.localDir,
     branch: params.branch ?? null,
+    devBranch: params.devBranch ?? null,
+    uatBranch: params.uatBranch ?? null,
+    prdBranch: params.prdBranch ?? null,
+    hasClaudeMd: params.hasClaudeMd,
+    folderId: params.folderId ?? null,
+  })
+}
+
+export async function updateProjectRepo(params: {
+  id: number
+  name?: string | null
+  gitUrl?: string | null
+  localDir?: string | null
+  branch?: string | null
+  devBranch?: string | null
+  uatBranch?: string | null
+  prdBranch?: string | null
+  hasClaudeMd?: boolean
+  folderId?: number | null
+}): Promise<ProjectRepoInfo> {
+  return getTransport().call<ProjectRepoInfo>("update_project_repo", {
+    id: params.id,
+    name: params.name ?? null,
+    gitUrl: params.gitUrl ?? null,
+    localDir: params.localDir ?? null,
+    branch: params.branch ?? null,
+    devBranch: params.devBranch ?? null,
+    uatBranch: params.uatBranch ?? null,
+    prdBranch: params.prdBranch ?? null,
     hasClaudeMd: params.hasClaudeMd,
     folderId: params.folderId ?? null,
   })

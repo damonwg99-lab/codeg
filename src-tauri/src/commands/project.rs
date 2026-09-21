@@ -114,6 +114,9 @@ pub async fn update_project_core(
     default_agent_type: Option<Option<String>>,
     delegation_config: Option<Option<String>>,
     agent_config_json: Option<Option<String>>,
+    dev_branch: Option<Option<String>>,
+    uat_branch: Option<Option<String>>,
+    prd_branch: Option<Option<String>>,
 ) -> Result<ProjectInfo, AppCommandError> {
     let conn = &db.conn;
     let project = platform_project_service::update(
@@ -132,6 +135,9 @@ pub async fn update_project_core(
         default_agent_type,
         delegation_config,
         agent_config_json,
+        dev_branch,
+        uat_branch,
+        prd_branch,
     )
     .await
     .map_err(AppCommandError::from)?;
@@ -179,6 +185,9 @@ pub async fn add_project_repo_core(
     git_url: &str,
     local_dir: &str,
     branch: Option<String>,
+    dev_branch: Option<String>,
+    uat_branch: Option<String>,
+    prd_branch: Option<String>,
     has_claude_md: bool,
     folder_id: Option<i32>,
 ) -> Result<ProjectRepoInfo, AppCommandError> {
@@ -225,6 +234,9 @@ pub async fn add_project_repo_core(
         git_url,
         local_dir,
         branch,
+        dev_branch,
+        uat_branch,
+        prd_branch,
         has_claude_md,
         resolved_folder_id,
     )
@@ -253,12 +265,44 @@ pub async fn remove_project_repo_core(
     Ok(())
 }
 
+pub async fn update_project_repo_core(
+    db: &AppDatabase,
+    id: i32,
+    name: Option<String>,
+    git_url: Option<String>,
+    local_dir: Option<String>,
+    branch: Option<Option<String>>,
+    dev_branch: Option<Option<String>>,
+    uat_branch: Option<Option<String>>,
+    prd_branch: Option<Option<String>>,
+    has_claude_md: Option<bool>,
+    folder_id: Option<Option<i32>>,
+) -> Result<ProjectRepoInfo, AppCommandError> {
+    platform_project_repo_service::update(
+        &db.conn,
+        id,
+        name,
+        git_url,
+        local_dir,
+        branch,
+        dev_branch,
+        uat_branch,
+        prd_branch,
+        has_claude_md,
+        folder_id,
+    )
+    .await
+    .map_err(AppCommandError::from)
+}
+
 pub async fn scan_git_repos_core(
     root_dir: &str,
 ) -> Result<Vec<GitRepoScanResult>, AppCommandError> {
-    git_scan::scan_root_dir(root_dir).await.map_err(|e| {
-        AppCommandError::io_error("Failed to scan git repositories").with_detail(e.to_string())
-    })
+    git_scan::scan_root_dir(root_dir)
+        .await
+        .map_err(|e| {
+            AppCommandError::io_error("Failed to scan git repositories").with_detail(e.to_string())
+        })
 }
 
 // ─── Global Config ───
@@ -468,11 +512,15 @@ pub async fn update_project(
     default_agent_type: Option<Option<String>>,
     delegation_config: Option<Option<String>>,
     agent_config_json: Option<Option<String>>,
+    dev_branch: Option<Option<String>>,
+    uat_branch: Option<Option<String>>,
+    prd_branch: Option<Option<String>>,
 ) -> Result<ProjectInfo, AppCommandError> {
     update_project_core(
         &db, &emitter, id, name, description, client_name, status,
         folder_id, zentao_project_id, zentao_product_id, jenkins_url,
         kb_repo_url, kb_local_dir, default_agent_type, delegation_config, agent_config_json,
+        dev_branch, uat_branch, prd_branch,
     ).await
 }
 
@@ -506,10 +554,44 @@ pub async fn add_project_repo(
     git_url: String,
     local_dir: String,
     branch: Option<String>,
+    dev_branch: Option<String>,
+    uat_branch: Option<String>,
+    prd_branch: Option<String>,
     has_claude_md: bool,
     folder_id: Option<i32>,
 ) -> Result<ProjectRepoInfo, AppCommandError> {
-    add_project_repo_core(&db, &emitter, project_id, &name, &git_url, &local_dir, branch, has_claude_md, folder_id).await
+    add_project_repo_core(&db, &emitter, project_id, &name, &git_url, &local_dir, branch, dev_branch, uat_branch, prd_branch, has_claude_md, folder_id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn update_project_repo(
+    db: tauri::State<'_, AppDatabase>,
+    id: i32,
+    name: Option<String>,
+    git_url: Option<String>,
+    local_dir: Option<String>,
+    branch: Option<Option<String>>,
+    dev_branch: Option<Option<String>>,
+    uat_branch: Option<Option<String>>,
+    prd_branch: Option<Option<String>>,
+    has_claude_md: Option<bool>,
+    folder_id: Option<Option<i32>>,
+) -> Result<ProjectRepoInfo, AppCommandError> {
+    update_project_repo_core(
+        &db,
+        id,
+        name,
+        git_url,
+        local_dir,
+        branch,
+        dev_branch,
+        uat_branch,
+        prd_branch,
+        has_claude_md,
+        folder_id,
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]

@@ -72,6 +72,9 @@ async fn ensure_kb_dir(db: &AppDatabase, project_id: i32) -> Result<String, AppC
                 None,           // default_agent_type
                 None,           // delegation_config
                 None,           // agent_config_json
+                None,           // dev_branch
+                None,           // uat_branch
+                None,           // prd_branch
             )
             .await
             .map_err(AppCommandError::from)?;

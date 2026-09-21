@@ -14,6 +14,13 @@ pub struct Model {
     pub local_dir: String,
     #[sea_orm(column_type = "Text")]
     pub branch: Option<String>,
+    // Per-repo environment branch overrides (fall back to the project default)
+    #[sea_orm(column_type = "Text")]
+    pub dev_branch: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub uat_branch: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub prd_branch: Option<String>,
     #[sea_orm(default_value = false)]
     pub has_claude_md: bool,
     pub folder_id: Option<i32>,

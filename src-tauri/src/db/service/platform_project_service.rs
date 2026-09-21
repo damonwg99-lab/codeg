@@ -25,6 +25,9 @@ fn to_info(m: platform_project::Model) -> ProjectInfo {
         default_agent_type: m.default_agent_type,
         delegation_config: m.delegation_config,
         agent_config_json: m.agent_config_json,
+        dev_branch: m.dev_branch,
+        uat_branch: m.uat_branch,
+        prd_branch: m.prd_branch,
         created_at: m.created_at,
         updated_at: m.updated_at,
     }
@@ -98,6 +101,9 @@ pub async fn create(
         default_agent_type: Set(default_agent_type),
         delegation_config: Set(None),
         agent_config_json: Set(None),
+        dev_branch: Set(None),
+        uat_branch: Set(None),
+        prd_branch: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(None),
@@ -123,6 +129,9 @@ pub async fn update(
     default_agent_type: Option<Option<String>>,
     delegation_config: Option<Option<String>>,
     agent_config_json: Option<Option<String>>,
+    dev_branch: Option<Option<String>>,
+    uat_branch: Option<Option<String>>,
+    prd_branch: Option<Option<String>>,
 ) -> Result<ProjectInfo, DbError> {
     let row = platform_project::Entity::find_by_id(id)
         .filter(platform_project::Column::DeletedAt.is_null())
@@ -169,6 +178,15 @@ pub async fn update(
     }
     if let Some(v) = agent_config_json {
         active.agent_config_json = Set(v);
+    }
+    if let Some(v) = dev_branch {
+        active.dev_branch = Set(v);
+    }
+    if let Some(v) = uat_branch {
+        active.uat_branch = Set(v);
+    }
+    if let Some(v) = prd_branch {
+        active.prd_branch = Set(v);
     }
     active.updated_at = Set(Utc::now());
     let result = active.update(conn).await?;

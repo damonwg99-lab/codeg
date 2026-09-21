@@ -29,6 +29,13 @@ pub struct Model {
     pub delegation_config: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub agent_config_json: Option<String>,
+    // Project-level default environment branches (repo value overrides these)
+    #[sea_orm(column_type = "Text")]
+    pub dev_branch: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub uat_branch: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub prd_branch: Option<String>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub deleted_at: Option<DateTimeUtc>,

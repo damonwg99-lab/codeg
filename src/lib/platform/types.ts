@@ -21,6 +21,9 @@ export interface ProjectInfo {
   defaultAgentType: string | null
   delegationConfig: string | null
   agentConfigJson: string | null
+  devBranch: string | null
+  uatBranch: string | null
+  prdBranch: string | null
   createdAt: string
   updatedAt: string
 }
@@ -47,6 +50,9 @@ export interface ProjectRepoInfo {
   gitUrl: string
   localDir: string
   branch: string | null
+  devBranch: string | null
+  uatBranch: string | null
+  prdBranch: string | null
   hasClaudeMd: boolean
   folderId: number | null
   createdAt: string

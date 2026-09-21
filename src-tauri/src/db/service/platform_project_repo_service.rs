@@ -16,6 +16,9 @@ fn to_info(m: platform_project_repo::Model) -> ProjectRepoInfo {
         git_url: m.git_url,
         local_dir: m.local_dir,
         branch: m.branch,
+        dev_branch: m.dev_branch,
+        uat_branch: m.uat_branch,
+        prd_branch: m.prd_branch,
         has_claude_md: m.has_claude_md,
         folder_id: m.folder_id,
         created_at: m.created_at,
@@ -52,6 +55,9 @@ pub async fn create(
     git_url: &str,
     local_dir: &str,
     branch: Option<String>,
+    dev_branch: Option<String>,
+    uat_branch: Option<String>,
+    prd_branch: Option<String>,
     has_claude_md: bool,
     folder_id: Option<i32>,
 ) -> Result<ProjectRepoInfo, DbError> {
@@ -63,6 +69,9 @@ pub async fn create(
         git_url: Set(git_url.to_string()),
         local_dir: Set(local_dir.to_string()),
         branch: Set(branch),
+        dev_branch: Set(dev_branch),
+        uat_branch: Set(uat_branch),
+        prd_branch: Set(prd_branch),
         has_claude_md: Set(has_claude_md),
         folder_id: Set(folder_id),
         created_at: Set(now),
@@ -80,6 +89,9 @@ pub async fn update(
     git_url: Option<String>,
     local_dir: Option<String>,
     branch: Option<Option<String>>,
+    dev_branch: Option<Option<String>>,
+    uat_branch: Option<Option<String>>,
+    prd_branch: Option<Option<String>>,
     has_claude_md: Option<bool>,
     folder_id: Option<Option<i32>>,
 ) -> Result<ProjectRepoInfo, DbError> {
@@ -100,6 +112,15 @@ pub async fn update(
     }
     if let Some(v) = branch {
         active.branch = Set(v);
+    }
+    if let Some(v) = dev_branch {
+        active.dev_branch = Set(v);
+    }
+    if let Some(v) = uat_branch {
+        active.uat_branch = Set(v);
+    }
+    if let Some(v) = prd_branch {
+        active.prd_branch = Set(v);
     }
     if let Some(v) = has_claude_md {
         active.has_claude_md = Set(v);

@@ -43,6 +43,9 @@ pub struct UpdateProjectParams {
     pub default_agent_type: Option<Option<String>>,
     pub delegation_config: Option<Option<String>>,
     pub agent_config_json: Option<Option<String>>,
+    pub dev_branch: Option<Option<String>>,
+    pub uat_branch: Option<Option<String>>,
+    pub prd_branch: Option<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -71,8 +74,26 @@ pub struct AddProjectRepoParams {
     pub git_url: String,
     pub local_dir: String,
     pub branch: Option<String>,
+    pub dev_branch: Option<String>,
+    pub uat_branch: Option<String>,
+    pub prd_branch: Option<String>,
     pub has_claude_md: bool,
     pub folder_id: Option<i32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProjectRepoParams {
+    pub id: i32,
+    pub name: Option<String>,
+    pub git_url: Option<String>,
+    pub local_dir: Option<String>,
+    pub branch: Option<Option<String>>,
+    pub dev_branch: Option<Option<String>>,
+    pub uat_branch: Option<Option<String>>,
+    pub prd_branch: Option<Option<String>>,
+    pub has_claude_md: Option<bool>,
+    pub folder_id: Option<Option<i32>>,
 }
 
 #[derive(Deserialize)]
@@ -176,6 +197,9 @@ pub async fn update_project(
             params.default_agent_type,
             params.delegation_config,
             params.agent_config_json,
+            params.dev_branch,
+            params.uat_branch,
+            params.prd_branch,
         )
         .await?,
     ))
@@ -209,6 +233,31 @@ pub async fn add_project_repo(
             &params.git_url,
             &params.local_dir,
             params.branch,
+            params.dev_branch,
+            params.uat_branch,
+            params.prd_branch,
+            params.has_claude_md,
+            params.folder_id,
+        )
+        .await?,
+    ))
+}
+
+pub async fn update_project_repo(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<UpdateProjectRepoParams>,
+) -> Result<Json<ProjectRepoInfo>, AppCommandError> {
+    Ok(Json(
+        project_commands::update_project_repo_core(
+            &state.db,
+            params.id,
+            params.name,
+            params.git_url,
+            params.local_dir,
+            params.branch,
+            params.dev_branch,
+            params.uat_branch,
+            params.prd_branch,
             params.has_claude_md,
             params.folder_id,
         )

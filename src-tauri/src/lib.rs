@@ -2054,6 +2054,7 @@ mod tauri_app {
                 project_commands::delete_project,
                 project_commands::list_project_repos,
                 project_commands::add_project_repo,
+                project_commands::update_project_repo,
                 project_commands::remove_project_repo,
                 project_commands::scan_git_repos,
                 project_commands::get_global_config,
