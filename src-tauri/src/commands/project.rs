@@ -265,6 +265,7 @@ pub async fn remove_project_repo_core(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_project_repo_core(
     db: &AppDatabase,
     id: i32,
@@ -565,6 +566,7 @@ pub async fn add_project_repo(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)]
 pub async fn update_project_repo(
     db: tauri::State<'_, AppDatabase>,
     id: i32,

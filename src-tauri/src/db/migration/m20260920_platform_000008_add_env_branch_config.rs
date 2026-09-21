@@ -57,6 +57,7 @@ enum TargetTable {
 }
 
 #[derive(DeriveIden)]
+#[allow(clippy::enum_variant_names)]
 enum EnvBranch {
     DevBranch,
     UatBranch,

@@ -37,6 +37,7 @@ pub mod notification;
 pub mod pet;
 pub mod project_boot;
 // ─── Platform commands (Cluster A/B/C) ───
+pub mod branch_board;
 pub mod file_search;
 pub mod knowledge;
 pub mod project;

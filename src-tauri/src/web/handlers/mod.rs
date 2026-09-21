@@ -31,6 +31,7 @@ pub mod office_watch_proxy;
 pub mod pet;
 pub mod project_boot;
 // ─── Platform handlers (Cluster A/B/C) ───
+pub mod branch_board;
 pub mod knowledge;
 pub mod project;
 pub mod task;
