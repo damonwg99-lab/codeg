@@ -1,0 +1,650 @@
+"use client"
+
+import { useCallback, useEffect, useMemo, useState } from "react"
+import { useTranslations } from "next-intl"
+import { toast } from "sonner"
+import { RefreshCw, Trash2, Pencil, Archive, ArchiveRestore } from "lucide-react"
+
+import { Button } from "@/components/ui/button"
+import { Badge } from "@/components/ui/badge"
+import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
+import { ConflictDialog } from "@/components/layout/conflict-dialog"
+import { usePlatform } from "@/contexts/platform-context"
+
+import {
+  getProjectBranchMatrix,
+  listBranchStates,
+  upsertBranchState,
+  addExistingWorktree,
+  removeTempWorktree,
+} from "@/lib/platform/api"
+import {
+  gitStatus,
+  gitMerge,
+  gitDeleteBranch,
+  gitFetch,
+  gitListAllBranches,
+  openWorktreeFolder,
+} from "@/lib/api"
+import {
+  canMerge,
+  envCellState,
+  filterRows,
+  isFullyMerged,
+  resolveEffectiveEnv,
+} from "@/lib/platform/branch-board"
+import type {
+  BranchRow,
+  BranchStateInfo,
+  EnvKey,
+  ProjectRepoInfo,
+  RepoBranchMatrix,
+} from "@/lib/platform/types"
+import type { GitConflictInfo } from "@/lib/types"
+import { cn } from "@/lib/utils"
+
+interface Props {
+  projectId: number
+}
+
+interface DirtyBlock {
+  repoName: string
+  paths: string[]
+}
+
+interface ConflictState {
+  info: GitConflictInfo
+  repo: ProjectRepoInfo
+  targetPath: string
+  targetFolderId: number
+  temp: boolean
+}
+
+interface NoteEdit {
+  repoId: number
+  branch: string
+  value: string
+}
+
+const ENVS: EnvKey[] = ["dev", "uat", "prd"]
+
+export function BranchBoard({ projectId }: Props) {
+  const t = useTranslations("Platform")
+  const { activeProject, activeProjectRepos } = usePlatform()
+
+  const [matrices, setMatrices] = useState<RepoBranchMatrix[]>([])
+  const [states, setStates] = useState<Map<string, BranchStateInfo>>(new Map())
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [repoFilter, setRepoFilter] = useState<string>("all")
+  const [archived, setArchived] = useState(false)
+  const [onlyUnmerged, setOnlyUnmerged] = useState(false)
+  const [keyword, setKeyword] = useState("")
+
+  const [dirtyBlock, setDirtyBlock] = useState<DirtyBlock | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<{
+    repo: ProjectRepoInfo
+    branch: string
+  } | null>(null)
+  const [noteEdit, setNoteEdit] = useState<NoteEdit | null>(null)
+  const [conflict, setConflict] = useState<ConflictState | null>(null)
+
+  const stateKey = (repoId: number, branch: string) => `${repoId}:${branch}`
+
+  const refresh = useCallback(async () => {
+    if (!projectId) return
+    setLoading(true)
+    try {
+      const [m, s] = await Promise.all([
+        getProjectBranchMatrix(projectId),
+        listBranchStates(projectId),
+      ])
+      setMatrices(m)
+      setStates(new Map(s.map((x) => [stateKey(x.repoId, x.branch), x])))
+    } catch {
+      /* non-critical */
+    } finally {
+      setLoading(false)
+    }
+  }, [projectId])
+
+  useEffect(() => {
+    void refresh()
+  }, [refresh])
+
+  const repoById = useMemo(() => {
+    const map = new Map<number, ProjectRepoInfo>()
+    for (const r of activeProjectRepos) map.set(r.id, r)
+    return map
+  }, [activeProjectRepos])
+
+  const visibleMatrices = useMemo(
+    () =>
+      repoFilter === "all"
+        ? matrices
+        : matrices.filter((m) => String(m.repoId) === repoFilter),
+    [matrices, repoFilter]
+  )
+
+  const handleSync = async (repoId: number) => {
+    const repo = repoById.get(repoId)
+    if (!repo) return
+    setBusy(true)
+    try {
+      await gitFetch(repo.localDir)
+      await refresh()
+    } catch {
+      toast.error(t("task.mergeFailed"))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const performMerge = async (
+    repo: ProjectRepoInfo,
+    row: BranchRow,
+    env: EnvKey
+  ) => {
+    if (!activeProject) return
+    const envBranch = resolveEffectiveEnv(repo, activeProject, env)
+    if (!envBranch) {
+      toast.error(t("task.notConfigured"))
+      return
+    }
+    if (envBranch === row.branch) return
+
+    setBusy(true)
+    let tempPath: string | null = null
+    try {
+      // Hard gate: source tree must be clean.
+      const status = await gitStatus(repo.localDir)
+      const gate = canMerge(status)
+      if (!gate.ok) {
+        setDirtyBlock({ repoName: repo.name, paths: gate.dirtyPaths })
+        return
+      }
+
+      const list = await gitListAllBranches(repo.localDir)
+      let targetPath = repo.localDir
+      let targetFolderId = repo.folderId ?? 0
+      let temp = false
+
+      if (list.main_worktree_branch !== envBranch) {
+        const parent = repo.localDir.replace(/[\\/][^\\/]*$/, "")
+        tempPath = `${parent}/.codeg-wt-${repo.name}-${env}-${Date.now()}`
+        await addExistingWorktree(repo.localDir, tempPath, envBranch)
+        const folder = await openWorktreeFolder(tempPath, repo.folderId ?? 0)
+        targetPath = tempPath
+        targetFolderId = folder.id
+        temp = true
+      }
+
+      const res = await gitMerge(targetPath, row.branch)
+      if (res.conflict?.has_conflicts) {
+        setConflict({
+          info: res.conflict,
+          repo,
+          targetPath,
+          targetFolderId,
+          temp,
+        })
+        return
+      }
+      if (temp && tempPath) {
+        await removeTempWorktree(repo.localDir, tempPath).catch(() => {})
+      }
+      toast.success(
+        res.merged_commits === 0
+          ? t("task.mergeNoNewCommits")
+          : t("task.mergeSuccess")
+      )
+      await refresh()
+    } catch {
+      if (tempPath) {
+        await removeTempWorktree(repo.localDir, tempPath).catch(() => {})
+      }
+      toast.error(t("task.mergeFailed"))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const finishConflict = () => {
+    const c = conflict
+    setConflict(null)
+    if (c?.temp) {
+      void removeTempWorktree(c.repo.localDir, c.targetPath).catch(() => {})
+    }
+    void refresh()
+  }
+
+  const toggleArchive = async (row: BranchRow, repoId: number) => {
+    const cur = states.get(stateKey(repoId, row.branch))
+    try {
+      const next = await upsertBranchState(repoId, row.branch, {
+        isArchived: !(cur?.isArchived ?? false),
+      })
+      setStates((prev) => {
+        const m = new Map(prev)
+        m.set(stateKey(next.repoId, next.branch), next)
+        return m
+      })
+    } catch {
+      toast.error(t("task.mergeFailed"))
+    }
+  }
+
+  const saveNote = async () => {
+    if (!noteEdit) return
+    try {
+      const next = await upsertBranchState(noteEdit.repoId, noteEdit.branch, {
+        description: noteEdit.value || null,
+      })
+      setStates((prev) => {
+        const m = new Map(prev)
+        m.set(stateKey(next.repoId, next.branch), next)
+        return m
+      })
+      setNoteEdit(null)
+    } catch {
+      toast.error(t("task.mergeFailed"))
+    }
+  }
+
+  const confirmDelete = async () => {
+    if (!deleteTarget) return
+    const { repo, branch } = deleteTarget
+    setDeleteTarget(null)
+    try {
+      await gitDeleteBranch(repo.localDir, branch)
+      await refresh()
+    } catch {
+      toast.error(t("task.mergeFailed"))
+    }
+  }
+
+  if (loading) {
+    return (
+      <p className="p-4 text-sm text-muted-foreground">{t("task.loading")}</p>
+    )
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      {/* Toolbar */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Select value={repoFilter} onValueChange={setRepoFilter}>
+          <SelectTrigger size="sm" className="w-[160px] text-[0.8125rem]">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">{t("task.allRepos")}</SelectItem>
+            {activeProjectRepos.map((r) => (
+              <SelectItem key={r.id} value={String(r.id)}>
+                {r.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+
+        <Button
+          variant={archived ? "outline" : "secondary"}
+          size="sm"
+          onClick={() => setArchived(false)}
+        >
+          {t("task.activeBranches")}
+        </Button>
+        <Button
+          variant={archived ? "secondary" : "outline"}
+          size="sm"
+          onClick={() => setArchived(true)}
+        >
+          {t("task.archivedBranches")}
+        </Button>
+
+        <label className="flex items-center gap-1.5 text-[0.8125rem] text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={onlyUnmerged}
+            onChange={(e) => setOnlyUnmerged(e.target.checked)}
+          />
+          {t("task.onlyUnmerged")}
+        </label>
+
+        <Input
+          value={keyword}
+          onChange={(e) => setKeyword(e.target.value)}
+          placeholder={t("task.searchBranch")}
+          className="h-8 w-[180px] text-[0.8125rem]"
+        />
+
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => void refresh()}
+          disabled={busy}
+        >
+          <RefreshCw className={cn("mr-1 h-3.5 w-3.5", busy && "animate-spin")} />
+          {t("task.refresh")}
+        </Button>
+      </div>
+
+      {/* Matrices */}
+      {visibleMatrices.length === 0 ? (
+        <p className="p-4 text-sm text-muted-foreground">
+          {t("task.emptyBranches")}
+        </p>
+      ) : (
+        visibleMatrices.map((m) => {
+          const repo = repoById.get(m.repoId)
+          const rows = filterRows(
+            m.branches,
+            (b) => states.get(stateKey(m.repoId, b)),
+            { archived, onlyUnmerged, keyword }
+          )
+          return (
+            <div key={m.repoId} className="rounded-lg border">
+              <div className="flex items-center justify-between border-b px-3 py-2">
+                <span className="font-medium text-sm">{m.repoName}</span>
+                {!m.configured && (
+                  <Badge variant="outline" className="text-[0.625rem]">
+                    {t("task.notConfigured")}
+                  </Badge>
+                )}
+                {repo && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => void handleSync(m.repoId)}
+                    disabled={busy}
+                  >
+                    {t("task.syncRemote")}
+                  </Button>
+                )}
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b text-left text-[0.75rem] text-muted-foreground">
+                      <th className="px-3 py-2 font-medium">
+                        {t("task.colBranch")}
+                      </th>
+                      <th className="px-2 py-2 font-medium">
+                        {t("task.colCreated")}
+                      </th>
+                      {ENVS.map((e) => (
+                        <th key={e} className="px-2 py-2 font-medium">
+                          {t(`task.env${e[0].toUpperCase()}${e.slice(1)}` as never)}
+                        </th>
+                      ))}
+                      <th className="px-2 py-2 font-medium">
+                        {t("task.colAheadBehind")}
+                      </th>
+                      <th className="px-2 py-2 font-medium">
+                        {t("task.colLastCommit")}
+                      </th>
+                      <th className="px-2 py-2 font-medium">
+                        {t("task.colNote")}
+                      </th>
+                      <th className="px-3 py-2 font-medium">
+                        {t("task.colActions")}
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((row) => {
+                      const state = states.get(
+                        stateKey(m.repoId, row.branch)
+                      )
+                      const ab = row.envs
+                        .map((e) => `+${e.ahead}/-${e.behind}`)
+                        .join(" ")
+                      return (
+                        <tr
+                          key={row.branch}
+                          className="border-b last:border-0 hover:bg-accent/40"
+                        >
+                          <td className="px-3 py-2 font-mono text-[0.8125rem]">
+                            {m.repoId && repoFilter === "all"
+                              ? `${m.repoName}:${row.branch}`
+                              : row.branch}
+                            {isFullyMerged(row) && (
+                              <Badge
+                                variant="secondary"
+                                className="ml-2 text-[0.625rem]"
+                              >
+                                {t("task.suggestArchive")}
+                              </Badge>
+                            )}
+                          </td>
+                          <td className="px-2 py-2 text-muted-foreground">
+                            {row.createdAt
+                              ? `${row.createdAtSource === "first_commit" ? "~" : ""}${row.createdAt.slice(0, 10)}`
+                              : "—"}
+                          </td>
+                          {ENVS.map((e) => {
+                            const cell = envCellState(row, e)
+                            return (
+                              <td key={e} className="px-2 py-2">
+                                <span
+                                  className={cn(
+                                    "text-[0.75rem]",
+                                    cell.kind === "merged" &&
+                                      "text-green-600 dark:text-green-400",
+                                    cell.kind === "unmerged" &&
+                                      "text-muted-foreground",
+                                    cell.kind === "env" && "text-muted-foreground"
+                                  )}
+                                >
+                                  {cell.label}
+                                </span>
+                              </td>
+                            )
+                          })}
+                          <td className="px-2 py-2 font-mono text-[0.6875rem] text-muted-foreground">
+                            {ab}
+                          </td>
+                          <td className="px-2 py-2 text-muted-foreground">
+                            {row.lastCommitAt
+                              ? row.lastCommitAt.slice(0, 10)
+                              : "—"}
+                          </td>
+                          <td className="px-2 py-2 text-muted-foreground">
+                            {state?.description || "—"}
+                          </td>
+                          <td className="px-3 py-2">
+                            <div className="flex items-center gap-1">
+                              {!row.isEnvBranch && repo && (
+                                <Select
+                                  value=""
+                                  onValueChange={(v) =>
+                                    void performMerge(
+                                      repo,
+                                      row,
+                                      v as EnvKey
+                                    )
+                                  }
+                                >
+                                  <SelectTrigger
+                                    size="sm"
+                                    className="h-7 w-[110px] text-[0.6875rem]"
+                                  >
+                                    <SelectValue
+                                      placeholder={t("task.mergeTo")}
+                                    />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    {ENVS.map((e) => (
+                                      <SelectItem key={e} value={e}>
+                                        {t("task.mergeTo")} {e.toUpperCase()}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                              )}
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-7 w-7"
+                                title={
+                                  state?.isArchived
+                                    ? t("task.restoreBranch")
+                                    : t("task.archiveBranch")
+                                }
+                                onClick={() => void toggleArchive(row, m.repoId)}
+                              >
+                                {state?.isArchived ? (
+                                  <ArchiveRestore className="h-3.5 w-3.5" />
+                                ) : (
+                                  <Archive className="h-3.5 w-3.5" />
+                                )}
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-7 w-7"
+                                title={t("task.editNote")}
+                                onClick={() =>
+                                  setNoteEdit({
+                                    repoId: m.repoId,
+                                    branch: row.branch,
+                                    value: state?.description ?? "",
+                                  })
+                                }
+                              >
+                                <Pencil className="h-3.5 w-3.5" />
+                              </Button>
+                              {!row.isEnvBranch && repo && (
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-7 w-7 text-muted-foreground hover:text-destructive"
+                                  onClick={() =>
+                                    setDeleteTarget({
+                                      repo,
+                                      branch: row.branch,
+                                    })
+                                  }
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </Button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )
+        })
+      )}
+
+      {/* Dirty gate */}
+      <AlertDialog
+        open={dirtyBlock !== null}
+        onOpenChange={(o) => !o && setDirtyBlock(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("task.dirtyBlockTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("task.dirtyBlockBody")}
+              <br />
+              <span className="font-mono text-xs">
+                {dirtyBlock?.paths.join(", ")}
+              </span>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("task.cancel")}</AlertDialogCancel>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Delete confirm */}
+      <AlertDialog
+        open={deleteTarget !== null}
+        onOpenChange={(o) => !o && setDeleteTarget(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("task.deleteBranch")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("task.deleteBranchConfirm", { branch: deleteTarget?.branch ?? "" })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("task.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => void confirmDelete()}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {t("task.delete")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Note edit */}
+      <Dialog open={noteEdit !== null} onOpenChange={(o) => !o && setNoteEdit(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("task.editNote")}</DialogTitle>
+          </DialogHeader>
+          <Textarea
+            value={noteEdit?.value ?? ""}
+            onChange={(e) =>
+              setNoteEdit((prev) =>
+                prev ? { ...prev, value: e.target.value } : prev
+              )
+            }
+            rows={4}
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setNoteEdit(null)}>
+              {t("task.cancel")}
+            </Button>
+            <Button onClick={() => void saveNote()}>{t("task.saveNote")}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Conflict resolution (reuses the shared merge tool) */}
+      <ConflictDialog
+        conflictInfo={conflict?.info ?? null}
+        folderId={conflict?.targetFolderId ?? 0}
+        folderPath={conflict?.targetPath ?? ""}
+        onClose={finishConflict}
+        onResolved={finishConflict}
+      />
+    </div>
+  )
+}

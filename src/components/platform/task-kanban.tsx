@@ -46,6 +46,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { cn } from "@/lib/utils"
+import { BranchBoard } from "@/components/platform/branch-board"
 import { ArchiveView } from "@/components/platform/archive-view"
 
 // 鈹€鈹€ Relative date helper 鈹€鈹€
@@ -411,6 +412,9 @@ export function TaskKanban({ projectId }: { projectId: number }) {
       <div className="flex items-center justify-between px-4 py-3 shrink-0 border-b gap-3">
         <TabsList className="shrink-0">
           <TabsTrigger value="kanban">{t("task.kanban")}</TabsTrigger>
+          <TabsTrigger value="changes">
+            {t("task.changesAndRelease")}
+          </TabsTrigger>
           <TabsTrigger value="archive">{t("task.archivedTasks")}</TabsTrigger>
         </TabsList>
         <div className="flex items-center gap-2">
@@ -619,6 +623,12 @@ export function TaskKanban({ projectId }: { projectId: number }) {
             )}
           </div>
         </DndContext>
+      </TabsContent>
+      <TabsContent
+        value="changes"
+        className="flex flex-col flex-1 min-h-0 overflow-auto p-4"
+      >
+        <BranchBoard projectId={projectId} />
       </TabsContent>
       <TabsContent
         value="archive"
