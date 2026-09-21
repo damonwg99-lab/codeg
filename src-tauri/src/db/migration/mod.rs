@@ -54,6 +54,7 @@ mod m20260905_000001_knowledge_doc_fts;
 mod m20260907_000001_canvas_node_path;
 mod m20260920_platform_000007_drop_branch_and_release;
 mod m20260920_platform_000008_add_env_branch_config;
+mod m20260920_platform_000010_create_branch_state;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -114,6 +115,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260718_platform_000006_create_branch_and_release::Migration),
             Box::new(m20260920_platform_000007_drop_branch_and_release::Migration),
             Box::new(m20260920_platform_000008_add_env_branch_config::Migration),
+            Box::new(m20260920_platform_000010_create_branch_state::Migration),
         ]
     }
 }

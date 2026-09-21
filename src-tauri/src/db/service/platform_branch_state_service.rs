@@ -1,0 +1,87 @@
+use chrono::Utc;
+use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
+
+use crate::db::entities::{platform_branch_state, platform_project_repo};
+use crate::db::error::DbError;
+use crate::models::BranchStateInfo;
+
+fn to_info(m: platform_branch_state::Model) -> BranchStateInfo {
+    BranchStateInfo {
+        id: m.id,
+        repo_id: m.repo_id,
+        branch: m.branch,
+        is_archived: m.is_archived,
+        archived_at: m.archived_at,
+        description: m.description,
+        created_at: m.created_at,
+        updated_at: m.updated_at,
+    }
+}
+
+pub async fn list_by_project<C: ConnectionTrait>(
+    conn: &C,
+    project_id: i32,
+) -> Result<Vec<BranchStateInfo>, DbError> {
+    let repo_ids: Vec<i32> = platform_project_repo::Entity::find()
+        .filter(platform_project_repo::Column::ProjectId.eq(project_id))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    if repo_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = platform_branch_state::Entity::find()
+        .filter(platform_branch_state::Column::RepoId.is_in(repo_ids))
+        .all(conn)
+        .await?;
+    Ok(rows.into_iter().map(to_info).collect())
+}
+
+/// Insert or update the human state of a branch. `is_archived`/`description`
+/// are optional so callers can update just one aspect. A repo/branch pair with
+/// no row = active with no note.
+pub async fn upsert<C: ConnectionTrait>(
+    conn: &C,
+    repo_id: i32,
+    branch: &str,
+    is_archived: Option<bool>,
+    description: Option<Option<String>>,
+) -> Result<BranchStateInfo, DbError> {
+    let existing = platform_branch_state::Entity::find()
+        .filter(platform_branch_state::Column::RepoId.eq(repo_id))
+        .filter(platform_branch_state::Column::Branch.eq(branch))
+        .one(conn)
+        .await?;
+    let now = Utc::now();
+
+    match existing {
+        Some(m) => {
+            let mut a: platform_branch_state::ActiveModel = m.into();
+            if let Some(v) = is_archived {
+                a.is_archived = Set(v);
+                a.archived_at = Set(if v { Some(now) } else { None });
+            }
+            if let Some(v) = description {
+                a.description = Set(v);
+            }
+            a.updated_at = Set(now);
+            Ok(to_info(a.update(conn).await?))
+        }
+        None => {
+            let archived = is_archived.unwrap_or(false);
+            let a = platform_branch_state::ActiveModel {
+                repo_id: Set(repo_id),
+                branch: Set(branch.to_string()),
+                is_archived: Set(archived),
+                archived_at: Set(if archived { Some(now) } else { None }),
+                description: Set(description.flatten()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            };
+            Ok(to_info(a.insert(conn).await?))
+        }
+    }
+}

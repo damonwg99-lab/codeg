@@ -66,6 +66,7 @@ pub use system::{
 // ─── Platform models (Cluster A/B/C) ───
 pub mod platform_project;
 pub mod platform_task;
+pub mod platform_branch_state;
 pub mod platform_config;
 pub mod platform_knowledge_doc;
 pub use platform_project::{
@@ -81,3 +82,4 @@ pub use platform_knowledge_doc::{
 };
 pub mod platform_knowledge;
 pub use platform_knowledge::{KbInitResult, ScanResultInfo, ScannedDoc, SkillInfo};
+pub use platform_branch_state::BranchStateInfo;
