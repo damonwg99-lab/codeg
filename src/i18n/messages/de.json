@@ -5839,7 +5839,12 @@
         "active": "Aktiv",
         "completed": "Abgeschlossen",
         "archived": "Archiviert"
-      }
+      },
+      "envBranches": "Environment branches (default)",
+      "envDevPlaceholder": "DEV branch",
+      "envUatPlaceholder": "UAT branch",
+      "envPrdPlaceholder": "PRD branch",
+      "useDefault": "default"
     },
     "task": {
       "kanban": "Kanban",

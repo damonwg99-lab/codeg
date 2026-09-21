@@ -5839,7 +5839,12 @@
         "active": "進行中",
         "completed": "完了",
         "archived": "アーカイブ"
-      }
+      },
+      "envBranches": "Environment branches (default)",
+      "envDevPlaceholder": "DEV branch",
+      "envUatPlaceholder": "UAT branch",
+      "envPrdPlaceholder": "PRD branch",
+      "useDefault": "default"
     },
     "task": {
       "kanban": "カンバン",

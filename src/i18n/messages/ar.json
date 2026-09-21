@@ -5839,7 +5839,12 @@
         "active": "نشط",
         "completed": "مكتمل",
         "archived": "مؤرشف"
-      }
+      },
+      "envBranches": "Environment branches (default)",
+      "envDevPlaceholder": "DEV branch",
+      "envUatPlaceholder": "UAT branch",
+      "envPrdPlaceholder": "PRD branch",
+      "useDefault": "default"
     },
     "task": {
       "kanban": "كانبان",

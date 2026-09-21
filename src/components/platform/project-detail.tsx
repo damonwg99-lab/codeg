@@ -17,6 +17,7 @@ import {
   scanGitRepos,
   addProjectRepo,
   removeProjectRepo,
+  updateProjectRepo,
 } from "@/lib/platform/api"
 import type { ProjectDetail, GitRepoScanResult } from "@/lib/platform/types"
 import { KnowledgeManager } from "./knowledge-manager"
@@ -80,6 +81,9 @@ export function ProjectDetail({ id }: { id: number }) {
   const [editClientName, setEditClientName] = useState("")
   const [editDefaultAgentType, setEditDefaultAgentType] = useState("")
   const [editStatus, setEditStatus] = useState("")
+  const [editDevBranch, setEditDevBranch] = useState("")
+  const [editUatBranch, setEditUatBranch] = useState("")
+  const [editPrdBranch, setEditPrdBranch] = useState("")
 
   // Project status values (matches backend default + common statuses)
   const PROJECT_STATUSES = ["planning", "active", "completed", "archived"]
@@ -105,6 +109,9 @@ export function ProjectDetail({ id }: { id: number }) {
           setEditClientName(d.project.clientName ?? "")
           setEditDefaultAgentType(d.project.defaultAgentType ?? "")
           setEditStatus(d.project.status)
+          setEditDevBranch(d.project.devBranch ?? "")
+          setEditUatBranch(d.project.uatBranch ?? "")
+          setEditPrdBranch(d.project.prdBranch ?? "")
           setLoading(false)
         }
       } catch {
@@ -128,6 +135,9 @@ export function ProjectDetail({ id }: { id: number }) {
         clientName: editClientName || undefined,
         status: editStatus,
         defaultAgentType: editDefaultAgentType || undefined,
+        devBranch: editDevBranch,
+        uatBranch: editUatBranch,
+        prdBranch: editPrdBranch,
       })
       setDetail((prev) => (prev ? { ...prev, project: updated } : null))
       // Refresh PlatformContext's projects list so ProjectList picks up
@@ -148,6 +158,22 @@ export function ProjectDetail({ id }: { id: number }) {
     editDefaultAgentType,
     loadProjects,
   ])
+
+  const saveRepoEnv = useCallback(
+    async (
+      repoId: number,
+      patch: { devBranch?: string; uatBranch?: string; prdBranch?: string }
+    ) => {
+      try {
+        await updateProjectRepo({ id: repoId, ...patch })
+        const d = await getProject(id)
+        setDetail(d)
+      } catch (e) {
+        console.error("Failed to save repo env branches:", e)
+      }
+    },
+    [id]
+  )
 
   const handleScan = useCallback(async () => {
     if (!detail) return
@@ -436,6 +462,26 @@ export function ProjectDetail({ id }: { id: number }) {
                           </SelectContent>
                         </Select>
                       </div>
+                      <div className="flex flex-col gap-1.5">
+                        <Label>{t("project.envBranches")}</Label>
+                        <div className="flex gap-2">
+                          <Input
+                            placeholder={t("project.envDevPlaceholder")}
+                            value={editDevBranch}
+                            onChange={(e) => setEditDevBranch(e.target.value)}
+                          />
+                          <Input
+                            placeholder={t("project.envUatPlaceholder")}
+                            value={editUatBranch}
+                            onChange={(e) => setEditUatBranch(e.target.value)}
+                          />
+                          <Input
+                            placeholder={t("project.envPrdPlaceholder")}
+                            value={editPrdBranch}
+                            onChange={(e) => setEditPrdBranch(e.target.value)}
+                          />
+                        </div>
+                      </div>
                     </>
                   ) : (
                     <>
@@ -547,40 +593,80 @@ export function ProjectDetail({ id }: { id: number }) {
                       {repos.map((repo) => (
                         <div
                           key={repo.id}
-                          className="flex items-center gap-2 rounded-md border p-2"
+                          className="flex flex-col gap-1.5 rounded-md border p-2"
                         >
-                          <div className="flex flex-col gap-0.5 min-w-0">
-                            <span className="text-[0.875rem] font-medium truncate">
-                              {repo.name}
-                            </span>
-                            <span className="text-[0.75rem] text-muted-foreground truncate">
-                              {repo.localDir}
-                            </span>
+                          <div className="flex items-center gap-2">
+                            <div className="flex flex-col gap-0.5 min-w-0">
+                              <span className="text-[0.875rem] font-medium truncate">
+                                {repo.name}
+                              </span>
+                              <span className="text-[0.75rem] text-muted-foreground truncate">
+                                {repo.localDir}
+                              </span>
+                            </div>
+                            {repo.branch && (
+                              <Badge
+                                variant="outline"
+                                className="text-[0.625rem] shrink-0"
+                              >
+                                {repo.branch}
+                              </Badge>
+                            )}
+                            {repo.hasClaudeMd && (
+                              <Badge
+                                variant="outline"
+                                className="text-[0.625rem] shrink-0 bg-green-50 text-green-700"
+                              >
+                                CLAUDE.md
+                              </Badge>
+                            )}
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive ml-auto"
+                              onClick={() => handleRemoveRepo(repo.id)}
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </Button>
                           </div>
-                          {repo.branch && (
-                            <Badge
-                              variant="outline"
-                              className="text-[0.625rem] shrink-0"
-                            >
-                              {repo.branch}
-                            </Badge>
-                          )}
-                          {repo.hasClaudeMd && (
-                            <Badge
-                              variant="outline"
-                              className="text-[0.625rem] shrink-0 bg-green-50 text-green-700"
-                            >
-                              CLAUDE.md
-                            </Badge>
-                          )}
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive"
-                            onClick={() => handleRemoveRepo(repo.id)}
-                          >
-                            <X className="h-3.5 w-3.5" />
-                          </Button>
+                          <div className="flex gap-2">
+                            <Input
+                              defaultValue={repo.devBranch ?? ""}
+                              placeholder={`${t("project.envDevPlaceholder")}（${t("project.useDefault")}）`}
+                              className="h-7 text-[0.75rem]"
+                              onBlur={(e) => {
+                                if ((repo.devBranch ?? "") !== e.target.value) {
+                                  void saveRepoEnv(repo.id, {
+                                    devBranch: e.target.value,
+                                  })
+                                }
+                              }}
+                            />
+                            <Input
+                              defaultValue={repo.uatBranch ?? ""}
+                              placeholder={`${t("project.envUatPlaceholder")}（${t("project.useDefault")}）`}
+                              className="h-7 text-[0.75rem]"
+                              onBlur={(e) => {
+                                if ((repo.uatBranch ?? "") !== e.target.value) {
+                                  void saveRepoEnv(repo.id, {
+                                    uatBranch: e.target.value,
+                                  })
+                                }
+                              }}
+                            />
+                            <Input
+                              defaultValue={repo.prdBranch ?? ""}
+                              placeholder={`${t("project.envPrdPlaceholder")}（${t("project.useDefault")}）`}
+                              className="h-7 text-[0.75rem]"
+                              onBlur={(e) => {
+                                if ((repo.prdBranch ?? "") !== e.target.value) {
+                                  void saveRepoEnv(repo.id, {
+                                    prdBranch: e.target.value,
+                                  })
+                                }
+                              }}
+                            />
+                          </div>
                         </div>
                       ))}
                     </div>
