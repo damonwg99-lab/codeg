@@ -5985,7 +5985,9 @@
       "suggestArchive": "Ready to archive",
       "createdApprox": "approximate",
       "refresh": "Refresh",
-      "deleteBranch": "Delete Branch"
+      "deleteBranch": "Delete Branch",
+      "prevPage": "Prev",
+      "nextPage": "Next"
     },
     "repoSelector": {
       "root": "Racine du projet",

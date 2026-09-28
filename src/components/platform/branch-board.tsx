@@ -92,6 +92,7 @@ interface NoteEdit {
 }
 
 const ENVS: EnvKey[] = ["dev", "uat", "prd"]
+const PAGE_SIZE = 50
 
 export function BranchBoard({ projectId }: Props) {
   const t = useTranslations("Platform")
@@ -100,11 +101,13 @@ export function BranchBoard({ projectId }: Props) {
   const [matrices, setMatrices] = useState<RepoBranchMatrix[]>([])
   const [states, setStates] = useState<Map<string, BranchStateInfo>>(new Map())
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [repoFilter, setRepoFilter] = useState<string>("all")
   const [archived, setArchived] = useState(false)
   const [onlyUnmerged, setOnlyUnmerged] = useState(false)
   const [keyword, setKeyword] = useState("")
+  const [page, setPage] = useState(1)
 
   const [dirtyBlock, setDirtyBlock] = useState<DirtyBlock | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<{
@@ -119,15 +122,23 @@ export function BranchBoard({ projectId }: Props) {
   const refresh = useCallback(async () => {
     if (!projectId) return
     setLoading(true)
+    setError(null)
     try {
       const [m, s] = await Promise.all([
         getProjectBranchMatrix(projectId),
         listBranchStates(projectId),
       ])
-      setMatrices(m)
-      setStates(new Map(s.map((x) => [stateKey(x.repoId, x.branch), x])))
-    } catch {
-      /* non-critical */
+      setMatrices(m ?? [])
+      setStates(new Map((s ?? []).map((x) => [stateKey(x.repoId, x.branch), x])))
+    } catch (e) {
+      const obj = (e ?? {}) as Record<string, unknown>
+      const parts = [
+        typeof e === "string" ? e : obj.message,
+        obj.detail,
+        obj.code,
+      ].filter(Boolean)
+      setError(parts.length ? parts.join(" | ") : JSON.stringify(e))
+      console.error("branch matrix failed:", e)
     } finally {
       setLoading(false)
     }
@@ -151,15 +162,39 @@ export function BranchBoard({ projectId }: Props) {
     [matrices, repoFilter]
   )
 
-  const handleSync = async (repoId: number) => {
-    const repo = repoById.get(repoId)
-    if (!repo) return
+  const flatRows = useMemo(() => {
+    const out: { repoId: number; repoName: string; row: BranchRow }[] = []
+    for (const m of visibleMatrices) {
+      const rows = filterRows(
+        m.branches,
+        (b) => states.get(stateKey(m.repoId, b)),
+        { archived, onlyUnmerged, keyword }
+      )
+      for (const row of rows) {
+        out.push({ repoId: m.repoId, repoName: m.repoName, row })
+      }
+    }
+    return out
+  }, [visibleMatrices, states, archived, onlyUnmerged, keyword])
+
+  const totalPages = Math.max(1, Math.ceil(flatRows.length / PAGE_SIZE))
+  const pageRows = useMemo(
+    () => flatRows.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
+    [flatRows, page]
+  )
+
+  useEffect(() => {
+    setPage(1)
+  }, [repoFilter, archived, onlyUnmerged, keyword])
+
+  const handleSync = async () => {
     setBusy(true)
     try {
-      await gitFetch(repo.localDir)
+      for (const m of visibleMatrices) {
+        const repo = repoById.get(m.repoId)
+        if (repo) await gitFetch(repo.localDir).catch(() => {})
+      }
       await refresh()
-    } catch {
-      toast.error(t("task.mergeFailed"))
     } finally {
       setBusy(false)
     }
@@ -295,9 +330,9 @@ export function BranchBoard({ projectId }: Props) {
   }
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex flex-col gap-3 h-full min-h-0">
       {/* Toolbar */}
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2 shrink-0">
         <Select value={repoFilter} onValueChange={setRepoFilter}>
           <SelectTrigger size="sm" className="w-[160px] text-[0.8125rem]">
             <SelectValue />
@@ -344,6 +379,14 @@ export function BranchBoard({ projectId }: Props) {
         />
 
         <Button
+          variant="outline"
+          size="sm"
+          onClick={() => void handleSync()}
+          disabled={busy}
+        >
+          {t("task.syncRemote")}
+        </Button>
+        <Button
           variant="ghost"
           size="sm"
           onClick={() => void refresh()}
@@ -354,217 +397,200 @@ export function BranchBoard({ projectId }: Props) {
         </Button>
       </div>
 
-      {/* Matrices */}
-      {visibleMatrices.length === 0 ? (
+      {/* Flat branch list */}
+      {flatRows.length === 0 ? (
         <p className="p-4 text-sm text-muted-foreground">
-          {t("task.emptyBranches")}
+          {error ? `加载分支失败：${error}` : t("task.emptyBranches")}
         </p>
       ) : (
-        visibleMatrices.map((m) => {
-          const repo = repoById.get(m.repoId)
-          const rows = filterRows(
-            m.branches,
-            (b) => states.get(stateKey(m.repoId, b)),
-            { archived, onlyUnmerged, keyword }
-          )
-          return (
-            <div key={m.repoId} className="rounded-lg border">
-              <div className="flex items-center justify-between border-b px-3 py-2">
-                <span className="font-medium text-sm">{m.repoName}</span>
-                {!m.configured && (
-                  <Badge variant="outline" className="text-[0.625rem]">
-                    {t("task.notConfigured")}
-                  </Badge>
-                )}
-                {repo && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => void handleSync(m.repoId)}
-                    disabled={busy}
+        <div className="flex-1 min-h-0 overflow-auto rounded-lg border">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b text-left text-[0.75rem] text-muted-foreground">
+                <th className="sticky top-0 z-10 bg-background px-3 py-2 font-medium">
+                  {t("task.colBranch")}
+                </th>
+                <th className="sticky top-0 z-10 bg-background px-2 py-2 font-medium">
+                  {t("task.colCreated")}
+                </th>
+                {ENVS.map((e) => (
+                  <th
+                    key={e}
+                    className="sticky top-0 z-10 bg-background px-2 py-2 font-medium"
                   >
-                    {t("task.syncRemote")}
-                  </Button>
-                )}
-              </div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b text-left text-[0.75rem] text-muted-foreground">
-                      <th className="px-3 py-2 font-medium">
-                        {t("task.colBranch")}
-                      </th>
-                      <th className="px-2 py-2 font-medium">
-                        {t("task.colCreated")}
-                      </th>
-                      {ENVS.map((e) => (
-                        <th key={e} className="px-2 py-2 font-medium">
-                          {t(`task.env${e[0].toUpperCase()}${e.slice(1)}` as never)}
-                        </th>
-                      ))}
-                      <th className="px-2 py-2 font-medium">
-                        {t("task.colAheadBehind")}
-                      </th>
-                      <th className="px-2 py-2 font-medium">
-                        {t("task.colLastCommit")}
-                      </th>
-                      <th className="px-2 py-2 font-medium">
-                        {t("task.colNote")}
-                      </th>
-                      <th className="px-3 py-2 font-medium">
-                        {t("task.colActions")}
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {rows.map((row) => {
-                      const state = states.get(
-                        stateKey(m.repoId, row.branch)
-                      )
-                      const ab = row.envs
-                        .map((e) => `+${e.ahead}/-${e.behind}`)
-                        .join(" ")
-                      return (
-                        <tr
-                          key={row.branch}
-                          className="border-b last:border-0 hover:bg-accent/40"
+                    {t(`task.env${e[0].toUpperCase()}${e.slice(1)}` as never)}
+                  </th>
+                ))}
+                <th className="sticky top-0 z-10 bg-background px-2 py-2 font-medium">
+                  {t("task.colAheadBehind")}
+                </th>
+                <th className="sticky top-0 z-10 bg-background px-2 py-2 font-medium">
+                  {t("task.colLastCommit")}
+                </th>
+                <th className="sticky top-0 z-10 bg-background px-2 py-2 font-medium">
+                  {t("task.colNote")}
+                </th>
+                <th className="sticky top-0 z-10 bg-background px-3 py-2 font-medium">
+                  {t("task.colActions")}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {pageRows.map(({ repoId, repoName, row }) => {
+                const repo = repoById.get(repoId)
+                const state = states.get(stateKey(repoId, row.branch))
+                const ab = row.envs
+                  .map((e) => `+${e.ahead}/-${e.behind}`)
+                  .join(" ")
+                return (
+                  <tr
+                    key={`${repoId}:${row.branch}`}
+                    className="border-b last:border-0 hover:bg-accent/40"
+                  >
+                    <td className="px-3 py-2 font-mono text-[0.8125rem]">
+                      {repoName}:{row.branch}
+                      {isFullyMerged(row) && (
+                        <Badge
+                          variant="secondary"
+                          className="ml-2 text-[0.625rem]"
                         >
-                          <td className="px-3 py-2 font-mono text-[0.8125rem]">
-                            {m.repoId && repoFilter === "all"
-                              ? `${m.repoName}:${row.branch}`
-                              : row.branch}
-                            {isFullyMerged(row) && (
-                              <Badge
-                                variant="secondary"
-                                className="ml-2 text-[0.625rem]"
-                              >
-                                {t("task.suggestArchive")}
-                              </Badge>
+                          {t("task.suggestArchive")}
+                        </Badge>
+                      )}
+                    </td>
+                    <td className="px-2 py-2 text-muted-foreground">
+                      {row.createdAt
+                        ? `${row.createdAtSource === "first_commit" ? "~" : ""}${row.createdAt.slice(0, 10)}`
+                        : "—"}
+                    </td>
+                    {ENVS.map((e) => {
+                      const cell = envCellState(row, e)
+                      return (
+                        <td key={e} className="px-2 py-2">
+                          <span
+                            className={cn(
+                              "text-[0.75rem]",
+                              cell.kind === "merged" &&
+                                "text-green-600 dark:text-green-400",
+                              cell.kind === "unmerged" &&
+                                "text-muted-foreground",
+                              cell.kind === "env" && "text-muted-foreground"
                             )}
-                          </td>
-                          <td className="px-2 py-2 text-muted-foreground">
-                            {row.createdAt
-                              ? `${row.createdAtSource === "first_commit" ? "~" : ""}${row.createdAt.slice(0, 10)}`
-                              : "—"}
-                          </td>
-                          {ENVS.map((e) => {
-                            const cell = envCellState(row, e)
-                            return (
-                              <td key={e} className="px-2 py-2">
-                                <span
-                                  className={cn(
-                                    "text-[0.75rem]",
-                                    cell.kind === "merged" &&
-                                      "text-green-600 dark:text-green-400",
-                                    cell.kind === "unmerged" &&
-                                      "text-muted-foreground",
-                                    cell.kind === "env" && "text-muted-foreground"
-                                  )}
-                                >
-                                  {cell.label}
-                                </span>
-                              </td>
-                            )
-                          })}
-                          <td className="px-2 py-2 font-mono text-[0.6875rem] text-muted-foreground">
-                            {ab}
-                          </td>
-                          <td className="px-2 py-2 text-muted-foreground">
-                            {row.lastCommitAt
-                              ? row.lastCommitAt.slice(0, 10)
-                              : "—"}
-                          </td>
-                          <td className="px-2 py-2 text-muted-foreground">
-                            {state?.description || "—"}
-                          </td>
-                          <td className="px-3 py-2">
-                            <div className="flex items-center gap-1">
-                              {!row.isEnvBranch && repo && (
-                                <Select
-                                  value=""
-                                  onValueChange={(v) =>
-                                    void performMerge(
-                                      repo,
-                                      row,
-                                      v as EnvKey
-                                    )
-                                  }
-                                >
-                                  <SelectTrigger
-                                    size="sm"
-                                    className="h-7 w-[110px] text-[0.6875rem]"
-                                  >
-                                    <SelectValue
-                                      placeholder={t("task.mergeTo")}
-                                    />
-                                  </SelectTrigger>
-                                  <SelectContent>
-                                    {ENVS.map((e) => (
-                                      <SelectItem key={e} value={e}>
-                                        {t("task.mergeTo")} {e.toUpperCase()}
-                                      </SelectItem>
-                                    ))}
-                                  </SelectContent>
-                                </Select>
-                              )}
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-7 w-7"
-                                title={
-                                  state?.isArchived
-                                    ? t("task.restoreBranch")
-                                    : t("task.archiveBranch")
-                                }
-                                onClick={() => void toggleArchive(row, m.repoId)}
-                              >
-                                {state?.isArchived ? (
-                                  <ArchiveRestore className="h-3.5 w-3.5" />
-                                ) : (
-                                  <Archive className="h-3.5 w-3.5" />
-                                )}
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-7 w-7"
-                                title={t("task.editNote")}
-                                onClick={() =>
-                                  setNoteEdit({
-                                    repoId: m.repoId,
-                                    branch: row.branch,
-                                    value: state?.description ?? "",
-                                  })
-                                }
-                              >
-                                <Pencil className="h-3.5 w-3.5" />
-                              </Button>
-                              {!row.isEnvBranch && repo && (
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  className="h-7 w-7 text-muted-foreground hover:text-destructive"
-                                  onClick={() =>
-                                    setDeleteTarget({
-                                      repo,
-                                      branch: row.branch,
-                                    })
-                                  }
-                                >
-                                  <Trash2 className="h-3.5 w-3.5" />
-                                </Button>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
+                          >
+                            {cell.label}
+                          </span>
+                        </td>
                       )
                     })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )
-        })
+                    <td className="px-2 py-2 font-mono text-[0.6875rem] text-muted-foreground">
+                      {ab}
+                    </td>
+                    <td className="px-2 py-2 text-muted-foreground">
+                      {row.lastCommitAt ? row.lastCommitAt.slice(0, 10) : "—"}
+                    </td>
+                    <td className="px-2 py-2 text-muted-foreground">
+                      {state?.description || "—"}
+                    </td>
+                    <td className="px-3 py-2">
+                      <div className="flex items-center gap-1">
+                        {!row.isEnvBranch && repo && (
+                          <Select
+                            value=""
+                            onValueChange={(v) =>
+                              void performMerge(repo, row, v as EnvKey)
+                            }
+                          >
+                            <SelectTrigger
+                              size="sm"
+                              className="h-7 w-[110px] text-[0.6875rem]"
+                            >
+                              <SelectValue placeholder={t("task.mergeTo")} />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {ENVS.map((e) => (
+                                <SelectItem key={e} value={e}>
+                                  {t("task.mergeTo")} {e.toUpperCase()}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7"
+                          title={
+                            state?.isArchived
+                              ? t("task.restoreBranch")
+                              : t("task.archiveBranch")
+                          }
+                          onClick={() => void toggleArchive(row, repoId)}
+                        >
+                          {state?.isArchived ? (
+                            <ArchiveRestore className="h-3.5 w-3.5" />
+                          ) : (
+                            <Archive className="h-3.5 w-3.5" />
+                          )}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7"
+                          title={t("task.editNote")}
+                          onClick={() =>
+                            setNoteEdit({
+                              repoId,
+                              branch: row.branch,
+                              value: state?.description ?? "",
+                            })
+                          }
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                        {!row.isEnvBranch && repo && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-7 w-7 text-muted-foreground hover:text-destructive"
+                            onClick={() =>
+                              setDeleteTarget({ repo, branch: row.branch })
+                            }
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {flatRows.length > PAGE_SIZE && (
+        <div className="flex items-center justify-end gap-2 text-[0.8125rem] shrink-0">
+          <span className="text-muted-foreground">
+            {page} / {totalPages} · {flatRows.length}
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={page <= 1}
+            onClick={() => setPage((p) => Math.max(1, p - 1))}
+          >
+            {t("task.prevPage")}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={page >= totalPages}
+            onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+          >
+            {t("task.nextPage")}
+          </Button>
+        </div>
       )}
 
       {/* Dirty gate */}

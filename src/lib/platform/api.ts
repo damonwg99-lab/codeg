@@ -163,7 +163,7 @@ export async function getProjectBranchMatrix(
   projectId: number
 ): Promise<RepoBranchMatrix[]> {
   return getTransport().call<RepoBranchMatrix[]>("git_project_branch_matrix", {
-    project_id: projectId,
+    projectId,
   })
 }
 
@@ -193,7 +193,7 @@ export async function listBranchStates(
   projectId: number
 ): Promise<BranchStateInfo[]> {
   return getTransport().call<BranchStateInfo[]>("list_branch_states", {
-    project_id: projectId,
+    projectId,
   })
 }
 

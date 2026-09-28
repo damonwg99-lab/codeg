@@ -626,7 +626,7 @@ export function TaskKanban({ projectId }: { projectId: number }) {
       </TabsContent>
       <TabsContent
         value="changes"
-        className="flex flex-col flex-1 min-h-0 overflow-auto p-4"
+        className="flex flex-col flex-1 min-h-0 overflow-hidden p-4"
       >
         <BranchBoard projectId={projectId} />
       </TabsContent>
