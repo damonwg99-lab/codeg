@@ -55,6 +55,7 @@ impl MigrationTrait for Migration {
 
 #[derive(DeriveIden)]
 enum BranchState {
+    #[sea_orm(iden = "platform_branch_state")]
     Table,
     Id,
     RepoId,

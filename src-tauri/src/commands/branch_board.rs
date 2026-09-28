@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::app_error::AppCommandError;
@@ -11,18 +12,19 @@ use crate::models::{BranchRow, BranchStateInfo, EnvMergeStatus, RepoBranchMatrix
 // Pure helpers (unit-tested)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Parse `git rev-list --left-right --count A...B` output ("<left>\t<right>").
-/// `left` = commits reachable from A only (behind), `right` = from B only (ahead).
-pub(crate) fn parse_left_right(stdout: &str) -> Option<(i64, i64)> {
-    let mut it = stdout.split_whitespace();
-    let left = it.next()?.parse().ok()?;
-    let right = it.next()?.parse().ok()?;
-    Some((left, right))
+/// Parse a single `%(refname:short)%09%(ahead-behind:<env>)` line into
+/// `(branch, ahead, behind)`. The value is "ahead behind".
+pub(crate) fn parse_ahead_behind_line(line: &str) -> Option<(String, i64, i64)> {
+    let (name, counts) = line.split_once('\t')?;
+    let mut it = counts.split_whitespace();
+    let ahead: i64 = it.next()?.parse().ok()?;
+    let behind: i64 = it.next()?.parse().ok()?;
+    Some((name.trim().to_string(), ahead, behind))
 }
 
 /// B is merged into env E iff B has no commit E lacks (ahead == 0).
-pub(crate) fn is_merged(behind_ahead: (i64, i64)) -> bool {
-    behind_ahead.1 == 0
+pub(crate) fn is_merged(ahead: i64) -> bool {
+    ahead == 0
 }
 
 /// Effective env branch: repo override wins, else project default.
@@ -34,21 +36,15 @@ pub(crate) fn effective_env(repo: Option<&str>, project: Option<&str>) -> Option
     }
 }
 
-/// Extract the ISO timestamp from a `git reflog --date=iso` line whose action is
-/// "branch: Created from ...". Returns `None` for other reflog lines.
-pub(crate) fn extract_reflog_creation_date(line: &str) -> Option<String> {
-    if !line.contains("branch: Created from") {
-        return None;
-    }
-    let start = line.find("HEAD@{")? + "HEAD@{".len();
-    let rest = &line[start..];
-    let end = rest.find('}')?;
-    let date = rest[..end].trim();
-    if date.is_empty() {
-        None
-    } else {
-        Some(date.to_string())
-    }
+/// Extract the epoch seconds from a reflog line. Reflog file line format is
+/// `<old> <new> <name> <email> <ts> <tz>\t<message>`; the timestamp is the
+/// second-to-last whitespace token before the tab.
+pub(crate) fn parse_reflog_epoch(line: &str) -> Option<i64> {
+    let before_tab = line.split('\t').next()?;
+    let mut tokens = before_tab.split_whitespace();
+    let _tz = tokens.next_back()?; // timezone
+    let ts = tokens.next_back()?; // epoch seconds
+    ts.parse().ok()
 }
 
 /// Resolve a repo's `local_dir` to an absolute path (relative ones hang off the
@@ -119,13 +115,21 @@ async fn list_local_branches(path: &str) -> Result<Vec<LocalBranch>, AppCommandE
     Ok(rows)
 }
 
-/// (behind, ahead) of `branch` relative to `env`.
-async fn ahead_behind(path: &str, env: &str, branch: &str) -> Result<(i64, i64), AppCommandError> {
-    let range = format!("{env}...{branch}");
-    let out = git_stdout(path, &["rev-list", "--left-right", "--count", &range]).await?;
-    parse_left_right(&out).ok_or_else(|| {
-        AppCommandError::external_command("cannot parse rev-list output", out.clone())
-    })
+/// Ahead/behind for every local branch relative to `env`, in ONE git call
+/// (git >= 2.41 `%(ahead-behind:)`). Returns `branch -> (ahead, behind)`.
+async fn env_ahead_behind_map(
+    path: &str,
+    env: &str,
+) -> Result<HashMap<String, (i64, i64)>, AppCommandError> {
+    let format = format!("--format=%(refname:short)%09%(ahead-behind:{env})");
+    let out = git_stdout(path, &["for-each-ref", &format, "refs/heads"]).await?;
+    let mut map = HashMap::new();
+    for line in out.lines() {
+        if let Some((name, ahead, behind)) = parse_ahead_behind_line(line) {
+            map.insert(name, (ahead, behind));
+        }
+    }
+    Ok(map)
 }
 
 /// Merge method + date for a merged branch. `merge_via` = "fast_forward" when
@@ -153,39 +157,33 @@ async fn merge_info(
     }
 }
 
-/// Branch creation date: reflog "Created from" when available, else the earliest
-/// commit unique to the branch since its merge-base with `base_ref`.
-async fn created_at_info(
-    path: &str,
-    branch: &str,
-    base_ref: Option<&str>,
-) -> Result<(Option<String>, Option<String>), AppCommandError> {
-    if let Ok(out) = git_output(path, &["reflog", "show", "--date=iso", branch]).await {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                if let Some(date) = extract_reflog_creation_date(line) {
-                    return Ok((Some(date), Some("reflog".to_string())));
-                }
-            }
-        }
-    }
+/// Absolute `.git` dir for a repo (one git call per repo).
+async fn git_dir(path: &str) -> Option<String> {
+    git_stdout(path, &["rev-parse", "--absolute-git-dir"])
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
 
-    if let Some(base) = base_ref {
-        if let Ok(mb) = git_stdout(path, &["merge-base", branch, base]).await {
-            let mb = mb.trim().to_string();
-            if !mb.is_empty() {
-                let range = format!("{mb}..{branch}");
-                if let Ok(log) = git_stdout(path, &["log", "--reverse", "--format=%cI", &range]).await
-                {
-                    if let Some(first) = log.lines().next() {
-                        return Ok((Some(first.trim().to_string()), Some("first_commit".to_string())));
-                    }
-                }
+/// Branch creation date read straight from the reflog file (no git process):
+/// the oldest entry that records `branch: Created from ...`.
+fn created_at_from_reflog(git_dir: &str, branch: &str) -> Option<String> {
+    let log_path = Path::new(git_dir)
+        .join("logs")
+        .join("refs")
+        .join("heads")
+        .join(branch);
+    let content = std::fs::read_to_string(log_path).ok()?;
+    for line in content.lines() {
+        if line.contains("branch: Created from") {
+            if let Some(epoch) = parse_reflog_epoch(line) {
+                let dt = chrono::DateTime::from_timestamp(epoch, 0)?;
+                return Some(dt.to_rfc3339());
             }
         }
     }
-    Ok((None, None))
+    None
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -217,7 +215,6 @@ pub async fn git_project_branch_matrix_core(
             .into_iter()
             .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
             .collect();
-        let base_ref = envs.first().map(|(_, n)| n.clone()).or_else(|| repo.branch.clone());
 
         let locals = match list_local_branches(&path).await {
             Ok(v) => v,
@@ -232,6 +229,15 @@ pub async fn git_project_branch_matrix_core(
                 continue;
             }
         };
+
+        // One git call per env for all branches' ahead/behind.
+        let mut env_maps: HashMap<String, HashMap<String, (i64, i64)>> = HashMap::new();
+        for (_, env_name) in &envs {
+            if let Ok(map) = env_ahead_behind_map(&path, env_name).await {
+                env_maps.insert(env_name.clone(), map);
+            }
+        }
+        let git_dir = git_dir(&path).await;
 
         let mut rows = Vec::new();
         for lb in locals {
@@ -250,10 +256,11 @@ pub async fn git_project_branch_matrix_core(
                     });
                     continue;
                 }
-                let (behind, ahead) = ahead_behind(&path, env_name, &lb.name)
-                    .await
+                let (ahead, behind) = env_maps
+                    .get(env_name)
+                    .and_then(|m| m.get(&lb.name).copied())
                     .unwrap_or((0, 0));
-                let merged = is_merged((behind, ahead));
+                let merged = is_merged(ahead);
                 let (via, date) = if merged {
                     merge_info(&path, &lb.name, env_name, &lb.tip)
                         .await
@@ -271,14 +278,14 @@ pub async fn git_project_branch_matrix_core(
                 });
             }
 
-            let (created_at, created_src) = created_at_info(&path, &lb.name, base_ref.as_deref())
-                .await
-                .unwrap_or((None, None));
+            let created_at = git_dir
+                .as_deref()
+                .and_then(|gd| created_at_from_reflog(gd, &lb.name));
 
             rows.push(BranchRow {
                 branch: lb.name,
+                created_at_source: created_at.as_ref().map(|_| "reflog".to_string()),
                 created_at,
-                created_at_source: created_src,
                 is_env_branch,
                 last_commit_at: Some(lb.date).filter(|s| !s.is_empty()),
                 envs: statuses,
@@ -310,7 +317,6 @@ pub async fn git_worktree_remove_temp_core(
 ) -> Result<(), AppCommandError> {
     let out = git_output(&path, &["worktree", "remove", "--force", &worktree_path]).await?;
     if !out.status.success() {
-        // Cleanup is best-effort; a leftover registration is pruned below.
         tracing::warn!(
             "[branch_board] worktree remove failed for {worktree_path}: {}",
             String::from_utf8_lossy(&out.stderr)
@@ -403,18 +409,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_left_right_reads_counts() {
-        assert_eq!(parse_left_right("3\t0\n"), Some((3, 0)));
-        assert_eq!(parse_left_right("0 5"), Some((0, 5)));
-        assert_eq!(parse_left_right(""), None);
-        assert_eq!(parse_left_right("abc"), None);
+    fn parse_ahead_behind_line_reads_counts() {
+        assert_eq!(
+            parse_ahead_behind_line("feat/a\t3 0"),
+            Some(("feat/a".to_string(), 3, 0))
+        );
+        assert_eq!(
+            parse_ahead_behind_line("dev\t0 12"),
+            Some(("dev".to_string(), 0, 12))
+        );
+        assert_eq!(parse_ahead_behind_line("nope"), None);
     }
 
     #[test]
-    fn merged_when_no_unique_commits() {
-        assert!(is_merged((0, 0)));
-        assert!(is_merged((7, 0)));
-        assert!(!is_merged((0, 2)));
+    fn merged_when_no_ahead() {
+        assert!(is_merged(0));
+        assert!(!is_merged(2));
     }
 
     #[test]
@@ -432,18 +442,16 @@ mod tests {
     }
 
     #[test]
-    fn reflog_creation_date_extracted() {
-        let line = "abc1234 HEAD@{2026-09-01 10:00:00 +0800}: branch: Created from main";
-        assert_eq!(
-            extract_reflog_creation_date(line).as_deref(),
-            Some("2026-09-01 10:00:00 +0800")
-        );
-        assert_eq!(extract_reflog_creation_date("abc1234 HEAD@{x}: commit: msg"), None);
+    fn parse_reflog_epoch_extracts_timestamp() {
+        let line =
+            "0000 1111 Alice <a@b.c> 1700000000 +0800\tbranch: Created from main";
+        assert_eq!(parse_reflog_epoch(line), Some(1700000000));
+        assert_eq!(parse_reflog_epoch("garbage"), None);
     }
 
     #[test]
     fn resolve_repo_path_joins_relative() {
         let p = resolve_repo_path("/root", "svc/api");
-        assert!(p.ends_with("svc") || p.contains("svc"));
+        assert!(p.contains("svc"));
     }
 }
