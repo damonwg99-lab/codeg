@@ -93,6 +93,8 @@ export interface RepoBranchMatrix {
   repoName: string
   repoPath: string
   configured: boolean
+  /** Configured environment keys for this repo, e.g. ["uat", "prd"]. */
+  envs: EnvKey[]
   branches: BranchRow[]
 }
 

@@ -208,8 +208,12 @@ export function BranchBoard({ projectId }: Props) {
     [flatRows, page]
   )
 
-  // Hide the DEV/UAT/PRD columns entirely when nothing is configured.
-  const hasEnvColumns = visibleMatrices.some((m) => m.configured)
+  // Show an env column only when at least one visible repo has it configured.
+  const shownEnvs = useMemo(
+    () =>
+      ENVS.filter((e) => visibleMatrices.some((m) => (m.envs ?? []).includes(e))),
+    [visibleMatrices]
+  )
 
   useEffect(() => {
     setPage(1)
@@ -444,15 +448,14 @@ export function BranchBoard({ projectId }: Props) {
                 <th className="sticky top-0 z-10 bg-background px-2 py-2 font-medium">
                   {t("task.colCreated")}
                 </th>
-                {hasEnvColumns &&
-                  ENVS.map((e) => (
-                    <th
-                      key={e}
-                      className="sticky top-0 z-10 bg-background px-2 py-2 font-medium"
-                    >
-                      {t(`task.env${e[0].toUpperCase()}${e.slice(1)}` as never)}
-                    </th>
-                  ))}
+                {shownEnvs.map((e) => (
+                  <th
+                    key={e}
+                    className="sticky top-0 z-10 bg-background px-2 py-2 font-medium"
+                  >
+                    {t(`task.env${e[0].toUpperCase()}${e.slice(1)}` as never)}
+                  </th>
+                ))}
                 <th className="sticky top-0 z-10 bg-background px-2 py-2 font-medium">
                   {t("task.colLastCommit")}
                 </th>
@@ -489,8 +492,7 @@ export function BranchBoard({ projectId }: Props) {
                         ? `${row.createdAtSource === "first_commit" ? "~" : ""}${row.createdAt.slice(0, 10)}`
                         : "—"}
                     </td>
-                    {hasEnvColumns &&
-                      ENVS.map((e) => {
+                    {shownEnvs.map((e) => {
                         const cell = envCellState(row, e)
                         const label =
                           cell.kind === "env"

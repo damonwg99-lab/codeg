@@ -349,6 +349,7 @@ async fn compute_repo_cached(
         repo_name: repo_name.to_string(),
         repo_path,
         configured,
+        envs: envs.iter().map(|(k, _)| k.clone()).collect(),
         branches,
     };
 

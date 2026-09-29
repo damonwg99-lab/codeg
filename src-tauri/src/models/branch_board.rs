@@ -34,5 +34,7 @@ pub struct RepoBranchMatrix {
     pub repo_path: String,
     /// Whether at least one environment branch is configured for this repo.
     pub configured: bool,
+    /// Configured environment keys for this repo, e.g. ["uat", "prd"].
+    pub envs: Vec<String>,
     pub branches: Vec<BranchRow>,
 }
