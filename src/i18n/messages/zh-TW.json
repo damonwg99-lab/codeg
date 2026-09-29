@@ -5963,7 +5963,7 @@
       "colNote": "備註",
       "colActions": "操作",
       "colAheadBehind": "領先/落後",
-      "envDev": "開發",
+      "envDev": "DEV",
       "envUat": "UAT",
       "envPrd": "PRD",
       "mergeTo": "合併到",
