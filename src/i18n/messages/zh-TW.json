@@ -5987,7 +5987,9 @@
       "refresh": "重新整理",
       "deleteBranch": "刪除分支",
       "prevPage": "上一頁",
-      "nextPage": "下一頁"
+      "nextPage": "下一頁",
+      "envMerged": "已合併",
+      "envUnmerged": "未合併"
     },
     "repoSelector": {
       "root": "專案根目錄",

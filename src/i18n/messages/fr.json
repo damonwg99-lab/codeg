@@ -5987,7 +5987,9 @@
       "refresh": "Refresh",
       "deleteBranch": "Delete Branch",
       "prevPage": "Prev",
-      "nextPage": "Next"
+      "nextPage": "Next",
+      "envMerged": "Merged",
+      "envUnmerged": "Unmerged"
     },
     "repoSelector": {
       "root": "Racine du projet",

@@ -6,6 +6,7 @@ import {
   filterRows,
   isFullyMerged,
   resolveEffectiveEnv,
+  unmergedEnvs,
 } from "./branch-board"
 import type { BranchRow, BranchStateInfo, ProjectInfo, ProjectRepoInfo } from "./types"
 
@@ -59,21 +60,23 @@ const baseRow: BranchRow = {
 }
 
 describe("envCellState", () => {
-  it("shows the merge date when merged", () => {
+  it("merged carries the merge date", () => {
     const s = envCellState(baseRow, "uat")
     expect(s.kind).toBe("merged")
-    expect(s.label).toBe("2026-09-01")
+    expect(s.mergeDate).toBe("2026-09-01T00:00:00Z")
   })
 
-  it("shows —（FF） for fast-forward merges", () => {
+  it("fast-forward merges carry mergeVia=fast_forward", () => {
     const row = {
       ...baseRow,
       envs: [{ ...baseRow.envs[0], mergeVia: "fast_forward" as const }],
     }
-    expect(envCellState(row, "uat").label).toBe("—（FF）")
+    const s = envCellState(row, "uat")
+    expect(s.kind).toBe("merged")
+    expect(s.mergeVia).toBe("fast_forward")
   })
 
-  it("shows +ahead when unmerged", () => {
+  it("unmerged", () => {
     const row = {
       ...baseRow,
       envs: [
@@ -87,9 +90,7 @@ describe("envCellState", () => {
         },
       ],
     }
-    const s = envCellState(row, "uat")
-    expect(s.kind).toBe("unmerged")
-    expect(s.label).toBe("+3")
+    expect(envCellState(row, "uat").kind).toBe("unmerged")
   })
 
   it("marks the env branch itself", () => {
@@ -100,6 +101,41 @@ describe("envCellState", () => {
 
   it("marks unconfigured environments", () => {
     expect(envCellState(baseRow, "prd").kind).toBe("unconfigured")
+  })
+})
+
+describe("unmergedEnvs", () => {
+  it("only lists environments the branch is not merged into", () => {
+    const row: BranchRow = {
+      ...baseRow,
+      envs: [
+        {
+          env: "dev",
+          merged: false,
+          mergeVia: null,
+          mergeDate: null,
+          ahead: 0,
+          behind: 0,
+        },
+        {
+          env: "uat",
+          merged: true,
+          mergeVia: "merge",
+          mergeDate: null,
+          ahead: 0,
+          behind: 0,
+        },
+        {
+          env: "prd",
+          merged: true,
+          mergeVia: "merge",
+          mergeDate: null,
+          ahead: 0,
+          behind: 0,
+        },
+      ],
+    }
+    expect(unmergedEnvs(row)).toEqual(["dev"])
   })
 })
 

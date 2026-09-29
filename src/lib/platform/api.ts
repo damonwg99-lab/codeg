@@ -160,10 +160,12 @@ export async function removeProjectRepo(id: number): Promise<void> {
 // ─── Branch Board ───
 
 export async function getProjectBranchMatrix(
-  projectId: number
+  projectId: number,
+  force = false
 ): Promise<RepoBranchMatrix[]> {
   return getTransport().call<RepoBranchMatrix[]>("git_project_branch_matrix", {
     projectId,
+    force,
   })
 }
 

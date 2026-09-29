@@ -3,12 +3,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
-import { RefreshCw, Trash2, Pencil, Archive, ArchiveRestore } from "lucide-react"
+import { RefreshCw, Trash2, Pencil, Archive, ArchiveRestore, GitMerge } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   Select,
   SelectContent,
@@ -57,6 +58,7 @@ import {
   filterRows,
   isFullyMerged,
   resolveEffectiveEnv,
+  unmergedEnvs,
 } from "@/lib/platform/branch-board"
 import type {
   BranchRow,
@@ -106,6 +108,7 @@ export function BranchBoard({ projectId }: Props) {
   const [repoFilter, setRepoFilter] = useState<string>("all")
   const [archived, setArchived] = useState(false)
   const [onlyUnmerged, setOnlyUnmerged] = useState(false)
+  const [keywordInput, setKeywordInput] = useState("")
   const [keyword, setKeyword] = useState("")
   const [page, setPage] = useState(1)
 
@@ -116,33 +119,47 @@ export function BranchBoard({ projectId }: Props) {
   } | null>(null)
   const [noteEdit, setNoteEdit] = useState<NoteEdit | null>(null)
   const [conflict, setConflict] = useState<ConflictState | null>(null)
+  const [mergeTarget, setMergeTarget] = useState<{
+    repo: ProjectRepoInfo
+    row: BranchRow
+    env: EnvKey
+  } | null>(null)
+  const [mergePick, setMergePick] = useState<{
+    repo: ProjectRepoInfo
+    row: BranchRow
+  } | null>(null)
 
   const stateKey = (repoId: number, branch: string) => `${repoId}:${branch}`
 
-  const refresh = useCallback(async () => {
-    if (!projectId) return
-    setLoading(true)
-    setError(null)
-    try {
-      const [m, s] = await Promise.all([
-        getProjectBranchMatrix(projectId),
-        listBranchStates(projectId),
-      ])
-      setMatrices(m ?? [])
-      setStates(new Map((s ?? []).map((x) => [stateKey(x.repoId, x.branch), x])))
-    } catch (e) {
-      const obj = (e ?? {}) as Record<string, unknown>
-      const parts = [
-        typeof e === "string" ? e : obj.message,
-        obj.detail,
-        obj.code,
-      ].filter(Boolean)
-      setError(parts.length ? parts.join(" | ") : JSON.stringify(e))
-      console.error("branch matrix failed:", e)
-    } finally {
-      setLoading(false)
-    }
-  }, [projectId])
+  const refresh = useCallback(
+    async (force = false) => {
+      if (!projectId) return
+      setLoading(true)
+      setError(null)
+      try {
+        const [m, s] = await Promise.all([
+          getProjectBranchMatrix(projectId, force),
+          listBranchStates(projectId),
+        ])
+        setMatrices(m ?? [])
+        setStates(
+          new Map((s ?? []).map((x) => [stateKey(x.repoId, x.branch), x]))
+        )
+      } catch (e) {
+        const obj = (e ?? {}) as Record<string, unknown>
+        const parts = [
+          typeof e === "string" ? e : obj.message,
+          obj.detail,
+          obj.code,
+        ].filter(Boolean)
+        setError(parts.length ? parts.join(" | ") : JSON.stringify(e))
+        console.error("branch matrix failed:", e)
+      } finally {
+        setLoading(false)
+      }
+    },
+    [projectId]
+  )
 
   useEffect(() => {
     void refresh()
@@ -174,6 +191,10 @@ export function BranchBoard({ projectId }: Props) {
         out.push({ repoId: m.repoId, repoName: m.repoName, row })
       }
     }
+    // Most recent commit first.
+    out.sort((a, b) =>
+      (b.row.lastCommitAt ?? "").localeCompare(a.row.lastCommitAt ?? "")
+    )
     return out
   }, [visibleMatrices, states, archived, onlyUnmerged, keyword])
 
@@ -186,6 +207,12 @@ export function BranchBoard({ projectId }: Props) {
   useEffect(() => {
     setPage(1)
   }, [repoFilter, archived, onlyUnmerged, keyword])
+
+  // Debounce the search box: only filter after the user stops typing.
+  useEffect(() => {
+    const id = setTimeout(() => setKeyword(keywordInput), 300)
+    return () => clearTimeout(id)
+  }, [keywordInput])
 
   const handleSync = async () => {
     setBusy(true)
@@ -347,20 +374,17 @@ export function BranchBoard({ projectId }: Props) {
           </SelectContent>
         </Select>
 
-        <Button
-          variant={archived ? "outline" : "secondary"}
-          size="sm"
-          onClick={() => setArchived(false)}
+        <Tabs
+          value={archived ? "archived" : "active"}
+          onValueChange={(v) => setArchived(v === "archived")}
         >
-          {t("task.activeBranches")}
-        </Button>
-        <Button
-          variant={archived ? "secondary" : "outline"}
-          size="sm"
-          onClick={() => setArchived(true)}
-        >
-          {t("task.archivedBranches")}
-        </Button>
+          <TabsList>
+            <TabsTrigger value="active">{t("task.activeBranches")}</TabsTrigger>
+            <TabsTrigger value="archived">
+              {t("task.archivedBranches")}
+            </TabsTrigger>
+          </TabsList>
+        </Tabs>
 
         <label className="flex items-center gap-1.5 text-[0.8125rem] text-muted-foreground">
           <input
@@ -372,8 +396,8 @@ export function BranchBoard({ projectId }: Props) {
         </label>
 
         <Input
-          value={keyword}
-          onChange={(e) => setKeyword(e.target.value)}
+          value={keywordInput}
+          onChange={(e) => setKeywordInput(e.target.value)}
           placeholder={t("task.searchBranch")}
           className="h-8 w-[180px] text-[0.8125rem]"
         />
@@ -389,7 +413,7 @@ export function BranchBoard({ projectId }: Props) {
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => void refresh()}
+          onClick={() => void refresh(true)}
           disabled={busy}
         >
           <RefreshCw className={cn("mr-1 h-3.5 w-3.5", busy && "animate-spin")} />
@@ -422,9 +446,6 @@ export function BranchBoard({ projectId }: Props) {
                   </th>
                 ))}
                 <th className="sticky top-0 z-10 bg-background px-2 py-2 font-medium">
-                  {t("task.colAheadBehind")}
-                </th>
-                <th className="sticky top-0 z-10 bg-background px-2 py-2 font-medium">
                   {t("task.colLastCommit")}
                 </th>
                 <th className="sticky top-0 z-10 bg-background px-2 py-2 font-medium">
@@ -439,9 +460,6 @@ export function BranchBoard({ projectId }: Props) {
               {pageRows.map(({ repoId, repoName, row }) => {
                 const repo = repoById.get(repoId)
                 const state = states.get(stateKey(repoId, row.branch))
-                const ab = row.envs
-                  .map((e) => `+${e.ahead}/-${e.behind}`)
-                  .join(" ")
                 return (
                   <tr
                     key={`${repoId}:${row.branch}`}
@@ -465,6 +483,18 @@ export function BranchBoard({ projectId }: Props) {
                     </td>
                     {ENVS.map((e) => {
                       const cell = envCellState(row, e)
+                      const label =
+                        cell.kind === "env"
+                          ? "—"
+                          : cell.kind === "unconfigured"
+                            ? t("task.notConfigured")
+                            : cell.kind === "unmerged"
+                              ? t("task.envUnmerged")
+                              : cell.mergeVia === "fast_forward"
+                                ? "—（FF）"
+                                : cell.mergeDate
+                                  ? cell.mergeDate.slice(0, 10)
+                                  : t("task.envMerged")
                       return (
                         <td key={e} className="px-2 py-2">
                           <span
@@ -472,19 +502,17 @@ export function BranchBoard({ projectId }: Props) {
                               "text-[0.75rem]",
                               cell.kind === "merged" &&
                                 "text-green-600 dark:text-green-400",
-                              cell.kind === "unmerged" &&
-                                "text-muted-foreground",
-                              cell.kind === "env" && "text-muted-foreground"
+                              (cell.kind === "unmerged" ||
+                                cell.kind === "env" ||
+                                cell.kind === "unconfigured") &&
+                                "text-muted-foreground"
                             )}
                           >
-                            {cell.label}
+                            {label}
                           </span>
                         </td>
                       )
                     })}
-                    <td className="px-2 py-2 font-mono text-[0.6875rem] text-muted-foreground">
-                      {ab}
-                    </td>
                     <td className="px-2 py-2 text-muted-foreground">
                       {row.lastCommitAt ? row.lastCommitAt.slice(0, 10) : "—"}
                     </td>
@@ -493,28 +521,19 @@ export function BranchBoard({ projectId }: Props) {
                     </td>
                     <td className="px-3 py-2">
                       <div className="flex items-center gap-1">
-                        {!row.isEnvBranch && repo && (
-                          <Select
-                            value=""
-                            onValueChange={(v) =>
-                              void performMerge(repo, row, v as EnvKey)
-                            }
-                          >
-                            <SelectTrigger
-                              size="sm"
-                              className="h-7 w-[110px] text-[0.6875rem]"
+                        {!row.isEnvBranch &&
+                          repo &&
+                          unmergedEnvs(row).length > 0 && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-7 w-7"
+                              title={t("task.mergeTo")}
+                              onClick={() => setMergePick({ repo, row })}
                             >
-                              <SelectValue placeholder={t("task.mergeTo")} />
-                            </SelectTrigger>
-                            <SelectContent>
-                              {ENVS.map((e) => (
-                                <SelectItem key={e} value={e}>
-                                  {t("task.mergeTo")} {e.toUpperCase()}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                        )}
+                              <GitMerge className="h-3.5 w-3.5" />
+                            </Button>
+                          )}
                         <Button
                           variant="ghost"
                           size="icon"
@@ -592,6 +611,74 @@ export function BranchBoard({ projectId }: Props) {
           </Button>
         </div>
       )}
+
+      {/* Pick target environment */}
+      <Dialog
+        open={mergePick !== null}
+        onOpenChange={(o) => !o && setMergePick(null)}
+      >
+        <DialogContent className="sm:max-w-xs">
+          <DialogHeader>
+            <DialogTitle>{t("task.mergeTo")}</DialogTitle>
+          </DialogHeader>
+          <p className="font-mono text-[0.8125rem] text-muted-foreground">
+            {mergePick?.row.branch}
+          </p>
+          <div className="flex flex-col gap-2">
+            {(mergePick ? unmergedEnvs(mergePick.row) : []).map((e) => (
+              <Button
+                key={e}
+                variant="outline"
+                onClick={() => {
+                  const p = mergePick
+                  setMergePick(null)
+                  if (p) setMergeTarget({ repo: p.repo, row: p.row, env: e })
+                }}
+              >
+                {t("task.mergeTo")}{" "}
+                {t(`task.env${e[0].toUpperCase()}${e.slice(1)}` as never)}
+              </Button>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Merge confirm (safety gate) */}
+      <AlertDialog
+        open={mergeTarget !== null}
+        onOpenChange={(o) => !o && setMergeTarget(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("task.mergeConfirmTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("task.mergeConfirmBody", {
+                branch: mergeTarget?.row.branch ?? "",
+                env:
+                  mergeTarget && activeProject
+                    ? (resolveEffectiveEnv(
+                        mergeTarget.repo,
+                        activeProject,
+                        mergeTarget.env
+                      ) ?? mergeTarget.env.toUpperCase())
+                    : "",
+              })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("task.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                const m = mergeTarget
+                setMergeTarget(null)
+                if (m) void performMerge(m.repo, m.row, m.env)
+              }}
+            >
+              {t("task.confirm")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Dirty gate */}
       <AlertDialog

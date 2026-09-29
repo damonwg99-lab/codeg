@@ -23,28 +23,29 @@ export function resolveEffectiveEnv(
 
 export interface EnvCellState {
   kind: "env" | "merged" | "unmerged" | "unconfigured"
-  label: string
-  sub?: string
+  mergeVia?: "merge" | "fast_forward" | null
+  mergeDate?: string | null
 }
 
 /** Presentation state for one branch × one environment cell. */
 export function envCellState(row: BranchRow, env: EnvKey): EnvCellState {
   const e = row.envs.find((x) => x.env === env)
-  if (!e) return { kind: "unconfigured", label: "未配置" }
-  if (row.isEnvBranch) return { kind: "env", label: "—" }
+  if (!e) return { kind: "unconfigured" }
+  if (row.isEnvBranch) return { kind: "env" }
   if (e.merged) {
-    if (e.mergeVia === "fast_forward") {
-      return { kind: "merged", label: "—（FF）" }
-    }
-    const date = e.mergeDate ? e.mergeDate.slice(0, 10) : ""
-    return { kind: "merged", label: date || "已合并" }
+    return { kind: "merged", mergeVia: e.mergeVia, mergeDate: e.mergeDate }
   }
-  return { kind: "unmerged", label: `+${e.ahead}`, sub: `-${e.behind}` }
+  return { kind: "unmerged" }
 }
 
 /** True if the branch has landed on every configured environment. */
 export function isFullyMerged(row: BranchRow): boolean {
   return row.envs.length > 0 && row.envs.every((e) => e.merged)
+}
+
+/** Environments this branch has NOT been merged into yet (merge targets). */
+export function unmergedEnvs(row: BranchRow): EnvKey[] {
+  return row.envs.filter((e) => !e.merged).map((e) => e.env)
 }
 
 export interface BranchFilterOptions {
