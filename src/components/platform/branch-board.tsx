@@ -208,6 +208,9 @@ export function BranchBoard({ projectId }: Props) {
     [flatRows, page]
   )
 
+  // Hide the DEV/UAT/PRD columns entirely when nothing is configured.
+  const hasEnvColumns = visibleMatrices.some((m) => m.configured)
+
   useEffect(() => {
     setPage(1)
   }, [repoFilter, archived, onlyUnmerged, keyword])
@@ -441,14 +444,15 @@ export function BranchBoard({ projectId }: Props) {
                 <th className="sticky top-0 z-10 bg-background px-2 py-2 font-medium">
                   {t("task.colCreated")}
                 </th>
-                {ENVS.map((e) => (
-                  <th
-                    key={e}
-                    className="sticky top-0 z-10 bg-background px-2 py-2 font-medium"
-                  >
-                    {t(`task.env${e[0].toUpperCase()}${e.slice(1)}` as never)}
-                  </th>
-                ))}
+                {hasEnvColumns &&
+                  ENVS.map((e) => (
+                    <th
+                      key={e}
+                      className="sticky top-0 z-10 bg-background px-2 py-2 font-medium"
+                    >
+                      {t(`task.env${e[0].toUpperCase()}${e.slice(1)}` as never)}
+                    </th>
+                  ))}
                 <th className="sticky top-0 z-10 bg-background px-2 py-2 font-medium">
                   {t("task.colLastCommit")}
                 </th>
@@ -485,38 +489,39 @@ export function BranchBoard({ projectId }: Props) {
                         ? `${row.createdAtSource === "first_commit" ? "~" : ""}${row.createdAt.slice(0, 10)}`
                         : "—"}
                     </td>
-                    {ENVS.map((e) => {
-                      const cell = envCellState(row, e)
-                      const label =
-                        cell.kind === "env"
-                          ? "—"
-                          : cell.kind === "unconfigured"
-                            ? t("task.notConfigured")
-                            : cell.kind === "unmerged"
-                              ? t("task.envUnmerged")
-                              : cell.mergeVia === "fast_forward"
-                                ? "—（FF）"
-                                : cell.mergeDate
-                                  ? cell.mergeDate.slice(0, 10)
-                                  : t("task.envMerged")
-                      return (
-                        <td key={e} className="px-2 py-2">
-                          <span
-                            className={cn(
-                              "text-[0.75rem]",
-                              cell.kind === "merged" &&
-                                "text-green-600 dark:text-green-400",
-                              (cell.kind === "unmerged" ||
-                                cell.kind === "env" ||
-                                cell.kind === "unconfigured") &&
-                                "text-muted-foreground"
-                            )}
-                          >
-                            {label}
-                          </span>
-                        </td>
-                      )
-                    })}
+                    {hasEnvColumns &&
+                      ENVS.map((e) => {
+                        const cell = envCellState(row, e)
+                        const label =
+                          cell.kind === "env"
+                            ? "—"
+                            : cell.kind === "unconfigured"
+                              ? t("task.notConfigured")
+                              : cell.kind === "unmerged"
+                                ? t("task.envUnmerged")
+                                : cell.mergeVia === "fast_forward"
+                                  ? "—（FF）"
+                                  : cell.mergeDate
+                                    ? cell.mergeDate.slice(0, 10)
+                                    : t("task.envMerged")
+                        return (
+                          <td key={e} className="px-2 py-2">
+                            <span
+                              className={cn(
+                                "text-[0.75rem]",
+                                cell.kind === "merged" &&
+                                  "text-green-600 dark:text-green-400",
+                                (cell.kind === "unmerged" ||
+                                  cell.kind === "env" ||
+                                  cell.kind === "unconfigured") &&
+                                  "text-muted-foreground"
+                              )}
+                            >
+                              {label}
+                            </span>
+                          </td>
+                        )
+                      })}
                     <td className="px-2 py-2 text-muted-foreground">
                       {row.lastCommitAt ? row.lastCommitAt.slice(0, 10) : "—"}
                     </td>

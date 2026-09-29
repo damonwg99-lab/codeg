@@ -1,5 +1,5 @@
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
+use sea_orm::{ConnectionTrait, EntityTrait, Set};
 
 use crate::db::entities::platform_branch_matrix_cache;
 use crate::db::error::DbError;
