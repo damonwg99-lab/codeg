@@ -21,6 +21,7 @@ pub mod remote_workspace_connection;
 
 // ─── Platform entities (Cluster A/B/C) ───
 pub mod platform_activity_log;
+pub mod platform_branch_matrix_cache;
 pub mod platform_branch_state;
 pub mod platform_credential;
 pub mod platform_global_config;

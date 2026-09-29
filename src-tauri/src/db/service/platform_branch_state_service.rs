@@ -85,3 +85,19 @@ pub async fn upsert<C: ConnectionTrait>(
         }
     }
 }
+
+/// Delete state rows for branches that no longer exist in git, for one repo.
+/// Keeps the archive/note table free of orphans.
+pub async fn prune_not_in<C: ConnectionTrait>(
+    conn: &C,
+    repo_id: i32,
+    keep: &[String],
+) -> Result<u64, DbError> {
+    let mut delete = platform_branch_state::Entity::delete_many()
+        .filter(platform_branch_state::Column::RepoId.eq(repo_id));
+    if !keep.is_empty() {
+        delete = delete.filter(platform_branch_state::Column::Branch.is_not_in(keep.to_vec()));
+    }
+    let result = delete.exec(conn).await?;
+    Ok(result.rows_affected)
+}

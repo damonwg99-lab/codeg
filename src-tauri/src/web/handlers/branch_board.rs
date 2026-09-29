@@ -12,6 +12,7 @@ use crate::models::{BranchStateInfo, RepoBranchMatrix};
 #[serde(rename_all = "camelCase")]
 pub struct GitProjectBranchMatrixParams {
     pub project_id: i32,
+    pub force: Option<bool>,
 }
 
 pub async fn git_project_branch_matrix(
@@ -19,7 +20,12 @@ pub async fn git_project_branch_matrix(
     Json(params): Json<GitProjectBranchMatrixParams>,
 ) -> Result<Json<Vec<RepoBranchMatrix>>, AppCommandError> {
     Ok(Json(
-        branch_board_commands::git_project_branch_matrix_core(&state.db, params.project_id).await?,
+        branch_board_commands::git_project_branch_matrix_core(
+            &state.db,
+            params.project_id,
+            params.force.unwrap_or(false),
+        )
+        .await?,
     ))
 }
 

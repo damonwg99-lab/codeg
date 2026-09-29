@@ -1,31 +1,24 @@
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+
+use futures::stream::{self, StreamExt};
+use sea_orm::DatabaseConnection;
 
 use crate::app_error::AppCommandError;
 use crate::db::service::{
+    platform_branch_matrix_cache_service as cache_service,
     platform_branch_state_service, platform_project_repo_service, platform_project_service,
 };
 use crate::db::AppDatabase;
 use crate::models::{BranchRow, BranchStateInfo, EnvMergeStatus, RepoBranchMatrix};
 
+/// Max repos processed concurrently (each spawns a few git processes).
+const REPO_CONCURRENCY: usize = 6;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure helpers (unit-tested)
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Parse a single `%(refname:short)%09%(ahead-behind:<env>)` line into
-/// `(branch, ahead, behind)`. The value is "ahead behind".
-pub(crate) fn parse_ahead_behind_line(line: &str) -> Option<(String, i64, i64)> {
-    let (name, counts) = line.split_once('\t')?;
-    let mut it = counts.split_whitespace();
-    let ahead: i64 = it.next()?.parse().ok()?;
-    let behind: i64 = it.next()?.parse().ok()?;
-    Some((name.trim().to_string(), ahead, behind))
-}
-
-/// B is merged into env E iff B has no commit E lacks (ahead == 0).
-pub(crate) fn is_merged(ahead: i64) -> bool {
-    ahead == 0
-}
 
 /// Effective env branch: repo override wins, else project default.
 pub(crate) fn effective_env(repo: Option<&str>, project: Option<&str>) -> Option<String> {
@@ -55,6 +48,71 @@ pub(crate) fn resolve_repo_path(root_dir: &str, local_dir: &str) -> String {
     } else {
         Path::new(root_dir).join(local_dir).to_string_lossy().to_string()
     }
+}
+
+/// Locate the repo's `.git` directory WITHOUT spawning git: a plain dir, or the
+/// path recorded in a `.git` file (worktrees / submodules).
+fn git_dir_no_spawn(repo_path: &str) -> Option<PathBuf> {
+    let dot = Path::new(repo_path).join(".git");
+    if dot.is_dir() {
+        return Some(dot);
+    }
+    if dot.is_file() {
+        let content = std::fs::read_to_string(&dot).ok()?;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("gitdir:") {
+                let p = rest.trim();
+                let abs = if Path::new(p).is_absolute() {
+                    PathBuf::from(p)
+                } else {
+                    Path::new(repo_path).join(p)
+                };
+                if abs.is_dir() {
+                    return Some(abs);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn push_entry(p: &Path, out: &mut Vec<String>) {
+    if let Ok(md) = std::fs::metadata(p) {
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        out.push(format!("{}:{}:{}", p.to_string_lossy(), mtime, md.len()));
+    }
+}
+
+/// Cheap signature of a repo's ref state (file metadata only, no git process).
+/// Any branch add/delete/move changes the underlying ref files, hence the hash.
+/// `None` when the repo has no local `.git` (not a repo / missing).
+fn ref_fingerprint(repo_path: &str) -> Option<String> {
+    let git_dir = git_dir_no_spawn(repo_path)?;
+    let mut entries: Vec<String> = Vec::new();
+    push_entry(&git_dir.join("packed-refs"), &mut entries);
+    push_entry(&git_dir.join("HEAD"), &mut entries);
+    let mut stack = vec![git_dir.join("refs")];
+    while let Some(dir) = stack.pop() {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    push_entry(&p, &mut entries);
+                }
+            }
+        }
+    }
+    entries.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entries.hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -115,65 +173,63 @@ async fn list_local_branches(path: &str) -> Result<Vec<LocalBranch>, AppCommandE
     Ok(rows)
 }
 
-/// Ahead/behind for every local branch relative to `env`, in ONE git call
-/// (git >= 2.41 `%(ahead-behind:)`). Returns `branch -> (ahead, behind)`.
-async fn env_ahead_behind_map(
-    path: &str,
-    env: &str,
-) -> Result<HashMap<String, (i64, i64)>, AppCommandError> {
-    let format = format!("--format=%(refname:short)%09%(ahead-behind:{env})");
-    let out = git_stdout(path, &["for-each-ref", &format, "refs/heads"]).await?;
-    let mut map = HashMap::new();
-    for line in out.lines() {
-        if let Some((name, ahead, behind)) = parse_ahead_behind_line(line) {
-            map.insert(name, (ahead, behind));
-        }
+/// Set of local branches already merged into `env`, in ONE git call
+/// (`for-each-ref --merged=<env>`). Empty on error (e.g. env branch missing).
+async fn merged_set(path: &str, env: &str) -> HashSet<String> {
+    let merged_arg = format!("--merged={env}");
+    let out = git_stdout(
+        path,
+        &["for-each-ref", "--format=%(refname:short)", &merged_arg, "refs/heads"],
+    )
+    .await;
+    match out {
+        Ok(s) => s
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        Err(_) => HashSet::new(),
     }
-    Ok(map)
 }
 
-/// Merge method + date for a merged branch. `merge_via` = "fast_forward" when
-/// the earliest ancestry-path commit is the branch tip itself (no merge commit).
+/// Merge method + date for a merged branch, in ONE git call: the earliest
+/// ancestry-path commit between branch and env. Fast-forward when that commit
+/// is the branch tip itself (no merge commit, so no date).
 async fn merge_info(
     path: &str,
     branch: &str,
     env: &str,
     branch_tip: &str,
-) -> Result<(Option<String>, Option<String>), AppCommandError> {
+) -> (Option<String>, Option<String>) {
     let range = format!("{branch}..{env}");
-    let out = git_stdout(
+    let out = match git_stdout(
         path,
-        &["log", "--ancestry-path", "--format=%H", "--reverse", &range],
+        &["log", "--ancestry-path", "--reverse", "--format=%cI%x09%H", &range],
     )
-    .await?;
-    let first = out.lines().next().map(|s| s.trim().to_string());
-    match first {
-        Some(sha) if sha == branch_tip => Ok((Some("fast_forward".to_string()), None)),
-        Some(sha) => {
-            let date = git_stdout(path, &["log", "-1", "--format=%cI", &sha]).await?;
-            Ok((Some("merge".to_string()), Some(date.trim().to_string())))
-        }
-        None => Ok((None, None)),
+    .await
+    {
+        Ok(s) => s,
+        Err(_) => return (None, None),
+    };
+    let Some(line) = out.lines().next() else {
+        return (None, None);
+    };
+    let mut parts = line.splitn(2, '\t');
+    let date = parts.next().unwrap_or("").trim().to_string();
+    let sha = parts.next().unwrap_or("").trim();
+    if sha == branch_tip {
+        return (Some("fast_forward".to_string()), None);
+    }
+    if date.is_empty() {
+        (None, None)
+    } else {
+        (Some("merge".to_string()), Some(date))
     }
 }
 
-/// Absolute `.git` dir for a repo (one git call per repo).
-async fn git_dir(path: &str) -> Option<String> {
-    git_stdout(path, &["rev-parse", "--absolute-git-dir"])
-        .await
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-/// Branch creation date read straight from the reflog file (no git process):
-/// the oldest entry that records `branch: Created from ...`.
-fn created_at_from_reflog(git_dir: &str, branch: &str) -> Option<String> {
-    let log_path = Path::new(git_dir)
-        .join("logs")
-        .join("refs")
-        .join("heads")
-        .join(branch);
+/// Branch creation date read straight from the reflog file (no git process).
+fn created_at_from_reflog(git_dir: &Path, branch: &str) -> Option<String> {
+    let log_path = git_dir.join("logs").join("refs").join("heads").join(branch);
     let content = std::fs::read_to_string(log_path).ok()?;
     for line in content.lines() {
         if line.contains("branch: Created from") {
@@ -186,13 +242,121 @@ fn created_at_from_reflog(git_dir: &str, branch: &str) -> Option<String> {
     None
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Core commands
-// ─────────────────────────────────────────────────────────────────────────────
+async fn compute_repo_matrix(repo_path: &str, envs: &[(String, String)]) -> Vec<BranchRow> {
+    let locals = match list_local_branches(repo_path).await {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    // One git call per env for the merged set.
+    let mut merged: HashMap<String, HashSet<String>> = HashMap::new();
+    for (env_key, env_name) in envs {
+        merged.insert(env_key.clone(), merged_set(repo_path, env_name).await);
+    }
+    let git_dir = git_dir_no_spawn(repo_path);
+
+    let mut rows = Vec::new();
+    for lb in locals {
+        let mut statuses = Vec::new();
+        let mut is_env_branch = false;
+        for (env_key, env_name) in envs {
+            if lb.name == *env_name {
+                is_env_branch = true;
+                statuses.push(EnvMergeStatus {
+                    env: env_key.clone(),
+                    merged: true,
+                    merge_via: None,
+                    merge_date: None,
+                    ahead: 0,
+                    behind: 0,
+                });
+                continue;
+            }
+            let is_merged = merged
+                .get(env_key)
+                .map(|s| s.contains(&lb.name))
+                .unwrap_or(false);
+            let (via, date) = if is_merged {
+                merge_info(repo_path, &lb.name, env_name, &lb.tip).await
+            } else {
+                (None, None)
+            };
+            statuses.push(EnvMergeStatus {
+                env: env_key.clone(),
+                merged: is_merged,
+                merge_via: via,
+                merge_date: date,
+                ahead: 0,
+                behind: 0,
+            });
+        }
+
+        let created_at = git_dir
+            .as_deref()
+            .and_then(|gd| created_at_from_reflog(gd, &lb.name));
+
+        rows.push(BranchRow {
+            branch: lb.name,
+            created_at_source: created_at.as_ref().map(|_| "reflog".to_string()),
+            created_at,
+            is_env_branch,
+            last_commit_at: Some(lb.date).filter(|s| !s.is_empty()),
+            envs: statuses,
+        });
+    }
+    rows
+}
+
+async fn compute_repo_cached(
+    conn: &DatabaseConnection,
+    repo_id: i32,
+    repo_name: &str,
+    repo_path: String,
+    envs: Vec<(String, String)>,
+    configured: bool,
+    force: bool,
+) -> RepoBranchMatrix {
+    let fingerprint = ref_fingerprint(&repo_path);
+
+    if !force {
+        if let Some(fp) = fingerprint.as_deref() {
+            if let Ok(Some((cached_fp, json))) = cache_service::get(conn, repo_id).await {
+                if cached_fp == fp {
+                    if let Ok(matrix) = serde_json::from_str::<RepoBranchMatrix>(&json) {
+                        return matrix;
+                    }
+                }
+            }
+        }
+    }
+
+    let branches = compute_repo_matrix(&repo_path, &envs).await;
+
+    // Auto-clean orphaned archive/note rows for branches git no longer has.
+    let keep: Vec<String> = branches.iter().map(|b| b.branch.clone()).collect();
+    let _ = platform_branch_state_service::prune_not_in(conn, repo_id, &keep).await;
+
+    let matrix = RepoBranchMatrix {
+        repo_id,
+        repo_name: repo_name.to_string(),
+        repo_path,
+        configured,
+        branches,
+    };
+
+    if let Some(fp) = fingerprint {
+        if let Ok(json) = serde_json::to_string(&matrix) {
+            let _ = cache_service::upsert(conn, repo_id, &fp, &json).await;
+        }
+    }
+
+    matrix
+}
 
 pub async fn git_project_branch_matrix_core(
     db: &AppDatabase,
     project_id: i32,
+    force: bool,
 ) -> Result<Vec<RepoBranchMatrix>, AppCommandError> {
     let conn = &db.conn;
     let project = platform_project_service::get_by_id(conn, project_id)
@@ -203,104 +367,45 @@ pub async fn git_project_branch_matrix_core(
         .await
         .map_err(AppCommandError::from)?;
 
-    let mut out = Vec::new();
-    for repo in repos {
-        let path = resolve_repo_path(&project.root_dir, &repo.local_dir);
-        let dev = effective_env(repo.dev_branch.as_deref(), project.dev_branch.as_deref());
-        let uat = effective_env(repo.uat_branch.as_deref(), project.uat_branch.as_deref());
-        let prd = effective_env(repo.prd_branch.as_deref(), project.prd_branch.as_deref());
-        let configured = dev.is_some() || uat.is_some() || prd.is_some();
+    let root_dir = project.root_dir.clone();
+    let p_dev = project.dev_branch.clone();
+    let p_uat = project.uat_branch.clone();
+    let p_prd = project.prd_branch.clone();
 
-        let envs: Vec<(String, String)> = [("dev", dev), ("uat", uat), ("prd", prd)]
-            .into_iter()
-            .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
-            .collect();
-
-        let locals = match list_local_branches(&path).await {
-            Ok(v) => v,
-            Err(_) => {
-                out.push(RepoBranchMatrix {
-                    repo_id: repo.id,
-                    repo_name: repo.name,
-                    repo_path: path,
-                    configured,
-                    branches: Vec::new(),
-                });
-                continue;
-            }
-        };
-
-        // One git call per env for all branches' ahead/behind.
-        let mut env_maps: HashMap<String, HashMap<String, (i64, i64)>> = HashMap::new();
-        for (_, env_name) in &envs {
-            if let Ok(map) = env_ahead_behind_map(&path, env_name).await {
-                env_maps.insert(env_name.clone(), map);
-            }
+    let mut results: Vec<RepoBranchMatrix> = stream::iter(repos.into_iter().map(|repo| {
+        let conn = conn.clone();
+        let root_dir = root_dir.clone();
+        let p_dev = p_dev.clone();
+        let p_uat = p_uat.clone();
+        let p_prd = p_prd.clone();
+        async move {
+            let repo_path = resolve_repo_path(&root_dir, &repo.local_dir);
+            let dev = effective_env(repo.dev_branch.as_deref(), p_dev.as_deref());
+            let uat = effective_env(repo.uat_branch.as_deref(), p_uat.as_deref());
+            let prd = effective_env(repo.prd_branch.as_deref(), p_prd.as_deref());
+            let configured = dev.is_some() || uat.is_some() || prd.is_some();
+            let envs: Vec<(String, String)> = [("dev", dev), ("uat", uat), ("prd", prd)]
+                .into_iter()
+                .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
+                .collect();
+            compute_repo_cached(
+                &conn,
+                repo.id,
+                &repo.name,
+                repo_path,
+                envs,
+                configured,
+                force,
+            )
+            .await
         }
-        let git_dir = git_dir(&path).await;
+    }))
+    .buffer_unordered(REPO_CONCURRENCY)
+    .collect()
+    .await;
 
-        let mut rows = Vec::new();
-        for lb in locals {
-            let mut statuses = Vec::new();
-            let mut is_env_branch = false;
-            for (env_key, env_name) in &envs {
-                if &lb.name == env_name {
-                    is_env_branch = true;
-                    statuses.push(EnvMergeStatus {
-                        env: env_key.clone(),
-                        merged: true,
-                        merge_via: None,
-                        merge_date: None,
-                        ahead: 0,
-                        behind: 0,
-                    });
-                    continue;
-                }
-                let (ahead, behind) = env_maps
-                    .get(env_name)
-                    .and_then(|m| m.get(&lb.name).copied())
-                    .unwrap_or((0, 0));
-                let merged = is_merged(ahead);
-                let (via, date) = if merged {
-                    merge_info(&path, &lb.name, env_name, &lb.tip)
-                        .await
-                        .unwrap_or((None, None))
-                } else {
-                    (None, None)
-                };
-                statuses.push(EnvMergeStatus {
-                    env: env_key.clone(),
-                    merged,
-                    merge_via: via,
-                    merge_date: date,
-                    ahead,
-                    behind,
-                });
-            }
-
-            let created_at = git_dir
-                .as_deref()
-                .and_then(|gd| created_at_from_reflog(gd, &lb.name));
-
-            rows.push(BranchRow {
-                branch: lb.name,
-                created_at_source: created_at.as_ref().map(|_| "reflog".to_string()),
-                created_at,
-                is_env_branch,
-                last_commit_at: Some(lb.date).filter(|s| !s.is_empty()),
-                envs: statuses,
-            });
-        }
-
-        out.push(RepoBranchMatrix {
-            repo_id: repo.id,
-            repo_name: repo.name,
-            repo_path: path,
-            configured,
-            branches: rows,
-        });
-    }
-    Ok(out)
+    results.sort_by_key(|m| m.repo_id);
+    Ok(results)
 }
 
 pub async fn git_worktree_add_existing_core(
@@ -356,8 +461,9 @@ pub async fn upsert_branch_state_core(
 pub async fn git_project_branch_matrix(
     db: tauri::State<'_, AppDatabase>,
     project_id: i32,
+    force: Option<bool>,
 ) -> Result<Vec<RepoBranchMatrix>, AppCommandError> {
-    git_project_branch_matrix_core(&db, project_id).await
+    git_project_branch_matrix_core(&db, project_id, force.unwrap_or(false)).await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -409,25 +515,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_ahead_behind_line_reads_counts() {
-        assert_eq!(
-            parse_ahead_behind_line("feat/a\t3 0"),
-            Some(("feat/a".to_string(), 3, 0))
-        );
-        assert_eq!(
-            parse_ahead_behind_line("dev\t0 12"),
-            Some(("dev".to_string(), 0, 12))
-        );
-        assert_eq!(parse_ahead_behind_line("nope"), None);
-    }
-
-    #[test]
-    fn merged_when_no_ahead() {
-        assert!(is_merged(0));
-        assert!(!is_merged(2));
-    }
-
-    #[test]
     fn effective_env_prefers_repo_then_project() {
         assert_eq!(
             effective_env(Some("release/uat"), Some("uat")).as_deref(),
@@ -443,8 +530,7 @@ mod tests {
 
     #[test]
     fn parse_reflog_epoch_extracts_timestamp() {
-        let line =
-            "0000 1111 Alice <a@b.c> 1700000000 +0800\tbranch: Created from main";
+        let line = "0000 1111 Alice <a@b.c> 1700000000 +0800\tbranch: Created from main";
         assert_eq!(parse_reflog_epoch(line), Some(1700000000));
         assert_eq!(parse_reflog_epoch("garbage"), None);
     }

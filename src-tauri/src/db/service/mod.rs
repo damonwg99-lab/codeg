@@ -19,6 +19,7 @@ pub mod tab_service;
 pub mod thread_binding_service;
 
 // ─── Platform services (Cluster A/B/C) ───
+pub mod platform_branch_matrix_cache_service;
 pub mod platform_branch_state_service;
 pub mod platform_credential_service;
 pub mod platform_folder_kind;

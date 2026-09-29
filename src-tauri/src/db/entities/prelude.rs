@@ -21,6 +21,7 @@ pub use super::quick_message::Entity as QuickMessage;
 
 // ─── Platform entities (Cluster A/B/C) ───
 pub use super::platform_activity_log::Entity as PlatformActivityLog;
+pub use super::platform_branch_matrix_cache::Entity as PlatformBranchMatrixCache;
 pub use super::platform_branch_state::Entity as PlatformBranchState;
 pub use super::platform_credential::Entity as PlatformCredential;
 pub use super::platform_global_config::Entity as PlatformGlobalConfig;

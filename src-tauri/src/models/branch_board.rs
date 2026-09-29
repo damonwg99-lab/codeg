@@ -1,7 +1,7 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One environment's merge status for a branch, derived from git.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvMergeStatus {
     /// "dev" | "uat" | "prd"
@@ -14,7 +14,7 @@ pub struct EnvMergeStatus {
     pub behind: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BranchRow {
     pub branch: String,
@@ -26,7 +26,7 @@ pub struct BranchRow {
     pub envs: Vec<EnvMergeStatus>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RepoBranchMatrix {
     pub repo_id: i32,
