@@ -47,6 +47,9 @@ const baseRow: BranchRow = {
   createdAtSource: null,
   isEnvBranch: false,
   lastCommitAt: null,
+  upstream: null,
+  hasRemote: false,
+  needsPush: false,
   envs: [
     {
       env: "uat",
@@ -216,6 +219,65 @@ describe("filterRows", () => {
       onlyUnmerged: true,
     })
     expect(out.map((r) => r.branch)).toEqual(["feat/x"])
+  })
+
+  it("filters by env + status", () => {
+    const rows: BranchRow[] = [
+      {
+        ...baseRow,
+        branch: "feat/uat-merged",
+        envs: [
+          { env: "uat", merged: true, mergeVia: "merge", mergeDate: null, ahead: 0, behind: 0 },
+          { env: "prd", merged: false, mergeVia: null, mergeDate: null, ahead: 1, behind: 0 },
+        ],
+      },
+      {
+        ...baseRow,
+        branch: "feat/uat-open",
+        envs: [
+          { env: "uat", merged: false, mergeVia: null, mergeDate: null, ahead: 2, behind: 0 },
+        ],
+      },
+      { ...baseRow, branch: "feat/no-env", envs: [] },
+    ]
+    expect(
+      filterRows(rows, () => undefined, {
+        archived: false,
+        onlyUnmerged: false,
+        env: "uat",
+        status: "merged",
+      }).map((r) => r.branch)
+    ).toEqual(["feat/uat-merged"])
+    expect(
+      filterRows(rows, () => undefined, {
+        archived: false,
+        onlyUnmerged: false,
+        env: "uat",
+        status: "unmerged",
+      }).map((r) => r.branch)
+    ).toEqual(["feat/uat-open"])
+    // env filter excludes branches that don't have that env at all
+    expect(
+      filterRows(rows, () => undefined, {
+        archived: false,
+        onlyUnmerged: false,
+        env: "prd",
+      }).map((r) => r.branch)
+    ).toEqual(["feat/uat-merged"])
+  })
+
+  it("filters to only-needs-push", () => {
+    const rows: BranchRow[] = [
+      { ...baseRow, branch: "feat/pushed", needsPush: false },
+      { ...baseRow, branch: "feat/dirty", needsPush: true },
+    ]
+    expect(
+      filterRows(rows, () => undefined, {
+        archived: false,
+        onlyUnmerged: false,
+        onlyNeedsPush: true,
+      }).map((r) => r.branch)
+    ).toEqual(["feat/dirty"])
   })
 })
 

@@ -143,15 +143,18 @@ struct LocalBranch {
     name: String,
     tip: String,
     date: String,
+    upstream: Option<String>,
+    trackshort: String,
 }
 
-/// Local branches with tip sha + committer date, via one `for-each-ref`.
+/// Local branches with tip sha + committer date + upstream tracking, via one
+/// `for-each-ref`.
 async fn list_local_branches(path: &str) -> Result<Vec<LocalBranch>, AppCommandError> {
     let out = git_stdout(
         path,
         &[
             "for-each-ref",
-            "--format=%(refname:short)%09%(objectname)%09%(committerdate:iso-strict)",
+            "--format=%(refname:short)%09%(objectname)%09%(committerdate:iso-strict)%09%(upstream:short)%09%(upstream:trackshort)",
             "refs/heads",
         ],
     )
@@ -162,15 +165,42 @@ async fn list_local_branches(path: &str) -> Result<Vec<LocalBranch>, AppCommandE
         let name = parts.next().unwrap_or("").trim();
         let tip = parts.next().unwrap_or("").trim();
         let date = parts.next().unwrap_or("").trim();
+        let upstream = parts.next().unwrap_or("").trim();
+        let trackshort = parts.next().unwrap_or("").trim();
         if !name.is_empty() {
             rows.push(LocalBranch {
                 name: name.to_string(),
                 tip: tip.to_string(),
                 date: date.to_string(),
+                upstream: if upstream.is_empty() {
+                    None
+                } else {
+                    Some(upstream.to_string())
+                },
+                trackshort: trackshort.to_string(),
             });
         }
     }
     Ok(rows)
+}
+
+/// Names of remote branches under `origin/` (without the prefix), excluding
+/// `origin/HEAD`.
+async fn remote_branches(path: &str) -> HashSet<String> {
+    let out = git_stdout(
+        path,
+        &["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin"],
+    )
+    .await;
+    match out {
+        Ok(s) => s
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("origin/"))
+            .filter(|n| !n.is_empty() && *n != "HEAD")
+            .map(|n| n.to_string())
+            .collect(),
+        Err(_) => HashSet::new(),
+    }
 }
 
 /// Set of local branches already merged into `env`, in ONE git call
@@ -254,6 +284,7 @@ async fn compute_repo_matrix(repo_path: &str, envs: &[(String, String)]) -> Vec<
         merged.insert(env_key.clone(), merged_set(repo_path, env_name).await);
     }
     let git_dir = git_dir_no_spawn(repo_path);
+    let remotes = remote_branches(repo_path).await;
 
     let mut rows = Vec::new();
     for lb in locals {
@@ -295,12 +326,28 @@ async fn compute_repo_matrix(repo_path: &str, envs: &[(String, String)]) -> Vec<
             .as_deref()
             .and_then(|gd| created_at_from_reflog(gd, &lb.name));
 
+        let has_remote = lb.upstream.is_some() || remotes.contains(&lb.name);
+        let needs_push = if lb.upstream.is_some() {
+            lb.trackshort.contains('>')
+        } else if remotes.contains(&lb.name) {
+            let range = format!("origin/{}..{}", lb.name, lb.name);
+            match git_stdout(repo_path, &["rev-list", "--count", &range]).await {
+                Ok(s) => s.trim().parse::<i64>().unwrap_or(0) > 0,
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+
         rows.push(BranchRow {
             branch: lb.name,
             created_at_source: created_at.as_ref().map(|_| "reflog".to_string()),
             created_at,
             is_env_branch,
             last_commit_at: Some(lb.date).filter(|s| !s.is_empty()),
+            upstream: lb.upstream,
+            has_remote,
+            needs_push,
             envs: statuses,
         });
     }

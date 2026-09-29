@@ -85,6 +85,9 @@ export interface BranchRow {
   createdAtSource: "reflog" | "first_commit" | null
   isEnvBranch: boolean
   lastCommitAt: string | null
+  upstream: string | null
+  hasRemote: boolean
+  needsPush: boolean
   envs: EnvMergeStatus[]
 }
 

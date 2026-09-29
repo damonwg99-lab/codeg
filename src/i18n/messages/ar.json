@@ -5991,7 +5991,19 @@
       "envMerged": "Merged",
       "envUnmerged": "Unmerged",
       "archiveConfirmTitle": "Archive branch",
-      "archiveConfirmBody": "Archive branch {branch}? It will be hidden from the active list."
+      "archiveConfirmBody": "Archive branch {branch}? It will be hidden from the active list.",
+      "colRemote": "Remote",
+      "remoteLocalOnly": "Local only",
+      "needsPush": "Needs push",
+      "remoteSynced": "Synced",
+      "push": "Push",
+      "onlyNeedsPush": "Needs push only",
+      "envAll": "All envs",
+      "statusAll": "All status",
+      "pushAfterMergeTitle": "Push to remote",
+      "pushAfterMergeBody": "Merged into {env}. Push {env} to remote now?",
+      "pushNow": "Push",
+      "pushLater": "Later"
     },
     "repoSelector": {
       "root": "جذر المشروع",

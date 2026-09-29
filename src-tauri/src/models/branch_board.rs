@@ -23,6 +23,12 @@ pub struct BranchRow {
     pub created_at_source: Option<String>,
     pub is_env_branch: bool,
     pub last_commit_at: Option<String>,
+    /// Tracked upstream, e.g. "origin/feat/x" (None when untracked).
+    pub upstream: Option<String>,
+    /// Whether a remote branch `origin/<branch>` exists.
+    pub has_remote: bool,
+    /// Whether the local branch has commits its remote counterpart lacks.
+    pub needs_push: bool,
     pub envs: Vec<EnvMergeStatus>,
 }
 

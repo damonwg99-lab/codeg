@@ -5991,7 +5991,19 @@
       "envMerged": "已合并",
       "envUnmerged": "未合并",
       "archiveConfirmTitle": "归档分支",
-      "archiveConfirmBody": "确认归档分支 {branch}？归档后将不在活跃列表显示。"
+      "archiveConfirmBody": "确认归档分支 {branch}？归档后将不在活跃列表显示。",
+      "colRemote": "远端",
+      "remoteLocalOnly": "仅本地",
+      "needsPush": "需推送",
+      "remoteSynced": "已同步",
+      "push": "推送",
+      "onlyNeedsPush": "仅需推送",
+      "envAll": "全部环境",
+      "statusAll": "全部状态",
+      "pushAfterMergeTitle": "推送到远端",
+      "pushAfterMergeBody": "已合并到 {env}，现在把 {env} 推送到远端？",
+      "pushNow": "推送",
+      "pushLater": "稍后"
     },
     "repoSelector": {
       "root": "项目根目录",
