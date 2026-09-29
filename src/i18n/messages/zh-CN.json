@@ -5989,7 +5989,9 @@
       "prevPage": "上一页",
       "nextPage": "下一页",
       "envMerged": "已合并",
-      "envUnmerged": "未合并"
+      "envUnmerged": "未合并",
+      "archiveConfirmTitle": "归档分支",
+      "archiveConfirmBody": "确认归档分支 {branch}？归档后将不在活跃列表显示。"
     },
     "repoSelector": {
       "root": "项目根目录",

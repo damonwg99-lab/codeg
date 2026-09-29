@@ -86,6 +86,37 @@ pub async fn upsert<C: ConnectionTrait>(
     }
 }
 
+/// Ensure a state row exists for `branch` and is archived. No-op when a row
+/// already exists (so a user's manual restore is never overridden). Used to
+/// hide environment branches (dev/uat/prd) from the active list by default.
+pub async fn ensure_archived<C: ConnectionTrait>(
+    conn: &C,
+    repo_id: i32,
+    branch: &str,
+) -> Result<(), DbError> {
+    let existing = platform_branch_state::Entity::find()
+        .filter(platform_branch_state::Column::RepoId.eq(repo_id))
+        .filter(platform_branch_state::Column::Branch.eq(branch))
+        .one(conn)
+        .await?;
+    if existing.is_some() {
+        return Ok(());
+    }
+    let now = Utc::now();
+    let active = platform_branch_state::ActiveModel {
+        repo_id: Set(repo_id),
+        branch: Set(branch.to_string()),
+        is_archived: Set(true),
+        archived_at: Set(Some(now)),
+        description: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+    let _ = active.insert(conn).await;
+    Ok(())
+}
+
 /// Delete state rows for branches that no longer exist in git, for one repo.
 /// Keeps the archive/note table free of orphans.
 pub async fn prune_not_in<C: ConnectionTrait>(

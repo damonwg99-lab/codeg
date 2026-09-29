@@ -332,6 +332,14 @@ async fn compute_repo_cached(
 
     let branches = compute_repo_matrix(&repo_path, &envs).await;
 
+    // Environment branches (dev/uat/prd) default to archived (hidden) unless the
+    // user has explicitly restored them.
+    for b in &branches {
+        if b.is_env_branch {
+            let _ = platform_branch_state_service::ensure_archived(conn, repo_id, &b.branch).await;
+        }
+    }
+
     // Auto-clean orphaned archive/note rows for branches git no longer has.
     let keep: Vec<String> = branches.iter().map(|b| b.branch.clone()).collect();
     let _ = platform_branch_state_service::prune_not_in(conn, repo_id, &keep).await;

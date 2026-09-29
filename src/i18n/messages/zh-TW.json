@@ -5989,7 +5989,9 @@
       "prevPage": "上一頁",
       "nextPage": "下一頁",
       "envMerged": "已合併",
-      "envUnmerged": "未合併"
+      "envUnmerged": "未合併",
+      "archiveConfirmTitle": "歸檔分支",
+      "archiveConfirmBody": "確認歸檔分支 {branch}？歸檔後將不在活躍列表顯示。"
     },
     "repoSelector": {
       "root": "專案根目錄",

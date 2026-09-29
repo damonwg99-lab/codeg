@@ -5989,7 +5989,9 @@
       "prevPage": "Prev",
       "nextPage": "Next",
       "envMerged": "Merged",
-      "envUnmerged": "Unmerged"
+      "envUnmerged": "Unmerged",
+      "archiveConfirmTitle": "Archive branch",
+      "archiveConfirmBody": "Archive branch {branch}? It will be hidden from the active list."
     },
     "repoSelector": {
       "root": "Raíz del proyecto",

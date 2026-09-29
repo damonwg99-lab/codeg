@@ -128,6 +128,10 @@ export function BranchBoard({ projectId }: Props) {
     repo: ProjectRepoInfo
     row: BranchRow
   } | null>(null)
+  const [archiveTarget, setArchiveTarget] = useState<{
+    repoId: number
+    branch: string
+  } | null>(null)
 
   const stateKey = (repoId: number, branch: string) => `${repoId}:${branch}`
 
@@ -305,10 +309,10 @@ export function BranchBoard({ projectId }: Props) {
     void refresh()
   }
 
-  const toggleArchive = async (row: BranchRow, repoId: number) => {
-    const cur = states.get(stateKey(repoId, row.branch))
+  const toggleArchive = async (repoId: number, branch: string) => {
+    const cur = states.get(stateKey(repoId, branch))
     try {
-      const next = await upsertBranchState(repoId, row.branch, {
+      const next = await upsertBranchState(repoId, branch, {
         isArchived: !(cur?.isArchived ?? false),
       })
       setStates((prev) => {
@@ -543,7 +547,13 @@ export function BranchBoard({ projectId }: Props) {
                               ? t("task.restoreBranch")
                               : t("task.archiveBranch")
                           }
-                          onClick={() => void toggleArchive(row, repoId)}
+                          onClick={() => {
+                            if (state?.isArchived) {
+                              void toggleArchive(repoId, row.branch)
+                            } else {
+                              setArchiveTarget({ repoId, branch: row.branch })
+                            }
+                          }}
                         >
                           {state?.isArchived ? (
                             <ArchiveRestore className="h-3.5 w-3.5" />
@@ -611,6 +621,35 @@ export function BranchBoard({ projectId }: Props) {
           </Button>
         </div>
       )}
+
+      {/* Archive confirm */}
+      <AlertDialog
+        open={archiveTarget !== null}
+        onOpenChange={(o) => !o && setArchiveTarget(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("task.archiveConfirmTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("task.archiveConfirmBody", {
+                branch: archiveTarget?.branch ?? "",
+              })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("task.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                const a = archiveTarget
+                setArchiveTarget(null)
+                if (a) void toggleArchive(a.repoId, a.branch)
+              }}
+            >
+              {t("task.archiveBranch")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Pick target environment */}
       <Dialog
