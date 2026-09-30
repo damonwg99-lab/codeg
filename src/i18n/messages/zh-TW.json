@@ -6018,7 +6018,8 @@
       "detailNoDiff": "無差異",
       "detailCommits": "提交歷史",
       "detailEmptyCommits": "尚無提交",
-      "detailLoadMore": "載入更多"
+      "detailLoadMore": "載入更多",
+      "detailCompareTo": "對比"
     },
     "repoSelector": {
       "root": "專案根目錄",
