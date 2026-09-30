@@ -52,6 +52,7 @@ import {
   collectExpandedDirectoryPaths,
   type CommitFileTreeNode,
 } from "@/lib/platform/commit-file-tree"
+import { parseDiffFileSections } from "@/lib/platform/diff-files"
 import type {
   BranchRow,
   BranchStateInfo,
@@ -116,6 +117,7 @@ export function BranchDetailPanel({
   const [diffEnv, setDiffEnv] = useState<EnvKey | "">("")
   const [diffText, setDiffText] = useState<string | null>(null)
   const [loadingDiff, setLoadingDiff] = useState(false)
+  const [diffFile, setDiffFile] = useState<string | null>(null)
 
   // Commit detail (git-log style: click a commit -> files -> per-file diff).
   const [openCommit, setOpenCommit] = useState<string | null>(null)
@@ -137,6 +139,7 @@ export function BranchDetailPanel({
     setHasMore(false)
     setDiffEnv("")
     setDiffText(null)
+    setDiffFile(null)
     setStatus(null)
     setCurrentBranch(null)
     setOpenCommit(null)
@@ -189,6 +192,7 @@ export function BranchDetailPanel({
     const envBranch = resolveEffectiveEnv(repo, project, env)
     if (!envBranch) return
     setDiffEnv(env)
+    setDiffFile(null)
     setLoadingDiff(true)
     try {
       setDiffText(await gitDiffWithBranch(path, envBranch))
@@ -227,10 +231,19 @@ export function BranchDetailPanel({
     }
   }
 
-  const changedFiles = useMemo(() => {
-    if (!diffText) return 0
-    return diffText.split("\n").filter((l) => l.startsWith("diff --git ")).length
-  }, [diffText])
+  const diffSections = useMemo(
+    () => parseDiffFileSections(diffText ?? ""),
+    [diffText]
+  )
+  const diffTree = useMemo(
+    () => buildCommitFileTree(diffSections.map((s) => s.change)),
+    [diffSections]
+  )
+  const diffFileText = useMemo(() => {
+    if (!diffFile) return null
+    return diffSections.find((s) => s.change.path === diffFile)?.text ?? null
+  }, [diffSections, diffFile])
+  const changedFiles = diffSections.length
 
   const isCheckedOut =
     currentBranch != null && row != null && currentBranch === row.branch
@@ -292,7 +305,10 @@ export function BranchDetailPanel({
     }
   }
 
-  const renderCommitTree = (nodes: CommitFileTreeNode[]): ReactElement[] =>
+  const renderFileTree = (
+    nodes: CommitFileTreeNode[],
+    onFileClick: (file: GitLogFileChange) => void
+  ): ReactElement[] =>
     nodes.map((node) => {
       if (node.kind === "dir") {
         return (
@@ -304,21 +320,19 @@ export function BranchDetailPanel({
             suffixClassName="text-muted-foreground/45"
             title={node.path}
           >
-            {renderCommitTree(node.children)}
+            {renderFileTree(node.children, onFileClick)}
           </FileTreeFolder>
         )
       }
       const file = node.change
       return (
         <FileTreeFile
-          key={`${openCommit}:${file.path}`}
+          key={file.path}
           className="w-full min-w-0 cursor-pointer"
           name={node.name}
           path={node.path}
           title={file.path}
-          onClick={() => {
-            if (openCommit) void openFile(openCommit, file.path)
-          }}
+          onClick={() => onFileClick(file)}
         >
           <span className="size-4 shrink-0" />
           <CommitFileInfo className="min-w-0 flex-1 gap-1.5">
@@ -553,16 +567,34 @@ export function BranchDetailPanel({
                       {t("task.loading")}
                     </p>
                   ) : diffText != null ? (
-                    diffText.trim() ? (
-                      <UnifiedDiffPreview
-                        diffText={diffText}
-                        embedded
-                        hideViewToggle
-                      />
-                    ) : (
+                    diffSections.length === 0 ? (
                       <p className="text-[0.75rem] text-muted-foreground">
                         {t("task.detailNoDiff")}
                       </p>
+                    ) : (
+                      <div className="flex flex-col gap-3">
+                        <FileTree
+                          key={diffEnv}
+                          defaultExpanded={collectExpandedDirectoryPaths(
+                            diffTree
+                          )}
+                          className="rounded-md border-border/60 bg-transparent text-xs [&>div]:p-1"
+                        >
+                          {renderFileTree(diffTree, (f) => setDiffFile(f.path))}
+                        </FileTree>
+                        {diffFileText != null && diffFileText.trim() && (
+                          <div className="overflow-hidden rounded-md border border-border/60">
+                            <div className="truncate border-b border-border/60 px-3 py-1.5 font-mono text-[0.6875rem] text-muted-foreground">
+                              {diffFile}
+                            </div>
+                            <UnifiedDiffPreview
+                              diffText={diffFileText}
+                              embedded
+                              hideViewToggle
+                            />
+                          </div>
+                        )}
+                      </div>
                     )
                   ) : null}
                 </div>
@@ -644,7 +676,10 @@ export function BranchDetailPanel({
                                       defaultExpanded={dirPaths}
                                       className="max-h-[32rem] overflow-auto rounded-md border-border/60 bg-transparent text-xs [&>div]:p-1"
                                     >
-                                      {renderCommitTree(treeNodes)}
+                                      {renderFileTree(treeNodes, (f) => {
+                                        if (openCommit)
+                                          void openFile(openCommit, f.path)
+                                      })}
                                     </FileTree>
                                   )
                                 })()}
