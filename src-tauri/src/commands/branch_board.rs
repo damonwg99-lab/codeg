@@ -20,6 +20,15 @@ const REPO_CONCURRENCY: usize = 6;
 // Pure helpers (unit-tested)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Parse `git rev-list --left-right --count A...B` output ("<left>\t<right>").
+/// left = reachable from A only, right = from B only.
+pub(crate) fn parse_left_right(stdout: &str) -> Option<(i64, i64)> {
+    let mut it = stdout.split_whitespace();
+    let left = it.next()?.parse().ok()?;
+    let right = it.next()?.parse().ok()?;
+    Some((left, right))
+}
+
 /// Effective env branch: repo override wins, else project default.
 pub(crate) fn effective_env(repo: Option<&str>, project: Option<&str>) -> Option<String> {
     match (repo, project) {
@@ -257,19 +266,38 @@ async fn merge_info(
     }
 }
 
-/// Branch creation date read straight from the reflog file (no git process).
-fn created_at_from_reflog(git_dir: &Path, branch: &str) -> Option<String> {
+/// Branch creation date + creator read straight from the reflog file (no git
+/// process). Returns `(created_at_rfc3339, created_by)`.
+fn created_at_from_reflog(git_dir: &Path, branch: &str) -> Option<(String, Option<String>)> {
     let log_path = git_dir.join("logs").join("refs").join("heads").join(branch);
     let content = std::fs::read_to_string(log_path).ok()?;
     for line in content.lines() {
         if line.contains("branch: Created from") {
-            if let Some(epoch) = parse_reflog_epoch(line) {
-                let dt = chrono::DateTime::from_timestamp(epoch, 0)?;
-                return Some(dt.to_rfc3339());
-            }
+            let epoch = parse_reflog_epoch(line)?;
+            let dt = chrono::DateTime::from_timestamp(epoch, 0)?;
+            return Some((dt.to_rfc3339(), parse_reflog_created_by(line)));
         }
     }
     None
+}
+
+/// Extract the creator identity ("Name <email>") from a reflog creation line.
+pub(crate) fn parse_reflog_created_by(line: &str) -> Option<String> {
+    if !line.contains("branch: Created from") {
+        return None;
+    }
+    let before_tab = line.split('\t').next()?;
+    let tokens: Vec<&str> = before_tab.split_whitespace().collect();
+    // tokens: [old, new, name..., <email>, ts, tz]
+    if tokens.len() < 5 {
+        return None;
+    }
+    let mid = &tokens[2..tokens.len() - 2];
+    if mid.is_empty() {
+        None
+    } else {
+        Some(mid.join(" "))
+    }
 }
 
 async fn compute_repo_matrix(repo_path: &str, envs: &[(String, String)]) -> Vec<BranchRow> {
@@ -322,21 +350,33 @@ async fn compute_repo_matrix(repo_path: &str, envs: &[(String, String)]) -> Vec<
             });
         }
 
-        let created_at = git_dir
+        let created = git_dir
             .as_deref()
             .and_then(|gd| created_at_from_reflog(gd, &lb.name));
+        let (created_at, created_by) = match created {
+            Some((d, b)) => (Some(d), b),
+            None => (None, None),
+        };
 
         let has_remote = lb.upstream.is_some() || remotes.contains(&lb.name);
-        let needs_push = if lb.upstream.is_some() {
-            lb.trackshort.contains('>')
+        let (needs_push, needs_pull) = if lb.upstream.is_some() {
+            (lb.trackshort.contains('>'), lb.trackshort.contains('<'))
         } else if remotes.contains(&lb.name) {
-            let range = format!("origin/{}..{}", lb.name, lb.name);
-            match git_stdout(repo_path, &["rev-list", "--count", &range]).await {
-                Ok(s) => s.trim().parse::<i64>().unwrap_or(0) > 0,
-                Err(_) => false,
+            let range = format!("origin/{}...{}", lb.name, lb.name);
+            match git_stdout(
+                repo_path,
+                &["rev-list", "--left-right", "--count", &range],
+            )
+            .await
+            {
+                Ok(s) => match parse_left_right(&s) {
+                    Some((behind, ahead)) => (ahead > 0, behind > 0),
+                    None => (false, false),
+                },
+                Err(_) => (false, false),
             }
         } else {
-            false
+            (false, false)
         };
 
         rows.push(BranchRow {
@@ -345,9 +385,11 @@ async fn compute_repo_matrix(repo_path: &str, envs: &[(String, String)]) -> Vec<
             created_at,
             is_env_branch,
             last_commit_at: Some(lb.date).filter(|s| !s.is_empty()),
+            created_by,
             upstream: lb.upstream,
             has_remote,
             needs_push,
+            needs_pull,
             envs: statuses,
         });
     }
@@ -589,6 +631,22 @@ mod tests {
         let line = "0000 1111 Alice <a@b.c> 1700000000 +0800\tbranch: Created from main";
         assert_eq!(parse_reflog_epoch(line), Some(1700000000));
         assert_eq!(parse_reflog_epoch("garbage"), None);
+    }
+
+    #[test]
+    fn parse_reflog_created_by_extracts_identity() {
+        let line = "0000 1111 Alice <a@b.c> 1700000000 +0800\tbranch: Created from main";
+        assert_eq!(
+            parse_reflog_created_by(line).as_deref(),
+            Some("Alice <a@b.c>")
+        );
+        assert_eq!(parse_reflog_created_by("x\tcommit: msg"), None);
+    }
+
+    #[test]
+    fn parse_left_right_reads_counts() {
+        assert_eq!(parse_left_right("3\t0\n"), Some((3, 0)));
+        assert_eq!(parse_left_right("0 5"), Some((0, 5)));
     }
 
     #[test]

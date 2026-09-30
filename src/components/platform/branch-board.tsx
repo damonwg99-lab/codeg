@@ -11,6 +11,7 @@ import {
   ArchiveRestore,
   GitMerge,
   Upload,
+  Download,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
@@ -60,7 +61,9 @@ import {
   gitListAllBranches,
   openWorktreeFolder,
   openPushWindow,
+  gitUpdateBranch,
 } from "@/lib/api"
+import { useGitCredential } from "@/contexts/git-credential-context"
 import {
   canMerge,
   envCellState,
@@ -108,6 +111,7 @@ const PAGE_SIZE = 50
 export function BranchBoard({ projectId }: Props) {
   const t = useTranslations("Platform")
   const { activeProject, activeProjectRepos } = usePlatform()
+  const { withCredentialRetry } = useGitCredential()
 
   const [matrices, setMatrices] = useState<RepoBranchMatrix[]>([])
   const [states, setStates] = useState<Map<string, BranchStateInfo>>(new Map())
@@ -286,6 +290,21 @@ export function BranchBoard({ projectId }: Props) {
       return
     }
     void openPushWindow(repo.folderId, branch)
+  }
+
+  const doPull = async (repo: ProjectRepoInfo, branch: string) => {
+    setBusy(true)
+    try {
+      await withCredentialRetry(
+        (creds) => gitUpdateBranch(repo.localDir, branch, false, creds),
+        { folderPath: repo.localDir }
+      )
+      await refresh()
+    } catch {
+      toast.error(t("task.mergeFailed"))
+    } finally {
+      setBusy(false)
+    }
   }
 
   const performMerge = async (
@@ -549,6 +568,9 @@ export function BranchBoard({ projectId }: Props) {
                 <th className="sticky top-0 z-10 bg-background px-2 py-2 font-medium">
                   {t("task.colCreated")}
                 </th>
+                <th className="sticky top-0 z-10 bg-background px-2 py-2 font-medium">
+                  {t("task.colAuthor")}
+                </th>
                 {shownEnvs.map((e) => (
                   <th
                     key={e}
@@ -596,6 +618,9 @@ export function BranchBoard({ projectId }: Props) {
                         ? `${row.createdAtSource === "first_commit" ? "~" : ""}${row.createdAt.slice(0, 10)}`
                         : "—"}
                     </td>
+                    <td className="px-2 py-2 text-muted-foreground">
+                      {row.createdBy || "—"}
+                    </td>
                     {shownEnvs.map((e) => {
                         const cell = envCellState(row, e)
                         const label =
@@ -636,12 +661,26 @@ export function BranchBoard({ projectId }: Props) {
                         <span className="text-[0.7rem] text-muted-foreground">
                           {t("task.remoteLocalOnly")}
                         </span>
+                      ) : row.needsPush && row.needsPull ? (
+                        <Badge
+                          variant="outline"
+                          className="text-[0.625rem] text-destructive border-destructive/40"
+                        >
+                          {t("task.diverged")}
+                        </Badge>
                       ) : row.needsPush ? (
                         <Badge
                           variant="outline"
                           className="text-[0.625rem] text-orange-600 border-orange-300"
                         >
                           {t("task.needsPush")}
+                        </Badge>
+                      ) : row.needsPull ? (
+                        <Badge
+                          variant="outline"
+                          className="text-[0.625rem] text-blue-600 border-blue-300"
+                        >
+                          {t("task.needsPull")}
                         </Badge>
                       ) : (
                         <span className="text-[0.7rem] text-green-600 dark:text-green-400">
@@ -677,6 +716,18 @@ export function BranchBoard({ projectId }: Props) {
                             onClick={() => doPush(repo, row.branch)}
                           >
                             <Upload className="h-3.5 w-3.5" />
+                          </Button>
+                        )}
+                        {repo && row.hasRemote && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-7 w-7"
+                            title={t("task.pull")}
+                            disabled={!row.needsPull || busy}
+                            onClick={() => void doPull(repo, row.branch)}
+                          >
+                            <Download className="h-3.5 w-3.5" />
                           </Button>
                         )}
                         <Button

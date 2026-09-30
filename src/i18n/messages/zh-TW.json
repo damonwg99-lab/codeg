@@ -6003,7 +6003,11 @@
       "pushAfterMergeTitle": "推送到遠端",
       "pushAfterMergeBody": "已合併到 {env}，現在把 {env} 推送到遠端？",
       "pushNow": "推送",
-      "pushLater": "稍後"
+      "pushLater": "稍後",
+      "colAuthor": "建立者",
+      "needsPull": "有更新",
+      "diverged": "已分叉",
+      "pull": "拉取"
     },
     "repoSelector": {
       "root": "專案根目錄",

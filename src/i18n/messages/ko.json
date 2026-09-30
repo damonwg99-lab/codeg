@@ -6003,7 +6003,11 @@
       "pushAfterMergeTitle": "Push to remote",
       "pushAfterMergeBody": "Merged into {env}. Push {env} to remote now?",
       "pushNow": "Push",
-      "pushLater": "Later"
+      "pushLater": "Later",
+      "colAuthor": "Author",
+      "needsPull": "Update available",
+      "diverged": "Diverged",
+      "pull": "Pull"
     },
     "repoSelector": {
       "root": "프로젝트 루트",

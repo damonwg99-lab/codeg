@@ -47,9 +47,11 @@ const baseRow: BranchRow = {
   createdAtSource: null,
   isEnvBranch: false,
   lastCommitAt: null,
+  createdBy: null,
   upstream: null,
   hasRemote: false,
   needsPush: false,
+  needsPull: false,
   envs: [
     {
       env: "uat",
