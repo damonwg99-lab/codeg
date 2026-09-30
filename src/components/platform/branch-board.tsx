@@ -603,7 +603,7 @@ export function BranchBoard({ projectId }: Props) {
         </p>
       ) : (
         <div className="flex-1 min-h-0 overflow-auto rounded-lg border">
-          <table className="w-full text-sm">
+          <table className="w-full min-w-[900px] text-sm">
             <thead>
               <tr className="border-b text-left text-[0.75rem] text-muted-foreground">
                 <th className="sticky top-0 z-10 bg-background px-3 py-2 font-medium">

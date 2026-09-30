@@ -16,6 +16,7 @@ import {
   FileTreeFolder,
 } from "@/components/ai-elements/file-tree"
 import { Button } from "@/components/ui/button"
+import { UnifiedDiffPreview } from "@/components/diff/unified-diff-preview"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   Select,
@@ -497,9 +498,11 @@ export function BranchDetailPanel({
                   </p>
                 ) : diffText != null ? (
                   diffText.trim() ? (
-                    <pre className="max-h-[60vh] overflow-auto rounded-md bg-muted/40 p-2 font-mono text-[0.6875rem] leading-relaxed">
-                      {diffText}
-                    </pre>
+                    <UnifiedDiffPreview
+                      diffText={diffText}
+                      embedded
+                      hideViewToggle
+                    />
                   ) : (
                     <p className="text-[0.75rem] text-muted-foreground">
                       {t("task.detailNoDiff")}
@@ -572,11 +575,18 @@ export function BranchDetailPanel({
                                     </FileTree>
                                   )
                                 })()}
-                                {fileDiff && (
-                                  <pre className="max-h-[50vh] overflow-auto rounded-md bg-muted/40 p-2 font-mono text-[0.6875rem] leading-relaxed">
-                                    {fileDiff.text || t("task.detailNoDiff")}
-                                  </pre>
-                                )}
+                                {fileDiff &&
+                                  (fileDiff.text.trim() ? (
+                                    <UnifiedDiffPreview
+                                      diffText={fileDiff.text}
+                                      embedded
+                                      hideViewToggle
+                                    />
+                                  ) : (
+                                    <p className="text-[0.75rem] text-muted-foreground">
+                                      {t("task.detailNoDiff")}
+                                    </p>
+                                  ))}
                               </>
                             )}
                           </div>
