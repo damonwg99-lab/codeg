@@ -6019,7 +6019,11 @@
       "detailCommits": "提交歷史",
       "detailEmptyCommits": "尚無提交",
       "detailLoadMore": "載入更多",
-      "detailCompareTo": "對比"
+      "detailCompareTo": "對比",
+      "detailSync": "同步",
+      "detailManage": "管理",
+      "detailDanger": "危險操作",
+      "merge": "合併"
     },
     "repoSelector": {
       "root": "專案根目錄",

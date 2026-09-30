@@ -6019,7 +6019,11 @@
       "detailCommits": "提交历史",
       "detailEmptyCommits": "暂无提交",
       "detailLoadMore": "加载更多",
-      "detailCompareTo": "对比"
+      "detailCompareTo": "对比",
+      "detailSync": "同步",
+      "detailManage": "管理",
+      "detailDanger": "危险操作",
+      "merge": "合并"
     },
     "repoSelector": {
       "root": "项目根目录",

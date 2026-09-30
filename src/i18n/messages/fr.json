@@ -6019,7 +6019,11 @@
       "detailCommits": "Commits",
       "detailEmptyCommits": "No commits",
       "detailLoadMore": "Load more",
-      "detailCompareTo": "Compare to"
+      "detailCompareTo": "Compare to",
+      "detailSync": "Synchroniser",
+      "detailManage": "Gérer",
+      "detailDanger": "Zone de danger",
+      "merge": "Fusionner"
     },
     "repoSelector": {
       "root": "Racine du projet",

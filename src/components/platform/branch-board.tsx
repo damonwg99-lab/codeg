@@ -3,16 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
-import {
-  RefreshCw,
-  Trash2,
-  Pencil,
-  Archive,
-  ArchiveRestore,
-  GitMerge,
-  Upload,
-  Download,
-} from "lucide-react"
+import { RefreshCw } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -77,7 +68,6 @@ import {
   filterRows,
   isFullyMerged,
   resolveEffectiveEnv,
-  unmergedEnvs,
 } from "@/lib/platform/branch-board"
 import type {
   BranchRow,
@@ -148,10 +138,6 @@ export function BranchBoard({ projectId }: Props) {
     repo: ProjectRepoInfo
     row: BranchRow
     env: EnvKey
-  } | null>(null)
-  const [mergePick, setMergePick] = useState<{
-    repo: ProjectRepoInfo
-    row: BranchRow
   } | null>(null)
   const [archiveTarget, setArchiveTarget] = useState<{
     repoId: number
@@ -636,9 +622,6 @@ export function BranchBoard({ projectId }: Props) {
                 <th className="sticky top-0 z-10 bg-background px-2 py-2 font-medium">
                   {t("task.colNote")}
                 </th>
-                <th className="sticky top-0 z-10 bg-background px-3 py-2 font-medium">
-                  {t("task.colActions")}
-                </th>
               </tr>
             </thead>
             <tbody>
@@ -648,7 +631,8 @@ export function BranchBoard({ projectId }: Props) {
                 return (
                   <tr
                     key={`${repoId}:${row.branch}`}
-                    className="border-b last:border-0 hover:bg-accent/40"
+                    className="cursor-pointer border-b last:border-0 hover:bg-accent/40"
+                    onClick={() => repo && setDetail({ repo, row })}
                   >
                     <td className="px-3 py-2 font-mono text-[0.8125rem]">
                       <button
@@ -736,97 +720,6 @@ export function BranchBoard({ projectId }: Props) {
                     <td className="px-2 py-2 text-muted-foreground">
                       {state?.description || "—"}
                     </td>
-                    <td className="px-3 py-2">
-                      <div className="flex items-center gap-1">
-                        {!row.isEnvBranch &&
-                          repo &&
-                          unmergedEnvs(row).length > 0 && (
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-7 w-7"
-                              title={t("task.mergeTo")}
-                              onClick={() => setMergePick({ repo, row })}
-                            >
-                              <GitMerge className="h-3.5 w-3.5" />
-                            </Button>
-                          )}
-                        {repo && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7"
-                            title={t("task.push")}
-                            disabled={repo.folderId == null}
-                            onClick={() => doPush(repo, row.branch)}
-                          >
-                            <Upload className="h-3.5 w-3.5" />
-                          </Button>
-                        )}
-                        {repo && row.hasRemote && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7"
-                            title={t("task.pull")}
-                            disabled={!row.needsPull || busy}
-                            onClick={() => void doPull(repo, row.branch)}
-                          >
-                            <Download className="h-3.5 w-3.5" />
-                          </Button>
-                        )}
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-7 w-7"
-                          title={
-                            state?.isArchived
-                              ? t("task.restoreBranch")
-                              : t("task.archiveBranch")
-                          }
-                          onClick={() => {
-                            if (state?.isArchived) {
-                              void toggleArchive(repoId, row.branch)
-                            } else {
-                              setArchiveTarget({ repoId, branch: row.branch })
-                            }
-                          }}
-                        >
-                          {state?.isArchived ? (
-                            <ArchiveRestore className="h-3.5 w-3.5" />
-                          ) : (
-                            <Archive className="h-3.5 w-3.5" />
-                          )}
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-7 w-7"
-                          title={t("task.editNote")}
-                          onClick={() =>
-                            setNoteEdit({
-                              repoId,
-                              branch: row.branch,
-                              value: state?.description ?? "",
-                            })
-                          }
-                        >
-                          <Pencil className="h-3.5 w-3.5" />
-                        </Button>
-                        {!row.isEnvBranch && repo && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7 text-muted-foreground hover:text-destructive"
-                            onClick={() =>
-                              setDeleteTarget({ repo, branch: row.branch })
-                            }
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </Button>
-                        )}
-                      </div>
-                    </td>
                   </tr>
                 )
               })}
@@ -898,6 +791,40 @@ export function BranchBoard({ projectId }: Props) {
                 row={detail.row}
                 project={activeProject}
                 state={states.get(stateKey(detail.repo.id, detail.row.branch))}
+                busy={busy}
+                onMerge={(env) =>
+                  setMergeTarget({ repo: detail.repo, row: detail.row, env })
+                }
+                onPush={() => doPush(detail.repo, detail.row.branch)}
+                onPull={() => void doPull(detail.repo, detail.row.branch)}
+                onArchive={() => {
+                  const st = states.get(
+                    stateKey(detail.repo.id, detail.row.branch)
+                  )
+                  if (st?.isArchived) {
+                    void toggleArchive(detail.repo.id, detail.row.branch)
+                  } else {
+                    setArchiveTarget({
+                      repoId: detail.repo.id,
+                      branch: detail.row.branch,
+                    })
+                  }
+                }}
+                onEditNote={() =>
+                  setNoteEdit({
+                    repoId: detail.repo.id,
+                    branch: detail.row.branch,
+                    value:
+                      states.get(stateKey(detail.repo.id, detail.row.branch))
+                        ?.description ?? "",
+                  })
+                }
+                onDelete={() =>
+                  setDeleteTarget({
+                    repo: detail.repo,
+                    branch: detail.row.branch,
+                  })
+                }
                 onClose={() => setDetail(null)}
               />
             </ResizablePanel>
@@ -933,37 +860,6 @@ export function BranchBoard({ projectId }: Props) {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-
-      {/* Pick target environment */}
-      <Dialog
-        open={mergePick !== null}
-        onOpenChange={(o) => !o && setMergePick(null)}
-      >
-        <DialogContent className="sm:max-w-xs">
-          <DialogHeader>
-            <DialogTitle>{t("task.mergeTo")}</DialogTitle>
-          </DialogHeader>
-          <p className="font-mono text-[0.8125rem] text-muted-foreground">
-            {mergePick?.row.branch}
-          </p>
-          <div className="flex flex-col gap-2">
-            {(mergePick ? unmergedEnvs(mergePick.row) : []).map((e) => (
-              <Button
-                key={e}
-                variant="outline"
-                onClick={() => {
-                  const p = mergePick
-                  setMergePick(null)
-                  if (p) setMergeTarget({ repo: p.repo, row: p.row, env: e })
-                }}
-              >
-                {t("task.mergeTo")}{" "}
-                {t(`task.env${e[0].toUpperCase()}${e.slice(1)}` as never)}
-              </Button>
-            ))}
-          </div>
-        </DialogContent>
-      </Dialog>
 
       {/* Merge confirm (safety gate) */}
       <AlertDialog

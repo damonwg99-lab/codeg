@@ -12,6 +12,12 @@ import {
   CloudCheck,
   CloudOff,
   CircleHelp,
+  Upload,
+  Download,
+  Archive,
+  ArchiveRestore,
+  Trash2,
+  Pencil,
 } from "lucide-react"
 import {
   FileTree,
@@ -75,6 +81,13 @@ interface Props {
   row: BranchRow | null
   project: ProjectInfo | null
   state?: BranchStateInfo
+  busy?: boolean
+  onMerge: (env: EnvKey) => void
+  onPush: () => void
+  onPull: () => void
+  onArchive: () => void
+  onEditNote: () => void
+  onDelete?: () => void
   onClose?: () => void
 }
 
@@ -102,7 +115,14 @@ export function BranchDetailPanel({
   repoPath,
   row,
   project,
-  state: _state,
+  state,
+  busy,
+  onMerge,
+  onPush,
+  onPull,
+  onArchive,
+  onEditNote,
+  onDelete,
   onClose,
 }: Props) {
   const t = useTranslations("Platform")
@@ -437,52 +457,174 @@ export function BranchDetailPanel({
             className="mt-0 min-h-0 flex-1 overflow-hidden"
           >
             <ScrollArea className="h-full">
-              <div className="px-5 py-4">
-                {envs.length === 0 ? (
-                  <p className="text-[0.75rem] text-muted-foreground">
-                    {t("task.notConfigured")}
-                  </p>
-                ) : (
-                  <div className="flex flex-col divide-y divide-border/60">
-                    {envs.map((e) => {
-                      const cell = row
-                        ? envCellState(row, e)
-                        : { kind: "unconfigured" as const }
-                      const label =
-                        cell.kind === "merged"
-                          ? cell.mergeVia === "fast_forward"
-                            ? "—（FF）"
-                            : cell.mergeDate
-                              ? `${t("task.envMerged")} · ${cell.mergeDate.slice(0, 10)}`
-                              : t("task.envMerged")
-                          : cell.kind === "unmerged"
-                            ? t("task.envUnmerged")
-                            : cell.kind === "env"
-                              ? "—"
-                              : t("task.notConfigured")
-  return (
-                        <div
-                          key={e}
-                          className="flex items-center justify-between py-2 text-[0.8125rem] first:pt-0 last:pb-0"
-                        >
-                          <span className="text-muted-foreground">
-                            {t(
-                              `task.env${e[0].toUpperCase()}${e.slice(1)}` as never
-                            )}
-                          </span>
-                          <span
-                            className={
-                              cell.kind === "merged"
-                                ? "text-green-600 dark:text-green-400"
-                                : "text-muted-foreground"
-                            }
-                          >
-                            {label}
-                          </span>
-                        </div>
-                      )
-                    })}
+              <div className="flex flex-col gap-5 px-5 py-4">
+                {/* Sync */}
+                <section className="flex flex-col gap-2">
+                  <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
+                    {t("task.detailSync")}
+                  </h3>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="gap-1.5"
+                      disabled={busy || !repo || repo.folderId == null}
+                      onClick={onPush}
+                    >
+                      <Upload className="size-3.5" />
+                      {t("task.push")}
+                    </Button>
+                    {row?.hasRemote && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="gap-1.5"
+                        disabled={busy || !row.needsPull}
+                        onClick={onPull}
+                      >
+                        <Download className="size-3.5" />
+                        {t("task.pull")}
+                      </Button>
+                    )}
                   </div>
+                </section>
+
+                {/* Merge to env */}
+                <section className="flex flex-col gap-2">
+                  <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
+                    {t("task.mergeTo")}
+                  </h3>
+                  {envs.length === 0 ? (
+                    <p className="text-[0.75rem] text-muted-foreground">
+                      {t("task.notConfigured")}
+                    </p>
+                  ) : (
+                    <div className="flex flex-col divide-y divide-border/60">
+                      {envs.map((e) => {
+                        const cell = row
+                          ? envCellState(row, e)
+                          : { kind: "unconfigured" as const }
+                        const label =
+                          cell.kind === "merged"
+                            ? cell.mergeVia === "fast_forward"
+                              ? "—（FF）"
+                              : cell.mergeDate
+                                ? `${t("task.envMerged")} · ${cell.mergeDate.slice(0, 10)}`
+                                : t("task.envMerged")
+                            : cell.kind === "unmerged"
+                              ? t("task.envUnmerged")
+                              : cell.kind === "env"
+                                ? "—"
+                                : t("task.notConfigured")
+                        const canMergeEnv =
+                          row != null &&
+                          !row.isEnvBranch &&
+                          cell.kind === "unmerged"
+                        return (
+                          <div
+                            key={e}
+                            className="flex items-center justify-between gap-2 py-2 text-[0.8125rem] first:pt-0 last:pb-0"
+                          >
+                            <span className="text-muted-foreground">
+                              {t(
+                                `task.env${e[0].toUpperCase()}${e.slice(1)}` as never
+                              )}
+                            </span>
+                            <div className="flex items-center gap-2">
+                              <span
+                                className={
+                                  cell.kind === "merged"
+                                    ? "text-green-600 dark:text-green-400"
+                                    : "text-muted-foreground"
+                                }
+                              >
+                                {label}
+                              </span>
+                              {canMergeEnv && (
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-6 px-2 text-[0.6875rem]"
+                                  disabled={busy}
+                                  onClick={() => onMerge(e)}
+                                >
+                                  {t("task.merge")}
+                                </Button>
+                              )}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+                </section>
+
+                {/* Note */}
+                <section className="flex flex-col gap-2">
+                  <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
+                    {t("task.colNote")}
+                  </h3>
+                  <div className="flex items-start gap-2">
+                    <p className="min-w-0 flex-1 whitespace-pre-wrap break-words text-[0.8125rem] text-muted-foreground">
+                      {state?.description || "—"}
+                    </p>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 shrink-0"
+                      title={t("task.editNote")}
+                      disabled={busy}
+                      onClick={onEditNote}
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                </section>
+
+                {/* Manage */}
+                <section className="flex flex-col gap-2">
+                  <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
+                    {t("task.detailManage")}
+                  </h3>
+                  <div>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="gap-1.5"
+                      disabled={busy}
+                      onClick={onArchive}
+                    >
+                      {state?.isArchived ? (
+                        <ArchiveRestore className="size-3.5" />
+                      ) : (
+                        <Archive className="size-3.5" />
+                      )}
+                      {state?.isArchived
+                        ? t("task.restoreBranch")
+                        : t("task.archiveBranch")}
+                    </Button>
+                  </div>
+                </section>
+
+                {/* Danger */}
+                {row && !row.isEnvBranch && onDelete && (
+                  <section className="flex flex-col gap-2 border-t border-border/60 pt-4">
+                    <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
+                      {t("task.detailDanger")}
+                    </h3>
+                    <div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="gap-1.5 border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                        disabled={busy}
+                        onClick={onDelete}
+                      >
+                        <Trash2 className="size-3.5" />
+                        {t("task.deleteBranch")}
+                      </Button>
+                    </div>
+                  </section>
                 )}
               </div>
             </ScrollArea>

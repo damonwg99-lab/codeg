@@ -6019,7 +6019,11 @@
       "detailCommits": "Commits",
       "detailEmptyCommits": "No commits",
       "detailLoadMore": "Load more",
-      "detailCompareTo": "Compare to"
+      "detailCompareTo": "Compare to",
+      "detailSync": "同期",
+      "detailManage": "管理",
+      "detailDanger": "危険な操作",
+      "merge": "マージ"
     },
     "repoSelector": {
       "root": "プロジェクトルート",
