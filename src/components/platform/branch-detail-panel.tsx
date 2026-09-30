@@ -460,57 +460,59 @@ export function BranchDetailPanel({
             value="diff"
             className="mt-0 min-h-0 flex-1 overflow-hidden"
           >
-            <ScrollArea className="h-full">
-              <div className="flex flex-col gap-3 px-5 py-4">
-                <div className="flex items-center gap-2">
-                  <span className="text-[0.75rem] text-muted-foreground">
-                    {t("task.detailCompareTo")}
-                  </span>
-                  <Select
-                    value={diffEnv}
-                    onValueChange={(v) => void loadDiff(v as EnvKey)}
+            <div className="flex h-full min-h-0 flex-col">
+              <div className="flex shrink-0 items-center gap-2 border-b border-border/60 px-5 py-3">
+                <span className="text-[0.75rem] text-muted-foreground">
+                  {t("task.detailCompareTo")}
+                </span>
+                <Select
+                  value={diffEnv}
+                  onValueChange={(v) => void loadDiff(v as EnvKey)}
+                >
+                  <SelectTrigger
+                    size="sm"
+                    className="w-[140px] text-[0.8125rem]"
                   >
-                    <SelectTrigger
-                      size="sm"
-                      className="w-[140px] text-[0.8125rem]"
-                    >
-                      <SelectValue placeholder={t("task.detailDiff")} />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {envs.map((e) => (
-                        <SelectItem key={e} value={e}>
-                          {t(
-                            `task.env${e[0].toUpperCase()}${e.slice(1)}` as never
-                          )}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  {diffText != null && (
-                    <span className="text-[0.75rem] text-muted-foreground">
-                      {t("task.detailChangedFiles", { count: changedFiles })}
-                    </span>
-                  )}
-                </div>
-                {loadingDiff ? (
-                  <p className="text-[0.75rem] text-muted-foreground">
-                    {t("task.loading")}
-                  </p>
-                ) : diffText != null ? (
-                  diffText.trim() ? (
-                    <UnifiedDiffPreview
-                      diffText={diffText}
-                      embedded
-                      hideViewToggle
-                    />
-                  ) : (
-                    <p className="text-[0.75rem] text-muted-foreground">
-                      {t("task.detailNoDiff")}
-                    </p>
-                  )
-                ) : null}
+                    <SelectValue placeholder={t("task.detailDiff")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {envs.map((e) => (
+                      <SelectItem key={e} value={e}>
+                        {t(
+                          `task.env${e[0].toUpperCase()}${e.slice(1)}` as never
+                        )}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {diffText != null && (
+                  <span className="text-[0.75rem] text-muted-foreground">
+                    {t("task.detailChangedFiles", { count: changedFiles })}
+                  </span>
+                )}
               </div>
-            </ScrollArea>
+              <ScrollArea className="min-h-0 flex-1">
+                <div className="px-5 py-4">
+                  {loadingDiff ? (
+                    <p className="text-[0.75rem] text-muted-foreground">
+                      {t("task.loading")}
+                    </p>
+                  ) : diffText != null ? (
+                    diffText.trim() ? (
+                      <UnifiedDiffPreview
+                        diffText={diffText}
+                        embedded
+                        hideViewToggle
+                      />
+                    ) : (
+                      <p className="text-[0.75rem] text-muted-foreground">
+                        {t("task.detailNoDiff")}
+                      </p>
+                    )
+                  ) : null}
+                </div>
+              </ScrollArea>
+            </div>
           </TabsContent>
 
           {/* Commits */}
