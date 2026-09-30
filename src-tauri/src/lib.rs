@@ -2062,6 +2062,7 @@ mod tauri_app {
                 branch_board_commands::git_worktree_remove_temp,
                 branch_board_commands::list_branch_states,
                 branch_board_commands::upsert_branch_state,
+                branch_board_commands::git_pull_branch,
                 project_commands::scan_git_repos,
                 project_commands::get_global_config,
                 project_commands::set_global_config,

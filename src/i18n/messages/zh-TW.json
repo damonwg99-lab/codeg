@@ -6007,7 +6007,8 @@
       "colAuthor": "建立者",
       "needsPull": "有更新",
       "diverged": "已分叉",
-      "pull": "拉取"
+      "pull": "拉取",
+      "pullFailed": "拉取失敗"
     },
     "repoSelector": {
       "root": "專案根目錄",

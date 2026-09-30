@@ -52,6 +52,7 @@ import {
   upsertBranchState,
   addExistingWorktree,
   removeTempWorktree,
+  pullBranch,
 } from "@/lib/platform/api"
 import {
   gitStatus,
@@ -61,7 +62,6 @@ import {
   gitListAllBranches,
   openWorktreeFolder,
   openPushWindow,
-  gitUpdateBranch,
 } from "@/lib/api"
 import { useGitCredential } from "@/contexts/git-credential-context"
 import {
@@ -295,13 +295,23 @@ export function BranchBoard({ projectId }: Props) {
   const doPull = async (repo: ProjectRepoInfo, branch: string) => {
     setBusy(true)
     try {
-      await withCredentialRetry(
-        (creds) => gitUpdateBranch(repo.localDir, branch, false, creds),
+      const res = await withCredentialRetry(
+        (creds) => pullBranch(repo.localDir, branch, creds),
         { folderPath: repo.localDir }
       )
+      if (res.conflict?.has_conflicts && repo.folderId != null) {
+        setConflict({
+          info: res.conflict,
+          repo,
+          targetPath: repo.localDir,
+          targetFolderId: repo.folderId,
+          temp: false,
+        })
+        return
+      }
       await refresh()
     } catch {
-      toast.error(t("task.mergeFailed"))
+      toast.error(t("task.pullFailed"))
     } finally {
       setBusy(false)
     }
@@ -662,26 +672,17 @@ export function BranchBoard({ projectId }: Props) {
                           {t("task.remoteLocalOnly")}
                         </span>
                       ) : row.needsPush && row.needsPull ? (
-                        <Badge
-                          variant="outline"
-                          className="text-[0.625rem] text-destructive border-destructive/40"
-                        >
+                        <span className="text-[0.7rem] text-destructive">
                           {t("task.diverged")}
-                        </Badge>
+                        </span>
                       ) : row.needsPush ? (
-                        <Badge
-                          variant="outline"
-                          className="text-[0.625rem] text-orange-600 border-orange-300"
-                        >
+                        <span className="text-[0.7rem] text-orange-600 dark:text-orange-400">
                           {t("task.needsPush")}
-                        </Badge>
+                        </span>
                       ) : row.needsPull ? (
-                        <Badge
-                          variant="outline"
-                          className="text-[0.625rem] text-blue-600 border-blue-300"
-                        >
+                        <span className="text-[0.7rem] text-blue-600 dark:text-blue-400">
                           {t("task.needsPull")}
-                        </Badge>
+                        </span>
                       ) : (
                         <span className="text-[0.7rem] text-green-600 dark:text-green-400">
                           {t("task.remoteSynced")}

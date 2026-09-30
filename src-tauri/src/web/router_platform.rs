@@ -84,6 +84,10 @@ pub fn platform_routes() -> Router {
             "/upsert_branch_state",
             post(handlers::branch_board::upsert_branch_state),
         )
+        .route(
+            "/git_pull_branch",
+            post(handlers::branch_board::git_pull_branch),
+        )
         .route("/scan_git_repos", post(handlers::project::scan_git_repos))
         .route("/get_global_config", post(handlers::project::get_global_config))
         .route("/set_global_config", post(handlers::project::set_global_config))

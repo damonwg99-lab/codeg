@@ -1,5 +1,6 @@
 import { getTransport } from "@/lib/transport"
 import { getCodegToken } from "@/lib/transport/web-auth"
+import type { GitCredentials, GitPullResult } from "@/lib/types"
 import type {
   ProjectInfo,
   ProjectDetail,
@@ -209,6 +210,18 @@ export async function upsertBranchState(
     branch,
     isArchived: params.isArchived,
     description: params.description,
+  })
+}
+
+export async function pullBranch(
+  path: string,
+  branch: string,
+  credentials?: GitCredentials
+): Promise<GitPullResult> {
+  return getTransport().call<GitPullResult>("git_pull_branch", {
+    path,
+    branch,
+    credentials,
   })
 }
 

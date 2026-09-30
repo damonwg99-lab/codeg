@@ -6,7 +6,7 @@ use serde::Deserialize;
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::branch_board as branch_board_commands;
-use crate::models::{BranchStateInfo, RepoBranchMatrix};
+use crate::models::{BranchStateInfo, GitCredentials, RepoBranchMatrix};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,6 +98,30 @@ pub async fn upsert_branch_state(
             params.branch,
             params.is_archived,
             params.description,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPullBranchParams {
+    pub path: String,
+    pub branch: String,
+    pub credentials: Option<GitCredentials>,
+}
+
+pub async fn git_pull_branch(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<GitPullBranchParams>,
+) -> Result<Json<crate::commands::folders::GitPullResult>, AppCommandError> {
+    Ok(Json(
+        branch_board_commands::git_pull_branch_core(
+            &state.db,
+            &params.path,
+            &params.branch,
+            params.credentials.as_ref(),
+            &state.data_dir,
         )
         .await?,
     ))

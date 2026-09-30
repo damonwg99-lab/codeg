@@ -6007,7 +6007,8 @@
       "colAuthor": "Author",
       "needsPull": "Update available",
       "diverged": "Diverged",
-      "pull": "Pull"
+      "pull": "Pull",
+      "pullFailed": "Pull failed"
     },
     "repoSelector": {
       "root": "プロジェクトルート",

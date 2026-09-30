@@ -281,7 +281,7 @@ fn created_at_from_reflog(git_dir: &Path, branch: &str) -> Option<(String, Optio
     None
 }
 
-/// Extract the creator identity ("Name <email>") from a reflog creation line.
+/// Extract the creator NAME (without email) from a reflog creation line.
 pub(crate) fn parse_reflog_created_by(line: &str) -> Option<String> {
     if !line.contains("branch: Created from") {
         return None;
@@ -289,14 +289,14 @@ pub(crate) fn parse_reflog_created_by(line: &str) -> Option<String> {
     let before_tab = line.split('\t').next()?;
     let tokens: Vec<&str> = before_tab.split_whitespace().collect();
     // tokens: [old, new, name..., <email>, ts, tz]
-    if tokens.len() < 5 {
+    if tokens.len() < 6 {
         return None;
     }
-    let mid = &tokens[2..tokens.len() - 2];
-    if mid.is_empty() {
+    let name = tokens[2..tokens.len() - 3].join(" ");
+    if name.is_empty() {
         None
     } else {
-        Some(mid.join(" "))
+        Some(name)
     }
 }
 
@@ -550,6 +550,50 @@ pub async fn upsert_branch_state_core(
         .map_err(AppCommandError::from)
 }
 
+/// Pull (fast-forward) a local branch from `origin/<branch>`. Auto-sets the
+/// upstream when the branch has a remote counterpart but no tracking config, so
+/// the existing `git_update_branch` (which requires an upstream) can run.
+pub async fn git_pull_branch_core(
+    db: &AppDatabase,
+    path: &str,
+    branch: &str,
+    credentials: Option<&crate::models::GitCredentials>,
+    data_dir: &std::path::Path,
+) -> Result<crate::commands::folders::GitPullResult, AppCommandError> {
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    let exists = git_output(path, &["rev-parse", "--verify", "--quiet", &remote_ref])
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !exists {
+        return Err(AppCommandError::not_found(format!(
+            "Remote branch 'origin/{branch}' not found; sync remote first"
+        )));
+    }
+
+    let remote_cfg = git_stdout(
+        path,
+        &["config", "--get", &format!("branch.{branch}.remote")],
+    )
+    .await
+    .unwrap_or_default();
+    if remote_cfg.trim().is_empty() {
+        let _ = git_output(
+            path,
+            &[
+                "branch",
+                "--set-upstream-to",
+                &format!("origin/{branch}"),
+                branch,
+            ],
+        )
+        .await;
+    }
+
+    crate::commands::folders::git_update_branch_core(path, branch, false, credentials, db, data_dir)
+        .await
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tauri commands
 // ─────────────────────────────────────────────────────────────────────────────
@@ -604,6 +648,24 @@ pub async fn upsert_branch_state(
     upsert_branch_state_core(&db, repo_id, branch, is_archived, description).await
 }
 
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn git_pull_branch(
+    db: tauri::State<'_, AppDatabase>,
+    path: String,
+    branch: String,
+    credentials: Option<crate::models::GitCredentials>,
+    app_handle: tauri::AppHandle,
+) -> Result<crate::commands::folders::GitPullResult, AppCommandError> {
+    use tauri::Manager;
+    let data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| AppCommandError::external_command("Failed to resolve app data dir", e.to_string()))?;
+    let data_dir = crate::paths::resolve_effective_data_dir(&data_dir);
+    git_pull_branch_core(&db, &path, &branch, credentials.as_ref(), &data_dir).await
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -634,12 +696,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_reflog_created_by_extracts_identity() {
+    fn parse_reflog_created_by_extracts_name() {
         let line = "0000 1111 Alice <a@b.c> 1700000000 +0800\tbranch: Created from main";
-        assert_eq!(
-            parse_reflog_created_by(line).as_deref(),
-            Some("Alice <a@b.c>")
-        );
+        assert_eq!(parse_reflog_created_by(line).as_deref(), Some("Alice"));
         assert_eq!(parse_reflog_created_by("x\tcommit: msg"), None);
     }
 
