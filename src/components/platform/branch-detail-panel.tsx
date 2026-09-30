@@ -18,6 +18,15 @@ import {
   FileTreeFile,
   FileTreeFolder,
 } from "@/components/ai-elements/file-tree"
+import {
+  CommitFileInfo,
+  CommitFileStatus,
+  CommitFileIcon,
+  CommitFilePath,
+  CommitFileChanges,
+  CommitFileAdditions,
+  CommitFileDeletions,
+} from "@/components/ai-elements/commit"
 import { Button } from "@/components/ui/button"
 import { UnifiedDiffPreview } from "@/components/diff/unified-diff-preview"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
@@ -70,6 +79,21 @@ interface Props {
 
 function MetaDot() {
   return <span className="text-muted-foreground/50">·</span>
+}
+
+function mapFileStatus(
+  status: string
+): "added" | "modified" | "deleted" | "renamed" {
+  switch (status.toUpperCase().charAt(0)) {
+    case "A":
+      return "added"
+    case "D":
+      return "deleted"
+    case "R":
+      return "renamed"
+    default:
+      return "modified"
+  }
 }
 
 export function BranchDetailPanel({
@@ -296,13 +320,18 @@ export function BranchDetailPanel({
             if (openCommit) void openFile(openCommit, file.path)
           }}
         >
-          <span className="min-w-0 flex-1 truncate">{node.name}</span>
-          <span className="shrink-0 font-mono text-[0.625rem]">
-            <span className="text-green-600 dark:text-green-400">
-              +{file.additions}
-            </span>{" "}
-            <span className="text-destructive">-{file.deletions}</span>
-          </span>
+          <span className="size-4 shrink-0" />
+          <CommitFileInfo className="min-w-0 flex-1 gap-1.5">
+            <CommitFileStatus status={mapFileStatus(file.status)}>
+              {file.status}
+            </CommitFileStatus>
+            <CommitFileIcon />
+            <CommitFilePath title={file.path}>{node.name}</CommitFilePath>
+          </CommitFileInfo>
+          <CommitFileChanges>
+            <CommitFileAdditions count={file.additions} />
+            <CommitFileDeletions count={file.deletions} />
+          </CommitFileChanges>
         </FileTreeFile>
       )
     })
