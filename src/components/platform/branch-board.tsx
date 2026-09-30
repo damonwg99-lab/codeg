@@ -44,6 +44,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { BranchDetailPanel } from "@/components/platform/branch-detail-panel"
+import { ScrollArea } from "@/components/ui/scroll-area"
 import { ConflictDialog } from "@/components/layout/conflict-dialog"
 import {
   ResizableHandle,
@@ -602,7 +603,10 @@ export function BranchBoard({ projectId }: Props) {
           {error ? `加载分支失败：${error}` : t("task.emptyBranches")}
         </p>
       ) : (
-        <div className="flex-1 min-h-0 overflow-auto rounded-lg border">
+        <ScrollArea
+          x="scroll"
+          className="flex-1 min-h-0 rounded-lg border"
+        >
           <table className="w-full min-w-[900px] text-sm">
             <thead>
               <tr className="border-b text-left text-[0.75rem] text-muted-foreground">
@@ -828,7 +832,7 @@ export function BranchBoard({ projectId }: Props) {
               })}
             </tbody>
           </table>
-        </div>
+        </ScrollArea>
       )}
 
       {flatRows.length > PAGE_SIZE && (
