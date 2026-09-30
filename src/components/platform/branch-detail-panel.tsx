@@ -9,6 +9,9 @@ import {
   FileDiff,
   FolderPen,
   X,
+  CloudCheck,
+  CloudOff,
+  CircleHelp,
 } from "lucide-react"
 import {
   FileTree,
@@ -78,6 +81,7 @@ export function BranchDetailPanel({
   onClose,
 }: Props) {
   const t = useTranslations("Platform")
+  const tLog = useTranslations("Folder.gitLogTab")
   const path = repoPath ?? ""
 
   const [entries, setEntries] = useState<GitLogEntry[]>([])
@@ -241,6 +245,28 @@ export function BranchDetailPanel({
       </span>
     )
   })()
+
+  const pushMeta = (pushed: boolean | null) => {
+    if (pushed === true) {
+      return {
+        Icon: CloudCheck,
+        cls: "text-emerald-500",
+        label: tLog("pushStatus.pushed"),
+      }
+    }
+    if (pushed === false) {
+      return {
+        Icon: CloudOff,
+        cls: "text-amber-500",
+        label: tLog("pushStatus.notPushed"),
+      }
+    }
+    return {
+      Icon: CircleHelp,
+      cls: "text-muted-foreground",
+      label: tLog("pushStatus.unknown"),
+    }
+  }
 
   const renderCommitTree = (nodes: CommitFileTreeNode[]): ReactElement[] =>
     nodes.map((node) => {
@@ -539,15 +565,31 @@ export function BranchDetailPanel({
                       >
                         <button
                           type="button"
-                          className="w-full rounded px-1 py-2 text-left hover:bg-accent/40"
+                          className="flex w-full items-start gap-2 rounded px-1 py-2 text-left hover:bg-accent/40"
                           onClick={() => void toggleCommit(c.full_hash)}
                         >
-                          <span className="block truncate text-[0.8125rem]">
-                            {c.message.split("\n")[0]}
-                          </span>
-                          <span className="mt-0.5 block truncate font-mono text-[0.6875rem] text-muted-foreground">
-                            {c.hash.slice(0, 8)} · {c.author} ·{" "}
-                            {c.date.slice(0, 10)}
+                          {(() => {
+                            const m = pushMeta(c.pushed)
+                            const Icon = m.Icon
+                            return (
+                              <span
+                                className={`mt-0.5 flex shrink-0 ${m.cls}`}
+                                title={m.label}
+                                aria-label={m.label}
+                                role="img"
+                              >
+                                <Icon className="size-4" aria-hidden />
+                              </span>
+                            )
+                          })()}
+                          <span className="flex min-w-0 flex-1 flex-col">
+                            <span className="truncate text-[0.8125rem]">
+                              {c.message.split("\n")[0]}
+                            </span>
+                            <span className="mt-0.5 truncate font-mono text-[0.6875rem] text-muted-foreground">
+                              {c.hash.slice(0, 8)} · {c.author} ·{" "}
+                              {c.date.slice(0, 10)}
+                            </span>
                           </span>
                         </button>
                         {openCommit === c.full_hash && (
