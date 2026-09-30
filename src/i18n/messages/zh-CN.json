@@ -6008,7 +6008,17 @@
       "needsPull": "有更新",
       "diverged": "已分叉",
       "pull": "拉取",
-      "pullFailed": "拉取失败"
+      "pullFailed": "拉取失败",
+      "detailOverview": "概览",
+      "detailWorkingTree": "未提交改动",
+      "detailNotCheckedOut": "该分支未检出，无工作区改动",
+      "detailNoChanges": "无未提交改动",
+      "detailDiff": "差异",
+      "detailChangedFiles": "{count} 个文件",
+      "detailNoDiff": "无差异",
+      "detailCommits": "提交历史",
+      "detailEmptyCommits": "暂无提交",
+      "detailLoadMore": "加载更多"
     },
     "repoSelector": {
       "root": "项目根目录",

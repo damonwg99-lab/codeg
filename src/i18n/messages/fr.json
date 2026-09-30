@@ -6008,7 +6008,17 @@
       "needsPull": "Update available",
       "diverged": "Diverged",
       "pull": "Pull",
-      "pullFailed": "Pull failed"
+      "pullFailed": "Pull failed",
+      "detailOverview": "Overview",
+      "detailWorkingTree": "Uncommitted changes",
+      "detailNotCheckedOut": "Not checked out — no working-tree changes",
+      "detailNoChanges": "No uncommitted changes",
+      "detailDiff": "Diff",
+      "detailChangedFiles": "{count} files",
+      "detailNoDiff": "No differences",
+      "detailCommits": "Commits",
+      "detailEmptyCommits": "No commits",
+      "detailLoadMore": "Load more"
     },
     "repoSelector": {
       "root": "Racine du projet",

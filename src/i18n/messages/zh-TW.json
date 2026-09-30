@@ -6008,7 +6008,17 @@
       "needsPull": "有更新",
       "diverged": "已分叉",
       "pull": "拉取",
-      "pullFailed": "拉取失敗"
+      "pullFailed": "拉取失敗",
+      "detailOverview": "概覽",
+      "detailWorkingTree": "未提交變更",
+      "detailNotCheckedOut": "該分支未檢出，無工作區變更",
+      "detailNoChanges": "無未提交變更",
+      "detailDiff": "差異",
+      "detailChangedFiles": "{count} 個檔案",
+      "detailNoDiff": "無差異",
+      "detailCommits": "提交歷史",
+      "detailEmptyCommits": "尚無提交",
+      "detailLoadMore": "載入更多"
     },
     "repoSelector": {
       "root": "專案根目錄",

@@ -43,6 +43,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
+import { BranchDetailSheet } from "@/components/platform/branch-detail-sheet"
 import { ConflictDialog } from "@/components/layout/conflict-dialog"
 import { usePlatform } from "@/contexts/platform-context"
 
@@ -154,6 +155,10 @@ export function BranchBoard({ projectId }: Props) {
     repo: ProjectRepoInfo
     branch: string
   } | null>(null)
+  const [detail, setDetail] = useState<{
+    repo: ProjectRepoInfo
+    row: BranchRow
+  } | null>(null)
 
   const stateKey = (repoId: number, branch: string) => `${repoId}:${branch}`
 
@@ -196,6 +201,19 @@ export function BranchBoard({ projectId }: Props) {
     for (const r of activeProjectRepos) map.set(r.id, r)
     return map
   }, [activeProjectRepos])
+
+  // Absolute repo paths come from the backend matrix (repoPathOf(repo) may be
+  // relative to the project root, which git commands would resolve wrongly).
+  const pathByRepoId = useMemo(() => {
+    const map = new Map<number, string>()
+    for (const mat of matrices) map.set(mat.repoId, mat.repoPath)
+    return map
+  }, [matrices])
+
+  const repoPathOf = useCallback(
+    (repo: ProjectRepoInfo) => pathByRepoId.get(repo.id) ?? repo.localDir,
+    [pathByRepoId]
+  )
 
   const visibleMatrices = useMemo(
     () =>
@@ -276,7 +294,7 @@ export function BranchBoard({ projectId }: Props) {
     try {
       for (const m of visibleMatrices) {
         const repo = repoById.get(m.repoId)
-        if (repo) await gitFetch(repo.localDir).catch(() => {})
+        if (repo) await gitFetch(repoPathOf(repo)).catch(() => {})
       }
       await refresh()
     } finally {
@@ -296,14 +314,14 @@ export function BranchBoard({ projectId }: Props) {
     setBusy(true)
     try {
       const res = await withCredentialRetry(
-        (creds) => pullBranch(repo.localDir, branch, creds),
-        { folderPath: repo.localDir }
+        (creds) => pullBranch(repoPathOf(repo), branch, creds),
+        { folderPath: repoPathOf(repo) }
       )
       if (res.conflict?.has_conflicts && repo.folderId != null) {
         setConflict({
           info: res.conflict,
           repo,
-          targetPath: repo.localDir,
+          targetPath: repoPathOf(repo),
           targetFolderId: repo.folderId,
           temp: false,
         })
@@ -334,22 +352,22 @@ export function BranchBoard({ projectId }: Props) {
     let tempPath: string | null = null
     try {
       // Hard gate: source tree must be clean.
-      const status = await gitStatus(repo.localDir)
+      const status = await gitStatus(repoPathOf(repo))
       const gate = canMerge(status)
       if (!gate.ok) {
         setDirtyBlock({ repoName: repo.name, paths: gate.dirtyPaths })
         return
       }
 
-      const list = await gitListAllBranches(repo.localDir)
-      let targetPath = repo.localDir
+      const list = await gitListAllBranches(repoPathOf(repo))
+      let targetPath = repoPathOf(repo)
       let targetFolderId = repo.folderId ?? 0
       let temp = false
 
       if (list.main_worktree_branch !== envBranch) {
-        const parent = repo.localDir.replace(/[\\/][^\\/]*$/, "")
+        const parent = repoPathOf(repo).replace(/[\\/][^\\/]*$/, "")
         tempPath = `${parent}/.codeg-wt-${repo.name}-${env}-${Date.now()}`
-        await addExistingWorktree(repo.localDir, tempPath, envBranch)
+        await addExistingWorktree(repoPathOf(repo), tempPath, envBranch)
         const folder = await openWorktreeFolder(tempPath, repo.folderId ?? 0)
         targetPath = tempPath
         targetFolderId = folder.id
@@ -368,7 +386,7 @@ export function BranchBoard({ projectId }: Props) {
         return
       }
       if (temp && tempPath) {
-        await removeTempWorktree(repo.localDir, tempPath).catch(() => {})
+        await removeTempWorktree(repoPathOf(repo), tempPath).catch(() => {})
       }
       toast.success(
         res.merged_commits === 0
@@ -382,7 +400,7 @@ export function BranchBoard({ projectId }: Props) {
       }
     } catch {
       if (tempPath) {
-        await removeTempWorktree(repo.localDir, tempPath).catch(() => {})
+        await removeTempWorktree(repoPathOf(repo), tempPath).catch(() => {})
       }
       toast.error(t("task.mergeFailed"))
     } finally {
@@ -394,7 +412,7 @@ export function BranchBoard({ projectId }: Props) {
     const c = conflict
     setConflict(null)
     if (c?.temp) {
-      void removeTempWorktree(c.repo.localDir, c.targetPath).catch(() => {})
+      void removeTempWorktree(repoPathOf(c.repo), c.targetPath).catch(() => {})
     }
     void refresh()
   }
@@ -437,7 +455,7 @@ export function BranchBoard({ projectId }: Props) {
     const { repo, branch } = deleteTarget
     setDeleteTarget(null)
     try {
-      await gitDeleteBranch(repo.localDir, branch)
+      await gitDeleteBranch(repoPathOf(repo), branch)
       await refresh()
     } catch {
       toast.error(t("task.mergeFailed"))
@@ -613,7 +631,13 @@ export function BranchBoard({ projectId }: Props) {
                     className="border-b last:border-0 hover:bg-accent/40"
                   >
                     <td className="px-3 py-2 font-mono text-[0.8125rem]">
-                      {repoName}:{row.branch}
+                      <button
+                        type="button"
+                        className="hover:underline"
+                        onClick={() => repo && setDetail({ repo, row })}
+                      >
+                        {repoName}:{row.branch}
+                      </button>
                       {isFullyMerged(row) && (
                         <Badge
                           variant="secondary"
@@ -1008,6 +1032,20 @@ export function BranchBoard({ projectId }: Props) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <BranchDetailSheet
+        open={detail !== null}
+        onOpenChange={(o) => !o && setDetail(null)}
+        repo={detail?.repo ?? null}
+        repoPath={detail ? repoPathOf(detail.repo) : null}
+        row={detail?.row ?? null}
+        project={activeProject}
+        state={
+          detail
+            ? states.get(stateKey(detail.repo.id, detail.row.branch))
+            : undefined
+        }
+      />
 
       {/* Conflict resolution (reuses the shared merge tool) */}
       <ConflictDialog
