@@ -544,10 +544,11 @@ export function BranchDetailPanel({
                                 <Button
                                   variant="outline"
                                   size="sm"
-                                  className="h-6 px-2 text-[0.6875rem]"
+                                  className="h-6 gap-1 px-2 text-[0.6875rem]"
                                   disabled={busy}
                                   onClick={() => onMerge(e)}
                                 >
+                                  <GitMerge className="size-3" />
                                   {t("task.merge")}
                                 </Button>
                               )}
