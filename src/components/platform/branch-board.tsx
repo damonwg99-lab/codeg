@@ -43,8 +43,13 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
-import { BranchDetailSheet } from "@/components/platform/branch-detail-sheet"
+import { BranchDetailPanel } from "@/components/platform/branch-detail-panel"
 import { ConflictDialog } from "@/components/layout/conflict-dialog"
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from "@/components/ui/resizable"
 import { usePlatform } from "@/contexts/platform-context"
 
 import {
@@ -469,7 +474,18 @@ export function BranchBoard({ projectId }: Props) {
   }
 
   return (
-    <div className="flex flex-col gap-3 h-full min-h-0">
+    <div className="flex h-full min-h-0 gap-0">
+      <ResizablePanelGroup
+        direction="horizontal"
+        className="h-full min-h-0"
+        autoSaveId="branch-board-split"
+      >
+        <ResizablePanel
+          defaultSize={detail ? 62 : 100}
+          minSize={30}
+          className="min-w-0"
+        >
+          <div className="flex h-full min-h-0 flex-col gap-3">
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2 shrink-0">
         <Select value={repoFilter} onValueChange={setRepoFilter}>
@@ -866,6 +882,25 @@ export function BranchBoard({ projectId }: Props) {
         </AlertDialogContent>
       </AlertDialog>
 
+          </div>
+        </ResizablePanel>
+        {detail && (
+          <>
+            <ResizableHandle withHandle />
+            <ResizablePanel defaultSize={38} minSize={22} className="min-w-0">
+              <BranchDetailPanel
+                repo={detail.repo}
+                repoPath={repoPathOf(detail.repo)}
+                row={detail.row}
+                project={activeProject}
+                state={states.get(stateKey(detail.repo.id, detail.row.branch))}
+                onClose={() => setDetail(null)}
+              />
+            </ResizablePanel>
+          </>
+        )}
+      </ResizablePanelGroup>
+
       {/* Archive confirm */}
       <AlertDialog
         open={archiveTarget !== null}
@@ -1032,20 +1067,6 @@ export function BranchBoard({ projectId }: Props) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-
-      <BranchDetailSheet
-        open={detail !== null}
-        onOpenChange={(o) => !o && setDetail(null)}
-        repo={detail?.repo ?? null}
-        repoPath={detail ? repoPathOf(detail.repo) : null}
-        row={detail?.row ?? null}
-        project={activeProject}
-        state={
-          detail
-            ? states.get(stateKey(detail.repo.id, detail.row.branch))
-            : undefined
-        }
-      />
 
       {/* Conflict resolution (reuses the shared merge tool) */}
       <ConflictDialog

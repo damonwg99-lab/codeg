@@ -8,20 +8,13 @@ import {
   GitMerge,
   FileDiff,
   FolderPen,
+  X,
 } from "lucide-react"
 import {
   FileTree,
   FileTreeFile,
   FileTreeFolder,
 } from "@/components/ai-elements/file-tree"
-import {
-  Drawer,
-  DrawerContent,
-  DrawerHeader,
-  DrawerTitle,
-  DrawerDescription,
-  SIDE_PANEL_CONTENT_CLASS,
-} from "@/components/ui/drawer"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
@@ -63,27 +56,25 @@ const ENVS: EnvKey[] = ["dev", "uat", "prd"]
 const PAGE = 50
 
 interface Props {
-  open: boolean
-  onOpenChange: (open: boolean) => void
   repo: ProjectRepoInfo | null
   repoPath: string | null
   row: BranchRow | null
   project: ProjectInfo | null
   state?: BranchStateInfo
+  onClose?: () => void
 }
 
 function MetaDot() {
   return <span className="text-muted-foreground/50">·</span>
 }
 
-export function BranchDetailSheet({
-  open,
-  onOpenChange,
+export function BranchDetailPanel({
   repo,
   repoPath,
   row,
   project,
   state: _state,
+  onClose,
 }: Props) {
   const t = useTranslations("Platform")
   const path = repoPath ?? ""
@@ -111,7 +102,7 @@ export function BranchDetailSheet({
   }, [repo, project])
 
   useEffect(() => {
-    if (!open || !path || !row) return
+    if (!path || !row) return
     let cancelled = false
     setEntries([])
     setHasMore(false)
@@ -147,7 +138,7 @@ export function BranchDetailSheet({
     return () => {
       cancelled = true
     }
-  }, [open, path, row])
+  }, [path, row])
 
   const loadMore = async () => {
     if (!path || !row) return
@@ -290,56 +281,58 @@ export function BranchDetailSheet({
     })
 
   return (
-    <Drawer open={open} onOpenChange={onOpenChange} swipeDirection="right">
-      <DrawerContent className={SIDE_PANEL_CONTENT_CLASS}>
-        <DrawerHeader className="shrink-0 gap-0 border-b border-border px-5 py-4">
-          <div className="flex items-start gap-3 pr-8">
-            <span className="mt-0.5 inline-flex size-9 shrink-0 items-center justify-center rounded-xl border border-border bg-muted/40 text-foreground">
-              <GitBranch
-                className="size-[1.125rem] text-muted-foreground"
-                aria-hidden="true"
-              />
-            </span>
-            <div className="flex min-w-0 flex-1 flex-col gap-1">
-              <div className="flex min-w-0 items-start gap-2">
-                <DrawerTitle className="min-w-0 break-words font-mono text-[0.9375rem] font-semibold leading-5">
-                  {row?.branch ?? ""}
-                </DrawerTitle>
-                <span className="flex h-5 shrink-0 items-center">
-                  {remoteChip}
-                </span>
-              </div>
-              <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[0.6875rem] leading-none text-muted-foreground">
-                {repo?.name && <span className="truncate">{repo.name}</span>}
-                {row?.createdBy && (
-                  <>
-                    <MetaDot />
-                    <span className="truncate">
-                      {t("task.colAuthor")}: {row.createdBy}
-                    </span>
-                  </>
-                )}
-                {row?.createdAt && (
-                  <>
-                    <MetaDot />
-                    <span>{row.createdAt.slice(0, 10)}</span>
-                  </>
-                )}
-                {row?.lastCommitAt && (
-                  <>
-                    <MetaDot />
-                    <span>
-                      {t("task.colLastCommit")}: {row.lastCommitAt.slice(0, 10)}
-                    </span>
-                  </>
-                )}
-              </div>
-            </div>
+    <div className="flex h-full min-h-0 flex-col border-l border-border bg-background">
+      <div className="flex shrink-0 items-start gap-3 border-b border-border px-4 py-3">
+        <span className="mt-0.5 inline-flex size-9 shrink-0 items-center justify-center rounded-xl border border-border bg-muted/40 text-foreground">
+          <GitBranch
+            className="size-[1.125rem] text-muted-foreground"
+            aria-hidden="true"
+          />
+        </span>
+        <div className="flex min-w-0 flex-1 flex-col gap-1">
+          <div className="flex min-w-0 items-start gap-2">
+            <h2 className="min-w-0 break-words font-mono text-[0.9375rem] font-semibold leading-5">
+              {row?.branch ?? ""}
+            </h2>
+            <span className="flex h-5 shrink-0 items-center">{remoteChip}</span>
           </div>
-          <DrawerDescription className="sr-only">
-            {t("task.detailOverview")}
-          </DrawerDescription>
-        </DrawerHeader>
+          <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[0.6875rem] leading-none text-muted-foreground">
+            {repo?.name && <span className="truncate">{repo.name}</span>}
+            {row?.createdBy && (
+              <>
+                <MetaDot />
+                <span className="truncate">
+                  {t("task.colAuthor")}: {row.createdBy}
+                </span>
+              </>
+            )}
+            {row?.createdAt && (
+              <>
+                <MetaDot />
+                <span>{row.createdAt.slice(0, 10)}</span>
+              </>
+            )}
+            {row?.lastCommitAt && (
+              <>
+                <MetaDot />
+                <span>
+                  {t("task.colLastCommit")}: {row.lastCommitAt.slice(0, 10)}
+                </span>
+              </>
+            )}
+          </div>
+        </div>
+        {onClose && (
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7 shrink-0 text-muted-foreground"
+            onClick={onClose}
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        )}
+      </div>
 
         <Tabs
           defaultValue="overview"
@@ -607,7 +600,6 @@ export function BranchDetailSheet({
             </ScrollArea>
           </TabsContent>
         </Tabs>
-      </DrawerContent>
-    </Drawer>
+    </div>
   )
 }
