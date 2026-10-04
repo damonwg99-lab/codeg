@@ -5998,6 +5998,7 @@
       "remoteSynced": "Synced",
       "push": "Push",
       "onlyNeedsPush": "Needs push only",
+      "onlyCurrent": "현재 체크아웃만",
       "envAll": "All envs",
       "statusAll": "All status",
       "pushAfterMergeTitle": "Push to remote",

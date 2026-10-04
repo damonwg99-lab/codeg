@@ -22,6 +22,8 @@ pub struct BranchRow {
     /// "reflog" | "first_commit" (approximation source)
     pub created_at_source: Option<String>,
     pub is_env_branch: bool,
+    /// Whether this is the branch checked out in the repo's main worktree.
+    pub is_current: bool,
     pub last_commit_at: Option<String>,
     /// Who created the branch (from the local reflog; None for cloned/fetched).
     pub created_by: Option<String>,

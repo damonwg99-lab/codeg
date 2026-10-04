@@ -231,6 +231,45 @@ async fn merged_set(path: &str, env: &str) -> HashSet<String> {
     }
 }
 
+/// Whether a ref resolves to a commit locally.
+async fn git_ref_exists(path: &str, ref_name: &str) -> bool {
+    git_output(path, &["rev-parse", "--verify", "--quiet", ref_name])
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Ref to compare/merge against for an env: the local branch when it exists,
+/// else the `origin/<env>` remote-tracking branch (the common case right after
+/// a clone, where the env branch only exists on the remote). Falls back to the
+/// bare name so behaviour is unchanged when neither exists.
+async fn resolve_env_ref(path: &str, env: &str) -> String {
+    if git_ref_exists(path, &format!("refs/heads/{env}")).await {
+        return env.to_string();
+    }
+    let remote = format!("origin/{env}");
+    if git_ref_exists(path, &remote).await {
+        return remote;
+    }
+    env.to_string()
+}
+
+/// Branch checked out in the repo's main worktree (None when detached).
+async fn current_branch(path: &str) -> Option<String> {
+    let out = git_output(path, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// Merge method + date for a merged branch, in ONE git call: the earliest
 /// ancestry-path commit between branch and env. Fast-forward when that commit
 /// is the branch tip itself (no merge commit, so no date).
@@ -306,19 +345,27 @@ async fn compute_repo_matrix(repo_path: &str, envs: &[(String, String)]) -> Vec<
         Err(_) => return Vec::new(),
     };
 
-    // One git call per env for the merged set.
-    let mut merged: HashMap<String, HashSet<String>> = HashMap::new();
+    // Resolve each env to a ref that exists locally (local branch, else the
+    // origin remote-tracking branch), then one git call per env for its merged
+    // set.
+    let mut env_refs: Vec<(String, String, String)> = Vec::new();
     for (env_key, env_name) in envs {
-        merged.insert(env_key.clone(), merged_set(repo_path, env_name).await);
+        let resolved = resolve_env_ref(repo_path, env_name).await;
+        env_refs.push((env_key.clone(), env_name.clone(), resolved));
+    }
+    let mut merged: HashMap<String, HashSet<String>> = HashMap::new();
+    for (env_key, _name, resolved) in &env_refs {
+        merged.insert(env_key.clone(), merged_set(repo_path, resolved).await);
     }
     let git_dir = git_dir_no_spawn(repo_path);
     let remotes = remote_branches(repo_path).await;
+    let current = current_branch(repo_path).await;
 
     let mut rows = Vec::new();
     for lb in locals {
         let mut statuses = Vec::new();
         let mut is_env_branch = false;
-        for (env_key, env_name) in envs {
+        for (env_key, env_name, resolved) in &env_refs {
             if lb.name == *env_name {
                 is_env_branch = true;
                 statuses.push(EnvMergeStatus {
@@ -336,7 +383,7 @@ async fn compute_repo_matrix(repo_path: &str, envs: &[(String, String)]) -> Vec<
                 .map(|s| s.contains(&lb.name))
                 .unwrap_or(false);
             let (via, date) = if is_merged {
-                merge_info(repo_path, &lb.name, env_name, &lb.tip).await
+                merge_info(repo_path, &lb.name, resolved, &lb.tip).await
             } else {
                 (None, None)
             };
@@ -379,11 +426,13 @@ async fn compute_repo_matrix(repo_path: &str, envs: &[(String, String)]) -> Vec<
             (false, false)
         };
 
+        let is_current = current.as_deref() == Some(lb.name.as_str());
         rows.push(BranchRow {
             branch: lb.name,
             created_at_source: created_at.as_ref().map(|_| "reflog".to_string()),
             created_at,
             is_env_branch,
+            is_current,
             last_commit_at: Some(lb.date).filter(|s| !s.is_empty()),
             created_by,
             upstream: lb.upstream,

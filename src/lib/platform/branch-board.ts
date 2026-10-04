@@ -57,6 +57,8 @@ export interface BranchFilterOptions {
   /** With a specific `env`, restrict to merged / unmerged. */
   status?: "all" | "merged" | "unmerged"
   onlyNeedsPush?: boolean
+  /** Restrict to the branch currently checked out in its repo. */
+  onlyCurrent?: boolean
 }
 
 /** Filter rows by archive flag, merge state, env, push state and keyword. */
@@ -73,6 +75,7 @@ export function filterRows(
     const archived = state?.isArchived ?? false
     if (opts.archived !== archived) return false
     if (opts.onlyUnmerged && !row.envs.some((e) => !e.merged)) return false
+    if (opts.onlyCurrent && !row.isCurrent) return false
     if (opts.onlyNeedsPush && !row.needsPush) return false
     if (env !== "all") {
       const e = row.envs.find((x) => x.env === env)

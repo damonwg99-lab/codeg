@@ -123,6 +123,7 @@ export function BranchBoard({ projectId }: Props) {
     "all"
   )
   const [onlyNeedsPush, setOnlyNeedsPush] = useState(false)
+  const [onlyCurrent, setOnlyCurrent] = useState(false)
   const [keywordInput, setKeywordInput] = useState("")
   const [keyword, setKeyword] = useState("")
   const [page, setPage] = useState(1)
@@ -228,6 +229,7 @@ export function BranchBoard({ projectId }: Props) {
           env: envFilter,
           status: statusFilter,
           onlyNeedsPush,
+          onlyCurrent,
         }
       )
       for (const row of rows) {
@@ -248,6 +250,7 @@ export function BranchBoard({ projectId }: Props) {
     envFilter,
     statusFilter,
     onlyNeedsPush,
+    onlyCurrent,
   ])
 
   const totalPages = Math.max(1, Math.ceil(flatRows.length / PAGE_SIZE))
@@ -273,6 +276,7 @@ export function BranchBoard({ projectId }: Props) {
     envFilter,
     statusFilter,
     onlyNeedsPush,
+    onlyCurrent,
   ])
 
   // Debounce the search box: only filter after the user stops typing.
@@ -555,6 +559,15 @@ export function BranchBoard({ projectId }: Props) {
             onChange={(e) => setOnlyNeedsPush(e.target.checked)}
           />
           {t("task.onlyNeedsPush")}
+        </label>
+
+        <label className="flex items-center gap-1.5 text-[0.8125rem] text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={onlyCurrent}
+            onChange={(e) => setOnlyCurrent(e.target.checked)}
+          />
+          {t("task.onlyCurrent")}
         </label>
 
         <Input

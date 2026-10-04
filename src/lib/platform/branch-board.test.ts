@@ -46,6 +46,7 @@ const baseRow: BranchRow = {
   createdAt: null,
   createdAtSource: null,
   isEnvBranch: false,
+  isCurrent: false,
   lastCommitAt: null,
   createdBy: null,
   upstream: null,
@@ -280,6 +281,20 @@ describe("filterRows", () => {
         onlyNeedsPush: true,
       }).map((r) => r.branch)
     ).toEqual(["feat/dirty"])
+  })
+
+  it("filters to only-current", () => {
+    const rows: BranchRow[] = [
+      { ...baseRow, branch: "feat/checked-out", isCurrent: true },
+      { ...baseRow, branch: "feat/other", isCurrent: false },
+    ]
+    expect(
+      filterRows(rows, () => undefined, {
+        archived: false,
+        onlyUnmerged: false,
+        onlyCurrent: true,
+      }).map((r) => r.branch)
+    ).toEqual(["feat/checked-out"])
   })
 })
 

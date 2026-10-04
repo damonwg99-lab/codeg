@@ -84,6 +84,7 @@ export interface BranchRow {
   createdAt: string | null
   createdAtSource: "reflog" | "first_commit" | null
   isEnvBranch: boolean
+  isCurrent: boolean
   lastCommitAt: string | null
   createdBy: string | null
   upstream: string | null

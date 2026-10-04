@@ -5998,6 +5998,7 @@
       "remoteSynced": "已同步",
       "push": "推送",
       "onlyNeedsPush": "僅需推送",
+      "onlyCurrent": "僅當前檢出",
       "envAll": "全部環境",
       "statusAll": "全部狀態",
       "pushAfterMergeTitle": "推送到遠端",
