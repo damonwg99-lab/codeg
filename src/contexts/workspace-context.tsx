@@ -20,6 +20,7 @@ import {
   gitIsTracked,
   gitShowDiff,
   gitShowFile,
+  listDirectoryWithFiles,
   readFileBase64,
   readFileForEdit,
   readFilePreview,
@@ -84,6 +85,15 @@ import {
   getBrowserPrefs,
   subscribeBrowserPrefs,
 } from "@/lib/browser/browser-prefs"
+import {
+  parseEmulatedBrowserDevice,
+  sameBrowserDevice,
+  type EmulatedBrowserDevice,
+} from "@/lib/browser/browser-device"
+import {
+  isRemoteHostAddress,
+  remoteConnectionOfProfile,
+} from "@/lib/browser/remote-host"
 import { randomUUID } from "@/lib/utils"
 
 export type WorkspaceMode = "conversation" | "fusion"
@@ -120,6 +130,18 @@ export interface BrowserTabSeed {
   /** The browser profile the tab lives in (its cookie jar and storage).
    *  Fixed for the tab's life: the surface is built in it. */
   profile: string
+  /** The address lives on the codeg host this window is bound to — a
+   *  loopback or private address seen from a remote-workspace window. Such a
+   *  tab never loads in a profile of this computer: there it would reach this
+   *  machine's `localhost`, not the one the address was printed on. Absent on
+   *  every other tab. */
+  remote?: true
+  /** The device the tab shows its page as (`lib/browser/browser-device`):
+   *  its page laid out in a tablet's or a phone's viewport, or in a custom
+   *  device's (kept as that viewport). Absent on a tab showing it as the
+   *  desktop it is, which every tab does until someone picks another — so
+   *  records written before this existed read the same. */
+  device?: EmulatedBrowserDevice
 }
 
 interface FileWorkspaceTabBase {
@@ -302,6 +324,9 @@ interface WorkspaceActionsValue {
   // which should show its page without pulling anyone out of a conversation);
   // `false` leaves the selection alone, claiming it only when nothing holds
   // it, so the strip never carries a tab with an empty column beside it.
+  //
+  // `remote` opens the address as one on the remote codeg host (see
+  // `BrowserTabSeed.remote`); a tab opened from a remote tab is remote too.
   openBrowserTab: (
     url: string,
     options?: {
@@ -310,6 +335,10 @@ interface WorkspaceActionsValue {
       openerTabId?: string
       index?: number
       profile?: string
+      remote?: boolean
+      /** The device a NEW record shows its page as (a reopened tab's); a tab
+       *  already open on the page keeps its own. */
+      device?: EmulatedBrowserDevice
     }
   ) => string | null
   // Register a tab for a webview the BACKEND already created — a popup the
@@ -332,6 +361,14 @@ interface WorkspaceActionsValue {
   // time it is shown a fresh surface loads that page. No-op for a tab that
   // has no surface. Returns whether a surface was released.
   suspendBrowserTab: (tabId: string) => boolean
+  // Show a browser tab's page as `device` from now on: filling the pane (the
+  // desktop) or laid out in a tablet's, a phone's or a custom device's
+  // viewport. The tab keeps it through a suspend, a restart and a reopen.
+  // No-op for an unknown id, and for a custom size out of range.
+  setBrowserTabDevice: (
+    tabId: string,
+    device: "desktop" | EmulatedBrowserDevice
+  ) => void
 }
 
 /** What a browser tab needs to come back after a restart (see
@@ -342,6 +379,10 @@ export interface RestorableBrowserTab {
   folderId: number | null
   /** A profile that exists (the restorer maps deleted ones to the default). */
   profile: string
+  /** See `BrowserTabSeed.remote`. */
+  remote?: boolean
+  /** See `BrowserTabSeed.device`. */
+  device?: EmulatedBrowserDevice
 }
 
 interface WorkspaceViewValue {
@@ -544,6 +585,9 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     new Map()
   )
   const fileTabsRef = useRef<FileWorkspaceTab[]>([])
+  // Keep dismissals across folder changes and effect re-subscriptions. A
+  // watcher event must not reopen a preview the user already closed.
+  const autoOpenedOfficePathsRef = useRef(new Set<string>())
   // Latest-state mirrors for the stable action callbacks. Actions live in a
   // context value that must NOT change identity when tabs/folder change, so
   // they read these refs instead of capturing render-scoped state. The refs
@@ -793,26 +837,37 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       folderId: number | null,
       openerTabId: string | null,
       profile: string,
-      title?: string | null
-    ): BrowserWorkspaceTab => ({
-      id: buildFileTabId({ kind: "browser", id: backendTabId }),
-      kind: "browser",
-      folderId,
-      // Host AND port, not just the host: two local servers are two tabs both
-      // called "localhost" otherwise, which is now a routine sight — a tab
-      // opened in the background (an auto-opened local server, a ⌘-click)
-      // keeps this name until someone switches to it and the page says its
-      // own. For an ordinary address with no explicit port this is the host,
-      // exactly as before.
-      title: title || (displayHostPort(url) ?? url),
-      description: null,
-      path: null,
-      language: "browser",
-      content: "",
-      loading: true,
-      readonly: true,
-      browser: { initialUrl: url, openerTabId, profile },
-    }),
+      title?: string | null,
+      remote?: boolean,
+      device?: EmulatedBrowserDevice
+    ): BrowserWorkspaceTab => {
+      const emulated = parseEmulatedBrowserDevice(device)
+      return {
+        id: buildFileTabId({ kind: "browser", id: backendTabId }),
+        kind: "browser",
+        folderId,
+        // Host AND port, not just the host: two local servers are two tabs
+        // both called "localhost" otherwise, which is now a routine sight — a
+        // tab opened in the background (an auto-opened local server, a
+        // ⌘-click) keeps this name until someone switches to it and the page
+        // says its own. For an ordinary address with no explicit port this is
+        // the host, exactly as before.
+        title: title || (displayHostPort(url) ?? url),
+        description: null,
+        path: null,
+        language: "browser",
+        content: "",
+        loading: true,
+        readonly: true,
+        browser: {
+          initialUrl: url,
+          openerTabId,
+          profile,
+          ...(remote ? { remote: true as const } : {}),
+          ...(emulated ? { device: emulated } : {}),
+        },
+      }
+    },
     []
   )
 
@@ -825,6 +880,8 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         openerTabId?: string
         index?: number
         profile?: string
+        remote?: boolean
+        device?: EmulatedBrowserDevice
       }
     ) => {
       const normalized = normalizeUrlForDedupe(url)
@@ -833,20 +890,36 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       const opener = options?.openerTabId
         ? fileTabsRef.current.find((tab) => tab.id === options.openerTabId)
         : undefined
+      // A caller that says settles it — "open it on this computer" is a
+      // person's decision. Otherwise a tab opened from a remote tab is
+      // remote, and so is any address of the remote host however it came to
+      // be opened (a page's ⌘-click, a refused pop-up opened anyway): in a
+      // profile of this computer it would reach this machine instead.
+      const remote =
+        options?.remote ??
+        ((opener?.kind === "browser" && opener.browser.remote === true) ||
+          // A request from a page of a connection's profile (a ⌘-click):
+          // its opener's, even when the opener's record is already gone.
+          remoteConnectionOfProfile(options?.profile) !== null ||
+          isRemoteHostAddress(url))
       // A tab opened from another tab (⌘-click, a popup) belongs with it:
       // same cookies, same signed-in state. Otherwise the preference. A
       // profile that no longer exists (a reopened tab of a deleted one, a
-      // stale record) is not recreated on the backend: default instead.
+      // stale record) is not recreated on the backend: default instead. A
+      // remote address is not in any profile of this computer, so it takes
+      // no part in the choice.
       const prefs = getBrowserPrefs()
       const wanted =
         options?.profile ??
         (opener?.kind === "browser" ? opener.browser.profile : undefined) ??
         prefs.newTabProfile
-      const profile = browserProfileExists(prefs, wanted)
-        ? wanted
-        : DEFAULT_BROWSER_PROFILE_ID
+      const profile =
+        !remote && browserProfileExists(prefs, wanted)
+          ? wanted
+          : DEFAULT_BROWSER_PROFILE_ID
       // One tab per page AND profile: the same page in two profiles is two
-      // different sessions, and both are worth a tab.
+      // different sessions, and both are worth a tab. A remote tab is its own
+      // kind of session: never the same tab as a local one on that address.
       //
       // The blank page is exempt: it is an empty tab, not a page, so two of
       // them are two tabs. Dedupe would also misfire once one is used — a
@@ -860,6 +933,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
               (tab) =>
                 tab.kind === "browser" &&
                 tab.browser.profile === profile &&
+                (tab.browser.remote === true) === remote &&
                 normalizeUrlForDedupe(tab.browser.initialUrl) === normalized
             )
       if (existing) {
@@ -875,7 +949,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           activeFolderRef.current?.id ??
           null,
         opener?.id ?? null,
-        profile
+        profile,
+        null,
+        remote,
+        options?.device
       )
       const insert = (prev: FileWorkspaceTab[]) => {
         if (prev.some((tab) => tab.id === record.id)) return prev
@@ -938,7 +1015,12 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         params.profile ??
           (opener?.kind === "browser"
             ? opener.browser.profile
-            : getBrowserPrefs().newTabProfile)
+            : getBrowserPrefs().newTabProfile),
+        null,
+        // A popup lives where its opener's traffic goes — which the profile
+        // the backend built it in says too, when the opener's record is gone.
+        (opener?.kind === "browser" && opener.browser.remote === true) ||
+          remoteConnectionOfProfile(params.profile) !== null
       )
       setFileTabs((prev) => {
         if (prev.some((tab) => tab.id === record.id)) return prev
@@ -969,7 +1051,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           prev.flatMap((tab) =>
             tab.kind === "browser"
               ? [
-                  `${tab.browser.profile} ${normalizeUrlForDedupe(tab.browser.initialUrl) ?? ""}`,
+                  `${tab.browser.remote === true ? "remote" : tab.browser.profile} ${normalizeUrlForDedupe(tab.browser.initialUrl) ?? ""}`,
                 ]
               : []
           )
@@ -979,10 +1061,15 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         for (const entry of entries) {
           const normalized = normalizeUrlForDedupe(entry.url)
           if (!normalized) continue
-          const profile = browserProfileExists(prefs, entry.profile)
-            ? entry.profile
-            : DEFAULT_BROWSER_PROFILE_ID
-          const key = `${profile} ${normalized}`
+          // An address of the remote host comes back as a remote tab even
+          // if its record did not say so (a page that walked there on its
+          // own): never as a page of this computer.
+          const remote = entry.remote === true || isRemoteHostAddress(entry.url)
+          const profile =
+            !remote && browserProfileExists(prefs, entry.profile)
+              ? entry.profile
+              : DEFAULT_BROWSER_PROFILE_ID
+          const key = `${remote ? "remote" : profile} ${normalized}`
           if (open.has(key)) continue
           open.add(key)
           records.push(
@@ -992,7 +1079,9 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
               entry.folderId,
               null,
               profile,
-              entry.title
+              entry.title,
+              remote,
+              entry.device
             )
           )
         }
@@ -1027,9 +1116,12 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
             getBrowserTabState(tab.id) === null &&
             !hasSurfaceClaim(browserTabBackendId(tab.id) ?? "")
           if (!prev.some(dormantOrphan)) return prev
+          // A remote tab is not a page of the default profile, whatever id it
+          // carries: never the tab that makes a local one a duplicate.
           const inDefault = new Set(
             prev.flatMap((tab) =>
               tab.kind === "browser" &&
+              tab.browser.remote !== true &&
               tab.browser.profile === DEFAULT_BROWSER_PROFILE_ID
                 ? [normalizeUrlForDedupe(tab.browser.initialUrl) ?? ""]
                 : []
@@ -1093,6 +1185,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           (t) =>
             t.kind === "browser" &&
             t.id !== tabId &&
+            t.browser.remote !== true &&
             t.browser.profile === profile &&
             normalizeUrlForDedupe(t.browser.initialUrl) === normalized
         )
@@ -1122,6 +1215,29 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     releaseBrowserTab(tabId, { suspending: true })
     return true
   }, [])
+
+  const setBrowserTabDevice = useCallback(
+    (tabId: string, device: "desktop" | EmulatedBrowserDevice) => {
+      const next =
+        device === "desktop" ? undefined : parseEmulatedBrowserDevice(device)
+      // Not a device after all (a size out of range): nothing to switch to,
+      // and the desktop is not what was asked for either.
+      if (device !== "desktop" && !next) return
+      setFileTabs((prev) => {
+        const tab = prev.find((t) => t.id === tabId)
+        if (!tab || tab.kind !== "browser") return prev
+        if (sameBrowserDevice(tab.browser.device, next)) return prev
+        // The desktop is the key's absence, not a value of it: a record
+        // that never left the desktop and one that came back to it are the
+        // same record.
+        const browser: BrowserTabSeed = { ...tab.browser }
+        if (next) browser.device = next
+        else delete browser.device
+        return prev.map((t) => (t.id === tabId ? { ...tab, browser } : t))
+      })
+    },
+    []
+  )
 
   // Mark an existing tab as refreshing. Preserves content / originalContent /
   // modifiedContent / gitBaseContent / savedContent / etag / mtimeMs /
@@ -1849,10 +1965,16 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     // Leading-edge with dedup: an agent building a doc fires a burst of writes,
     // so we open on first sighting and remember it in `autoOpened` (which also
     // keeps a tab the user has since closed from popping back open).
-    const autoOpened = new Set<string>()
+    const autoOpened = autoOpenedOfficePathsRef.current
+    const pending = new Set<string>()
+    let cancelled = false
     const streamRoot = folderPath
     const unsubscribe = subscribeOfficeEnvelopes(({ changed_paths }) => {
       if (!changed_paths || changed_paths.length === 0) return
+      const directories = new Map<
+        string,
+        ReturnType<typeof listDirectoryWithFiles>
+      >()
       // Tab identity is the absolute path, so joining the stream root onto
       // the changed relative path compares exactly — an identically-named
       // doc in another folder has a different absolute path and never
@@ -1877,12 +1999,53 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         // at once — which arrived here as a dozen unreadable previews.
         if (isOfficeOwnerFile(changed)) continue
         const abs = joinRootRel(streamRoot, changed)
-        if (autoOpened.has(abs) || openPaths.has(abs)) continue
-        autoOpened.add(abs)
-        void openFilePreview(abs)
+        if (autoOpened.has(abs) || pending.has(abs)) continue
+        // An already-open tab counts as a sighting, not just a skip: this
+        // feature exists to surface documents the user has NOT seen, so a tab
+        // they opened by hand must not become a fresh auto-open the moment
+        // they close it and the agent writes again.
+        if (openPaths.has(abs)) {
+          autoOpened.add(abs)
+          continue
+        }
+        const io = splitAbsPath(abs)
+        if (!io) continue
+        pending.add(abs)
+        // changed_paths includes removals, including removed worktree copies.
+        // Inspect directory metadata before opening a tab, without reading or
+        // locking the Office document. Share one listing per parent per burst.
+        let listing = directories.get(io.rootPath)
+        if (!listing) {
+          listing = listDirectoryWithFiles(io.rootPath)
+          directories.set(io.rootPath, listing)
+        }
+        void listing
+          .then((entries) => {
+            if (cancelled || autoOpened.has(abs)) return
+            const exists = entries.some(
+              (entry) =>
+                !entry.isDir &&
+                entry.size != null &&
+                normalizeAbsPath(entry.path) === abs
+            )
+            if (!exists) return
+            autoOpened.add(abs)
+            // A manual open during the lookup already handled this file.
+            if (fileTabsRef.current.some((tab) => tab.path === abs)) return
+            return openFilePreview(abs)
+          })
+          .catch(() => {
+            // Covers both halves of the chain: a removed/unreadable parent is
+            // not a document to preview, and `openFilePreview` already reports
+            // its own failures on the tab it seeded.
+          })
+          .finally(() => pending.delete(abs))
       }
     })
-    return unsubscribe
+    return () => {
+      cancelled = true
+      unsubscribe()
+    }
   }, [
     folderPath,
     activeFolderIdForOffice,
@@ -3078,6 +3241,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       adoptBrowserTab,
       restoreBrowserTabs,
       suspendBrowserTab,
+      setBrowserTabDevice,
     }),
     [
       setActivePane,
@@ -3110,6 +3274,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       adoptBrowserTab,
       restoreBrowserTabs,
       suspendBrowserTab,
+      setBrowserTabDevice,
     ]
   )
 

@@ -9,10 +9,13 @@ import {
   isBrowserProfileId,
   markBrowserFirstOpenSeen,
   mintBrowserProfileId,
+  readBrowserEvalApprovalNow,
   removeBrowserProfile,
   resetBrowserPrefsForTests,
   setAllDefaultLinkTargets,
+  setBrowserCustomDevice,
   setBrowserDevtools,
+  setBrowserEvalApproval,
   setBrowserHostRules,
   setBrowserHtmlPreviewEngine,
   setBrowserDefaultAgentGrant,
@@ -325,6 +328,42 @@ describe("browser prefs", () => {
     expect(getBrowserPrefs().defaultAgentGrant).toBe("control")
   })
 
+  // Running without asking is the default — the decision lives on the
+  // `browser_eval` tool switch, which ships off — so only the dialog is
+  // stored, and anything else in the key means the default.
+  it("stores the per-snippet dialog only when it has been asked for", () => {
+    expect(getBrowserPrefs().evalApproval).toBe("silent")
+    setBrowserEvalApproval("ask")
+    expect(localStorage.getItem("browser:eval-approval")).toBe("ask")
+    expect(getBrowserPrefs().evalApproval).toBe("ask")
+    setBrowserEvalApproval("silent")
+    expect(localStorage.getItem("browser:eval-approval")).toBeNull()
+    expect(getBrowserPrefs().evalApproval).toBe("silent")
+
+    for (const junk of ["", "Ask", "true", "confirm"]) {
+      localStorage.setItem("browser:eval-approval", junk)
+      resetCacheOnly()
+      expect(getBrowserPrefs().evalApproval).toBe("silent")
+    }
+  })
+
+  // The cached snapshot is only dropped when a `storage` event is DELIVERED,
+  // which is later than the other window's write and conditional on somebody
+  // being subscribed at that moment. The one reader that answers on a
+  // person's behalf must not be behind by either of those.
+  it("reads the eval answer past the cache, unlike the snapshot", () => {
+    expect(getBrowserPrefs().evalApproval).toBe("silent")
+    // Written the way another window writes it, with nothing dispatched and
+    // nobody subscribed to hear it.
+    localStorage.setItem("browser:eval-approval", "ask")
+
+    expect(getBrowserPrefs().evalApproval).toBe("silent") // snapshot: stale
+    expect(readBrowserEvalApprovalNow()).toBe("ask") // storage: current
+
+    localStorage.removeItem("browser:eval-approval")
+    expect(readBrowserEvalApprovalNow()).toBe("silent")
+  })
+
   // Notifying is the default (VS Code's too), so only the two other answers
   // are stored; anything else in the key means the default.
   it("stores the local-server mode only when it is not the default one", () => {
@@ -341,6 +380,29 @@ describe("browser prefs", () => {
     localStorage.setItem("browser:service-auto-open", "sometimes")
     resetCacheOnly()
     expect(getBrowserPrefs().serviceAutoOpen).toBe("notify")
+  })
+
+  // The size "Custom" starts at: the last one typed, stored only when it is
+  // not the default, and never a size a custom device cannot have.
+  it("remembers the custom device's size, and reads anything else as the default", () => {
+    expect(getBrowserPrefs().customDevice).toEqual({ width: 1280, height: 800 })
+    setBrowserCustomDevice({ width: 1440, height: 900 })
+    expect(
+      JSON.parse(localStorage.getItem("browser:custom-device") ?? "")
+    ).toEqual({ width: 1440, height: 900 })
+    expect(getBrowserPrefs().customDevice).toEqual({ width: 1440, height: 900 })
+    // Out of range: not kept, the last good one stays.
+    setBrowserCustomDevice({ width: 20, height: 900 })
+    expect(getBrowserPrefs().customDevice).toEqual({ width: 1440, height: 900 })
+    setBrowserCustomDevice({ width: 1280, height: 800 })
+    expect(localStorage.getItem("browser:custom-device")).toBeNull()
+    for (const raw of ["1440x900", '{"width":99999,"height":900}', "[1, 2]"]) {
+      localStorage.setItem("browser:custom-device", raw)
+      resetCacheOnly()
+      expect(getBrowserPrefs().customDevice).toEqual(
+        DEFAULT_BROWSER_PREFS.customDevice
+      )
+    }
   })
 
   it("useBrowserPrefs re-renders on change", () => {

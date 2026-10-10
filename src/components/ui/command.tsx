@@ -27,16 +27,19 @@ function CommandDialog({
   title = "Command",
   children,
   shouldFilter,
+  onOpenAutoFocus,
   ...props
-}: React.ComponentProps<typeof Dialog> & {
-  title?: string
-  shouldFilter?: boolean
-}) {
+}: React.ComponentProps<typeof Dialog> &
+  Pick<React.ComponentProps<typeof DialogContent>, "onOpenAutoFocus"> & {
+    title?: string
+    shouldFilter?: boolean
+  }) {
   return (
     <Dialog {...props}>
       <DialogContent
         className="overflow-hidden p-0 rounded-2xl max-w-2xl md:max-w-3xl lg:max-w-4xl"
         closeButtonClassName="top-1.5 z-10"
+        onOpenAutoFocus={onOpenAutoFocus}
       >
         <VisuallyHidden.Root>
           <DialogTitle>{title}</DialogTitle>

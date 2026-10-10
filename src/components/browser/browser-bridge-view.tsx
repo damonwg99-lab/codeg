@@ -19,11 +19,14 @@ import { browserTabBackendId } from "@/lib/file-tab-id"
 import { openExternalTab } from "@/lib/link-open"
 import { copyTextToClipboard, randomUUID } from "@/lib/utils"
 
+import { BrowserDeviceMenu } from "./browser-device-menu"
+import { useBrowserTabCustomSize } from "./browser-device-size"
+import { BrowserDeviceStage } from "./browser-device-stage"
 // The desktop toolbar's own button shape: this row stands in the same place,
 // under the same tab strip.
 import { ICON_BTN } from "./browser-toolbar-buttons"
 
-/** The frame keeps its origin (its own bridge port, shared with nothing) and
+/** The frame keeps its origin (this target's own, shared with nothing) and
  *  never navigates the workbench. */
 export const BRIDGE_FRAME_SANDBOX =
   "allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads"
@@ -48,8 +51,8 @@ function messageOf(error: unknown): string {
  * new address) takes a fresh grant under a hold id of its own and releases
  * exactly that hold when it is over — after the open has settled, so an
  * unmount during the round trip cannot leave a hold behind or take a later
- * attempt's away. The bridge port is probed from this browser before the
- * frame shows, so an unreachable port is explained instead of left blank.
+ * attempt's away. The bridge origin is probed from this browser before the
+ * frame shows, so one it cannot reach is explained instead of left blank.
  * "Open in a new tab" stays available throughout: whatever the frame cannot
  * show, a top-level tab on the same bridge origin can.
  */
@@ -57,6 +60,7 @@ export function BrowserBridgeView({ tab }: { tab: BrowserWorkspaceTab }) {
   const t = useTranslations("Browser.bridge")
   const url = tab.browser.initialUrl
   const tabId = browserTabBackendId(tab.id) ?? tab.id
+  const setCustomSize = useBrowserTabCustomSize(tab.id)
   const [attempt, setAttempt] = useState(0)
   // The outcome is stamped with the attempt it belongs to; a new attempt
   // (a reload, another address) reads as "opening" until its own outcome
@@ -119,7 +123,8 @@ export function BrowserBridgeView({ tab }: { tab: BrowserWorkspaceTab }) {
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    // Marked for the device menu, as the desktop view is.
+    <div data-browser-tab-view="" className="flex h-full min-h-0 flex-col">
       {/* Same shape as the desktop toolbar's row, and for the same reason:
           a browser tab has no title header above it, so this is the file
           column's top row (see `file-workspace-header.tsx`). */}
@@ -130,6 +135,7 @@ export function BrowserBridgeView({ tab }: { tab: BrowserWorkspaceTab }) {
         >
           {url}
         </span>
+        <BrowserDeviceMenu tab={tab} />
         <button
           type="button"
           className={ICON_BTN}
@@ -172,19 +178,51 @@ export function BrowserBridgeView({ tab }: { tab: BrowserWorkspaceTab }) {
           </div>
         ) : null}
         {phase.kind === "ready" ? (
-          <iframe
-            key={phase.src}
-            title={t("frameTitle")}
-            src={phase.src}
-            sandbox={BRIDGE_FRAME_SANDBOX}
-            referrerPolicy="no-referrer"
-            className="absolute inset-0 h-full w-full border-0 bg-white"
-          />
+          <BrowserDeviceStage
+            device={tab.browser.device ?? "desktop"}
+            onCustomSize={setCustomSize}
+            // Scaled by a transform, which goes as small as it has to: the
+            // page is at the device's own size however small the frame.
+            minZoom={0}
+          >
+            {({ viewport, frame }) => (
+              <iframe
+                key={phase.src}
+                title={t("frameTitle")}
+                src={phase.src}
+                sandbox={BRIDGE_FRAME_SANDBOX}
+                referrerPolicy="no-referrer"
+                className="absolute top-0 left-0 h-full w-full border-0 bg-white"
+                // A device's page is laid out in the device's viewport — a
+                // frame element's own size — and shrunk whole to the frame
+                // around it: a transform scales what is drawn, not the
+                // viewport the document inside sees.
+                style={
+                  viewport && frame
+                    ? {
+                        width: viewport.width,
+                        height: viewport.height,
+                        transform: `scale(${frame.width / viewport.width}, ${frame.height / viewport.height})`,
+                        transformOrigin: "0 0",
+                      }
+                    : undefined
+                }
+              />
+            )}
+          </BrowserDeviceStage>
         ) : null}
         {phase.kind === "unreachable" ? (
           <Notice
             title={t("unreachableTitle")}
-            body={t("unreachableHint", { origin: phase.origin })}
+            // Two ways of reaching the bridge, two things to check: a port
+            // the deployment has to publish, or a hostname its DNS and its
+            // proxy have to carry.
+            body={t(
+              phase.grant.bridgeHost
+                ? "unreachableHostHint"
+                : "unreachableHint",
+              { origin: phase.origin }
+            )}
             action={{
               label: t("openExternal"),
               onClick: () => openExternalTab(phase.src),

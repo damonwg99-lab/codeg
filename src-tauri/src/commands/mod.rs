@@ -12,7 +12,18 @@ pub mod browser_tools;
 pub mod canvas;
 pub mod chat_authoring;
 pub mod chat_channel;
+/// Files-onto-the-OS-clipboard. Only the command itself is desktop-gated; the
+/// path validation and URI encoding stay compiled in every mode so their tests
+/// run without the tauri stack.
+pub mod clipboard;
+/// Computer use: sharing windows, the helper, the agent reads — the desktop
+/// app's, and codeg-server's where it is let share the screen it runs on.
+pub mod computer;
+/// The computer-use switches. Like `browser_tools`, compiled in both runtimes:
+/// the shared codeg-mcp plumbing reads them.
+pub mod computer_tools;
 pub mod config_sync;
+pub mod conversation_tags;
 pub mod conversations;
 pub mod custom_agents;
 pub mod custom_skills;
@@ -59,3 +70,5 @@ pub mod version_control;
 pub mod windows;
 pub mod work_task;
 pub mod workspace_state;
+#[cfg(feature = "tauri-runtime")]
+pub mod workspace_windows;

@@ -12,7 +12,7 @@ import { NextIntlClientProvider } from "next-intl"
 import { toast } from "sonner"
 import type { ComponentProps } from "react"
 import type { Editor } from "@tiptap/core"
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { RichComposerHandle } from "./composer/rich-composer"
 import {
@@ -22,6 +22,7 @@ import {
 import {
   clearMessageInputDraftV2,
   loadMessageInputDraftV2,
+  saveMessageInputDraftV2,
 } from "@/lib/message-input-draft"
 import {
   emitAttachFileToSession,
@@ -82,6 +83,7 @@ vi.mock("@/hooks/use-enabled-skill-ids", () => ({
 vi.mock("@/components/chat/composer/use-reference-search", () => ({
   useReferenceSearch: () => async () => [],
 }))
+const folderPickerVisible = vi.hoisted(() => vi.fn(() => false))
 vi.mock("@/components/chat/conversation-context-bar", () => ({
   ConversationContextBar: ({
     extraContent,
@@ -89,10 +91,15 @@ vi.mock("@/components/chat/conversation-context-bar", () => ({
     extraContent?: React.ReactNode
   }) => <div data-testid="ctx-bar">{extraContent}</div>,
   // The composer imports these to render the below-input folder/branch row.
-  // Keep it hidden here (visibility → false) so these tests exercise the bare
-  // composer without pulling in the picker's tab-store/git dependencies.
+  // Hidden by default; the cold-start test resolves it after the editor mounts.
   ConversationFolderBranchPicker: () => null,
-  useConversationFolderBranchPickerVisible: () => false,
+  useConversationFolderBranchPickerVisible: folderPickerVisible,
+}))
+vi.mock("./composer-context-usage", () => ({
+  ComposerContextUsage: () => null,
+}))
+vi.mock("./composer-connection-status", () => ({
+  ComposerConnectionStatus: () => null,
 }))
 // The platform opener is the DESKTOP arm of the shared opener; this suite runs
 // in web mode, where a system-browser target lands on `window.open` instead.
@@ -203,11 +210,32 @@ import type {
 } from "@/lib/types"
 
 import { MessageInput } from "./message-input"
+import {
+  composerBoxMinHeight,
+  composerEditableMinHeight,
+} from "./composer/composer-sizing"
 
 const CAPS: PromptCapabilitiesInfo = {
   image: true,
   audio: false,
   embedded_context: true,
+}
+
+/**
+ * Dispatch a pointer-driven event that actually names its `pointerType`. jsdom
+ * ships no `PointerEvent`, so `fireEvent.pointerDown(el, { pointerType })`
+ * silently drops the property and every event reads as an unnamed one; React
+ * takes `pointerType` straight off the native event, so setting it by hand on a
+ * MouseEvent is what the composer's handlers actually see in a browser.
+ */
+function firePointer(
+  element: Element,
+  type: "pointerdown" | "click",
+  pointerType: "mouse" | "touch" | "pen"
+): boolean {
+  const event = new MouseEvent(type, { bubbles: true, cancelable: true })
+  Object.defineProperty(event, "pointerType", { value: pointerType })
+  return fireEvent(element, event)
 }
 
 function renderInput(
@@ -245,13 +273,13 @@ describe("MessageInput (RichComposer integration)", () => {
     expect(sendButton).toBeDisabled()
   })
 
-  it("claims a mousedown on the input's empty chrome (P8d focus wiring)", async () => {
+  it("claims a mouse press on the input's empty chrome (P8d focus wiring)", async () => {
     const { container } = renderInput({})
     await waitFor(() =>
       expect(container.querySelector('[role="textbox"]')).not.toBeNull()
     )
-    // The bordered card carries the chrome-focus handler; a mousedown on the
-    // card itself (not on the editor or a control) is claimed via preventDefault
+    // The bordered card carries the chrome-focus handler; a press on the card
+    // itself (not on the editor or a control) is claimed via preventDefault
     // before refocusing the editor. Asserting preventDefault (fireEvent returns
     // false when the event was canceled) avoids relying on jsdom focus.
     const card = container.querySelector('[class~="@container"]') as HTMLElement
@@ -259,7 +287,221 @@ describe("MessageInput (RichComposer integration)", () => {
     // The same box paints the text I-beam across its blank chrome (see the
     // `.codeg-composer-chrome` rule in globals.css).
     expect(card.className).toContain("codeg-composer-chrome")
+    expect(firePointer(card, "pointerdown", "mouse")).toBe(false)
+  })
+
+  // A tap's compatibility `mousedown` lands after the gesture has resolved, and
+  // cancelling it — which the mouse path above must do — is itself enough to
+  // stop the soft keyboard coming up. So touch must NOT go through the press
+  // path; it gets the caret from the `click` the tap produces instead.
+  it("leaves a touch press on the chrome alone and focuses on the tap", async () => {
+    const { container } = renderInput({})
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+    const card = container.querySelector('[class~="@container"]') as HTMLElement
+    const editor = container.querySelector('[role="textbox"]') as HTMLElement
+
+    // Not claimed: no preventDefault, so the browser's own tap handling runs.
+    expect(firePointer(card, "pointerdown", "touch")).toBe(true)
+    expect(document.activeElement).not.toBe(editor)
+
+    // The tap itself is what puts the caret in the editor.
+    firePointer(card, "click", "touch")
+    await waitFor(() => expect(document.activeElement).toBe(editor))
+  })
+
+  // The press already focused a mouse; focusing again on release would collapse
+  // a selection dragged out of the chrome.
+  it("ignores a mouse click on the chrome (the press owns it)", async () => {
+    const { container } = renderInput({})
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+    const card = container.querySelector('[class~="@container"]') as HTMLElement
+    const editor = container.querySelector('[role="textbox"]') as HTMLElement
+
+    firePointer(card, "click", "mouse")
+    expect(document.activeElement).not.toBe(editor)
+    // An event that names no pointer kind at all counts as a mouse too.
+    fireEvent.click(card)
+    expect(document.activeElement).not.toBe(editor)
+  })
+
+  // Switching a session is most often a read — you glance at another
+  // conversation's progress. The tab-activation auto-focus fires on every such
+  // switch, and on a phone focusing the editor raises the soft keyboard over the
+  // transcript. A coarse pointer therefore keeps the caret (and the keyboard)
+  // out until the user taps the composer, which focuses it as usual. A fine
+  // pointer is the mouse-driven behaviour the gate must not change: activating
+  // a tab still puts the caret in the composer, no keyboard in the picture.
+  //
+  // Both pointer kinds wait the same frames and then assert, so the fine side
+  // proves the wait covers the whole focus hand-off and the coarse side cannot
+  // pass by looking too early. A seeded draft makes readiness visible: the
+  // render that flips the composer ready schedules the draft restore and the
+  // auto-focus in that order, so once the draft is on screen the auto-focus
+  // frame has run. Tiptap's `focus` command then lands the DOM focus a frame
+  // later still (in jsdom; on iOS, Android and Safari it also focuses at once).
+  describe("tab-activation auto-focus", () => {
+    const draftKey = "test:tab-activation-focus"
+    // The browser's answer to the primary-pointer query. Every other query
+    // keeps the setup's desktop answer. `setPointer` changes it mid-session the
+    // way docking a 2-in-1 does, telling whoever listens.
+    let pointerCoarse = false
+    const pointerListeners = new Set<() => void>()
+    function setPointer(coarse: boolean) {
+      pointerCoarse = coarse
+      pointerListeners.forEach((listener) => listener())
+    }
+    beforeEach(() => {
+      const desktop = window.matchMedia
+      vi.spyOn(window, "matchMedia").mockImplementation((query) =>
+        query === "(pointer: coarse)"
+          ? ({
+              media: query,
+              get matches() {
+                return pointerCoarse
+              },
+              addEventListener: (_type: string, listener: () => void) =>
+                pointerListeners.add(listener),
+              removeEventListener: (_type: string, listener: () => void) =>
+                pointerListeners.delete(listener),
+            } as unknown as MediaQueryList)
+          : desktop(query)
+      )
+    })
+    afterEach(() => {
+      vi.mocked(window.matchMedia).mockRestore()
+      pointerListeners.clear()
+      pointerCoarse = false
+      clearMessageInputDraftV2(draftKey)
+    })
+
+    const composer = (isActive: boolean) => (
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput
+          onSend={vi.fn()}
+          promptCapabilities={CAPS}
+          draftStorageKey={draftKey}
+          isActive={isActive}
+        />
+      </NextIntlClientProvider>
+    )
+    const nextFrame = () =>
+      act(async () => {
+        await new Promise((resolve) =>
+          requestAnimationFrame(() => resolve(null))
+        )
+      })
+    async function mountReady(isActive: boolean, coarse: boolean) {
+      setPointer(coarse)
+      saveMessageInputDraftV2(draftKey, {
+        type: "doc",
+        content: [
+          { type: "paragraph", content: [{ type: "text", text: "draft" }] },
+        ],
+      })
+      const view = render(composer(isActive))
+      await waitFor(
+        () =>
+          expect(
+            view.container.querySelector('[role="textbox"]')?.textContent
+          ).toBe("draft"),
+        { timeout: 5000 }
+      )
+      return view
+    }
+
+    describe.each([
+      ["coarse", "leaves the composer unfocused", true, false],
+      ["fine", "focuses the composer", false, true],
+    ] as const)(
+      "on a %s pointer, tab activation %s",
+      (_pointer, _outcome, coarse, focused) => {
+        it("when the session opens in an active tab", async () => {
+          const { container } = await mountReady(true, coarse)
+          await nextFrame() // Tiptap's deferred DOM focus
+          const editor = container.querySelector('[role="textbox"]')
+          expect(document.activeElement).toBe(focused ? editor : document.body)
+        })
+
+        it("when switching to a session already open in the background", async () => {
+          const { container, rerender } = await mountReady(false, coarse)
+          // Still in the background, the composer holds no focus, so whatever
+          // the assertion below sees is the switch's doing.
+          await nextFrame() // Tiptap's deferred DOM focus, were one scheduled
+          expect(document.activeElement).toBe(document.body)
+
+          rerender(composer(true))
+          await nextFrame() // the auto-focus effect's own frame
+          await nextFrame() // Tiptap's deferred DOM focus
+          const editor = container.querySelector('[role="textbox"]')
+          expect(document.activeElement).toBe(focused ? editor : document.body)
+        })
+      }
+    )
+
+    // Passing through a tab, activating it and moving on before a frame is
+    // drawn, must not leave the caret in a composer that is no longer active.
+    // In a tiled group that composer is still on screen.
+    it("drops the pending focus when the tab goes inactive before its frame", async () => {
+      const { rerender } = await mountReady(false, false)
+      rerender(composer(true))
+      rerender(composer(false))
+      await nextFrame() // the auto-focus effect's own frame
+      await nextFrame() // Tiptap's deferred DOM focus
+      expect(document.activeElement).toBe(document.body)
+    })
+
+    // A pointer change is not a reason to focus. The session stays as it was,
+    // with no caret and no keyboard, until the user taps the composer.
+    it("leaves focus alone when the pointer turns fine mid-session", async () => {
+      await mountReady(true, true)
+      await nextFrame() // Tiptap's deferred DOM focus, were one scheduled
+      expect(document.activeElement).toBe(document.body)
+
+      act(() => setPointer(false))
+      await nextFrame() // an auto-focus effect's own frame, were one scheduled
+      await nextFrame() // Tiptap's deferred DOM focus
+      expect(document.activeElement).toBe(document.body)
+    })
+  })
+
+  // A browser with no Pointer Events dispatches no `pointerdown` and names no
+  // pointer kind on its clicks, so both paths above stand down and plain
+  // `mousedown` is all there is — jsdom is exactly such an environment, which
+  // is what lets this assert the fallback rather than describe it.
+  it("falls back to mousedown where the browser has no pointer events", async () => {
+    expect("PointerEvent" in window).toBe(false)
+    const { container } = renderInput({})
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+    const card = container.querySelector('[class~="@container"]') as HTMLElement
+    const editor = container.querySelector('[role="textbox"]') as HTMLElement
+
+    // Claimed (preventDefault) and focused, the way it behaved before the
+    // press/tap split.
     expect(fireEvent.mouseDown(card)).toBe(false)
+    await waitFor(() => expect(document.activeElement).toBe(editor))
+  })
+
+  // A tap on a control inside the box must reach the control, not be swallowed
+  // into "put the caret here" — same exclusion the mouse path has always had.
+  it("leaves a touch tap on a control inside the box to the control", async () => {
+    const { container } = renderInput({ isPrompting: true, onCancel: vi.fn() })
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+    const stop = container.querySelector(
+      `button[title="${enMessages.Folder.chat.messageInput.cancel}"]`
+    ) as HTMLElement
+    expect(stop).not.toBeNull()
+
+    const editor = container.querySelector('[role="textbox"]') as HTMLElement
+    firePointer(stop, "click", "touch")
+    expect(document.activeElement).not.toBe(editor)
   })
 })
 
@@ -354,9 +596,49 @@ describe("MessageInput attach-to-chat insertion position", () => {
       )
     )
     const text = serializeDocToDisplayText(editor.state.doc)
-    // A badge, not the block itself.
+    // A badge, not the block itself — one that carries the page's address,
+    // which is what the sent message lists under the bubble.
     expect(text).not.toContain("Captured from a web page")
-    expect(text).toMatch(/\[button#export]\(codeg:\/\/embedded\//)
+    expect(text).toMatch(
+      /\[button#export]\(codeg:\/\/embedded\/https%3A%2F%2Fexample\.com%2Forders#[^)\s]+\)/
+    )
+  })
+
+  // Nobody typed this badge, so taking it back has to be as cheap as one key.
+  // It used to take two: the insertion leaves a space after the badge, and the
+  // first Backspace went on that — an invisible change that reads as "Backspace
+  // cannot delete this".
+  it("takes a handed-over page back out on one Backspace", async () => {
+    const editor = await mountWithEditor()
+    act(() => {
+      emitAttachPageToSession({
+        tabId: "tab-1",
+        label: "button#export",
+        text: "Captured from a web page…\n\n- element: button#export",
+        uri: "https://example.com/orders",
+      })
+    })
+    await waitFor(() =>
+      expect(serializeDocToDisplayText(editor.state.doc)).toContain(
+        "button#export"
+      )
+    )
+
+    act(() => {
+      editor.view.dom.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Backspace",
+          keyCode: 8,
+          bubbles: true,
+          cancelable: true,
+        })
+      )
+    })
+
+    expect(editor.isEmpty).toBe(true)
+    expect(serializeDocToDisplayText(editor.state.doc)).not.toContain(
+      "button#export"
+    )
   })
 
   // The block quotes the page's own markup. `insertContent(string)` would
@@ -1393,6 +1675,55 @@ describe("MessageInput queue-edit restore vs. a late command list", () => {
     flush()
     expect(composerHandle.current?.getText()).toBe("the next one")
   })
+
+  // A queued page comes back as the badge it was queued as. Named after its
+  // uri instead, a marked-up screenshot of google.com came back as
+  // "www.google.com" — and a page with a path as its last segment.
+  it("restores a queued page as the badge it was queued as", async () => {
+    const { flush } = captureFrames()
+    renderInput({
+      availableCommands: NO_COMMANDS,
+      isEditingQueueItem: true,
+      editingItemId: "q3",
+      editingDraftBlocks: [
+        {
+          type: "resource",
+          uri: "https://shop.test/orders/42",
+          mime_type: "text/markdown",
+          text: [
+            "Captured from a web page in the built-in browser at the person's request.",
+            "",
+            "- page: Orders — https://shop.test/orders/42",
+            "- screenshot: the visible 1200×800 CSS px of the page",
+            "- markup: the person drew 1 numbered mark on this screenshot, in red",
+            "  1. box: 20×20 CSS px at (10, 10)",
+          ].join("\n"),
+          blob: null,
+        },
+        {
+          type: "resource",
+          uri: "clipboard://notes.md-1",
+          mime_type: "text/markdown",
+          text: "# Notes",
+          blob: null,
+        },
+      ],
+    })
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+    flush()
+    const editor = composerHandle.current?.getEditor()
+    if (!editor) throw new Error("composer editor not mounted")
+    const text = serializeDocToDisplayText(editor.state.doc)
+    // Named by what it is, and carrying the page for the chip it gets once sent.
+    expect(text).toMatch(
+      /\[Marked-up screenshot]\(codeg:\/\/embedded\/https%3A%2F%2Fshop\.test%2Forders%2F42#[^)\s]+\)/
+    )
+    // Anything that is not a page keeps the name its uri gives it.
+    expect(text).toMatch(/\[notes\.md-1]\(codeg:\/\/embedded\/[^)\s#]+\)/)
+  })
 })
 
 describe("MessageInput mid-turn send (live-feedback channel)", () => {
@@ -1493,6 +1824,61 @@ describe("MessageInput mid-turn send (live-feedback channel)", () => {
     )
     await waitFor(() => expect(screen.queryByTitle(MI.queueMessage)).toBeNull())
   })
+
+  it.each([
+    ["native", false],
+    ["pull", false],
+    ["native", true],
+    ["pull", true],
+  ] as const)(
+    "preserves edits during a %s steer (turn ended: %s)",
+    async (steerChannel, turnEnded) => {
+      const user = userEvent.setup()
+      const { isNoActiveTurnRejection } = await import("@/lib/turn-busy")
+      vi.mocked(isNoActiveTurnRejection).mockReturnValue(turnEnded)
+      let finish: () => void = () => {}
+      const onSteer = vi.fn(
+        () =>
+          new Promise<void>((resolve, reject) => {
+            finish = () =>
+              turnEnded ? reject(new Error("no active turn")) : resolve()
+          })
+      )
+      const onEnqueue = vi.fn()
+      const editor = await mountPrompting({
+        onSteer,
+        onEnqueue,
+        steerChannel,
+      })
+      typeDraft(editor, "original instruction")
+      const label =
+        steerChannel === "native" ? MI.steerIntoTurn : MI.steerAsNote
+      await user.click(screen.getByLabelText(label))
+      await user.click(await screen.findByRole("menuitem", { name: label }))
+      // The steer really started, with the draft as it was at the click, and
+      // is still in flight while the user edits. Without this the edit below
+      // would survive trivially if the click never reached `onSteer`.
+      await waitFor(() =>
+        expect(onSteer).toHaveBeenCalledWith("original instruction", undefined)
+      )
+      expect(screen.getByTitle(MI.queueMessage)).toBeDisabled()
+      typeDraft(editor, " additional instruction")
+      await act(async () => finish())
+      // …and it settled: the handler's `finally` re-enables the split.
+      await waitFor(() =>
+        expect(screen.getByTitle(MI.queueMessage)).toBeEnabled()
+      )
+      expect(serializeDocToText(editor.state.doc)).toContain(
+        "additional instruction"
+      )
+      if (turnEnded) {
+        expect(onEnqueue).toHaveBeenCalledWith(
+          expect.objectContaining({ displayText: "original instruction" }),
+          null
+        )
+      }
+    }
+  )
 
   it("falls back to the queue when the turn ends in the race window", async () => {
     const user = userEvent.setup()
@@ -2105,5 +2491,135 @@ describe("MessageInput prompt history", () => {
 
     // A recall here would replace the queued message being edited.
     expect(handle.getText()).toBe("queued edit")
+  })
+})
+
+/**
+ * The composer box is a flex column: editor on top, action row pinned under
+ * it. On mobile web the editor was collapsing to 0px, which floated the add /
+ * agent / stop controls to the TOP of the box and left the rest of it as blank
+ * dead space that could not be focused (#746).
+ *
+ * jsdom cannot measure any of that, so these lock the declared contract the
+ * geometry rests on. Real pixel behaviour is covered by the manual pass in the
+ * PR description.
+ */
+describe("MessageInput composer box sizing (#746)", () => {
+  it("sizes the editor off a content basis so it cannot collapse to zero", async () => {
+    const { container } = renderInput({})
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+
+    const chrome = container.querySelector(".codeg-composer-chrome")
+    expect(chrome).not.toBeNull()
+    const chromeClasses = chrome!.className.split(/\s+/)
+    expect(chromeClasses).toContain("flex")
+    expect(chromeClasses).toContain("flex-col")
+
+    const editorRoot = chrome!.querySelector(".codeg-composer")
+    expect(editorRoot).not.toBeNull()
+    const editorClasses = editorRoot!.className.split(/\s+/)
+    // A zero basis (`flex-1`) only reaches its intended height by absorbing the
+    // box's free space. Engines that read a min-height-only flex column as
+    // main-size-indefinite hand out none, and the editor lands at 0px.
+    expect(editorClasses).not.toContain("flex-1")
+    expect(editorClasses).toContain("grow")
+  })
+
+  // Both floors have to actually land, and on the right element: the box's on
+  // the box, the editable area's on the editor. Only then does the box reach
+  // its floor by summing its children, which is what makes the layout come out
+  // right on an engine that hands its flex-grow children no free space.
+  for (const tall of [false, true]) {
+    it(`states both height floors on the ${tall ? "tall" : "compact"} box`, async () => {
+      const { container } = renderInput({ tall })
+      await waitFor(() =>
+        expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+      )
+
+      const chrome = container.querySelector(".codeg-composer-chrome")!
+      const editorRoot = chrome.querySelector(".codeg-composer")!
+      expect(chrome.className.split(/\s+/)).toContain(
+        composerBoxMinHeight(tall)
+      )
+      expect(editorRoot.className.split(/\s+/)).toContain(
+        composerEditableMinHeight(tall, false)
+      )
+    })
+  }
+
+  it("keeps the action row a fixed-height last child, below the editor", async () => {
+    const { container } = renderInput({ isPrompting: true, onCancel: vi.fn() })
+    await waitFor(() =>
+      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    )
+
+    const chrome = container.querySelector(".codeg-composer-chrome")!
+    const editorRoot = chrome.querySelector(".codeg-composer")!
+    // The row holding the add menu / agent settings / stop button.
+    const actionRow = chrome.querySelector(":scope > .shrink-0.items-end")
+    expect(actionRow).not.toBeNull()
+
+    // Stop lives in that row (it is what appeared top-right in the report).
+    expect(
+      actionRow!.querySelector(
+        `button[title="${enMessages.Folder.chat.messageInput.cancel}"]`
+      )
+    ).not.toBeNull()
+
+    // Document order: editor first, action row after it. Anything else and the
+    // controls render above the text, which is the reported symptom.
+    expect(
+      editorRoot.compareDocumentPosition(actionRow!) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
+  })
+})
+
+describe("MessageInput folder data arriving after mount", () => {
+  afterEach(() => {
+    cleanup()
+    folderPickerVisible.mockReturnValue(false)
+  })
+
+  it("keeps a block wrapper and the editable draft when the folder row appears", async () => {
+    const input = (
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput onSend={vi.fn()} promptCapabilities={CAPS} />
+      </NextIntlClientProvider>
+    )
+    const { container, rerender } = render(input)
+    await waitFor(() =>
+      expect(composerHandle.current?.getEditor()).toBeTruthy()
+    )
+    const handle = composerHandle.current!
+    const editor = handle.getEditor()!
+    const editorDom = editor.view.dom
+    act(() => handle.insertTextAtCursor("keep this draft"))
+    const chrome = container.querySelector(".codeg-composer-chrome")!
+    const wrapper = chrome.parentElement!
+    // jsdom has no layout engine, so it cannot reproduce the collapse; this
+    // pins the class contract that avoids it. One class per negative
+    // assertion: `not.toHaveClass(a, b)` passes as soon as either is missing.
+    // Unattached, nothing may clip the chrome's outer focus ring.
+    expect(wrapper).toHaveClass("block")
+    expect(wrapper).not.toHaveClass("contents")
+    expect(wrapper).not.toHaveClass("overflow-hidden")
+
+    folderPickerVisible.mockReturnValue(true)
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput onSend={vi.fn()} promptCapabilities={CAPS} />
+      </NextIntlClientProvider>
+    )
+    expect(chrome.parentElement).toBe(wrapper)
+    expect(wrapper).toHaveClass("block", "overflow-hidden")
+    expect(wrapper).not.toHaveClass("contents")
+    expect(composerHandle.current!.getEditor()).toBe(editor)
+    expect(editor.view.dom).toBe(editorDom)
+    expect(handle.getText()).toBe("keep this draft")
+    act(() => editor.commands.undo())
+    expect(handle.getText()).toBe("")
   })
 })
