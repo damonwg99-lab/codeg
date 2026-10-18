@@ -2626,6 +2626,23 @@ export async function gitDeleteRemoteBranch(
   })
 }
 
+/**
+ * Delete a local branch's remote counterpart, letting the backend resolve which
+ * remote/branch it is (the branch may be published without a tracking config,
+ * in which case there is no remote name to pass from here).
+ */
+export async function gitDeleteBranchRemote(
+  path: string,
+  branch: string,
+  credentials?: GitCredentials | null
+): Promise<string> {
+  return getTransport().call("git_delete_branch_remote", {
+    path,
+    branch,
+    credentials: credentials ?? null,
+  })
+}
+
 export async function gitListConflicts(path: string): Promise<string[]> {
   return getTransport().call("git_list_conflicts", { path })
 }

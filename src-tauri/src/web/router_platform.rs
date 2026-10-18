@@ -89,6 +89,10 @@ pub fn platform_routes() -> Router {
             post(handlers::branch_board::git_pull_branch),
         )
         .route(
+            "/git_delete_branch_remote",
+            post(handlers::branch_board::git_delete_branch_remote),
+        )
+        .route(
             "/git_branch_diff_files",
             post(handlers::branch_board::git_branch_diff_files),
         )

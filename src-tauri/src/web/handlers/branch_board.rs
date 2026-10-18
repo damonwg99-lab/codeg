@@ -203,3 +203,27 @@ pub async fn git_pull_branch(
         .await?,
     ))
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDeleteBranchRemoteParams {
+    pub path: String,
+    pub branch: String,
+    pub credentials: Option<GitCredentials>,
+}
+
+pub async fn git_delete_branch_remote(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<GitDeleteBranchRemoteParams>,
+) -> Result<Json<String>, AppCommandError> {
+    Ok(Json(
+        branch_board_commands::git_delete_branch_remote_core(
+            &params.path,
+            &params.branch,
+            params.credentials.as_ref(),
+            &state.db,
+            &state.data_dir,
+        )
+        .await?,
+    ))
+}

@@ -56,6 +56,7 @@ import {
   gitStatus,
   gitMerge,
   gitDeleteBranch,
+  gitDeleteBranchRemote,
   gitFetch,
   openWorktreeFolder,
   openPushWindow,
@@ -68,7 +69,6 @@ import {
   envCellLabel,
   envCellState,
   filterRows,
-  isFullyMerged,
   remoteCountsLabel,
   remoteStatusKey,
   resolveEffectiveEnv,
@@ -175,10 +175,13 @@ export function BranchBoard({ projectId, active = true }: Props) {
   const [dirtyBlock, setDirtyBlock] = useState<DirtyBlock | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<{
     repo: ProjectRepoInfo
+    row: BranchRow
     branch: string
   } | null>(null)
   // Flip to true after a failed (unmerged) delete so the retry uses -D.
   const [forceDelete, setForceDelete] = useState(false)
+  // Whether the delete should also remove the branch on the remote.
+  const [deleteRemote, setDeleteRemote] = useState(false)
   const [noteEdit, setNoteEdit] = useState<NoteEdit | null>(null)
   const [conflict, setConflict] = useState<ConflictState | null>(null)
   const [mergeTarget, setMergeTarget] = useState<{
@@ -694,14 +697,30 @@ export function BranchBoard({ projectId, active = true }: Props) {
 
   const confirmDelete = async () => {
     if (!deleteTarget) return
-    const { repo, branch } = deleteTarget
+    const { repo, row, branch } = deleteTarget
+    const path = repoPathOf(repo)
     setBusy(true)
     try {
-      await gitDeleteBranch(repoPathOf(repo), branch, forceDelete)
+      // Delete the remote branch FIRST. If that fails (permissions, network,
+      // protected branch) nothing local has been touched, so the two never
+      // diverge silently; a retry simply tries the remote again. The backend
+      // resolves which remote/branch it is, so a branch published without a
+      // tracking config is handled too.
+      if (deleteRemote && row.hasRemote) {
+        await withCredentialRetry(
+          (creds) => gitDeleteBranchRemote(path, branch, creds),
+          { folderPath: path }
+        )
+        // Clear the flag: a later force retry must not try to delete a
+        // remote branch that is already gone.
+        setDeleteRemote(false)
+      }
+      await gitDeleteBranch(path, branch, forceDelete)
       // Close only after success; a failed delete keeps the confirmation (and
       // the selected branch) so the user can retry.
       setDeleteTarget(null)
       setForceDelete(false)
+      setDeleteRemote(false)
       await refresh()
       // refresh() closes the detail panel when the branch is gone; also close
       // it eagerly so stale content never flashes.
@@ -729,6 +748,22 @@ export function BranchBoard({ projectId, active = true }: Props) {
       <p className="p-4 text-sm text-muted-foreground">{t("task.loading")}</p>
     )
   }
+
+  // Environment branches this branch has not been merged into yet, for the
+  // delete confirmation. Uses the board's own merge data rather than waiting
+  // for git's `branch -d` refusal, so the warning names the environment(s).
+  const deleteUnmergedEnvs = deleteTarget
+    ? deleteTarget.row.envs
+        .filter((e) => !e.merged)
+        .map((e) =>
+          t(`task.env${e.env[0].toUpperCase()}${e.env.slice(1)}` as never)
+        )
+    : []
+  // The branch can be deleted on the remote when it is published there. Keyed
+  // on `hasRemote`, not `upstream`: a branch can be published with no tracking
+  // config (an adopted same-named remote ref), where `upstream` is null but the
+  // remote branch very much exists.
+  const canDeleteRemote = deleteTarget?.row.hasRemote ?? false
 
   return (
     <div className="flex h-full min-h-0 gap-0">
@@ -981,12 +1016,20 @@ export function BranchBoard({ projectId, active = true }: Props) {
                             >
                               {repoName}:{row.branch}
                             </button>
-                            {isFullyMerged(row) && (
+                            {row.isCurrent && (
                               <Badge
-                                variant="secondary"
-                                className="ml-2 text-[0.625rem]"
+                                variant="outline"
+                                className="ml-2 text-[0.625rem] text-green-600 dark:text-green-400"
                               >
-                                {t("task.suggestArchive")}
+                                {t("task.currentBranch")}
+                              </Badge>
+                            )}
+                            {row.remoteState === "unpublished" && (
+                              <Badge
+                                variant="outline"
+                                className="ml-2 text-[0.625rem] text-muted-foreground"
+                              >
+                                {t("task.unpublished")}
                               </Badge>
                             )}
                           </td>
@@ -1151,6 +1194,7 @@ export function BranchBoard({ projectId, active = true }: Props) {
                 onDelete={() =>
                   setDeleteTarget({
                     repo: detail.repo,
+                    row: detail.row,
                     branch: detail.row.branch,
                   })
                 }
@@ -1256,6 +1300,7 @@ export function BranchBoard({ projectId, active = true }: Props) {
           if (!o) {
             setDeleteTarget(null)
             setForceDelete(false)
+            setDeleteRemote(false)
           }
         }}
       >
@@ -1266,6 +1311,16 @@ export function BranchBoard({ projectId, active = true }: Props) {
               {t("task.deleteBranchConfirm", {
                 branch: deleteTarget?.branch ?? "",
               })}
+              {deleteUnmergedEnvs.length > 0 && (
+                <>
+                  <br />
+                  <span className="text-amber-600 dark:text-amber-400">
+                    {t("task.deleteUnmergedWarning", {
+                      envs: deleteUnmergedEnvs.join(", "),
+                    })}
+                  </span>
+                </>
+              )}
               {forceDelete && (
                 <>
                   <br />
@@ -1274,6 +1329,18 @@ export function BranchBoard({ projectId, active = true }: Props) {
               )}
             </AlertDialogDescription>
           </AlertDialogHeader>
+          {/* Only meaningful for a branch with a recorded upstream, and only
+              before a force retry (which is local-only by then). */}
+          {canDeleteRemote && !forceDelete && (
+            <label className="flex items-center gap-2 text-[0.8125rem]">
+              <input
+                type="checkbox"
+                checked={deleteRemote}
+                onChange={(e) => setDeleteRemote(e.target.checked)}
+              />
+              {t("task.deleteRemoteToo")}
+            </label>
+          )}
           <AlertDialogFooter>
             <AlertDialogCancel>{t("task.cancel")}</AlertDialogCancel>
             <AlertDialogAction

@@ -985,6 +985,49 @@ pub async fn git_pull_branch_core(
     .await
 }
 
+/// Delete the remote counterpart of `branch`, resolving the remote exactly the
+/// way the board decides a branch is published: its recorded upstream when that
+/// still exists, else the uniquely owning same-named remote branch.
+///
+/// Resolved here rather than in the caller because a branch can be published
+/// with no tracking config (e.g. a same-named remote ref was adopted), in which
+/// case the frontend has no remote name to pass. Errors when the branch is not
+/// published, so a wrong remote is never guessed.
+pub async fn git_delete_branch_remote_core(
+    path: &str,
+    branch: &str,
+    credentials: Option<&crate::models::GitCredentials>,
+    db: &AppDatabase,
+    data_dir: &std::path::Path,
+) -> Result<String, AppCommandError> {
+    crate::git_repo::ensure_git_repo(path)?;
+    ensure_not_option_like("branch", branch)?;
+
+    let remotes = remote_branches(path).await;
+    let remote_ref = push_comparison_ref(path, branch, &remotes)
+        .await
+        .ok_or_else(|| {
+            AppCommandError::not_found(format!(
+                "Branch '{branch}' has no remote counterpart to delete"
+            ))
+        })?;
+    // `remote_ref` looks like "origin/feat/x": the first path segment is the
+    // remote name, the rest is the branch name on that remote.
+    let (remote, remote_branch) = remote_ref.split_once('/').ok_or_else(|| {
+        AppCommandError::external_command("Unexpected upstream ref", remote_ref.clone())
+    })?;
+
+    crate::commands::folders::git_delete_remote_branch_core(
+        path,
+        remote,
+        remote_branch,
+        credentials,
+        db,
+        data_dir,
+    )
+    .await
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Branch ↔ environment diff
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1447,6 +1490,24 @@ pub async fn git_pull_branch(
         .map_err(|e| AppCommandError::external_command("Failed to resolve app data dir", e.to_string()))?;
     let data_dir = crate::paths::resolve_effective_data_dir(&data_dir);
     git_pull_branch_core(&db, &path, &branch, credentials.as_ref(), &data_dir).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn git_delete_branch_remote(
+    db: tauri::State<'_, AppDatabase>,
+    path: String,
+    branch: String,
+    credentials: Option<crate::models::GitCredentials>,
+    app_handle: tauri::AppHandle,
+) -> Result<String, AppCommandError> {
+    use tauri::Manager;
+    let data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| AppCommandError::external_command("Failed to resolve app data dir", e.to_string()))?;
+    let data_dir = crate::paths::resolve_effective_data_dir(&data_dir);
+    git_delete_branch_remote_core(&path, &branch, credentials.as_ref(), &db, &data_dir).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

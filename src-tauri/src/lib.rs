@@ -2228,6 +2228,7 @@ mod tauri_app {
                 branch_board_commands::list_branch_states,
                 branch_board_commands::upsert_branch_state,
                 branch_board_commands::git_pull_branch,
+                branch_board_commands::git_delete_branch_remote,
                 branch_board_commands::git_branch_diff_files,
                 branch_board_commands::git_branch_diff_file,
                 branch_board_commands::git_branch_own_commits,
