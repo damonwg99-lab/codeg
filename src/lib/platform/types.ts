@@ -89,8 +89,6 @@ export interface EnvMergeStatus {
   merged: boolean
   mergeVia: "merge" | "fast_forward" | null
   mergeDate: string | null
-  ahead: number
-  behind: number
 }
 
 export interface BranchRow {
@@ -115,10 +113,15 @@ export interface RepoBranchMatrix {
   repoId: number
   repoName: string
   repoPath: string
-  configured: boolean
   /** Configured environment keys for this repo, e.g. ["uat", "prd"]. */
   envs: EnvKey[]
   branches: BranchRow[]
+  /**
+   * Why this repo could not be scanned, with `branches` left empty. A project
+   * may contain repos the current developer has not cloned, so these are
+   * reported per repo instead of failing the whole matrix.
+   */
+  error: string | null
 }
 
 export interface BranchStateInfo {

@@ -66,9 +66,18 @@ export function remoteStatusKey(state: RemoteState): string {
   }
 }
 
-/** Environments this branch has NOT been merged into yet (merge targets). */
-export function unmergedEnvs(row: BranchRow): EnvKey[] {
-  return row.envs.filter((e) => !e.merged).map((e) => e.env)
+/**
+ * Compact ahead/behind suffix for a remote-state label, e.g. `↑2`, `↓3`,
+ * `↑2 ↓3`. Empty when there is nothing to report, so callers can append it
+ * unconditionally. Arrows rather than words, so it needs no translation.
+ */
+export function remoteCountsLabel(
+  row: Pick<BranchRow, "ahead" | "behind">
+): string {
+  const parts: string[] = []
+  if (row.ahead > 0) parts.push(`↑${row.ahead}`)
+  if (row.behind > 0) parts.push(`↓${row.behind}`)
+  return parts.join(" ")
 }
 
 export interface BranchFilterOptions {
@@ -80,6 +89,8 @@ export interface BranchFilterOptions {
   /** With a specific `env`, restrict to merged / unmerged. */
   status?: "all" | "merged" | "unmerged"
   onlyNeedsPush?: boolean
+  /** Restrict to branches whose remote has commits the local copy lacks. */
+  onlyNeedsPull?: boolean
   /** Restrict to the branch currently checked out in its repo. */
   onlyCurrent?: boolean
 }
@@ -105,6 +116,7 @@ export function filterRows(
       return false
     if (opts.onlyCurrent && !row.isCurrent) return false
     if (opts.onlyNeedsPush && !row.needsPush) return false
+    if (opts.onlyNeedsPull && !row.needsPull) return false
     if (env !== "all") {
       const e = row.envs.find((x) => x.env === env)
       if (!e) return false
@@ -137,9 +149,41 @@ export type CellKind = "env" | "unconfigured" | "unmerged" | "merged"
 
 export interface CellState {
   kind: CellKind
-  label: string
   mergeVia?: "merge" | "fast_forward" | null
   mergeDate?: string | null
+}
+
+export interface EnvCellLabels {
+  notConfigured: string
+  unmerged: string
+  merged: string
+  /** Marker for a branch merged by fast-forward (no merge commit). */
+  fastForward: string
+}
+
+/**
+ * The single source of truth for an environment cell's text. Both the board
+ * table and the detail panel render through this, so the two can no longer
+ * drift apart (they previously each rebuilt the same ternary chain and had
+ * already diverged on how a merged-with-date cell reads).
+ *
+ * `compact` drops the "merged" word when a date is available, for the narrow
+ * table column where the date alone carries the meaning.
+ */
+export function envCellLabel(
+  cell: CellState,
+  labels: EnvCellLabels,
+  compact = false
+): string {
+  if (cell.kind === "env") return "—"
+  if (cell.kind === "unconfigured") return labels.notConfigured
+  if (cell.kind === "unmerged") return labels.unmerged
+  const date = cell.mergeDate ? cell.mergeDate.slice(0, 10) : null
+  if (cell.mergeVia === "fast_forward") {
+    return date ? `${labels.fastForward} ${date}` : labels.fastForward
+  }
+  if (!date) return labels.merged
+  return compact ? date : `${labels.merged} · ${date}`
 }
 
 /**
@@ -151,18 +195,17 @@ export interface CellState {
  */
 export function envCellState(row: BranchRow, env: EnvKey): CellState {
   if (row.isEnvBranch) {
-    return { kind: "env", label: "—" }
+    return { kind: "env" }
   }
   const status = row.envs.find((e) => e.env === env)
   if (!status) {
-    return { kind: "unconfigured", label: "task.notConfigured" }
+    return { kind: "unconfigured" }
   }
   if (!status.merged) {
-    return { kind: "unmerged", label: "task.envUnmerged" }
+    return { kind: "unmerged" }
   }
   return {
     kind: "merged",
-    label: "task.envMerged",
     mergeVia: status.mergeVia,
     mergeDate: status.mergeDate,
   }

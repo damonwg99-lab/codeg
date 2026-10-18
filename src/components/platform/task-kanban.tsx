@@ -629,7 +629,10 @@ export function TaskKanban({ projectId }: { projectId: number }) {
         forceMount
         className="flex flex-col flex-1 min-h-0 overflow-hidden p-4 data-[state=inactive]:hidden"
       >
-        <BranchBoard projectId={projectId} />
+        {/* forceMount keeps filters and the split layout across tab switches,
+            so the board must be told when it is actually visible — otherwise
+            its multi-repo git scan runs on page load for everyone. */}
+        <BranchBoard projectId={projectId} active={activeTab === "changes"} />
       </TabsContent>
       <TabsContent
         value="archive"

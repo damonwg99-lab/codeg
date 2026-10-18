@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react"
 import { useTranslations } from "next-intl"
+import { toast } from "sonner"
 import {
   Loader2,
   Pencil,
@@ -25,6 +26,7 @@ import type {
   GitRepoScanResult,
   ProjectRepoInfo,
 } from "@/lib/platform/types"
+import { errorText } from "@/lib/platform/errors"
 import { KnowledgeManager } from "./knowledge-manager"
 import { usePlatform } from "@/contexts/platform-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
@@ -200,12 +202,23 @@ export function ProjectDetail({ id }: { id: number }) {
             repos: prev.repos.map((r) => (r.id === updated.id ? updated : r)),
           }
       )
+      // The branch board and its detail panel resolve env branches from
+      // PlatformContext's repo list, so updating only local state would leave
+      // them showing the previous configuration.
+      await loadProjectDetail()
       setRepoEnvEdit(null)
     } catch (e) {
-      console.error("Failed to save repo env branches:", e)
+      // Previously console-only: the dialog just stayed open with the spinner
+      // stopping and no indication that nothing had been saved.
+      toast.error(
+        t("task.opFailed", {
+          action: t("project.save"),
+          detail: errorText(e),
+        })
+      )
     }
     setSavingRepoEnv(false)
-  }, [repoEnvEdit, setRepoEnvEdit])
+  }, [repoEnvEdit, loadProjectDetail, t])
 
   const handleScan = useCallback(async () => {
     if (!detail) return
@@ -809,7 +822,7 @@ export function ProjectDetail({ id }: { id: number }) {
           </DialogHeader>
           <div className="flex flex-col gap-3">
             <div className="flex flex-col gap-1.5">
-              <Label>Dev</Label>
+              <Label>{t("task.envDev")}</Label>
               <Input
                 placeholder={t("project.envDevPlaceholder")}
                 value={repoEnvEdit?.dev ?? ""}
@@ -821,7 +834,7 @@ export function ProjectDetail({ id }: { id: number }) {
               />
             </div>
             <div className="flex flex-col gap-1.5">
-              <Label>UAT</Label>
+              <Label>{t("task.envUat")}</Label>
               <Input
                 placeholder={t("project.envUatPlaceholder")}
                 value={repoEnvEdit?.uat ?? ""}
@@ -833,7 +846,7 @@ export function ProjectDetail({ id }: { id: number }) {
               />
             </div>
             <div className="flex flex-col gap-1.5">
-              <Label>PRD</Label>
+              <Label>{t("task.envPrd")}</Label>
               <Input
                 placeholder={t("project.envPrdPlaceholder")}
                 value={repoEnvEdit?.prd ?? ""}

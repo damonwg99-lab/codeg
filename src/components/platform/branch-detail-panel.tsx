@@ -7,7 +7,6 @@ import {
   GitCommit,
   GitMerge,
   FileDiff,
-  FolderPen,
   X,
   CloudCheck,
   CloudOff,
@@ -48,21 +47,27 @@ import {
   gitLog,
   gitCommitFiles,
   gitShowDiff,
-  gitDiffWithBranch,
   gitStatus,
   resolveWorktreeFolder,
 } from "@/lib/api"
 import {
+  getBranchDiffFile,
+  getBranchDiffFiles,
+  getBranchOwnCommits,
+} from "@/lib/platform/api"
+import {
+  envCellLabel,
   envCellState,
+  remoteCountsLabel,
   remoteStatusKey,
   resolveEffectiveEnv,
+  type CellState,
 } from "@/lib/platform/branch-board"
 import {
   buildCommitFileTree,
   collectExpandedDirectoryPaths,
   type CommitFileTreeNode,
 } from "@/lib/platform/commit-file-tree"
-import { parseDiffFileSections } from "@/lib/platform/diff-files"
 import type {
   BranchRow,
   BranchStateInfo,
@@ -93,6 +98,40 @@ interface Props {
 
 function MetaDot() {
   return <span className="text-muted-foreground/50">·</span>
+}
+
+/**
+ * Which commits the Commits tab lists: the branch's OWN commits (not yet in any
+ * environment — what is waiting to be released), or its full ancestry. A plain
+ * `git log <branch>` is the latter, and for a feature branch that is mostly the
+ * environment's history from before it was cut.
+ */
+type CommitScope = "own" | "all"
+
+/** One page of commits for the chosen scope. */
+async function fetchCommitPage(
+  scope: CommitScope,
+  path: string,
+  branch: string,
+  envBranches: string[],
+  skip: number
+): Promise<GitLogEntry[]> {
+  if (scope === "own") {
+    const res = await getBranchOwnCommits(path, branch, envBranches, skip, PAGE)
+    return res.entries ?? []
+  }
+  // withFiles=false: per-commit file lists are loaded on expand, not per page.
+  const res = await gitLog(
+    path,
+    PAGE,
+    branch,
+    undefined,
+    skip || undefined,
+    undefined,
+    undefined,
+    false
+  )
+  return res.entries ?? []
 }
 
 function mapFileStatus(
@@ -136,16 +175,40 @@ export function BranchDetailPanel({
   const [status, setStatus] = useState<GitStatusEntry[] | null>(null)
   const [statusError, setStatusError] = useState(false)
   const [diffEnv, setDiffEnv] = useState<EnvKey | "">("")
-  const [diffText, setDiffText] = useState<string | null>(null)
+  // Env diff, loaded lazily: the file LIST first (names + counts, cheap), then
+  // one file's patch only when it is opened. `null` files = not loaded yet.
+  const [diffFiles, setDiffFiles] = useState<GitLogFileChange[] | null>(null)
+  const [diffError, setDiffError] = useState(false)
   const [loadingDiff, setLoadingDiff] = useState(false)
-  const [diffFile, setDiffFile] = useState<string | null>(null)
+  const [diffPatch, setDiffPatch] = useState<{
+    file: string
+    // null = the load failed (shown as an error, not as "no changes").
+    text: string | null
+    loading: boolean
+  } | null>(null)
 
   // Monotonic token so responses for a previously selected branch/commit/file
   // can never overwrite the current selection.
   const requestSeq = useRef(0)
   const diffSeq = useRef(0)
+  const diffPatchSeq = useRef(0)
   const commitSeq = useRef(0)
   const fileDiffSeq = useRef(0)
+  // Own token for the commit list: switching scope must drop an in-flight page
+  // without also discarding the worktree status guarded by `requestSeq`.
+  const logSeq = useRef(0)
+
+  // Which branch + scope the commit list is for. The branch is part of the
+  // value so the log effect can tell "scope chosen for THIS branch" from the
+  // stale value left over from the previously selected one.
+  const [commitView, setCommitView] = useState<{
+    branch: string
+    scope: CommitScope
+  } | null>(null)
+  // True when "own commits" came back empty and the list fell back to the
+  // full history, so the user is told why instead of seeing an unexplained
+  // switch.
+  const [scopeFallback, setScopeFallback] = useState(false)
 
   // Commit detail (git-log style: click a commit -> files -> per-file diff).
   const [openCommit, setOpenCommit] = useState<string | null>(null)
@@ -165,53 +228,80 @@ export function BranchDetailPanel({
     return ENVS.filter((e) => resolveEffectiveEnv(repo, project, e) != null)
   }, [repo, project])
 
+  const envLabels = useMemo(
+    () => ({
+      notConfigured: t("task.notConfigured"),
+      unmerged: t("task.envUnmerged"),
+      merged: t("task.envMerged"),
+      fastForward: t("task.mergedFastForward"),
+    }),
+    [t]
+  )
+
+  // Names of the environment branches this repo is configured with — the
+  // baseline "own commits" are measured against.
+  const envBranches = useMemo<string[]>(() => {
+    if (!repo || !project) return []
+    return envs
+      .map((e) => resolveEffectiveEnv(repo, project, e))
+      .filter((b): b is string => b != null)
+  }, [envs, repo, project])
+
+  // The log effect reads these through refs so a change in the environment
+  // configuration does not re-fetch the list; they are refreshed (below, before
+  // the effects that read them) on every render.
+  const envBranchesRef = useRef<string[]>([])
+  const defaultScopeRef = useRef<CommitScope>("all")
   useEffect(() => {
-    if (!path || !row) return
+    envBranchesRef.current = envBranches
+    // An environment branch's own "unreleased" commits are meaningless, and
+    // with no environment configured there is no baseline to measure against.
+    defaultScopeRef.current =
+      envBranches.length > 0 && !row?.isEnvBranch ? "own" : "all"
+  })
+
+  // Keyed on the branch NAME, not the `row` object: the board rebuilds every
+  // row object on each refresh (so the panel shows fresh merge/remote state),
+  // and depending on object identity made every refresh re-run the log, the
+  // worktree probe and `git status` — and snap the user back to the overview
+  // tab, discarding the diff they were reading. Only a genuine branch change
+  // should reset the panel.
+  const branchName = row?.branch ?? null
+
+  useEffect(() => {
+    if (!path || !branchName) return
     let cancelled = false
     const seq = ++requestSeq.current
     // Invalidate any in-flight diff/file-diff responses from the previous row.
     diffSeq.current++
+    diffPatchSeq.current++
     fileDiffSeq.current++
     commitSeq.current++
+    logSeq.current++
     setEntries([])
     setHasMore(false)
     setActiveTab("overview")
     setDiffEnv("")
-    setDiffText(null)
-    setDiffFile(null)
+    setDiffFiles(null)
+    setDiffError(false)
+    setLoadingDiff(false)
+    setDiffPatch(null)
     setStatus(null)
     setStatusError(false)
     setWorktreePath(null)
     setOpenCommit(null)
     setCommitFiles([])
     setFileDiff(null)
-    setLoadingLog(true)
-    gitLog(
-      path,
-      PAGE,
-      row.branch,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      false
-    )
-      .then((res) => {
-        if (cancelled || seq !== requestSeq.current) return
-        const list = res.entries ?? []
-        setEntries(list)
-        setHasMore(list.length >= PAGE)
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (!cancelled && seq === requestSeq.current) setLoadingLog(false)
-      })
+    setScopeFallback(false)
+    // The commit list itself is loaded by the effect below, which reacts to
+    // this value.
+    setCommitView({ branch: branchName, scope: defaultScopeRef.current })
     // Resolve the worktree that actually owns the selected branch, then read
     // that checkout's status — never the main worktree's when a different
     // branch is checked out there.
     void (async () => {
       try {
-        const res = await resolveWorktreeFolder(path, row.branch)
+        const res = await resolveWorktreeFolder(path, branchName)
         if (cancelled || seq !== requestSeq.current) return
         const wt = res.path
         setWorktreePath(wt)
@@ -229,33 +319,95 @@ export function BranchDetailPanel({
     return () => {
       cancelled = true
     }
-  }, [path, row])
+  }, [path, branchName])
+
+  // Loads the first page of commits for the selected branch + scope.
+  useEffect(() => {
+    if (!path || !branchName || !commitView) return
+    // Still the previous branch's value; the reset effect is about to replace it.
+    if (commitView.branch !== branchName) return
+
+    let cancelled = false
+    const seq = ++logSeq.current
+    const { scope } = commitView
+    setEntries([])
+    setHasMore(false)
+    setLoadingLog(true)
+
+    void (async () => {
+      let switchedScope = false
+      try {
+        const list = await fetchCommitPage(
+          scope,
+          path,
+          branchName,
+          envBranchesRef.current,
+          0
+        )
+        if (cancelled || seq !== logSeq.current) return
+        if (scope === "own" && list.length === 0) {
+          // Everything on the branch is already in an environment: an empty
+          // list would read as "failed to load", so show the history instead
+          // and say why.
+          switchedScope = true
+          setScopeFallback(true)
+          setCommitView({ branch: branchName, scope: "all" })
+          return
+        }
+        setEntries(list)
+        setHasMore(list.length >= PAGE)
+      } catch {
+        if (cancelled || seq !== logSeq.current) return
+        if (scope === "own") {
+          // e.g. none of the environment branches exist in this clone.
+          switchedScope = true
+          setCommitView({ branch: branchName, scope: "all" })
+        }
+      } finally {
+        if (!switchedScope && !cancelled && seq === logSeq.current) {
+          setLoadingLog(false)
+        }
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [path, branchName, commitView])
+
+  const changeScope = (scope: CommitScope) => {
+    if (!branchName || commitView?.scope === scope) return
+    // A manual choice clears the "fell back" explanation.
+    setScopeFallback(false)
+    commitSeq.current++
+    fileDiffSeq.current++
+    setOpenCommit(null)
+    setCommitFiles([])
+    setFileDiff(null)
+    setCommitView({ branch: branchName, scope })
+  }
 
   const loadMore = async () => {
-    if (!path || !row) return
-    // Guard against a row switch while this page is in flight: appending a
-    // stale branch's second page to the new branch's first must never happen.
-    const seq = requestSeq.current
+    if (!path || !row || !commitView) return
+    // Guard against a row or scope switch while this page is in flight:
+    // appending a stale list's second page to the new one must never happen.
+    const seq = logSeq.current
     setLoadingLog(true)
     try {
-      const res = await gitLog(
+      const list = await fetchCommitPage(
+        commitView.scope,
         path,
-        PAGE,
         row.branch,
-        undefined,
-        entries.length,
-        undefined,
-        undefined,
-        false
+        envBranches,
+        entries.length
       )
-      if (seq !== requestSeq.current) return
-      const list = res.entries ?? []
+      if (seq !== logSeq.current) return
       setEntries((prev) => [...prev, ...list])
       setHasMore(list.length >= PAGE)
     } catch {
       /* ignore */
     } finally {
-      if (seq === requestSeq.current) setLoadingLog(false)
+      if (seq === logSeq.current) setLoadingLog(false)
     }
   }
 
@@ -264,21 +416,71 @@ export function BranchDetailPanel({
     const envBranch = resolveEffectiveEnv(repo, project, env)
     if (!envBranch) return
     const seq = ++diffSeq.current
+    diffPatchSeq.current++
     setDiffEnv(env)
-    setDiffFile(null)
+    setDiffFiles(null)
+    setDiffError(false)
+    setDiffPatch(null)
     setLoadingDiff(true)
     try {
-      const text = await gitDiffWithBranch(
-        path,
-        row.branch,
-        undefined,
-        envBranch
-      )
-      if (seq === diffSeq.current) setDiffText(text)
+      const files = await getBranchDiffFiles(path, row.branch, envBranch)
+      if (seq === diffSeq.current) setDiffFiles(files)
     } catch {
-      if (seq === diffSeq.current) setDiffText("")
+      // Previously swallowed into an empty diff, which read as "no changes".
+      if (seq === diffSeq.current) setDiffError(true)
     } finally {
       if (seq === diffSeq.current) setLoadingDiff(false)
+    }
+  }
+
+  const openDiffFile = async (file: string) => {
+    if (!repo || !project || !path || !row || diffEnv === "") return
+    const envBranch = resolveEffectiveEnv(repo, project, diffEnv)
+    if (!envBranch) return
+    const seq = ++diffPatchSeq.current
+    setDiffPatch({ file, text: "", loading: true })
+    try {
+      const text = await getBranchDiffFile(path, row.branch, envBranch, file)
+      if (seq === diffPatchSeq.current)
+        setDiffPatch({ file, text, loading: false })
+    } catch {
+      if (seq === diffPatchSeq.current)
+        setDiffPatch({ file, text: null, loading: false })
+    }
+  }
+
+  // The environment worth showing first: one this branch still has to be
+  // merged into, since that is what "compare" is for. Falls back to the first.
+  const defaultDiffEnv = useMemo<EnvKey | null>(() => {
+    if (envs.length === 0) return null
+    const unmerged = row
+      ? envs.find((e) => envCellState(row, e).kind === "unmerged")
+      : undefined
+    return unmerged ?? envs[0]
+  }, [envs, row])
+
+  // The status was read once when the branch was selected; commit something,
+  // come back to the overview, and it would still claim the old changes.
+  const reloadStatus = async () => {
+    if (!worktreePath) return
+    const seq = requestSeq.current
+    try {
+      const s = await gitStatus(worktreePath)
+      if (seq !== requestSeq.current) return
+      setStatus(s)
+      setStatusError(false)
+    } catch {
+      if (seq === requestSeq.current) setStatusError(true)
+    }
+  }
+
+  const handleTabChange = (value: string) => {
+    setActiveTab(value)
+    if (value === "overview") void reloadStatus()
+    // Opening the diff tab with nothing selected used to show a blank pane
+    // until the user found the dropdown.
+    if (value === "diff" && diffEnv === "" && defaultDiffEnv) {
+      void loadDiff(defaultDiffEnv)
     }
   }
 
@@ -317,19 +519,11 @@ export function BranchDetailPanel({
     }
   }
 
-  const diffSections = useMemo(
-    () => parseDiffFileSections(diffText ?? ""),
-    [diffText]
-  )
   const diffTree = useMemo(
-    () => buildCommitFileTree(diffSections.map((s) => s.change)),
-    [diffSections]
+    () => buildCommitFileTree(diffFiles ?? []),
+    [diffFiles]
   )
-  const diffFileText = useMemo(() => {
-    if (!diffFile) return null
-    return diffSections.find((s) => s.change.path === diffFile)?.text ?? null
-  }, [diffSections, diffFile])
-  const changedFiles = diffSections.length
+  const changedFiles = diffFiles?.length ?? 0
 
   const isCheckedOut = worktreePath != null
 
@@ -348,9 +542,11 @@ export function BranchDetailPanel({
             : state === "diverged"
               ? "bg-destructive/10 text-destructive"
               : "bg-muted text-muted-foreground"
+    const counts = remoteCountsLabel(row)
     return (
       <span className={`${cls} ${tone}`}>
         {t(remoteStatusKey(state) as never)}
+        {counts && <span className="ml-1 font-mono">{counts}</span>}
       </span>
     )
   })()
@@ -484,7 +680,7 @@ export function BranchDetailPanel({
 
       <Tabs
         value={activeTab}
-        onValueChange={setActiveTab}
+        onValueChange={handleTabChange}
         className="flex min-h-0 flex-1 flex-col gap-0"
       >
         <div className="shrink-0 px-5 pt-3">
@@ -492,10 +688,6 @@ export function BranchDetailPanel({
             <TabsTrigger value="overview" className="gap-1">
               <GitMerge className="size-3.5" />
               {t("task.detailOverview")}
-            </TabsTrigger>
-            <TabsTrigger value="working" className="gap-1">
-              <FolderPen className="size-3.5" />
-              {t("task.detailWorkingTree")}
             </TabsTrigger>
             {envs.length > 0 && (
               <TabsTrigger value="diff" className="gap-1">
@@ -551,6 +743,57 @@ export function BranchDetailPanel({
                 </div>
               </section>
 
+              {/* Uncommitted changes. Shown only when there is something to say:
+                  these are NOT part of a merge, which is easy to forget when a
+                  branch looks finished. (The merge gate checks the TARGET
+                  environment's worktree, not this one.) */}
+              {isCheckedOut && (statusError || (status && status.length > 0)) && (
+                <section className="flex flex-col gap-2">
+                  <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
+                    {t("task.detailWorkingTree")}
+                    {status && status.length > 0 && (
+                      <span className="ml-1.5 normal-case tracking-normal">
+                        ·{" "}
+                        {t("task.detailChangedFiles", { count: status.length })}
+                      </span>
+                    )}
+                  </h3>
+                  {statusError ? (
+                    <p className="text-[0.75rem] text-destructive">
+                      {t("task.detailStatusError")}
+                    </p>
+                  ) : (
+                    <>
+                      <p className="text-[0.75rem] text-amber-600 dark:text-amber-400">
+                        {t("task.workingChangesNotMerged")}
+                      </p>
+                      <details className="group rounded-md border border-border/60">
+                        <summary className="cursor-pointer select-none px-2.5 py-1.5 text-[0.75rem] text-muted-foreground">
+                          {t("task.detailChangedFiles", {
+                            count: status?.length ?? 0,
+                          })}
+                        </summary>
+                        <div className="flex max-h-56 flex-col divide-y divide-border/60 overflow-auto border-t border-border/60 px-2.5">
+                          {status?.map((s) => (
+                            <div
+                              key={s.file}
+                              className="flex items-center gap-2 py-1.5 text-[0.75rem]"
+                            >
+                              <span className="inline-flex h-5 w-6 shrink-0 items-center justify-center rounded bg-muted font-mono text-[0.625rem] text-muted-foreground">
+                                {s.status}
+                              </span>
+                              <span className="min-w-0 truncate font-mono">
+                                {s.file}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </details>
+                    </>
+                  )}
+                </section>
+              )}
+
               {/* Merge to env */}
               <section className="flex flex-col gap-2">
                 <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
@@ -563,23 +806,10 @@ export function BranchDetailPanel({
                 ) : (
                   <div className="flex flex-col divide-y divide-border/60">
                     {envs.map((e) => {
-                      const cell = row
+                      const cell: CellState = row
                         ? envCellState(row, e)
-                        : { kind: "unconfigured" as const }
-                      const label =
-                        cell.kind === "merged"
-                          ? cell.mergeVia === "fast_forward"
-                            ? cell.mergeDate
-                              ? `FF ${cell.mergeDate.slice(0, 10)}`
-                              : "— (FF)"
-                            : cell.mergeDate
-                              ? `${t("task.envMerged")} · ${cell.mergeDate.slice(0, 10)}`
-                              : t("task.envMerged")
-                          : cell.kind === "unmerged"
-                            ? t("task.envUnmerged")
-                            : cell.kind === "env"
-                              ? "—"
-                              : t("task.notConfigured")
+                        : { kind: "unconfigured" }
+                      const label = envCellLabel(cell, envLabels)
                       const canMergeEnv =
                         row != null &&
                         !row.isEnvBranch &&
@@ -695,46 +925,6 @@ export function BranchDetailPanel({
           </ScrollArea>
         </TabsContent>
 
-        {/* Uncommitted changes */}
-        <TabsContent
-          value="working"
-          className="mt-0 min-h-0 flex-1 overflow-hidden"
-        >
-          <ScrollArea className="h-full">
-            <div className="px-5 py-4">
-              {!isCheckedOut ? (
-                <p className="text-[0.75rem] text-muted-foreground">
-                  {t("task.detailNotCheckedOut")}
-                </p>
-              ) : statusError ? (
-                <p className="text-[0.75rem] text-destructive">
-                  {t("task.detailStatusError")}
-                </p>
-              ) : status && status.length > 0 ? (
-                <div className="flex flex-col divide-y divide-border/60">
-                  {status.map((s) => (
-                    <div
-                      key={s.file}
-                      className="flex items-center gap-2 py-2 text-[0.75rem] first:pt-0 last:pb-0"
-                    >
-                      <span className="inline-flex h-5 w-6 shrink-0 items-center justify-center rounded bg-muted font-mono text-[0.625rem] text-muted-foreground">
-                        {s.status}
-                      </span>
-                      <span className="min-w-0 truncate font-mono">
-                        {s.file}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-[0.75rem] text-muted-foreground">
-                  {t("task.detailNoChanges")}
-                </p>
-              )}
-            </div>
-          </ScrollArea>
-        </TabsContent>
-
         {/* Diff vs env */}
         <TabsContent
           value="diff"
@@ -760,7 +950,7 @@ export function BranchDetailPanel({
                   ))}
                 </SelectContent>
               </Select>
-              {diffText != null && (
+              {diffFiles != null && (
                 <span className="text-[0.75rem] text-muted-foreground">
                   {t("task.detailChangedFiles", { count: changedFiles })}
                 </span>
@@ -772,8 +962,12 @@ export function BranchDetailPanel({
                   <p className="text-[0.75rem] text-muted-foreground">
                     {t("task.loading")}
                   </p>
-                ) : diffText != null ? (
-                  diffSections.length === 0 ? (
+                ) : diffError ? (
+                  <p className="text-[0.75rem] text-destructive">
+                    {t("task.detailStatusError")}
+                  </p>
+                ) : diffFiles != null ? (
+                  diffFiles.length === 0 ? (
                     <p className="text-[0.75rem] text-muted-foreground">
                       {t("task.detailNoDiff")}
                     </p>
@@ -786,18 +980,36 @@ export function BranchDetailPanel({
                         )}
                         className="rounded-md border-border/60 bg-transparent text-xs [&>div]:p-1"
                       >
-                        {renderFileTree(diffTree, (f) => setDiffFile(f.path))}
+                        {renderFileTree(diffTree, (f) =>
+                          void openDiffFile(f.path)
+                        )}
                       </FileTree>
-                      {diffFileText != null && diffFileText.trim() && (
+                      {diffPatch && (
                         <div className="overflow-hidden rounded-md border border-border/60">
                           <div className="truncate border-b border-border/60 px-3 py-1.5 font-mono text-[0.6875rem] text-muted-foreground">
-                            {diffFile}
+                            {diffPatch.file}
                           </div>
-                          <UnifiedDiffPreview
-                            diffText={diffFileText}
-                            embedded
-                            hideViewToggle
-                          />
+                          {diffPatch.loading ? (
+                            <p className="px-3 py-2 text-[0.75rem] text-muted-foreground">
+                              {t("task.loading")}
+                            </p>
+                          ) : diffPatch.text === null ? (
+                            <p className="px-3 py-2 text-[0.75rem] text-destructive">
+                              {t("task.detailStatusError")}
+                            </p>
+                          ) : diffPatch.text.trim() ? (
+                            <UnifiedDiffPreview
+                              diffText={diffPatch.text}
+                              embedded
+                              hideViewToggle
+                            />
+                          ) : (
+                            // Previously a file that produced no patch text
+                            // (e.g. a mode-only change) gave no feedback at all.
+                            <p className="px-3 py-2 text-[0.75rem] text-muted-foreground">
+                              {t("task.detailNoDiff")}
+                            </p>
+                          )}
                         </div>
                       )}
                     </div>
@@ -815,6 +1027,40 @@ export function BranchDetailPanel({
         >
           <ScrollArea className="h-full">
             <div className="px-5 py-4">
+              {/* Scope switch: only meaningful for a non-environment branch with
+                  an environment configured (there is nothing to exclude from
+                  otherwise). */}
+              {envBranches.length > 0 && !row?.isEnvBranch && (
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                  <div className="inline-flex rounded-md border border-border p-0.5">
+                    <Button
+                      variant={
+                        commitView?.scope === "own" ? "secondary" : "ghost"
+                      }
+                      size="sm"
+                      className="h-6 px-2 text-[0.6875rem]"
+                      onClick={() => changeScope("own")}
+                    >
+                      {t("task.commitsOwnOnly")}
+                    </Button>
+                    <Button
+                      variant={
+                        commitView?.scope === "all" ? "secondary" : "ghost"
+                      }
+                      size="sm"
+                      className="h-6 px-2 text-[0.6875rem]"
+                      onClick={() => changeScope("all")}
+                    >
+                      {t("task.commitsAllHistory")}
+                    </Button>
+                  </div>
+                  {scopeFallback && (
+                    <span className="text-[0.6875rem] text-muted-foreground">
+                      {t("task.commitsAllMerged")}
+                    </span>
+                  )}
+                </div>
+              )}
               {loadingLog && entries.length === 0 ? (
                 <p className="text-[0.75rem] text-muted-foreground">
                   {t("task.loading")}

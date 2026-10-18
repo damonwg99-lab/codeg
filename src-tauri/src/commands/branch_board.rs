@@ -16,6 +16,19 @@ use crate::models::{BranchRow, BranchStateInfo, EnvMergeStatus, RemoteState, Rep
 /// Max repos processed concurrently (each spawns a few git processes).
 const REPO_CONCURRENCY: usize = 6;
 
+/// Bump whenever the meaning or shape of a cached matrix changes.
+///
+/// The cache key is otherwise just a fingerprint of the repo's git refs, so after
+/// an upgrade an unchanged repo would keep serving rows computed by the OLD
+/// logic (wrong merge status, wrong creator, ...) until some ref happened to
+/// move or the user pressed refresh. Mixing this into the key retires them.
+const MATRIX_CACHE_VERSION: u32 = 2;
+
+/// Max branches probed concurrently *within* one repo. Multiplies with
+/// [`REPO_CONCURRENCY`], so kept small enough that the product stays a sane
+/// number of simultaneous git processes.
+const BRANCH_CONCURRENCY: usize = 8;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure helpers (unit-tested)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -186,16 +199,24 @@ struct LocalBranch {
     name: String,
     date: String,
     upstream: Option<String>,
+    /// Raw `%(upstream:track,nobracket)`: empty, `ahead 2`, `behind 3`,
+    /// `ahead 1, behind 2`, or `gone`.
+    track: String,
 }
 
-/// Local branches with tip sha + committer date + upstream tracking, via one
-/// `for-each-ref`.
+/// Local branches with committer date, upstream and its ahead/behind counts,
+/// via one `for-each-ref`.
+///
+/// `%(upstream:track)` is the reason the matrix needs no per-branch `rev-list`:
+/// git reports the counts for every branch in this single call, which on a
+/// repository with many branches is the difference between one git process and
+/// one per branch.
 async fn list_local_branches(path: &str) -> Result<Vec<LocalBranch>, AppCommandError> {
     let out = git_stdout(
         path,
         &[
             "for-each-ref",
-            "--format=%(refname:short)%09%(objectname)%09%(committerdate:iso8601-strict)%09%(upstream:short)",
+            "--format=%(refname:short)%09%(committerdate:iso8601-strict)%09%(upstream:short)%09%(upstream:track,nobracket)",
             "refs/heads",
         ],
     )
@@ -207,19 +228,48 @@ async fn list_local_branches(path: &str) -> Result<Vec<LocalBranch>, AppCommandE
         if parts.is_empty() || parts[0].trim().is_empty() {
             continue;
         }
-        let name = parts[0].trim().to_string();
-        let date = parts.get(2).map(|s| s.trim().to_string()).unwrap_or_default();
-        let upstream = parts
-            .get(3)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
         branches.push(LocalBranch {
-            name,
-            date,
-            upstream,
+            name: parts[0].trim().to_string(),
+            date: parts.get(1).map(|s| s.trim().to_string()).unwrap_or_default(),
+            upstream: parts
+                .get(2)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            track: parts.get(3).map(|s| s.trim().to_string()).unwrap_or_default(),
         });
     }
     Ok(branches)
+}
+
+/// Parsed `%(upstream:track,nobracket)` output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct UpstreamTrack {
+    pub ahead: i64,
+    pub behind: i64,
+    /// The upstream is still configured but no longer exists on the remote —
+    /// typically the branch was merged and deleted server-side, then a
+    /// `fetch --prune` ran locally.
+    pub gone: bool,
+}
+
+pub(crate) fn parse_upstream_track(raw: &str) -> UpstreamTrack {
+    let raw = raw.trim();
+    if raw == "gone" {
+        return UpstreamTrack {
+            gone: true,
+            ..Default::default()
+        };
+    }
+    let mut out = UpstreamTrack::default();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if let Some(n) = part.strip_prefix("ahead ") {
+            out.ahead = n.trim().parse().unwrap_or(0);
+        } else if let Some(n) = part.strip_prefix("behind ") {
+            out.behind = n.trim().parse().unwrap_or(0);
+        }
+    }
+    out
 }
 
 /// Names of remote-tracking branches (e.g. "origin/main", "origin/feat/x").
@@ -238,6 +288,19 @@ async fn remote_branches(path: &str) -> HashSet<String> {
         .filter(|s| !s.is_empty() && !s.ends_with("/HEAD"))
         .map(String::from)
         .collect()
+}
+
+/// Whether the repo has any remote configured at all (`git remote`).
+///
+/// Deliberately distinct from [`remote_branches`]: a remote that has never been
+/// fetched or pushed to has no remote-tracking refs, so judging "has a remote"
+/// by `refs/remotes` reports every branch in a freshly configured repo as
+/// local-only when they are really just unpublished.
+async fn has_configured_remote(path: &str) -> bool {
+    git_stdout(path, &["remote"])
+        .await
+        .map(|out| out.lines().any(|l| !l.trim().is_empty()))
+        .unwrap_or(false)
 }
 
 /// Configured tracking targets: map from local branch name -> remote-tracking
@@ -268,16 +331,31 @@ async fn branch_tracking_config(path: &str) -> HashMap<String, String> {
     map
 }
 
-/// Commits reachable from a ref: run `git branch --merged <env>`. Branches in
-/// the output have their tips contained in `<env>`.
+/// Local branches whose tip is contained in `<env>`.
+///
+/// Uses `for-each-ref` rather than `git branch --merged`: the latter decorates
+/// its output (`* ` for the checked-out branch, `+ ` for one checked out in a
+/// linked worktree, plus a `(HEAD detached at ...)` pseudo-entry), and any
+/// prefix left unstripped silently turns a merged branch into an unmerged one.
+/// `for-each-ref` emits bare names only.
 async fn merged_set(path: &str, env: &str) -> HashSet<String> {
-    let out = match git_stdout(path, &["branch", "--merged", env]).await {
+    let out = match git_stdout(
+        path,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "--merged",
+            env,
+            "refs/heads",
+        ],
+    )
+    .await
+    {
         Ok(s) => s,
         Err(_) => return HashSet::new(),
     };
     out.lines()
         .map(str::trim)
-        .map(|s| s.strip_prefix('*').unwrap_or(s).trim())
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
@@ -291,19 +369,34 @@ async fn git_ref_exists(path: &str, ref_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Ref to compare/merge against for an env: the local branch when it exists,
-/// else the `origin/<env>` remote-tracking branch (the common case right after
-/// a clone, where the env branch only exists on the remote). Falls back to the
-/// bare name so behaviour is unchanged when neither exists.
-async fn resolve_env_ref(path: &str, env: &str) -> String {
+/// Every ref that represents an environment branch, local first, then the
+/// remote-tracking one. Empty when neither exists.
+///
+/// A branch counts as released to an environment if EITHER ref contains it,
+/// because each alone is wrong in one direction: the local copy lags when a
+/// teammate merged on the remote and you have not pulled yet, and the remote
+/// lags right after you merged locally and before you pushed.
+///
+/// Never assumes `origin`: it picks the uniquely owning remote. The candidate
+/// match requires the part before `/<env>` to be a bare remote name, otherwise
+/// env `uat` would also match `origin/release/uat` and silently compare against
+/// the wrong branch. An ambiguous name (several remotes carry it) contributes
+/// no remote ref rather than a guess.
+async fn resolve_env_refs(path: &str, env: &str, remotes: &HashSet<String>) -> Vec<String> {
+    let mut refs = Vec::new();
     if git_ref_exists(path, &format!("refs/heads/{env}")).await {
-        return env.to_string();
+        refs.push(env.to_string());
     }
-    let remote = format!("origin/{env}");
-    if git_ref_exists(path, &remote).await {
-        return remote;
+    let suffix = format!("/{env}");
+    let mut candidates = remotes.iter().filter(|r| {
+        r.strip_suffix(&suffix)
+            .is_some_and(|remote| !remote.is_empty() && !remote.contains('/'))
+    });
+    // Remote-tracking names come from `for-each-ref`, so a hit is known to exist.
+    if let (Some(only), None) = (candidates.next(), candidates.next()) {
+        refs.push(only.clone());
     }
-    env.to_string()
+    refs
 }
 
 /// Branch checked out in the repo's main worktree (None when detached).
@@ -394,6 +487,42 @@ pub(crate) fn parse_reflog_created_by(line: &str) -> Option<String> {
     }
 }
 
+/// Date + author of the OLDEST commit reachable from `branch` but not from any
+/// ref in `exclude`. Serves as the branch-creation fallback when the reflog has
+/// no `branch: Created from` entry — the case for every fetched or cloned
+/// branch, i.e. most branches in a shared repository.
+///
+/// Note `--reverse` is NOT used: git applies commit limiting *before* the
+/// reversal, so `--reverse -1` yields the NEWEST commit. Since git logs
+/// newest-first, the oldest commit is simply the last line.
+///
+/// Requires a baseline. Without one the range would be the branch's entire
+/// history, whose oldest commit is the repository's first — not this branch's
+/// creation — so it reports nothing rather than something misleading, and
+/// avoids walking the whole history for every branch.
+async fn first_commit_info(
+    path: &str,
+    branch: &str,
+    exclude: &[String],
+) -> Option<(String, Option<String>)> {
+    if exclude.is_empty() {
+        return None;
+    }
+
+    let mut args: Vec<&str> = vec!["log", "--format=%cI%x09%an", branch, "--not"];
+    args.extend(exclude.iter().map(String::as_str));
+    let out = git_stdout(path, &args).await.ok()?;
+
+    let line = out.lines().filter(|l| !l.trim().is_empty()).next_back()?;
+    let mut parts = line.splitn(2, '\t');
+    let date = parts.next().unwrap_or("").trim().to_string();
+    if date.is_empty() {
+        return None;
+    }
+    let author = parts.next().unwrap_or("").trim();
+    Some((date, (!author.is_empty()).then(|| author.to_string())))
+}
+
 async fn rev_left_right(path: &str, a: &str, b: &str) -> Option<(i64, i64)> {
     let range = format!("{a}...{b}");
     let out = git_stdout(path, &["rev-list", "--left-right", "--count", &range])
@@ -412,34 +541,51 @@ pub(crate) fn state_from_counts(ahead: i64, behind: i64) -> RemoteState {
 }
 
 /// Compute remote relationship for a local branch.
+///
+/// Spawns no git process in the common cases: [`list_local_branches`] already
+/// carried the upstream and its ahead/behind counts. Only a branch with no
+/// tracking config that nonetheless has a same-named remote ref falls back to a
+/// `rev-list`, which is rare — both pushing a branch and checking out a fetched
+/// one write tracking config.
 async fn branch_remote_status(
     path: &str,
     lb: &LocalBranch,
     remotes: &HashSet<String>,
-    tracking: &HashMap<String, String>,
-) -> (RemoteState, Option<i64>, Option<i64>, bool) {
-    if remotes.is_empty() {
-        return (RemoteState::NoRemote, None, None, false);
+    has_remote_configured: bool,
+) -> (RemoteState, i64, i64, bool) {
+    // "No remote" is about configuration, not about whether anything has been
+    // fetched yet — see [`has_configured_remote`].
+    if !has_remote_configured {
+        return (RemoteState::NoRemote, 0, 0, false);
     }
-    let upstream = tracking
-        .get(&lb.name)
-        .cloned()
-        .or_else(|| {
-            let default_target = format!("origin/{}", lb.name);
-            remotes.contains(&default_target).then_some(default_target)
-        });
 
-    let Some(target) = upstream else {
-        return (RemoteState::Unpublished, None, None, false);
+    if let Some(upstream) = lb.upstream.as_deref() {
+        let track = parse_upstream_track(&lb.track);
+        if track.gone || !remotes.contains(upstream) {
+            return (RemoteState::Unpublished, 0, 0, false);
+        }
+        return (
+            state_from_counts(track.ahead, track.behind),
+            track.ahead,
+            track.behind,
+            true,
+        );
+    }
+
+    // No tracking config: adopt the uniquely owning remote ref if there is one.
+    // The prefix must be a bare remote name, else branch `uat` would also match
+    // `origin/release/uat`.
+    let suffix = format!("/{}", lb.name);
+    let mut candidates = remotes.iter().filter(|r| {
+        r.strip_suffix(&suffix)
+            .is_some_and(|remote| !remote.is_empty() && !remote.contains('/'))
+    });
+    let (Some(target), None) = (candidates.next(), candidates.next()) else {
+        return (RemoteState::Unpublished, 0, 0, false);
     };
-
-    if !remotes.contains(&target) {
-        return (RemoteState::Unpublished, None, None, false);
-    }
-
-    match rev_left_right(path, &lb.name, &target).await {
-        Some((ahead, behind)) => (state_from_counts(ahead, behind), Some(ahead), Some(behind), true),
-        None => (RemoteState::Unknown, None, None, true),
+    match rev_left_right(path, &lb.name, target).await {
+        Some((ahead, behind)) => (state_from_counts(ahead, behind), ahead, behind, true),
+        None => (RemoteState::Unknown, 0, 0, true),
     }
 }
 
@@ -458,119 +604,132 @@ async fn compute_repo_matrix(
         .await
         .map_err(|e| AppCommandError::external_command("Failed to list branches", e.to_string()))?;
 
-    // Resolve each env to a ref that exists locally (local branch, else the
-    // origin remote-tracking branch), then one git call per env for its merged
-    // set.
-    let mut env_refs: Vec<(String, String, String)> = Vec::new();
-    for (env_key, env_name) in envs {
-        let resolved = resolve_env_ref(repo_path, env_name).await;
-        env_refs.push((env_key.clone(), env_name.clone(), resolved));
-    }
-    let mut merged: HashMap<String, HashSet<String>> = HashMap::new();
-    for (env_key, _name, resolved) in &env_refs {
-        merged.insert(env_key.clone(), merged_set(repo_path, resolved).await);
-    }
-    let git_dir = git_dir_no_spawn(repo_path);
+    // Remotes come first: resolving an env branch that only exists remotely
+    // needs them.
     let remotes = remote_branches(repo_path).await;
-    let tracking = branch_tracking_config(repo_path).await;
+    let has_remote_configured = has_configured_remote(repo_path).await;
+
+    // Resolve each env to the refs that exist (local branch and/or its
+    // remote-tracking counterpart), then one git call per ref for its merged
+    // set. Only refs that actually resolve are ever passed on: a non-existent
+    // ref given to `git log --not` would fail the whole probe.
+    let mut env_refs: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut existing_env_refs: Vec<String> = Vec::new();
+    for (env_key, env_name) in envs {
+        let refs = resolve_env_refs(repo_path, env_name, &remotes).await;
+        existing_env_refs.extend(refs.iter().cloned());
+        env_refs.push((env_key.clone(), env_name.clone(), refs));
+    }
+    let mut merged: HashMap<String, Vec<(String, HashSet<String>)>> = HashMap::new();
+    for (env_key, _name, refs) in &env_refs {
+        let mut sets = Vec::with_capacity(refs.len());
+        for r in refs {
+            sets.push((r.clone(), merged_set(repo_path, r).await));
+        }
+        merged.insert(env_key.clone(), sets);
+    }
+
+    let git_dir = git_dir_no_spawn(repo_path);
     let current = current_branch(repo_path).await;
 
-    let mut rows = Vec::new();
-    for lb in locals {
-        let mut statuses = Vec::new();
-        let mut is_env_branch = false;
-        for (env_key, env_name, resolved) in &env_refs {
-            if lb.name == *env_name {
-                is_env_branch = true;
+    // Per-branch probes run concurrently. `merge_info` alone is one git process
+    // per (merged branch × env), which dominates a cold scan: on a repo with a
+    // hundred branches and three environments the serial version spent seconds
+    // waiting on process startup. Bounded so the nesting with REPO_CONCURRENCY
+    // cannot spawn an unbounded number of git processes at once.
+    let merged_ref = &merged;
+    let env_refs_ref = &env_refs;
+    let existing_env_refs_ref = &existing_env_refs;
+    let remotes_ref = &remotes;
+    let git_dir_ref = git_dir.as_deref();
+    let current_ref = current.as_deref();
+
+    let mut rows: Vec<BranchRow> = stream::iter(locals)
+        .map(|lb| async move {
+            let mut statuses = Vec::new();
+            let mut is_env_branch = false;
+            for (env_key, env_name, _refs) in env_refs_ref {
+                if lb.name == *env_name {
+                    is_env_branch = true;
+                    statuses.push(EnvMergeStatus {
+                        env: env_key.clone(),
+                        merged: true,
+                        merge_via: None,
+                        merge_date: None,
+                    });
+                    continue;
+                }
+                // First ref (local before remote) that contains the branch; it
+                // also supplies the merge method and date.
+                let containing = merged_ref
+                    .get(env_key)
+                    .and_then(|sets| sets.iter().find(|(_, s)| s.contains(&lb.name)))
+                    .map(|(r, _)| r.as_str());
+                let is_merged = containing.is_some();
+                let (via, date) = match containing {
+                    Some(r) => merge_info(repo_path, &lb.name, r).await,
+                    None => (None, None),
+                };
                 statuses.push(EnvMergeStatus {
                     env: env_key.clone(),
-                    merged: true,
-                    merge_via: None,
-                    merge_date: None,
-                    ahead: 0,
-                    behind: 0,
+                    merged: is_merged,
+                    merge_via: via,
+                    merge_date: date,
                 });
-                continue;
             }
-            let is_merged = merged
-                .get(env_key)
-                .map(|s| s.contains(&lb.name))
-                .unwrap_or(false);
-            let (via, date) = if is_merged {
-                merge_info(repo_path, &lb.name, resolved).await
-            } else {
-                (None, None)
+
+            let created = git_dir_ref.and_then(|gd| created_at_from_reflog(gd, &lb.name));
+            let (mut created_at, mut created_by, mut created_at_source) = match created {
+                Some((d, b)) => (Some(d), b, Some("reflog".to_string())),
+                None => (None, None, None),
             };
-            statuses.push(EnvMergeStatus {
-                env: env_key.clone(),
-                merged: is_merged,
-                merge_via: via,
-                merge_date: date,
-                ahead: 0,
-                behind: 0,
-            });
-        }
 
-        let created = git_dir
-            .as_deref()
-            .and_then(|gd| created_at_from_reflog(gd, &lb.name));
-        let (mut created_at, mut created_by, mut created_at_source) = match created {
-            Some((d, b)) => (Some(d), b, Some("reflog".to_string())),
-            None => (None, None, None),
-        };
-
-        if created_at.is_none() {
-            let base_range = env_refs
-                .first()
-                .map(|(_, _, resolved)| format!("{resolved}..{}", lb.name))
-                .unwrap_or_else(|| lb.name.clone());
-            if let Ok(out) = git_stdout(
-                repo_path,
-                &["log", "--reverse", "--format=%cI%x09%an", "-1", &base_range],
-            )
-            .await
-            {
-                if let Some(line) = out.lines().next() {
-                    let mut parts = line.splitn(2, '\t');
-                    let dt = parts.next().unwrap_or("").trim().to_string();
-                    let author = parts.next().unwrap_or("").trim().to_string();
-                    if !dt.is_empty() {
-                        created_at = Some(dt);
-                        created_by = if author.is_empty() { None } else { Some(author) };
-                        created_at_source = Some("first_commit".to_string());
-                    }
+            // Excluding every configured env (not just dev) keeps the probe
+            // honest for branches cut from uat/prd rather than dev.
+            if created_at.is_none() {
+                if let Some((dt, author)) =
+                    first_commit_info(repo_path, &lb.name, existing_env_refs_ref).await
+                {
+                    created_at = Some(dt);
+                    created_by = author;
+                    created_at_source = Some("first_commit".to_string());
                 }
             }
-        }
 
-        let (remote_state, ahead, behind, has_remote) =
-            branch_remote_status(repo_path, &lb, &remotes, &tracking).await;
-        let needs_push = matches!(
-            remote_state,
-            RemoteState::Ahead | RemoteState::Diverged | RemoteState::Unpublished
-        );
-        let needs_pull =
-            matches!(remote_state, RemoteState::Behind | RemoteState::Diverged);
+            let (remote_state, ahead, behind, has_remote) =
+                branch_remote_status(repo_path, &lb, remotes_ref, has_remote_configured).await;
+            let needs_push = matches!(
+                remote_state,
+                RemoteState::Ahead | RemoteState::Diverged | RemoteState::Unpublished
+            );
+            let needs_pull = matches!(remote_state, RemoteState::Behind | RemoteState::Diverged);
 
-        let is_current = current.as_deref() == Some(lb.name.as_str());
-        rows.push(BranchRow {
-            branch: lb.name,
-            created_at_source,
-            created_at,
-            is_env_branch,
-            is_current,
-            last_commit_at: Some(lb.date).filter(|s| !s.is_empty()),
-            created_by,
-            upstream: lb.upstream,
-            has_remote,
-            remote_state,
-            ahead: ahead.unwrap_or(0),
-            behind: behind.unwrap_or(0),
-            needs_push,
-            needs_pull,
-            envs: statuses,
-        });
-    }
+            let is_current = current_ref == Some(lb.name.as_str());
+            BranchRow {
+                branch: lb.name,
+                created_at_source,
+                created_at,
+                is_env_branch,
+                is_current,
+                last_commit_at: Some(lb.date).filter(|s| !s.is_empty()),
+                created_by,
+                upstream: lb.upstream,
+                has_remote,
+                remote_state,
+                ahead,
+                behind,
+                needs_push,
+                needs_pull,
+                envs: statuses,
+            }
+        })
+        .buffer_unordered(BRANCH_CONCURRENCY)
+        .collect()
+        .await;
+
+    // `buffer_unordered` completes out of order; sort so the cached JSON and
+    // the API response stay deterministic.
+    rows.sort_by(|a, b| a.branch.cmp(&b.branch));
     Ok(rows)
 }
 
@@ -585,7 +744,9 @@ async fn compute_repo_cached(
 ) -> Result<RepoBranchMatrix, AppCommandError> {
     let env_sig = env_config_signature(&envs, configured);
     let fp = ref_fingerprint(&repo_path);
-    let cache_key = fp.as_ref().map(|f| format!("{f}|{env_sig}"));
+    let cache_key = fp
+        .as_ref()
+        .map(|f| format!("v{MATRIX_CACHE_VERSION}|{f}|{env_sig}"));
 
     if !force {
         if let Some(ref key) = cache_key {
@@ -600,9 +761,9 @@ async fn compute_repo_cached(
                         repo_id,
                         repo_name: repo_name.to_string(),
                         repo_path,
-                        configured,
                         envs: envs.iter().map(|(k, _)| k.clone()).collect(),
                         branches: rows,
+                        error: None,
                     });
                 }
             }
@@ -621,9 +782,9 @@ async fn compute_repo_cached(
         repo_id,
         repo_name: repo_name.to_string(),
         repo_path,
-        configured,
         envs: envs.iter().map(|(k, _)| k.clone()).collect(),
         branches: rows,
+        error: None,
     })
 }
 
@@ -663,29 +824,44 @@ pub async fn git_project_branch_matrix_core(
     }
 
     let conn = &db.conn;
-    let results: Vec<Result<RepoBranchMatrix, AppCommandError>> = stream::iter(tasks)
+    // A repo that cannot be scanned degrades to an entry carrying `error`
+    // instead of failing the request: a project routinely contains repos the
+    // current developer has not cloned, and one of those must not blank the
+    // whole board. Failures are never cached (`compute_repo_cached` only writes
+    // the cache after a successful scan), so a later clone recovers on its own.
+    let mut results: Vec<RepoBranchMatrix> = stream::iter(tasks)
         .map(|(repo_id, repo_name, repo_path, envs, configured)| async move {
-            compute_repo_cached(conn, repo_id, &repo_name, repo_path, envs, configured, force)
-                .await
-                .map_err(|e| {
-                    AppCommandError::external_command(
-                        format!("Failed to compute branch matrix for repo '{repo_name}'"),
-                        e.to_string(),
-                    )
-                })
+            match compute_repo_cached(
+                conn,
+                repo_id,
+                &repo_name,
+                repo_path.clone(),
+                envs.clone(),
+                configured,
+                force,
+            )
+            .await
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("[branch_board] scanning repo '{repo_name}' failed: {e}");
+                    RepoBranchMatrix {
+                        repo_id,
+                        repo_name,
+                        repo_path,
+                        envs: envs.iter().map(|(k, _)| k.clone()).collect(),
+                        branches: Vec::new(),
+                        error: Some(e.to_string()),
+                    }
+                }
+            }
         })
         .buffer_unordered(REPO_CONCURRENCY)
         .collect()
         .await;
 
-    // Fail loudly when any repo cannot be scanned: an empty/partial matrix
-    // silently presented as fresh data is worse than an explicit error.
-    let mut ok = Vec::with_capacity(results.len());
-    for r in results {
-        ok.push(r?);
-    }
-    ok.sort_by_key(|m| m.repo_id);
-    Ok(ok)
+    results.sort_by_key(|m| m.repo_id);
+    Ok(results)
 }
 
 pub async fn git_worktree_add_existing_core(
@@ -703,10 +879,14 @@ pub async fn git_worktree_remove_temp_core(
 ) -> Result<(), AppCommandError> {
     let out = git_output(&path, &["worktree", "remove", "--force", &worktree_path]).await?;
     if !out.status.success() {
-        tracing::warn!(
-            "[branch_board] worktree remove failed for {worktree_path}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        // Reported rather than warn-and-Ok: returning success while the
+        // checkout is still on disk — and the folder row already deleted —
+        // left the next `worktree add` for this path failing with no trace of
+        // why. Bail out before touching the database so the two agree.
+        return Err(AppCommandError::external_command(
+            format!("Failed to remove worktree '{worktree_path}'"),
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
     }
     let _ = git_output(&path, &["worktree", "prune"]).await;
     if let Some(db) = db {
@@ -728,12 +908,14 @@ pub async fn list_branch_states_core(
         .map_err(AppCommandError::from)
 }
 
+/// Update a branch's archive flag and/or note. Omitting an argument leaves that
+/// aspect untouched; an empty `description` clears the note.
 pub async fn upsert_branch_state_core(
     db: &AppDatabase,
     repo_id: i32,
     branch: String,
     is_archived: Option<bool>,
-    description: Option<Option<String>>,
+    description: Option<String>,
 ) -> Result<BranchStateInfo, AppCommandError> {
     platform_branch_state_service::upsert(&db.conn, repo_id, &branch, is_archived, description)
         .await
@@ -782,8 +964,376 @@ pub async fn git_pull_branch_core(
         }
     }
 
-    crate::commands::folders::git_update_branch_core(path, branch, false, credentials, db, data_dir)
+    // A branch checked out in a LINKED worktree cannot be advanced from here:
+    // `git fetch origin x:x` refuses to move a branch that is checked out
+    // elsewhere ("refusing to fetch into branch ... checked out at ..."), and
+    // upstream's `git_update_branch_core` only recognises the main worktree's
+    // HEAD as "checked out". Task branches live in linked worktrees, so run the
+    // pull inside the worktree that owns the branch instead.
+    let pull_path = checked_out_worktree(path, branch)
         .await
+        .unwrap_or_else(|| path.to_string());
+
+    crate::commands::folders::git_update_branch_core(
+        &pull_path,
+        branch,
+        false,
+        credentials,
+        db,
+        data_dir,
+    )
+    .await
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Branch ↔ environment diff
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The ref a branch is compared against for an environment.
+///
+/// Both env refs can exist (see [`resolve_env_refs`]); the remote one is the
+/// better base when it is at or ahead of the local one, since a stale local
+/// copy would otherwise attribute env changes the branch has already merged in
+/// to the branch itself. When the local env branch has commits the remote
+/// lacks (an unpushed merge), the local one is the more advanced and wins.
+async fn diff_base_ref(path: &str, env: &str) -> Result<String, AppCommandError> {
+    let remotes = remote_branches(path).await;
+    let refs = resolve_env_refs(path, env, &remotes).await;
+    match refs.as_slice() {
+        [] => Err(AppCommandError::not_found(format!(
+            "Environment branch '{env}' was not found locally or on a remote"
+        ))),
+        [only] => Ok(only.clone()),
+        [local, remote, ..] => {
+            let remote_is_ahead = git_output(
+                path,
+                &["merge-base", "--is-ancestor", local.as_str(), remote.as_str()],
+            )
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+            let chosen = if remote_is_ahead { remote } else { local };
+            Ok(chosen.clone())
+        }
+    }
+}
+
+/// Reject names git would read as an option rather than a revision.
+fn ensure_not_option_like(what: &str, value: &str) -> Result<(), AppCommandError> {
+    if value.trim().is_empty() || value.starts_with('-') {
+        return Err(AppCommandError::invalid_input(format!(
+            "Invalid {what}: '{value}'"
+        )));
+    }
+    Ok(())
+}
+
+/// Files a branch changes relative to an environment, WITHOUT their contents.
+///
+/// The diff tab used to fetch the whole patch for every file up front, which is
+/// slow for a large branch and pointless when only one file gets opened.
+/// `--raw --numstat` returns just names, status and line counts; a file's patch
+/// is fetched on demand via [`git_branch_diff_file_core`].
+///
+/// Three-dot (`base...branch`): only the branch's OWN changes since it diverged,
+/// so commits other people landed on the environment do not show up as deletions.
+pub async fn git_branch_diff_files_core(
+    path: &str,
+    branch: &str,
+    env: &str,
+) -> Result<Vec<crate::commands::folders::GitLogFileChange>, AppCommandError> {
+    crate::git_repo::ensure_git_repo(path)?;
+    ensure_not_option_like("branch", branch)?;
+    ensure_not_option_like("environment branch", env)?;
+
+    let base = diff_base_ref(path, env).await?;
+    let range = format!("{base}...{branch}");
+    let out = git_output(
+        path,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--raw",
+            "--numstat",
+            "--no-renames",
+            "--no-color",
+            &range,
+        ],
+    )
+    .await?;
+    if !out.status.success() {
+        return Err(AppCommandError::external_command(
+            "git diff failed",
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    Ok(parse_raw_numstat(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Patch for ONE file of the branch ↔ environment comparison, against the same
+/// base as [`git_branch_diff_files_core`] so the list and the patch agree.
+pub async fn git_branch_diff_file_core(
+    path: &str,
+    branch: &str,
+    env: &str,
+    file: &str,
+) -> Result<String, AppCommandError> {
+    crate::git_repo::ensure_git_repo(path)?;
+    ensure_not_option_like("branch", branch)?;
+    ensure_not_option_like("environment branch", env)?;
+
+    let base = diff_base_ref(path, env).await?;
+    let range = format!("{base}...{branch}");
+    let pathspec = format!(":(literal){file}");
+    let out = git_output(
+        path,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-color",
+            &range,
+            "--",
+            &pathspec,
+        ],
+    )
+    .await?;
+    if !out.status.success() {
+        return Err(AppCommandError::external_command(
+            "git diff failed",
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The remote ref a branch's "pushed" state is measured against: its configured
+/// upstream when that still exists, else the uniquely owning same-named remote
+/// branch. `None` when the branch was never published.
+async fn push_comparison_ref(
+    path: &str,
+    branch: &str,
+    remotes: &HashSet<String>,
+) -> Option<String> {
+    let out = git_stdout(
+        path,
+        &[
+            "for-each-ref",
+            "--format=%(upstream:short)%09%(upstream:track,nobracket)",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .await
+    .ok()?;
+    let mut parts = out.lines().next().unwrap_or("").splitn(2, '\t');
+    let upstream = parts.next().unwrap_or("").trim();
+    let track = parts.next().unwrap_or("").trim();
+    if !upstream.is_empty() && track != "gone" && remotes.contains(upstream) {
+        return Some(upstream.to_string());
+    }
+
+    let suffix = format!("/{branch}");
+    let mut candidates = remotes.iter().filter(|r| {
+        r.strip_suffix(&suffix)
+            .is_some_and(|remote| !remote.is_empty() && !remote.contains('/'))
+    });
+    match (candidates.next(), candidates.next()) {
+        (Some(only), None) => Some(only.clone()),
+        _ => None,
+    }
+}
+
+/// Commits that are on `branch` but in NONE of the environment branches — the
+/// branch's own work, i.e. what is still waiting to be released.
+///
+/// `git log <branch>` lists every ancestor, so a feature branch's history view
+/// was dominated by the environment's history from before it was cut, and
+/// "load more" paged through the whole repository. Upstream's `git_log` has no
+/// way to exclude refs, hence this command; it also reproduces the per-commit
+/// `pushed` flag, which the caller would otherwise lose.
+///
+/// `env_branches` are environment branch NAMES; each contributes its local and
+/// remote ref (see [`resolve_env_refs`]). Errors when none of them exist, since
+/// an empty exclusion would silently return the full history.
+pub async fn git_branch_own_commits_core(
+    path: &str,
+    branch: &str,
+    env_branches: &[String],
+    skip: u32,
+    limit: u32,
+) -> Result<crate::commands::folders::GitLogResult, AppCommandError> {
+    use crate::commands::folders::{GitLogEntry, GitLogResult};
+
+    crate::git_repo::ensure_git_repo(path)?;
+    ensure_not_option_like("branch", branch)?;
+    for env in env_branches {
+        ensure_not_option_like("environment branch", env)?;
+    }
+
+    let remotes = remote_branches(path).await;
+    let mut exclude: Vec<String> = Vec::new();
+    for env in env_branches {
+        exclude.extend(resolve_env_refs(path, env, &remotes).await);
+    }
+    exclude.sort();
+    exclude.dedup();
+    if exclude.is_empty() {
+        return Err(AppCommandError::not_found(
+            "None of the environment branches were found locally or on a remote",
+        ));
+    }
+
+    let max = format!("--max-count={limit}");
+    let skip_arg = format!("--skip={skip}");
+    let mut args: Vec<&str> = vec![
+        "-c",
+        "core.quotePath=false",
+        "log",
+        &max,
+        &skip_arg,
+        "--format=%H%x00%h%x00%an%x00%aI%x00%B%x1e",
+        branch,
+        "--not",
+    ];
+    args.extend(exclude.iter().map(String::as_str));
+    let out = git_output(path, &args).await?;
+    if !out.status.success() {
+        return Err(AppCommandError::external_command(
+            "git log failed",
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+
+    // "Pushed" is measured against the branch's own remote counterpart. The
+    // `rev-list` is limited to the same window as the log (skip + limit): both
+    // walk in the same order, so every displayed unpushed commit falls inside
+    // the first `skip + limit` unpushed ones.
+    let remote_ref = push_comparison_ref(path, branch, &remotes).await;
+    let unpushed: Option<HashSet<String>> = match remote_ref.as_deref() {
+        Some(remote) => {
+            let window = format!("--max-count={}", u64::from(skip) + u64::from(limit));
+            let mut rl: Vec<&str> = vec!["rev-list", &window, branch, "--not", remote];
+            rl.extend(exclude.iter().map(String::as_str));
+            git_stdout(path, &rl)
+                .await
+                .ok()
+                .map(|s| s.lines().map(|l| l.trim().to_string()).collect())
+        }
+        None => None,
+    };
+    let remote_configured = has_configured_remote(path).await;
+
+    let mut entries = Vec::new();
+    for record in String::from_utf8_lossy(&out.stdout).split('\u{1e}') {
+        let record = record.trim_start_matches('\n');
+        if record.trim().is_empty() {
+            continue;
+        }
+        let mut f = record.splitn(5, '\0');
+        let (Some(full), Some(short), Some(author), Some(date), Some(message)) =
+            (f.next(), f.next(), f.next(), f.next(), f.next())
+        else {
+            continue;
+        };
+        let pushed = match (&remote_ref, &unpushed) {
+            (Some(_), Some(set)) => Some(!set.contains(full)),
+            // A remote ref exists but the comparison failed: say so, not "pushed".
+            (Some(_), None) => None,
+            // Never published: unpushed if a remote exists to push to.
+            (None, _) => remote_configured.then_some(false),
+        };
+        entries.push(GitLogEntry {
+            hash: short.to_string(),
+            full_hash: full.to_string(),
+            author: author.to_string(),
+            date: date.to_string(),
+            message: message.trim_end().to_string(),
+            files: Vec::new(),
+            pushed,
+        });
+    }
+
+    Ok(GitLogResult {
+        entries,
+        has_upstream: remote_ref.is_some(),
+    })
+}
+
+/// Merge `git diff --raw --numstat` output into one entry per path.
+///
+/// `--raw` lines look like `:100644 100644 <sha> <sha> M\t<path>` and carry the
+/// status; `--numstat` lines look like `<adds>\t<dels>\t<path>` (`-` for binary
+/// files). Upstream has an equivalent parser but keeps it private to its own
+/// module, so this one is kept here rather than changing a shared file.
+pub(crate) fn parse_raw_numstat(stdout: &str) -> Vec<crate::commands::folders::GitLogFileChange> {
+    use crate::commands::folders::GitLogFileChange;
+
+    let mut files: Vec<GitLogFileChange> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut slot = |path: &str, files: &mut Vec<GitLogFileChange>| -> usize {
+        *index.entry(path.to_string()).or_insert_with(|| {
+            files.push(GitLogFileChange {
+                path: path.to_string(),
+                status: "M".to_string(),
+                additions: 0,
+                deletions: 0,
+            });
+            files.len() - 1
+        })
+    };
+
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with(':') {
+            let mut parts = line.splitn(2, '\t');
+            let meta = parts.next().unwrap_or("");
+            let Some(path) = parts.next() else { continue };
+            let status = meta
+                .split_whitespace()
+                .last()
+                .and_then(|s| s.chars().next())
+                .unwrap_or('M')
+                .to_string();
+            let i = slot(path, &mut files);
+            files[i].status = status;
+            continue;
+        }
+        let mut parts = line.splitn(3, '\t');
+        let (Some(add), Some(del), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let count = |v: &str| v.parse::<u32>().unwrap_or(0);
+        let i = slot(path, &mut files);
+        files[i].additions = count(add);
+        files[i].deletions = count(del);
+    }
+    files
+}
+
+/// Path of the worktree that has `branch` checked out, when that is a worktree
+/// other than `path` itself. `None` when the branch is not checked out anywhere
+/// or is checked out in `path`'s own worktree (nothing to redirect).
+async fn checked_out_worktree(path: &str, branch: &str) -> Option<String> {
+    let out = git_stdout(path, &["worktree", "list", "--porcelain"])
+        .await
+        .ok()?;
+    let want = format!("branch refs/heads/{branch}");
+    let mut current: Option<&str> = None;
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            current = Some(p.trim());
+        } else if line.trim() == want {
+            let found = current?;
+            let same = |a: &str, b: &str| {
+                std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok()
+            };
+            return (!same(found, path)).then(|| found.to_string());
+        }
+    }
+    None
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -836,9 +1386,49 @@ pub async fn upsert_branch_state(
     repo_id: i32,
     branch: String,
     is_archived: Option<bool>,
-    description: Option<Option<String>>,
+    description: Option<String>,
 ) -> Result<BranchStateInfo, AppCommandError> {
     upsert_branch_state_core(&db, repo_id, branch, is_archived, description).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn git_branch_diff_files(
+    path: String,
+    branch: String,
+    env_branch: String,
+) -> Result<Vec<crate::commands::folders::GitLogFileChange>, AppCommandError> {
+    git_branch_diff_files_core(&path, &branch, &env_branch).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn git_branch_diff_file(
+    path: String,
+    branch: String,
+    env_branch: String,
+    file: String,
+) -> Result<String, AppCommandError> {
+    git_branch_diff_file_core(&path, &branch, &env_branch, &file).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn git_branch_own_commits(
+    path: String,
+    branch: String,
+    env_branches: Vec<String>,
+    skip: Option<u32>,
+    limit: Option<u32>,
+) -> Result<crate::commands::folders::GitLogResult, AppCommandError> {
+    git_branch_own_commits_core(
+        &path,
+        &branch,
+        &env_branches,
+        skip.unwrap_or(0),
+        limit.unwrap_or(50),
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -939,6 +1529,87 @@ mod tests {
     }
 
     #[test]
+    fn parse_upstream_track_reads_every_git_shape() {
+        // Shapes verified against git 2.50 `for-each-ref
+        // --format=%(upstream:track,nobracket)`.
+        assert_eq!(parse_upstream_track(""), UpstreamTrack::default());
+        assert_eq!(
+            parse_upstream_track("ahead 1"),
+            UpstreamTrack {
+                ahead: 1,
+                behind: 0,
+                gone: false
+            }
+        );
+        assert_eq!(
+            parse_upstream_track("behind 3"),
+            UpstreamTrack {
+                ahead: 0,
+                behind: 3,
+                gone: false
+            }
+        );
+        assert_eq!(
+            parse_upstream_track("ahead 2, behind 5"),
+            UpstreamTrack {
+                ahead: 2,
+                behind: 5,
+                gone: false
+            }
+        );
+        assert!(parse_upstream_track("gone").gone);
+        // An empty track means "in sync", never "diverged".
+        assert_eq!(
+            state_from_counts(
+                parse_upstream_track("").ahead,
+                parse_upstream_track("").behind
+            ),
+            RemoteState::Synced
+        );
+    }
+
+    #[test]
+    fn parse_raw_numstat_merges_status_and_counts() {
+        let out = "\
+:000000 100644 0000000 1111111 A\tsrc/new.rs
+:100644 100644 2222222 3333333 M\tsrc/old.rs
+:100644 000000 4444444 0000000 D\tdocs/gone.md
+:100644 100644 5555555 6666666 M\tassets/logo.png
+12\t0\tsrc/new.rs
+3\t1\tsrc/old.rs
+0\t9\tdocs/gone.md
+-\t-\tassets/logo.png
+";
+        let files = parse_raw_numstat(out);
+        let by = |p: &str| files.iter().find(|f| f.path == p).expect(p);
+
+        assert_eq!(files.len(), 4, "one entry per path, not one per line");
+        assert_eq!(
+            (by("src/new.rs").status.as_str(), by("src/new.rs").additions),
+            ("A", 12)
+        );
+        assert_eq!(
+            (by("src/old.rs").additions, by("src/old.rs").deletions),
+            (3, 1)
+        );
+        assert_eq!(by("docs/gone.md").status, "D");
+        // Binary files report `-` for both counts.
+        assert_eq!(
+            (by("assets/logo.png").additions, by("assets/logo.png").deletions),
+            (0, 0)
+        );
+        assert!(parse_raw_numstat("").is_empty());
+    }
+
+    #[test]
+    fn option_like_names_are_rejected() {
+        assert!(ensure_not_option_like("branch", "feat/x").is_ok());
+        assert!(ensure_not_option_like("branch", "--output=/tmp/x").is_err());
+        assert!(ensure_not_option_like("branch", "-D").is_err());
+        assert!(ensure_not_option_like("branch", "  ").is_err());
+    }
+
+    #[test]
     fn remote_state_from_counts_covers_all_directions() {
         assert_eq!(state_from_counts(0, 0), RemoteState::Synced);
         assert_eq!(state_from_counts(2, 0), RemoteState::Ahead);
@@ -962,6 +1633,24 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("spawn git")
+            .status
+            .success()
+    }
+
+    /// Like [`git`], but attributes the commit to `author` so a test can tell
+    /// a branch's first committer from its last.
+    fn git_as(dir: &std::path::Path, author: &str, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", author)
+            .env("GIT_AUTHOR_EMAIL", "a@example.com")
+            .env("GIT_COMMITTER_NAME", author)
+            .env("GIT_COMMITTER_EMAIL", "a@example.com")
             .output()
             .expect("spawn git")
             .status
@@ -1017,6 +1706,352 @@ mod tests {
         assert_eq!(feat.remote_state, RemoteState::Synced);
         assert!(feat.has_remote);
         assert!(!feat.needs_push && !feat.needs_pull);
+    }
+
+    #[tokio::test]
+    async fn merged_detection_covers_branches_checked_out_in_a_worktree() {
+        // `git branch --merged` prefixes a branch that is checked out in a
+        // linked worktree with "+". That prefix used to leak into the parsed
+        // name, so the branch matched nothing and a fully merged branch was
+        // reported as unmerged — the common case here, because worktrees are
+        // how this product gives a task its own checkout.
+        let repo_dir = tempfile::tempdir().expect("repo");
+        let wt_parent = tempfile::tempdir().expect("wt parent");
+        init_repo(repo_dir.path());
+
+        assert!(git(repo_dir.path(), &["checkout", "-q", "-b", "feat/done"]));
+        std::fs::write(repo_dir.path().join("d.txt"), "d\n").expect("write");
+        assert!(git(repo_dir.path(), &["add", "-A"]));
+        assert!(git(repo_dir.path(), &["commit", "-q", "-m", "d"]));
+        assert!(git(repo_dir.path(), &["checkout", "-q", "main"]));
+        assert!(git(
+            repo_dir.path(),
+            &["merge", "-q", "--no-ff", "-m", "merge", "feat/done"]
+        ));
+
+        let wt = path_str(&wt_parent.path().join("done-wt"));
+        assert!(git(
+            repo_dir.path(),
+            &["worktree", "add", "-q", &wt, "feat/done"]
+        ));
+
+        let envs = vec![("dev".to_string(), "main".to_string())];
+        let rows = compute_repo_matrix(&path_str(repo_dir.path()), &envs)
+            .await
+            .expect("compute_repo_matrix");
+        let done = rows
+            .iter()
+            .find(|r| r.branch == "feat/done")
+            .expect("feat/done row");
+        let dev = done
+            .envs
+            .iter()
+            .find(|e| e.env == "dev")
+            .expect("dev status");
+        assert!(
+            dev.merged,
+            "a merged branch checked out in a linked worktree must still read as merged"
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_means_contained_in_either_the_local_or_the_remote_env_branch() {
+        // Each env ref alone is wrong in one direction: the local env branch
+        // lags when a teammate merged on the remote and you have not pulled,
+        // and the remote lags right after you merged locally and before you
+        // pushed. A branch is released if either contains it.
+        let work = tempfile::tempdir().expect("work");
+        let remote_dir = tempfile::tempdir().expect("remote");
+        let other = tempfile::tempdir().expect("other");
+        init_repo(work.path());
+        // `-b main`: with git config cleared the bare repo's HEAD would default
+        // to `master`, and the clone below could not check anything out.
+        assert!(git(
+            remote_dir.path(),
+            &["init", "-q", "--bare", "-b", "main", "r.git"]
+        ));
+        let bare = path_str(&remote_dir.path().join("r.git"));
+        assert!(git(work.path(), &["remote", "add", "origin", &bare]));
+        assert!(git(work.path(), &["push", "-q", "-u", "origin", "main"]));
+
+        let commit_on_branch = |name: &str| {
+            assert!(git(work.path(), &["checkout", "-q", "-b", name, "main"]));
+            std::fs::write(work.path().join(format!("{name}.txt")), "x\n").expect("write");
+            assert!(git(work.path(), &["add", "-A"]));
+            assert!(git(work.path(), &["commit", "-q", "-m", name]));
+            assert!(git(work.path(), &["checkout", "-q", "main"]));
+        };
+        commit_on_branch("feat/remote-merged");
+        commit_on_branch("feat/local-merged");
+        commit_on_branch("feat/open");
+        assert!(git(
+            work.path(),
+            &["push", "-q", "origin", "feat/remote-merged"]
+        ));
+
+        // A teammate merges feat/remote-merged on the remote; we only fetch, so
+        // the local `main` stays behind origin/main.
+        assert!(git(
+            other.path(),
+            &["clone", "-q", &bare, &path_str(&other.path().join("c"))]
+        ));
+        let c = other.path().join("c");
+        assert!(git(&c, &["config", "user.name", "o"]));
+        assert!(git(&c, &["config", "user.email", "o@example.com"]));
+        assert!(git(
+            &c,
+            &["merge", "-q", "--no-ff", "-m", "m", "origin/feat/remote-merged"]
+        ));
+        assert!(git(&c, &["push", "-q", "origin", "main"]));
+        assert!(git(work.path(), &["fetch", "-q", "origin"]));
+
+        // We merge feat/local-merged locally and do not push.
+        assert!(git(
+            work.path(),
+            &["merge", "-q", "--no-ff", "-m", "m2", "feat/local-merged"]
+        ));
+
+        let envs = vec![("dev".to_string(), "main".to_string())];
+        let rows = compute_repo_matrix(&path_str(work.path()), &envs)
+            .await
+            .expect("compute_repo_matrix");
+        let merged_into_dev = |branch: &str| {
+            rows.iter()
+                .find(|r| r.branch == branch)
+                .unwrap_or_else(|| panic!("row {branch}"))
+                .envs
+                .iter()
+                .find(|e| e.env == "dev")
+                .expect("dev status")
+                .merged
+        };
+
+        assert!(
+            merged_into_dev("feat/remote-merged"),
+            "merged on origin/main only: the stale local main must not hide it"
+        );
+        assert!(
+            merged_into_dev("feat/local-merged"),
+            "merged on local main only: the unpushed merge must still count"
+        );
+        assert!(
+            !merged_into_dev("feat/open"),
+            "a branch in neither env ref stays unmerged"
+        );
+    }
+
+    #[tokio::test]
+    async fn own_commits_exclude_the_environment_history() {
+        let repo = tempfile::tempdir().expect("repo");
+        init_repo(repo.path());
+        assert!(git(repo.path(), &["checkout", "-q", "-b", "feat/own"]));
+        for (n, author) in [("1", "First"), ("2", "Middle"), ("3", "Last")] {
+            std::fs::write(repo.path().join(format!("f{n}.txt")), "x\n").expect("write");
+            assert!(git(repo.path(), &["add", "-A"]));
+            assert!(git_as(repo.path(), author, &["commit", "-q", "-m", n]));
+        }
+        // Someone else lands a commit on the environment meanwhile.
+        assert!(git(repo.path(), &["checkout", "-q", "main"]));
+        std::fs::write(repo.path().join("theirs.txt"), "t\n").expect("write");
+        assert!(git(repo.path(), &["add", "-A"]));
+        assert!(git(repo.path(), &["commit", "-q", "-m", "theirs"]));
+
+        let path = path_str(repo.path());
+        let envs = vec!["main".to_string()];
+
+        let own = git_branch_own_commits_core(&path, "feat/own", &envs, 0, 50)
+            .await
+            .expect("own commits");
+        let authors: Vec<&str> = own.entries.iter().map(|e| e.author.as_str()).collect();
+        assert_eq!(
+            authors,
+            vec!["Last", "Middle", "First"],
+            "newest first, and not the base/env commits (plain `git log` returns 5)"
+        );
+
+        // Paging walks the same list.
+        let page = git_branch_own_commits_core(&path, "feat/own", &envs, 1, 1)
+            .await
+            .expect("page");
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].author, "Middle");
+
+        // Once merged into the environment, nothing is left that is "its own".
+        assert!(git(
+            repo.path(),
+            &["merge", "-q", "--no-ff", "-m", "m", "feat/own"]
+        ));
+        let merged = git_branch_own_commits_core(&path, "feat/own", &envs, 0, 50)
+            .await
+            .expect("merged");
+        assert!(merged.entries.is_empty());
+
+        // No environment branch exists: refuse, rather than return full history
+        // that the caller would present as "the branch's own commits".
+        assert!(
+            git_branch_own_commits_core(&path, "feat/own", &["nope".to_string()], 0, 50)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn own_commits_report_whether_each_one_is_pushed() {
+        let work = tempfile::tempdir().expect("work");
+        let remote_dir = tempfile::tempdir().expect("remote");
+        init_repo(work.path());
+        assert!(git(
+            remote_dir.path(),
+            &["init", "-q", "--bare", "-b", "main", "r.git"]
+        ));
+        let bare = path_str(&remote_dir.path().join("r.git"));
+        assert!(git(work.path(), &["remote", "add", "origin", &bare]));
+        assert!(git(work.path(), &["push", "-q", "-u", "origin", "main"]));
+        assert!(git(work.path(), &["checkout", "-q", "-b", "feat/p"]));
+
+        let commit = |n: &str| {
+            std::fs::write(work.path().join(format!("{n}.txt")), "x\n").expect("write");
+            assert!(git(work.path(), &["add", "-A"]));
+            assert!(git(work.path(), &["commit", "-q", "-m", n]));
+        };
+        commit("pushed-1");
+        commit("pushed-2");
+        assert!(git(work.path(), &["push", "-q", "-u", "origin", "feat/p"]));
+        commit("local-only");
+
+        let path = path_str(work.path());
+        let res = git_branch_own_commits_core(&path, "feat/p", &["main".to_string()], 0, 50)
+            .await
+            .expect("own commits");
+        assert!(res.has_upstream);
+        let flags: Vec<(String, Option<bool>)> = res
+            .entries
+            .iter()
+            .map(|e| (e.message.clone(), e.pushed))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("local-only".to_string(), Some(false)),
+                ("pushed-2".to_string(), Some(true)),
+                ("pushed-1".to_string(), Some(true)),
+            ]
+        );
+
+        // A branch that was never published: every commit is unpushed (a remote
+        // exists to push to), and there is no upstream.
+        assert!(git(work.path(), &["checkout", "-q", "-b", "feat/new", "main"]));
+        commit("brand-new");
+        let fresh = git_branch_own_commits_core(&path, "feat/new", &["main".to_string()], 0, 50)
+            .await
+            .expect("unpublished");
+        assert!(!fresh.has_upstream);
+        assert_eq!(fresh.entries[0].pushed, Some(false));
+    }
+
+    #[tokio::test]
+    async fn branch_diff_lists_only_the_branchs_own_changes() {
+        // Two-dot (`env..branch` / `git diff env branch`) would list the file
+        // someone else landed on the environment as a DELETION in the branch.
+        // Three-dot shows only what the branch itself changed.
+        let repo = tempfile::tempdir().expect("repo");
+        init_repo(repo.path());
+        assert!(git(repo.path(), &["checkout", "-q", "-b", "feat/mine"]));
+        std::fs::write(repo.path().join("mine.txt"), "mine\n").expect("write");
+        assert!(git(repo.path(), &["add", "-A"]));
+        assert!(git(repo.path(), &["commit", "-q", "-m", "mine"]));
+        assert!(git(repo.path(), &["checkout", "-q", "main"]));
+        std::fs::write(repo.path().join("theirs.txt"), "theirs\n").expect("write");
+        assert!(git(repo.path(), &["add", "-A"]));
+        assert!(git(repo.path(), &["commit", "-q", "-m", "theirs"]));
+
+        let path = path_str(repo.path());
+        let files = git_branch_diff_files_core(&path, "feat/mine", "main")
+            .await
+            .expect("diff files");
+        let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(names, vec!["mine.txt"], "only the branch's own change");
+        assert_eq!(files[0].status, "A");
+        assert_eq!(files[0].additions, 1);
+
+        // The per-file patch uses the same base, so it agrees with the list.
+        let patch = git_branch_diff_file_core(&path, "feat/mine", "main", "mine.txt")
+            .await
+            .expect("diff file");
+        assert!(patch.contains("+mine"), "patch was: {patch}");
+        assert!(!patch.contains("theirs"));
+
+        // A missing environment branch is a clear error, not an empty diff.
+        assert!(git_branch_diff_files_core(&path, "feat/mine", "no-such-env")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn pull_is_redirected_to_the_worktree_that_owns_the_branch() {
+        // `git fetch origin x:x` refuses to advance a branch checked out in a
+        // linked worktree, so the pull must run inside that worktree. This
+        // pins the lookup that decides where.
+        let repo_dir = tempfile::tempdir().expect("repo");
+        let wt_parent = tempfile::tempdir().expect("wt parent");
+        init_repo(repo_dir.path());
+        assert!(git(repo_dir.path(), &["branch", "feat/wt"]));
+        assert!(git(repo_dir.path(), &["branch", "feat/free"]));
+        let wt = wt_parent.path().join("feat-wt");
+        assert!(git(
+            repo_dir.path(),
+            &["worktree", "add", "-q", &path_str(&wt), "feat/wt"]
+        ));
+        let repo = path_str(repo_dir.path());
+
+        let found = checked_out_worktree(&repo, "feat/wt")
+            .await
+            .expect("feat/wt is checked out in a linked worktree");
+        assert_eq!(
+            std::fs::canonicalize(&found).expect("canonicalize found"),
+            std::fs::canonicalize(&wt).expect("canonicalize wt"),
+        );
+        // Checked out in the main worktree itself: nothing to redirect.
+        assert_eq!(checked_out_worktree(&repo, "main").await, None);
+        // Not checked out anywhere.
+        assert_eq!(checked_out_worktree(&repo, "feat/free").await, None);
+    }
+
+    #[tokio::test]
+    async fn created_at_fallback_reports_the_first_commit_not_the_last() {
+        // With no reflog entry (every fetched or cloned branch), creation info
+        // falls back to the branch's own first commit. `git log --reverse -1`
+        // returns the NEWEST commit instead, because commit limiting is applied
+        // before the reversal — which mislabeled the last committer as the
+        // branch's creator.
+        let repo_dir = tempfile::tempdir().expect("repo");
+        init_repo(repo_dir.path());
+        assert!(git(repo_dir.path(), &["checkout", "-q", "-b", "feat/multi"]));
+        for (n, author) in [("1", "First"), ("2", "Middle"), ("3", "Last")] {
+            std::fs::write(repo_dir.path().join(format!("f{n}.txt")), "x\n").expect("write");
+            assert!(git(repo_dir.path(), &["add", "-A"]));
+            assert!(git_as(repo_dir.path(), author, &["commit", "-q", "-m", n]));
+        }
+
+        // Simulate a fetched branch: no local "branch: Created from" entry.
+        std::fs::remove_dir_all(repo_dir.path().join(".git").join("logs"))
+            .expect("drop reflog");
+
+        let envs = vec![("dev".to_string(), "main".to_string())];
+        let rows = compute_repo_matrix(&path_str(repo_dir.path()), &envs)
+            .await
+            .expect("compute_repo_matrix");
+        let row = rows
+            .iter()
+            .find(|r| r.branch == "feat/multi")
+            .expect("feat/multi row");
+
+        assert_eq!(row.created_at_source.as_deref(), Some("first_commit"));
+        assert_eq!(
+            row.created_by.as_deref(),
+            Some("First"),
+            "the fallback must report the branch's first commit, not its latest"
+        );
     }
 
     #[tokio::test]

@@ -62,11 +62,14 @@ import {
   resolveWorktreeFolder,
 } from "@/lib/api"
 import { useGitCredential } from "@/contexts/git-credential-context"
+import { errorText } from "@/lib/platform/errors"
 import {
   canMerge,
+  envCellLabel,
   envCellState,
   filterRows,
   isFullyMerged,
+  remoteCountsLabel,
   remoteStatusKey,
   resolveEffectiveEnv,
 } from "@/lib/platform/branch-board"
@@ -83,7 +86,20 @@ import { cn } from "@/lib/utils"
 
 interface Props {
   projectId: number
+  /**
+   * Whether the board's tab is currently showing.
+   *
+   * The parent keeps the board mounted (`forceMount`) so filters, pagination
+   * and the split layout survive tab switches. Without this flag that also
+   * meant the full multi-repo git scan ran on page load for users who never
+   * open the tab, while users who opened it an hour later saw that stale first
+   * snapshot. Defaults to `true` for standalone use.
+   */
+  active?: boolean
 }
+
+/** How long a matrix snapshot stays good while the tab is hidden. */
+const STALE_AFTER_MS = 60_000
 
 interface DirtyBlock {
   repoName: string
@@ -107,14 +123,12 @@ interface NoteEdit {
 const ENVS: EnvKey[] = ["dev", "uat", "prd"]
 const PAGE_SIZE = 50
 
-/** Best-effort human-readable text for an unknown thrown value. */
-function errorText(e: unknown): string {
-  if (typeof e === "string") return e
-  const obj = (e ?? {}) as Record<string, unknown>
-  const parts = [obj.message, obj.detail, obj.code].filter(
-    (p): p is string => typeof p === "string" && p.length > 0
-  )
-  return parts.length ? parts.join(" | ") : String(e ?? "")
+/**
+ * Whether a failed `git branch -d` is the "has unmerged commits" refusal, the
+ * only one a `-D` retry can get past.
+ */
+function isUnmergedDeleteError(e: unknown): boolean {
+  return /not fully merged/i.test(errorText(e))
 }
 
 /** Text colour for a remote-state chip, matching the detail panel. */
@@ -133,7 +147,7 @@ function remoteTone(state: RemoteState): string {
   }
 }
 
-export function BranchBoard({ projectId }: Props) {
+export function BranchBoard({ projectId, active = true }: Props) {
   const t = useTranslations("Platform")
   const { activeProject, activeProjectRepos } = usePlatform()
   const { withCredentialRetry } = useGitCredential()
@@ -152,6 +166,7 @@ export function BranchBoard({ projectId }: Props) {
     "all" | "merged" | "unmerged"
   >("all")
   const [onlyNeedsPush, setOnlyNeedsPush] = useState(false)
+  const [onlyNeedsPull, setOnlyNeedsPull] = useState(false)
   const [onlyCurrent, setOnlyCurrent] = useState(false)
   const [keywordInput, setKeywordInput] = useState("")
   const [keyword, setKeyword] = useState("")
@@ -190,11 +205,23 @@ export function BranchBoard({ projectId }: Props) {
   // can distinguish "done" from "dismissed without resolving".
   const conflictResolvedRef = useRef(false)
 
+  // When the current snapshot was loaded (0 = never), so becoming visible can
+  // decide between reusing it and refetching.
+  const loadedAtRef = useRef(0)
+  // Whether rows are currently on screen. A ref, not `matrices.length`, so
+  // `refresh` keeps a stable identity and the visibility effect below is not
+  // re-armed by its own result.
+  const hasRowsRef = useRef(false)
+  // Guards the visibility effect against firing a second scan while the first
+  // is still in flight (the stamp is only written once it succeeds).
+  const inFlightRef = useRef(false)
+
   const refresh = useCallback(
     async (force = false) => {
       if (!projectId) return
       // Only the very first load swaps the whole board to a placeholder;
       // subsequent refreshes keep the DOM (dialogs, scroll position) intact.
+      inFlightRef.current = true
       setRefreshing(true)
       setError(null)
       try {
@@ -203,6 +230,7 @@ export function BranchBoard({ projectId }: Props) {
           listBranchStates(projectId),
         ])
         setMatrices(m ?? [])
+        hasRowsRef.current = (m ?? []).length > 0
         setStates(
           new Map((s ?? []).map((x) => [stateKey(x.repoId, x.branch), x]))
         )
@@ -215,21 +243,35 @@ export function BranchBoard({ projectId }: Props) {
             ?.branches.find((b) => b.branch === prev.row.branch)
           return row ? { ...prev, row } : null
         })
+        loadedAtRef.current = Date.now()
         setLoading(false)
       } catch (e) {
-        setError(errorText(e))
+        const detail = errorText(e)
+        setError(detail)
         console.error("branch matrix failed:", e)
+        // The inline error only renders on an empty board, so a failure that
+        // leaves the previous rows on screen would otherwise show nothing at
+        // all beyond the spinner stopping.
+        if (hasRowsRef.current) {
+          toast.error(t("task.opFailed", { action: t("task.refresh"), detail }))
+        }
       } finally {
+        inFlightRef.current = false
         setRefreshing(false)
         setLoading(false)
       }
     },
-    [projectId]
+    [projectId, t]
   )
 
+  // Load on first becoming visible, and again when the snapshot has gone stale
+  // while the tab was hidden.
   useEffect(() => {
+    if (!active || inFlightRef.current) return
+    const loadedAt = loadedAtRef.current
+    if (loadedAt !== 0 && Date.now() - loadedAt <= STALE_AFTER_MS) return
     void refresh()
-  }, [refresh])
+  }, [active, refresh])
 
   const repoById = useMemo(() => {
     const map = new Map<number, ProjectRepoInfo>()
@@ -273,6 +315,7 @@ export function BranchBoard({ projectId }: Props) {
           // passing "all" keeps the UI selection from silently doing nothing.
           status: envFilter === "all" ? "all" : statusFilter,
           onlyNeedsPush,
+          onlyNeedsPull,
           onlyCurrent,
         }
       )
@@ -294,6 +337,7 @@ export function BranchBoard({ projectId }: Props) {
     envFilter,
     statusFilter,
     onlyNeedsPush,
+    onlyNeedsPull,
     onlyCurrent,
   ])
 
@@ -312,6 +356,24 @@ export function BranchBoard({ projectId }: Props) {
     [visibleMatrices]
   )
 
+  // Repos the backend could not scan — typically not cloned locally. Their
+  // branches are simply absent from the table, so without this the user sees a
+  // silently incomplete board.
+  const repoErrors = useMemo(
+    () => visibleMatrices.filter((m) => m.error),
+    [visibleMatrices]
+  )
+
+  const envLabels = useMemo(
+    () => ({
+      notConfigured: t("task.notConfigured"),
+      unmerged: t("task.envUnmerged"),
+      merged: t("task.envMerged"),
+      fastForward: t("task.mergedFastForward"),
+    }),
+    [t]
+  )
+
   useEffect(() => {
     setPage(1)
   }, [
@@ -322,6 +384,7 @@ export function BranchBoard({ projectId }: Props) {
     envFilter,
     statusFilter,
     onlyNeedsPush,
+    onlyNeedsPull,
     onlyCurrent,
   ])
 
@@ -444,6 +507,22 @@ export function BranchBoard({ projectId }: Props) {
     }
   }
 
+  /**
+   * Remove a temporary merge worktree. The backend reports a failed removal
+   * rather than claiming success. There is nothing to ask the user at these
+   * call sites (the merge has already succeeded or failed), so it is not
+   * thrown — but a leftover `.codeg-wt-` directory blocks the next merge into
+   * this environment, so the user is told where it is.
+   */
+  const cleanupTempWorktree = async (repoPath: string, tempPath: string) => {
+    try {
+      await removeTempWorktree(repoPath, tempPath)
+    } catch (e) {
+      console.warn(`failed to remove temp worktree ${tempPath}:`, e)
+      toast.warning(t("task.tempWorktreeCleanupFailed", { path: tempPath }))
+    }
+  }
+
   const performMerge = async (
     repo: ProjectRepoInfo,
     row: BranchRow,
@@ -499,7 +578,7 @@ export function BranchBoard({ projectId }: Props) {
       const gate = canMerge(status)
       if (!gate.ok) {
         if (temp && tempPath) {
-          await removeTempWorktree(repoPath, tempPath).catch(() => {})
+          await cleanupTempWorktree(repoPath, tempPath)
         }
         setDirtyBlock({ repoName: repo.name, paths: gate.dirtyPaths })
         return
@@ -518,7 +597,7 @@ export function BranchBoard({ projectId }: Props) {
         return
       }
       if (temp && tempPath) {
-        await removeTempWorktree(repoPath, tempPath).catch(() => {})
+        await cleanupTempWorktree(repoPath, tempPath)
       }
       toast.success(
         res.merged_commits === 0
@@ -532,7 +611,7 @@ export function BranchBoard({ projectId }: Props) {
       }
     } catch (e) {
       if (tempPath) {
-        await removeTempWorktree(repoPathOf(repo), tempPath).catch(() => {})
+        await cleanupTempWorktree(repoPathOf(repo), tempPath)
       }
       toast.error(
         t("task.opFailed", {
@@ -562,7 +641,7 @@ export function BranchBoard({ projectId }: Props) {
     conflictResolvedRef.current = true
     setConflict(null)
     if (c?.temp) {
-      void removeTempWorktree(repoPathOf(c.repo), c.targetPath).catch(() => {})
+      void cleanupTempWorktree(repoPathOf(c.repo), c.targetPath)
     }
     void refresh()
   }
@@ -593,7 +672,9 @@ export function BranchBoard({ projectId }: Props) {
     if (!noteEdit) return
     try {
       const next = await upsertBranchState(noteEdit.repoId, noteEdit.branch, {
-        description: noteEdit.value.trim() || null,
+        // An empty string clears the note. Sending `null`/omitting the field
+        // would mean "leave it alone", and must not be used here.
+        description: noteEdit.value.trim(),
       })
       setStates((prev) => {
         const m = new Map(prev)
@@ -628,9 +709,10 @@ export function BranchBoard({ projectId }: Props) {
         prev?.repo.id === repo.id && prev.row.branch === branch ? null : prev
       )
     } catch (e) {
-      // Unmerged-branch errors are retriable with force; keep the dialog open
-      // and surface the retry option.
-      setForceDelete(true)
+      // Only an unmerged branch is retriable with force. Offering it for any
+      // other failure (checked out in a worktree, no such branch) walks the
+      // user into a second, identical failure.
+      if (isUnmergedDeleteError(e)) setForceDelete(true)
       toast.error(
         t("task.opFailed", {
           action: t("task.deleteBranch"),
@@ -758,6 +840,18 @@ export function BranchBoard({ projectId }: Props) {
                 {t("task.onlyNeedsPush")}
               </label>
 
+              {/* "Which branches need the latest code" is a primary question
+                  this board exists to answer; `needsPull` was computed but had
+                  no filter. Reuses the existing `needsPull` label. */}
+              <label className="flex items-center gap-1.5 text-[0.8125rem] text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={onlyNeedsPull}
+                  onChange={(e) => setOnlyNeedsPull(e.target.checked)}
+                />
+                {t("task.needsPull")}
+              </label>
+
               <label className="flex items-center gap-1.5 text-[0.8125rem] text-muted-foreground">
                 <input
                   type="checkbox"
@@ -797,6 +891,25 @@ export function BranchBoard({ projectId }: Props) {
                 {t("task.refresh")}
               </Button>
             </div>
+
+            {/* Repos that could not be scanned — usually not cloned locally.
+                Called out so the board is never silently incomplete. */}
+            {repoErrors.length > 0 && (
+              <div className="shrink-0 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
+                {repoErrors.map((m) => (
+                  <p
+                    key={m.repoId}
+                    className="truncate text-[0.75rem] text-destructive"
+                    title={m.error ?? ""}
+                  >
+                    {t("task.repoUnavailable", {
+                      repo: m.repoName,
+                      detail: m.error ?? "",
+                    })}
+                  </p>
+                ))}
+              </div>
+            )}
 
             {/* Flat branch list */}
             {flatRows.length === 0 ? (
@@ -887,20 +1000,9 @@ export function BranchBoard({ projectId }: Props) {
                           </td>
                           {shownEnvs.map((e) => {
                             const cell = envCellState(row, e)
-                            const label =
-                              cell.kind === "env"
-                                ? "—"
-                                : cell.kind === "unconfigured"
-                                  ? t("task.notConfigured")
-                                  : cell.kind === "unmerged"
-                                    ? t("task.envUnmerged")
-                                    : cell.mergeVia === "fast_forward"
-                                      ? cell.mergeDate
-                                        ? `FF ${cell.mergeDate.slice(0, 10)}`
-                                        : "— (FF)"
-                                      : cell.mergeDate
-                                        ? cell.mergeDate.slice(0, 10)
-                                        : t("task.envMerged")
+                            // Compact: the date alone carries the meaning in
+                            // this narrow column.
+                            const label = envCellLabel(cell, envLabels, true)
                             return (
                               <td key={e} className="px-2 py-2">
                                 <span
@@ -924,7 +1026,7 @@ export function BranchBoard({ projectId }: Props) {
                               ? row.lastCommitAt.slice(0, 10)
                               : "—"}
                           </td>
-                          <td className="px-2 py-2">
+                          <td className="px-2 py-2 whitespace-nowrap">
                             <span
                               className={cn(
                                 "text-[0.7rem]",
@@ -933,6 +1035,13 @@ export function BranchBoard({ projectId }: Props) {
                             >
                               {t(remoteStatusKey(row.remoteState) as never)}
                             </span>
+                            {/* How far ahead/behind, not just the direction —
+                                the counts were already computed and dropped. */}
+                            {remoteCountsLabel(row) && (
+                              <span className="ml-1.5 font-mono text-[0.7rem] text-muted-foreground">
+                                {remoteCountsLabel(row)}
+                              </span>
+                            )}
                           </td>
                           <td className="px-2 py-2 text-muted-foreground">
                             {state?.description || "—"}

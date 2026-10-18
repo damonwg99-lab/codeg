@@ -1,6 +1,11 @@
 import { getTransport } from "@/lib/transport"
 import { getCodegToken } from "@/lib/transport/web-auth"
-import type { GitCredentials, GitPullResult } from "@/lib/types"
+import type {
+  GitCredentials,
+  GitLogFileChange,
+  GitLogResult,
+  GitPullResult,
+} from "@/lib/types"
 import type {
   ProjectInfo,
   ProjectDetail,
@@ -200,16 +205,78 @@ export async function listBranchStates(
   })
 }
 
+/**
+ * Update a branch's archive flag and/or note. The two aspects are independent:
+ * an omitted field leaves the stored value untouched, so archiving never wipes
+ * the note and saving a note never un-archives the branch. Pass an empty
+ * `description` to clear the note.
+ */
 export async function upsertBranchState(
   repoId: number,
   branch: string,
-  params: { isArchived?: boolean; description?: string | null }
+  params: { isArchived?: boolean; description?: string }
 ): Promise<BranchStateInfo> {
   return getTransport().call<BranchStateInfo>("upsert_branch_state", {
     repoId,
     branch,
-    isArchived: params.isArchived,
-    description: params.description,
+    // Must stay `undefined` (dropped on the wire) rather than null — the
+    // backend reads an absent field as "leave this column alone".
+    isArchived: params.isArchived ?? undefined,
+    description: params.description ?? undefined,
+  })
+}
+
+/**
+ * Files a branch changes relative to an environment branch — names, status and
+ * line counts only. Patches are fetched per file via `getBranchDiffFile`, so
+ * opening the diff tab no longer downloads every file's full patch.
+ */
+export async function getBranchDiffFiles(
+  path: string,
+  branch: string,
+  envBranch: string
+): Promise<GitLogFileChange[]> {
+  return getTransport().call<GitLogFileChange[]>("git_branch_diff_files", {
+    path,
+    branch,
+    envBranch,
+  })
+}
+
+/**
+ * A branch's own commits: those on the branch but in none of the given
+ * environment branches. Same result shape as `gitLog` (without per-commit
+ * files), including the `pushed` flag. Rejects when none of the environment
+ * branches exist, so callers can fall back to the full history.
+ */
+export async function getBranchOwnCommits(
+  path: string,
+  branch: string,
+  envBranches: string[],
+  skip: number,
+  limit: number
+): Promise<GitLogResult> {
+  return getTransport().call<GitLogResult>("git_branch_own_commits", {
+    path,
+    branch,
+    envBranches,
+    skip,
+    limit,
+  })
+}
+
+/** Patch for one file of the same comparison as `getBranchDiffFiles`. */
+export async function getBranchDiffFile(
+  path: string,
+  branch: string,
+  envBranch: string,
+  file: string
+): Promise<string> {
+  return getTransport().call<string>("git_branch_diff_file", {
+    path,
+    branch,
+    envBranch,
+    file,
   })
 }
 

@@ -89,8 +89,10 @@ pub async fn list_branch_states(
 pub struct UpsertBranchStateParams {
     pub repo_id: i32,
     pub branch: String,
+    /// Absent leaves the stored archive flag untouched.
     pub is_archived: Option<bool>,
-    pub description: Option<Option<String>>,
+    /// Absent leaves the stored note untouched; empty clears it.
+    pub description: Option<String>,
 }
 
 pub async fn upsert_branch_state(
@@ -104,6 +106,75 @@ pub async fn upsert_branch_state(
             params.branch,
             params.is_archived,
             params.description,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranchDiffFilesParams {
+    pub path: String,
+    pub branch: String,
+    pub env_branch: String,
+}
+
+pub async fn git_branch_diff_files(
+    Json(params): Json<GitBranchDiffFilesParams>,
+) -> Result<Json<Vec<crate::commands::folders::GitLogFileChange>>, AppCommandError> {
+    Ok(Json(
+        branch_board_commands::git_branch_diff_files_core(
+            &params.path,
+            &params.branch,
+            &params.env_branch,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranchDiffFileParams {
+    pub path: String,
+    pub branch: String,
+    pub env_branch: String,
+    pub file: String,
+}
+
+pub async fn git_branch_diff_file(
+    Json(params): Json<GitBranchDiffFileParams>,
+) -> Result<Json<String>, AppCommandError> {
+    Ok(Json(
+        branch_board_commands::git_branch_diff_file_core(
+            &params.path,
+            &params.branch,
+            &params.env_branch,
+            &params.file,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranchOwnCommitsParams {
+    pub path: String,
+    pub branch: String,
+    pub env_branches: Vec<String>,
+    pub skip: Option<u32>,
+    pub limit: Option<u32>,
+}
+
+pub async fn git_branch_own_commits(
+    Json(params): Json<GitBranchOwnCommitsParams>,
+) -> Result<Json<crate::commands::folders::GitLogResult>, AppCommandError> {
+    Ok(Json(
+        branch_board_commands::git_branch_own_commits_core(
+            &params.path,
+            &params.branch,
+            &params.env_branches,
+            params.skip.unwrap_or(0),
+            params.limit.unwrap_or(50),
         )
         .await?,
     ))

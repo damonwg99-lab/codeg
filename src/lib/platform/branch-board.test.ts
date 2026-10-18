@@ -2,12 +2,13 @@ import { describe, it, expect } from "vitest"
 import type { GitStatusEntry } from "@/lib/types"
 import {
   canMerge,
+  envCellLabel,
   envCellState,
   filterRows,
   isFullyMerged,
+  remoteCountsLabel,
   remoteStatusKey,
   resolveEffectiveEnv,
-  unmergedEnvs,
 } from "./branch-board"
 import type {
   BranchRow,
@@ -68,8 +69,6 @@ const baseRow: BranchRow = {
       merged: true,
       mergeVia: "merge",
       mergeDate: "2026-09-01T00:00:00Z",
-      ahead: 0,
-      behind: 2,
     },
   ],
 }
@@ -100,8 +99,6 @@ describe("envCellState", () => {
           merged: false,
           mergeVia: null,
           mergeDate: null,
-          ahead: 3,
-          behind: 1,
         },
       ],
     }
@@ -119,38 +116,75 @@ describe("envCellState", () => {
   })
 })
 
-describe("unmergedEnvs", () => {
-  it("only lists environments the branch is not merged into", () => {
-    const row: BranchRow = {
-      ...baseRow,
-      envs: [
-        {
-          env: "dev",
-          merged: false,
-          mergeVia: null,
-          mergeDate: null,
-          ahead: 0,
-          behind: 0,
-        },
-        {
-          env: "uat",
-          merged: true,
-          mergeVia: "merge",
-          mergeDate: null,
-          ahead: 0,
-          behind: 0,
-        },
-        {
-          env: "prd",
-          merged: true,
-          mergeVia: "merge",
-          mergeDate: null,
-          ahead: 0,
-          behind: 0,
-        },
-      ],
+describe("envCellLabel", () => {
+  const labels = {
+    notConfigured: "NOT_CONFIGURED",
+    unmerged: "UNMERGED",
+    merged: "MERGED",
+    fastForward: "FF",
+  }
+
+  it("renders each non-merged kind from the supplied labels", () => {
+    expect(envCellLabel({ kind: "env" }, labels)).toBe("—")
+    expect(envCellLabel({ kind: "unconfigured" }, labels)).toBe(
+      "NOT_CONFIGURED"
+    )
+    expect(envCellLabel({ kind: "unmerged" }, labels)).toBe("UNMERGED")
+  })
+
+  it("compact mode shows the date alone, full mode qualifies it", () => {
+    const cell = {
+      kind: "merged" as const,
+      mergeVia: "merge" as const,
+      mergeDate: "2026-09-01T12:34:56Z",
     }
-    expect(unmergedEnvs(row)).toEqual(["dev"])
+    expect(envCellLabel(cell, labels, true)).toBe("2026-09-01")
+    expect(envCellLabel(cell, labels)).toBe("MERGED · 2026-09-01")
+  })
+
+  it("marks fast-forward merges, with or without a date", () => {
+    expect(
+      envCellLabel(
+        {
+          kind: "merged",
+          mergeVia: "fast_forward",
+          mergeDate: "2026-09-01T00:00:00Z",
+        },
+        labels
+      )
+    ).toBe("FF 2026-09-01")
+    // Previously rendered as "— (FF)", which read as "no data".
+    expect(
+      envCellLabel(
+        { kind: "merged", mergeVia: "fast_forward", mergeDate: null },
+        labels
+      )
+    ).toBe("FF")
+  })
+
+  it("falls back to the merged label when no date is known", () => {
+    expect(
+      envCellLabel(
+        { kind: "merged", mergeVia: "merge", mergeDate: null },
+        labels
+      )
+    ).toBe("MERGED")
+  })
+
+  it("board and panel agree on every cell kind", () => {
+    // The two call sites used to rebuild this chain independently and had
+    // already drifted apart; only `compact` may differ between them.
+    const cells = [
+      { kind: "env" as const },
+      { kind: "unconfigured" as const },
+      { kind: "unmerged" as const },
+      { kind: "merged" as const, mergeVia: "merge" as const, mergeDate: null },
+    ]
+    for (const cell of cells) {
+      expect(envCellLabel(cell, labels, true)).toBe(
+        envCellLabel(cell, labels, false)
+      )
+    }
   })
 })
 
@@ -166,8 +200,6 @@ describe("isFullyMerged", () => {
           merged: false,
           mergeVia: null,
           mergeDate: null,
-          ahead: 1,
-          behind: 0,
         },
       ],
     }
@@ -213,6 +245,36 @@ describe("filterRows", () => {
     ).toEqual(["feat/b"])
   })
 
+  it("matches the note and the author, not just the branch name", () => {
+    const noted: BranchRow[] = [
+      { ...baseRow, branch: "feat/one", createdBy: "Alice" },
+      { ...baseRow, branch: "feat/two", createdBy: "Bob" },
+      { ...baseRow, branch: "feat/three", createdBy: null },
+    ]
+    const notes = new Map<string, BranchStateInfo>([
+      [
+        "feat/three",
+        {
+          branch: "feat/three",
+          description: "payment refactor",
+        } as unknown as BranchStateInfo,
+      ],
+    ])
+    const noteOf = (b: string) => notes.get(b)
+    const search = (keyword: string) =>
+      filterRows(noted, noteOf, {
+        archived: false,
+        onlyUnmerged: false,
+        keyword,
+      }).map((r) => r.branch)
+
+    expect(search("alice")).toEqual(["feat/one"])
+    expect(search("payment")).toEqual(["feat/three"])
+    // Still matches the branch name, and matching is case-insensitive.
+    expect(search("TWO")).toEqual(["feat/two"])
+    expect(search("nothing-matches")).toEqual([])
+  })
+
   it("filters to only-unmerged", () => {
     const mixed: BranchRow[] = [
       baseRow,
@@ -225,8 +287,6 @@ describe("filterRows", () => {
             merged: false,
             mergeVia: null,
             mergeDate: null,
-            ahead: 1,
-            behind: 0,
           },
         ],
       },
@@ -249,16 +309,12 @@ describe("filterRows", () => {
             merged: true,
             mergeVia: "merge",
             mergeDate: null,
-            ahead: 0,
-            behind: 0,
           },
           {
             env: "prd",
             merged: false,
             mergeVia: null,
             mergeDate: null,
-            ahead: 1,
-            behind: 0,
           },
         ],
       },
@@ -271,8 +327,6 @@ describe("filterRows", () => {
             merged: false,
             mergeVia: null,
             mergeDate: null,
-            ahead: 2,
-            behind: 0,
           },
         ],
       },
@@ -302,6 +356,36 @@ describe("filterRows", () => {
         env: "prd",
       }).map((r) => r.branch)
     ).toEqual(["feat/uat-merged"])
+  })
+
+  it("filters to only-needs-pull", () => {
+    const rows: BranchRow[] = [
+      { ...baseRow, branch: "feat/current", needsPull: false },
+      { ...baseRow, branch: "feat/stale", needsPull: true },
+    ]
+    expect(
+      filterRows(rows, () => undefined, {
+        archived: false,
+        onlyUnmerged: false,
+        onlyNeedsPull: true,
+      }).map((r) => r.branch)
+    ).toEqual(["feat/stale"])
+  })
+
+  it("needs-push and needs-pull are independent filters", () => {
+    const rows: BranchRow[] = [
+      { ...baseRow, branch: "feat/push", needsPush: true, needsPull: false },
+      { ...baseRow, branch: "feat/pull", needsPush: false, needsPull: true },
+      { ...baseRow, branch: "feat/both", needsPush: true, needsPull: true },
+    ]
+    expect(
+      filterRows(rows, () => undefined, {
+        archived: false,
+        onlyUnmerged: false,
+        onlyNeedsPush: true,
+        onlyNeedsPull: true,
+      }).map((r) => r.branch)
+    ).toEqual(["feat/both"])
   })
 
   it("filters to only-needs-push", () => {
@@ -378,6 +462,15 @@ describe("filterRows remote semantics", () => {
         onlyNeedsPush: true,
       }).map((r) => r.branch)
     ).toEqual(["feat/new"])
+  })
+})
+
+describe("remoteCountsLabel", () => {
+  it("reports each direction, and nothing when in sync", () => {
+    expect(remoteCountsLabel({ ahead: 0, behind: 0 })).toBe("")
+    expect(remoteCountsLabel({ ahead: 2, behind: 0 })).toBe("↑2")
+    expect(remoteCountsLabel({ ahead: 0, behind: 3 })).toBe("↓3")
+    expect(remoteCountsLabel({ ahead: 2, behind: 3 })).toBe("↑2 ↓3")
   })
 })
 

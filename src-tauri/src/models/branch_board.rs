@@ -10,8 +10,6 @@ pub struct EnvMergeStatus {
     /// "merge" | "fast_forward" (None while unmerged / unknown)
     pub merge_via: Option<String>,
     pub merge_date: Option<String>,
-    pub ahead: i64,
-    pub behind: i64,
 }
 
 /// Relationship between a local branch and its remote counterpart(s).
@@ -77,9 +75,13 @@ pub struct RepoBranchMatrix {
     pub repo_id: i32,
     pub repo_name: String,
     pub repo_path: String,
-    /// Whether at least one environment branch is configured for this repo.
-    pub configured: bool,
     /// Configured environment keys for this repo, e.g. ["uat", "prd"].
     pub envs: Vec<String>,
     pub branches: Vec<BranchRow>,
+    /// Why this repo could not be scanned (missing checkout, broken git, …).
+    ///
+    /// A project may legitimately contain repos the current developer has not
+    /// cloned, so one unreadable repo must never fail the whole matrix: it is
+    /// reported here with an empty `branches` list while the rest stay usable.
+    pub error: Option<String>,
 }

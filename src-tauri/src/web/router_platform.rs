@@ -88,6 +88,18 @@ pub fn platform_routes() -> Router {
             "/git_pull_branch",
             post(handlers::branch_board::git_pull_branch),
         )
+        .route(
+            "/git_branch_diff_files",
+            post(handlers::branch_board::git_branch_diff_files),
+        )
+        .route(
+            "/git_branch_diff_file",
+            post(handlers::branch_board::git_branch_diff_file),
+        )
+        .route(
+            "/git_branch_own_commits",
+            post(handlers::branch_board::git_branch_own_commits),
+        )
         .route("/scan_git_repos", post(handlers::project::scan_git_repos))
         .route("/get_global_config", post(handlers::project::get_global_config))
         .route("/set_global_config", post(handlers::project::set_global_config))

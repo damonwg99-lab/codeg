@@ -1,5 +1,5 @@
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
 
 use crate::db::entities::{platform_branch_state, platform_project_repo};
 use crate::db::error::DbError;
@@ -39,91 +39,59 @@ pub async fn list_by_project<C: ConnectionTrait>(
     Ok(rows.into_iter().map(to_info).collect())
 }
 
-/// Insert or update the human state of a branch. `is_archived`/`description`
-/// are optional so callers can update just one aspect. A repo/branch pair with
-/// no row = active with no note.
+/// Insert or update the human state of a branch. A repo/branch pair with no
+/// row = active with no note.
+///
+/// The two aspects update independently: an argument left `None` keeps the
+/// stored column untouched, so archiving a branch never clears its note and
+/// editing the note never un-archives it. A `description` that is empty or
+/// whitespace-only clears the note.
 pub async fn upsert<C: ConnectionTrait>(
     conn: &C,
     repo_id: i32,
     branch: &str,
     is_archived: Option<bool>,
-    description: Option<Option<String>>,
+    description: Option<String>,
 ) -> Result<BranchStateInfo, DbError> {
     let now = Utc::now();
     let archived = is_archived.unwrap_or(false);
-    let description = description.flatten();
+    let note = description
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let a = platform_branch_state::ActiveModel {
         repo_id: Set(repo_id),
         branch: Set(branch.to_string()),
         is_archived: Set(archived),
         archived_at: Set(if archived { Some(now) } else { None }),
-        description: Set(description.clone()),
+        description: Set(note),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
     };
+
+    // Overwrite only the columns the caller actually supplied. `created_at` is
+    // deliberately absent so the original creation stamp survives an update.
+    let mut update_columns = vec![platform_branch_state::Column::UpdatedAt];
+    if is_archived.is_some() {
+        update_columns.push(platform_branch_state::Column::IsArchived);
+        update_columns.push(platform_branch_state::Column::ArchivedAt);
+    }
+    if description.is_some() {
+        update_columns.push(platform_branch_state::Column::Description);
+    }
+
     let inserted = platform_branch_state::Entity::insert(a)
         .on_conflict(
             sea_orm::sea_query::OnConflict::columns([
                 platform_branch_state::Column::RepoId,
                 platform_branch_state::Column::Branch,
             ])
-            .update_columns([
-                platform_branch_state::Column::IsArchived,
-                platform_branch_state::Column::ArchivedAt,
-                platform_branch_state::Column::Description,
-                platform_branch_state::Column::UpdatedAt,
-            ])
+            .update_columns(update_columns)
             .to_owned(),
         )
         .exec_with_returning(conn)
         .await?;
     Ok(to_info(inserted))
-}
-
-/// Ensure a state row exists for `branch` and is archived. No-op when a row
-/// already exists (so a user's manual restore is never overridden). Used to
-/// hide environment branches (dev/uat/prd) from the active list by default.
-pub async fn ensure_archived<C: ConnectionTrait>(
-    conn: &C,
-    repo_id: i32,
-    branch: &str,
-) -> Result<(), DbError> {
-    let existing = platform_branch_state::Entity::find()
-        .filter(platform_branch_state::Column::RepoId.eq(repo_id))
-        .filter(platform_branch_state::Column::Branch.eq(branch))
-        .one(conn)
-        .await?;
-    if existing.is_some() {
-        return Ok(());
-    }
-    let now = Utc::now();
-    let active = platform_branch_state::ActiveModel {
-        repo_id: Set(repo_id),
-        branch: Set(branch.to_string()),
-        is_archived: Set(true),
-        archived_at: Set(Some(now)),
-        description: Set(None),
-        created_at: Set(now),
-        updated_at: Set(now),
-        ..Default::default()
-    };
-    let _ = active.insert(conn).await;
-    Ok(())
-}
-
-/// Delete state rows for branches that no longer exist in git, for one repo.
-/// Keeps the archive/note table free of orphans.
-pub async fn prune_not_in<C: ConnectionTrait>(
-    conn: &C,
-    repo_id: i32,
-    keep: &[String],
-) -> Result<u64, DbError> {
-    let mut delete = platform_branch_state::Entity::delete_many()
-        .filter(platform_branch_state::Column::RepoId.eq(repo_id));
-    if !keep.is_empty() {
-        delete = delete.filter(platform_branch_state::Column::Branch.is_not_in(keep.to_vec()));
-    }
-    let result = delete.exec(conn).await?;
-    Ok(result.rows_affected)
 }
