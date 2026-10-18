@@ -2625,11 +2625,50 @@ pub async fn git_diff(path: String, file: Option<String>) -> Result<String, AppC
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Resolve a comparison base to a ref that exists locally: the local branch
+/// when present, else a remote-tracking branch under any configured remote
+/// (e.g. an env branch that only exists on `origin`/`company`). Falls back to
+/// the bare name.
+async fn resolve_compare_ref(path: &str, name: &str) -> String {
+    if rev_parse_ref(path, &format!("refs/heads/{name}"))
+        .await
+        .is_some()
+    {
+        return name.to_string();
+    }
+    if let Ok(output) = crate::process::tokio_command("git")
+        .args(["for-each-ref", "--format=%(refname:short)", "refs/remotes"])
+        .current_dir(path)
+        .output()
+        .await
+    {
+        if output.status.success() {
+            let suffix = format!("/{name}");
+            let mut matches: Vec<String> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| l.ends_with(&suffix) && !l.ends_with("/HEAD"))
+                .collect();
+            matches.sort();
+            if let Some(first) = matches.into_iter().next() {
+                return first;
+            }
+        }
+    }
+    name.to_string()
+}
+
+/// Tip-to-tip diff between a comparison base and a branch. When `base_branch`
+/// is given the comparison is explicit (`git diff <base> <branch>`), so the
+/// selected branch's changes are shown even when another branch is checked out
+/// in the main worktree. Without it, the historical worktree-relative
+/// behaviour (`git diff <branch>`) is preserved.
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn git_diff_with_branch(
     path: String,
     branch: String,
     file: Option<String>,
+    base_branch: Option<String>,
 ) -> Result<String, AppCommandError> {
     ensure_git_repo(&path)?;
 
@@ -2641,11 +2680,14 @@ pub async fn git_diff_with_branch(
     }
 
     let literal_file = file.as_deref().map(to_git_literal_pathspec);
-    let mut args = vec![
-        "diff".to_string(),
-        "--no-color".to_string(),
-        target_branch.to_string(),
-    ];
+    let mut args = vec!["diff".to_string(), "--no-color".to_string()];
+    match base_branch.as_deref().map(str::trim) {
+        Some(base) if !base.is_empty() => {
+            let compare_ref = resolve_compare_ref(&path, base).await;
+            args.push(format!("{compare_ref}...{target_branch}"));
+        }
+        _ => args.push(target_branch.to_string()),
+    }
     if let Some(ref f) = literal_file {
         args.push("--".to_string());
         args.push(f.clone());

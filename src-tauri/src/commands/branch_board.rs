@@ -11,7 +11,7 @@ use crate::db::service::{
     platform_branch_state_service, platform_project_repo_service, platform_project_service,
 };
 use crate::db::AppDatabase;
-use crate::models::{BranchRow, BranchStateInfo, EnvMergeStatus, RepoBranchMatrix};
+use crate::models::{BranchRow, BranchStateInfo, EnvMergeStatus, RemoteState, RepoBranchMatrix};
 
 /// Max repos processed concurrently (each spawns a few git processes).
 const REPO_CONCURRENCY: usize = 6;
@@ -36,6 +36,16 @@ pub(crate) fn effective_env(repo: Option<&str>, project: Option<&str>) -> Option
         (_, Some(p)) if !p.trim().is_empty() => Some(p.trim().to_string()),
         _ => None,
     }
+}
+
+/// Stable signature of the effective environment configuration, used as part of
+/// the branch-matrix cache key so renaming an env branch (or toggling whether
+/// any is configured) invalidates the cached matrix even when git refs are
+/// unchanged. Order-independent.
+pub(crate) fn env_config_signature(envs: &[(String, String)], configured: bool) -> String {
+    let mut parts: Vec<String> = envs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    parts.sort();
+    format!("{}|configured={configured}", parts.join(";"))
 }
 
 /// Extract the epoch seconds from a reflog line. Reflog file line format is
@@ -97,6 +107,30 @@ fn push_entry(p: &Path, out: &mut Vec<String>) {
     }
 }
 
+/// Deterministic 64-bit FNV-1a hasher for stable cache fingerprints across
+/// process restarts (unlike `std::collections::hash_map::DefaultHasher` which
+/// is randomly seeded per process).
+#[derive(Default)]
+pub(crate) struct FnvHasher(u64);
+
+impl FnvHasher {
+    pub(crate) fn new() -> Self {
+        Self(0xcbf29ce484222325)
+    }
+}
+
+impl Hasher for FnvHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= byte as u64;
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+}
+
 /// Cheap signature of a repo's ref state (file metadata only, no git process).
 /// Any branch add/delete/move changes the underlying ref files, hence the hash.
 /// `None` when the repo has no local `.git` (not a repo / missing).
@@ -119,7 +153,7 @@ fn ref_fingerprint(repo_path: &str) -> Option<String> {
         }
     }
     entries.sort();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = FnvHasher::new();
     entries.hash(&mut hasher);
     Some(format!("{:016x}", hasher.finish()))
 }
@@ -150,10 +184,8 @@ async fn git_stdout(path: &str, args: &[&str]) -> Result<String, AppCommandError
 
 struct LocalBranch {
     name: String,
-    tip: String,
     date: String,
     upstream: Option<String>,
-    trackshort: String,
 }
 
 /// Local branches with tip sha + committer date + upstream tracking, via one
@@ -163,72 +195,92 @@ async fn list_local_branches(path: &str) -> Result<Vec<LocalBranch>, AppCommandE
         path,
         &[
             "for-each-ref",
-            "--format=%(refname:short)%09%(objectname)%09%(committerdate:iso-strict)%09%(upstream:short)%09%(upstream:trackshort)",
+            "--format=%(refname:short)%09%(objectname)%09%(committerdate:iso8601-strict)%09%(upstream:short)",
             "refs/heads",
         ],
     )
     .await?;
-    let mut rows = Vec::new();
+
+    let mut branches = Vec::new();
     for line in out.lines() {
-        let mut parts = line.split('\t');
-        let name = parts.next().unwrap_or("").trim();
-        let tip = parts.next().unwrap_or("").trim();
-        let date = parts.next().unwrap_or("").trim();
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.is_empty() || parts[0].trim().is_empty() {
+            continue;
+        }
+        let name = parts[0].trim().to_string();
+        let date = parts.get(2).map(|s| s.trim().to_string()).unwrap_or_default();
+        let upstream = parts
+            .get(3)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        branches.push(LocalBranch {
+            name,
+            date,
+            upstream,
+        });
+    }
+    Ok(branches)
+}
+
+/// Names of remote-tracking branches (e.g. "origin/main", "origin/feat/x").
+async fn remote_branches(path: &str) -> HashSet<String> {
+    let out = match git_stdout(
+        path,
+        &["for-each-ref", "--format=%(refname:short)", "refs/remotes"],
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(_) => return HashSet::new(),
+    };
+    out.lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.ends_with("/HEAD"))
+        .map(String::from)
+        .collect()
+}
+
+/// Configured tracking targets: map from local branch name -> remote-tracking
+/// ref (e.g. "feat/x" -> "origin/feat/x").
+async fn branch_tracking_config(path: &str) -> HashMap<String, String> {
+    let out = match git_stdout(
+        path,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)%09%(upstream:short)",
+            "refs/heads",
+        ],
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    let mut map = HashMap::new();
+    for line in out.lines() {
+        let mut parts = line.splitn(2, '\t');
+        let local = parts.next().unwrap_or("").trim();
         let upstream = parts.next().unwrap_or("").trim();
-        let trackshort = parts.next().unwrap_or("").trim();
-        if !name.is_empty() {
-            rows.push(LocalBranch {
-                name: name.to_string(),
-                tip: tip.to_string(),
-                date: date.to_string(),
-                upstream: if upstream.is_empty() {
-                    None
-                } else {
-                    Some(upstream.to_string())
-                },
-                trackshort: trackshort.to_string(),
-            });
+        if !local.is_empty() && !upstream.is_empty() {
+            map.insert(local.to_string(), upstream.to_string());
         }
     }
-    Ok(rows)
+    map
 }
 
-/// Names of remote branches under `origin/` (without the prefix), excluding
-/// `origin/HEAD`.
-async fn remote_branches(path: &str) -> HashSet<String> {
-    let out = git_stdout(
-        path,
-        &["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin"],
-    )
-    .await;
-    match out {
-        Ok(s) => s
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("origin/"))
-            .filter(|n| !n.is_empty() && *n != "HEAD")
-            .map(|n| n.to_string())
-            .collect(),
-        Err(_) => HashSet::new(),
-    }
-}
-
-/// Set of local branches already merged into `env`, in ONE git call
-/// (`for-each-ref --merged=<env>`). Empty on error (e.g. env branch missing).
+/// Commits reachable from a ref: run `git branch --merged <env>`. Branches in
+/// the output have their tips contained in `<env>`.
 async fn merged_set(path: &str, env: &str) -> HashSet<String> {
-    let merged_arg = format!("--merged={env}");
-    let out = git_stdout(
-        path,
-        &["for-each-ref", "--format=%(refname:short)", &merged_arg, "refs/heads"],
-    )
-    .await;
-    match out {
-        Ok(s) => s
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect(),
-        Err(_) => HashSet::new(),
-    }
+    let out = match git_stdout(path, &["branch", "--merged", env]).await {
+        Ok(s) => s,
+        Err(_) => return HashSet::new(),
+    };
+    out.lines()
+        .map(str::trim)
+        .map(|s| s.strip_prefix('*').unwrap_or(s).trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 /// Whether a ref resolves to a commit locally.
@@ -270,39 +322,42 @@ async fn current_branch(path: &str) -> Option<String> {
     }
 }
 
-/// Merge method + date for a merged branch, in ONE git call: the earliest
-/// ancestry-path commit between branch and env. Fast-forward when that commit
-/// is the branch tip itself (no merge commit, so no date).
+/// Merge method + date for a branch already known to be merged into `env`.
+///
+/// 1. Finds the earliest merge commit on `env` bringing `branch` in via `--merges`.
+///    If found, returns `(Some("merge"), Some(merge_commit_date))`.
+/// 2. If no merge commit exists in `branch..env`, the branch was incorporated via
+///    fast-forward: returns `(Some("fast_forward"), None)`.
 async fn merge_info(
     path: &str,
     branch: &str,
     env: &str,
-    branch_tip: &str,
 ) -> (Option<String>, Option<String>) {
     let range = format!("{branch}..{env}");
     let out = match git_stdout(
         path,
-        &["log", "--ancestry-path", "--reverse", "--format=%cI%x09%H", &range],
+        &[
+            "log",
+            "--merges",
+            "--ancestry-path",
+            "--reverse",
+            "--format=%cI%x09%H",
+            &range,
+        ],
     )
     .await
     {
         Ok(s) => s,
         Err(_) => return (None, None),
     };
-    let Some(line) = out.lines().next() else {
-        return (None, None);
-    };
-    let mut parts = line.splitn(2, '\t');
-    let date = parts.next().unwrap_or("").trim().to_string();
-    let sha = parts.next().unwrap_or("").trim();
-    if sha == branch_tip {
-        return (Some("fast_forward".to_string()), None);
+    if let Some(line) = out.lines().next() {
+        let mut parts = line.splitn(2, '\t');
+        let date = parts.next().unwrap_or("").trim().to_string();
+        if !date.is_empty() {
+            return (Some("merge".to_string()), Some(date));
+        }
     }
-    if date.is_empty() {
-        (None, None)
-    } else {
-        (Some("merge".to_string()), Some(date))
-    }
+    (Some("fast_forward".to_string()), None)
 }
 
 /// Branch creation date + creator read straight from the reflog file (no git
@@ -339,11 +394,69 @@ pub(crate) fn parse_reflog_created_by(line: &str) -> Option<String> {
     }
 }
 
-async fn compute_repo_matrix(repo_path: &str, envs: &[(String, String)]) -> Vec<BranchRow> {
-    let locals = match list_local_branches(repo_path).await {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
+async fn rev_left_right(path: &str, a: &str, b: &str) -> Option<(i64, i64)> {
+    let range = format!("{a}...{b}");
+    let out = git_stdout(path, &["rev-list", "--left-right", "--count", &range])
+        .await
+        .ok()?;
+    parse_left_right(&out)
+}
+
+pub(crate) fn state_from_counts(ahead: i64, behind: i64) -> RemoteState {
+    match (ahead, behind) {
+        (0, 0) => RemoteState::Synced,
+        (a, 0) if a > 0 => RemoteState::Ahead,
+        (0, b) if b > 0 => RemoteState::Behind,
+        _ => RemoteState::Diverged,
+    }
+}
+
+/// Compute remote relationship for a local branch.
+async fn branch_remote_status(
+    path: &str,
+    lb: &LocalBranch,
+    remotes: &HashSet<String>,
+    tracking: &HashMap<String, String>,
+) -> (RemoteState, Option<i64>, Option<i64>, bool) {
+    if remotes.is_empty() {
+        return (RemoteState::NoRemote, None, None, false);
+    }
+    let upstream = tracking
+        .get(&lb.name)
+        .cloned()
+        .or_else(|| {
+            let default_target = format!("origin/{}", lb.name);
+            remotes.contains(&default_target).then_some(default_target)
+        });
+
+    let Some(target) = upstream else {
+        return (RemoteState::Unpublished, None, None, false);
     };
+
+    if !remotes.contains(&target) {
+        return (RemoteState::Unpublished, None, None, false);
+    }
+
+    match rev_left_right(path, &lb.name, &target).await {
+        Some((ahead, behind)) => (state_from_counts(ahead, behind), Some(ahead), Some(behind), true),
+        None => (RemoteState::Unknown, None, None, true),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Matrix calculation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compute the branch matrix for one repo. Fails when the repo cannot be read
+/// at all (missing path / broken git) so the caller never caches an
+/// accidental empty matrix as a good result.
+async fn compute_repo_matrix(
+    repo_path: &str,
+    envs: &[(String, String)],
+) -> Result<Vec<BranchRow>, AppCommandError> {
+    let locals = list_local_branches(repo_path)
+        .await
+        .map_err(|e| AppCommandError::external_command("Failed to list branches", e.to_string()))?;
 
     // Resolve each env to a ref that exists locally (local branch, else the
     // origin remote-tracking branch), then one git call per env for its merged
@@ -359,6 +472,7 @@ async fn compute_repo_matrix(repo_path: &str, envs: &[(String, String)]) -> Vec<
     }
     let git_dir = git_dir_no_spawn(repo_path);
     let remotes = remote_branches(repo_path).await;
+    let tracking = branch_tracking_config(repo_path).await;
     let current = current_branch(repo_path).await;
 
     let mut rows = Vec::new();
@@ -383,7 +497,7 @@ async fn compute_repo_matrix(repo_path: &str, envs: &[(String, String)]) -> Vec<
                 .map(|s| s.contains(&lb.name))
                 .unwrap_or(false);
             let (via, date) = if is_merged {
-                merge_info(repo_path, &lb.name, resolved, &lb.tip).await
+                merge_info(repo_path, &lb.name, resolved).await
             } else {
                 (None, None)
             };
@@ -400,36 +514,48 @@ async fn compute_repo_matrix(repo_path: &str, envs: &[(String, String)]) -> Vec<
         let created = git_dir
             .as_deref()
             .and_then(|gd| created_at_from_reflog(gd, &lb.name));
-        let (created_at, created_by) = match created {
-            Some((d, b)) => (Some(d), b),
-            None => (None, None),
+        let (mut created_at, mut created_by, mut created_at_source) = match created {
+            Some((d, b)) => (Some(d), b, Some("reflog".to_string())),
+            None => (None, None, None),
         };
 
-        let has_remote = lb.upstream.is_some() || remotes.contains(&lb.name);
-        let (needs_push, needs_pull) = if lb.upstream.is_some() {
-            (lb.trackshort.contains('>'), lb.trackshort.contains('<'))
-        } else if remotes.contains(&lb.name) {
-            let range = format!("origin/{}...{}", lb.name, lb.name);
-            match git_stdout(
+        if created_at.is_none() {
+            let base_range = env_refs
+                .first()
+                .map(|(_, _, resolved)| format!("{resolved}..{}", lb.name))
+                .unwrap_or_else(|| lb.name.clone());
+            if let Ok(out) = git_stdout(
                 repo_path,
-                &["rev-list", "--left-right", "--count", &range],
+                &["log", "--reverse", "--format=%cI%x09%an", "-1", &base_range],
             )
             .await
             {
-                Ok(s) => match parse_left_right(&s) {
-                    Some((behind, ahead)) => (ahead > 0, behind > 0),
-                    None => (false, false),
-                },
-                Err(_) => (false, false),
+                if let Some(line) = out.lines().next() {
+                    let mut parts = line.splitn(2, '\t');
+                    let dt = parts.next().unwrap_or("").trim().to_string();
+                    let author = parts.next().unwrap_or("").trim().to_string();
+                    if !dt.is_empty() {
+                        created_at = Some(dt);
+                        created_by = if author.is_empty() { None } else { Some(author) };
+                        created_at_source = Some("first_commit".to_string());
+                    }
+                }
             }
-        } else {
-            (false, false)
-        };
+        }
+
+        let (remote_state, ahead, behind, has_remote) =
+            branch_remote_status(repo_path, &lb, &remotes, &tracking).await;
+        let needs_push = matches!(
+            remote_state,
+            RemoteState::Ahead | RemoteState::Diverged | RemoteState::Unpublished
+        );
+        let needs_pull =
+            matches!(remote_state, RemoteState::Behind | RemoteState::Diverged);
 
         let is_current = current.as_deref() == Some(lb.name.as_str());
         rows.push(BranchRow {
             branch: lb.name,
-            created_at_source: created_at.as_ref().map(|_| "reflog".to_string()),
+            created_at_source,
             created_at,
             is_env_branch,
             is_current,
@@ -437,12 +563,15 @@ async fn compute_repo_matrix(repo_path: &str, envs: &[(String, String)]) -> Vec<
             created_by,
             upstream: lb.upstream,
             has_remote,
+            remote_state,
+            ahead: ahead.unwrap_or(0),
+            behind: behind.unwrap_or(0),
             needs_push,
             needs_pull,
             envs: statuses,
         });
     }
-    rows
+    Ok(rows)
 }
 
 async fn compute_repo_cached(
@@ -453,106 +582,110 @@ async fn compute_repo_cached(
     envs: Vec<(String, String)>,
     configured: bool,
     force: bool,
-) -> RepoBranchMatrix {
-    let fingerprint = ref_fingerprint(&repo_path);
+) -> Result<RepoBranchMatrix, AppCommandError> {
+    let env_sig = env_config_signature(&envs, configured);
+    let fp = ref_fingerprint(&repo_path);
+    let cache_key = fp.as_ref().map(|f| format!("{f}|{env_sig}"));
 
     if !force {
-        if let Some(fp) = fingerprint.as_deref() {
-            if let Ok(Some((cached_fp, json))) = cache_service::get(conn, repo_id).await {
-                if cached_fp == fp {
-                    if let Ok(matrix) = serde_json::from_str::<RepoBranchMatrix>(&json) {
-                        return matrix;
-                    }
+        if let Some(ref key) = cache_key {
+            let cached = cache_service::get(conn, repo_id)
+                .await
+                .ok()
+                .flatten()
+                .filter(|(stored_fp, _)| stored_fp == key);
+            if let Some((_, cached_json)) = cached {
+                if let Ok(rows) = serde_json::from_str::<Vec<BranchRow>>(&cached_json) {
+                    return Ok(RepoBranchMatrix {
+                        repo_id,
+                        repo_name: repo_name.to_string(),
+                        repo_path,
+                        configured,
+                        envs: envs.iter().map(|(k, _)| k.clone()).collect(),
+                        branches: rows,
+                    });
                 }
             }
         }
     }
 
-    let branches = compute_repo_matrix(&repo_path, &envs).await;
+    let rows = compute_repo_matrix(&repo_path, &envs).await?;
 
-    // Environment branches (dev/uat/prd) default to archived (hidden) unless the
-    // user has explicitly restored them.
-    for b in &branches {
-        if b.is_env_branch {
-            let _ = platform_branch_state_service::ensure_archived(conn, repo_id, &b.branch).await;
+    if let Some(ref key) = cache_key {
+        if let Ok(json) = serde_json::to_string(&rows) {
+            let _ = cache_service::upsert(conn, repo_id, key, &json).await;
         }
     }
 
-    // Auto-clean orphaned archive/note rows for branches git no longer has.
-    let keep: Vec<String> = branches.iter().map(|b| b.branch.clone()).collect();
-    let _ = platform_branch_state_service::prune_not_in(conn, repo_id, &keep).await;
-
-    let matrix = RepoBranchMatrix {
+    Ok(RepoBranchMatrix {
         repo_id,
         repo_name: repo_name.to_string(),
         repo_path,
         configured,
         envs: envs.iter().map(|(k, _)| k.clone()).collect(),
-        branches,
-    };
-
-    if let Some(fp) = fingerprint {
-        if let Ok(json) = serde_json::to_string(&matrix) {
-            let _ = cache_service::upsert(conn, repo_id, &fp, &json).await;
-        }
-    }
-
-    matrix
+        branches: rows,
+    })
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public core functions
+// ─────────────────────────────────────────────────────────────────────────────
 
 pub async fn git_project_branch_matrix_core(
     db: &AppDatabase,
     project_id: i32,
     force: bool,
 ) -> Result<Vec<RepoBranchMatrix>, AppCommandError> {
-    let conn = &db.conn;
-    let project = platform_project_service::get_by_id(conn, project_id)
+    let project = platform_project_service::get_by_id(&db.conn, project_id)
         .await
         .map_err(AppCommandError::from)?
-        .ok_or_else(|| AppCommandError::not_found(format!("Project not found: {project_id}")))?;
-    let repos = platform_project_repo_service::list_by_project(conn, project_id)
+        .ok_or_else(|| AppCommandError::not_found("Project not found"))?;
+
+    let repos = platform_project_repo_service::list_by_project(&db.conn, project_id)
         .await
         .map_err(AppCommandError::from)?;
 
-    let root_dir = project.root_dir.clone();
-    let p_dev = project.dev_branch.clone();
-    let p_uat = project.uat_branch.clone();
-    let p_prd = project.prd_branch.clone();
-
-    let mut results: Vec<RepoBranchMatrix> = stream::iter(repos.into_iter().map(|repo| {
-        let conn = conn.clone();
-        let root_dir = root_dir.clone();
-        let p_dev = p_dev.clone();
-        let p_uat = p_uat.clone();
-        let p_prd = p_prd.clone();
-        async move {
-            let repo_path = resolve_repo_path(&root_dir, &repo.local_dir);
-            let dev = effective_env(repo.dev_branch.as_deref(), p_dev.as_deref());
-            let uat = effective_env(repo.uat_branch.as_deref(), p_uat.as_deref());
-            let prd = effective_env(repo.prd_branch.as_deref(), p_prd.as_deref());
-            let configured = dev.is_some() || uat.is_some() || prd.is_some();
-            let envs: Vec<(String, String)> = [("dev", dev), ("uat", uat), ("prd", prd)]
-                .into_iter()
-                .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
-                .collect();
-            compute_repo_cached(
-                &conn,
-                repo.id,
-                &repo.name,
-                repo_path,
-                envs,
-                configured,
-                force,
-            )
-            .await
+    let mut tasks = Vec::new();
+    for repo in repos {
+        let repo_path = resolve_repo_path(&project.root_dir, &repo.local_dir);
+        let mut envs: Vec<(String, String)> = Vec::new();
+        if let Some(b) = effective_env(repo.dev_branch.as_deref(), project.dev_branch.as_deref()) {
+            envs.push(("dev".to_string(), b));
         }
-    }))
-    .buffer_unordered(REPO_CONCURRENCY)
-    .collect()
-    .await;
+        if let Some(b) = effective_env(repo.uat_branch.as_deref(), project.uat_branch.as_deref()) {
+            envs.push(("uat".to_string(), b));
+        }
+        if let Some(b) = effective_env(repo.prd_branch.as_deref(), project.prd_branch.as_deref()) {
+            envs.push(("prd".to_string(), b));
+        }
+        let configured = !envs.is_empty();
+        tasks.push((repo.id, repo.name, repo_path, envs, configured));
+    }
 
-    results.sort_by_key(|m| m.repo_id);
-    Ok(results)
+    let conn = &db.conn;
+    let results: Vec<Result<RepoBranchMatrix, AppCommandError>> = stream::iter(tasks)
+        .map(|(repo_id, repo_name, repo_path, envs, configured)| async move {
+            compute_repo_cached(conn, repo_id, &repo_name, repo_path, envs, configured, force)
+                .await
+                .map_err(|e| {
+                    AppCommandError::external_command(
+                        format!("Failed to compute branch matrix for repo '{repo_name}'"),
+                        e.to_string(),
+                    )
+                })
+        })
+        .buffer_unordered(REPO_CONCURRENCY)
+        .collect()
+        .await;
+
+    // Fail loudly when any repo cannot be scanned: an empty/partial matrix
+    // silently presented as fresh data is worse than an explicit error.
+    let mut ok = Vec::with_capacity(results.len());
+    for r in results {
+        ok.push(r?);
+    }
+    ok.sort_by_key(|m| m.repo_id);
+    Ok(ok)
 }
 
 pub async fn git_worktree_add_existing_core(
@@ -564,6 +697,7 @@ pub async fn git_worktree_add_existing_core(
 }
 
 pub async fn git_worktree_remove_temp_core(
+    db: Option<&AppDatabase>,
     path: String,
     worktree_path: String,
 ) -> Result<(), AppCommandError> {
@@ -575,6 +709,13 @@ pub async fn git_worktree_remove_temp_core(
         );
     }
     let _ = git_output(&path, &["worktree", "prune"]).await;
+    if let Some(db) = db {
+        if let Err(e) = crate::db::service::folder_service::remove_folder(&db.conn, &worktree_path).await {
+            tracing::warn!(
+                "[branch_board] cleaning folder db entry for {worktree_path}: {e}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -599,9 +740,11 @@ pub async fn upsert_branch_state_core(
         .map_err(AppCommandError::from)
 }
 
-/// Pull (fast-forward) a local branch from `origin/<branch>`. Auto-sets the
-/// upstream when the branch has a remote counterpart but no tracking config, so
-/// the existing `git_update_branch` (which requires an upstream) can run.
+/// Pull (fast-forward) a local branch from its configured upstream. When the
+/// branch has a remote-tracking counterpart but no tracking config, the
+/// uniquely owning remote is adopted via `--set-upstream-to` so the existing
+/// `git_update_branch` (which requires an upstream) can run. Never assumes
+/// `origin`: an ambiguous or absent counterpart is reported explicitly.
 pub async fn git_pull_branch_core(
     db: &AppDatabase,
     path: &str,
@@ -609,34 +752,34 @@ pub async fn git_pull_branch_core(
     credentials: Option<&crate::models::GitCredentials>,
     data_dir: &std::path::Path,
 ) -> Result<crate::commands::folders::GitPullResult, AppCommandError> {
-    let remote_ref = format!("refs/remotes/origin/{branch}");
-    let exists = git_output(path, &["rev-parse", "--verify", "--quiet", &remote_ref])
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !exists {
-        return Err(AppCommandError::not_found(format!(
-            "Remote branch 'origin/{branch}' not found; sync remote first"
-        )));
-    }
-
-    let remote_cfg = git_stdout(
-        path,
-        &["config", "--get", &format!("branch.{branch}.remote")],
-    )
-    .await
-    .unwrap_or_default();
-    if remote_cfg.trim().is_empty() {
-        let _ = git_output(
-            path,
-            &[
-                "branch",
-                "--set-upstream-to",
-                &format!("origin/{branch}"),
-                branch,
-            ],
-        )
-        .await;
+    let tracking = branch_tracking_config(path).await;
+    if !tracking.contains_key(branch) {
+        let remotes = remote_branches(path).await;
+        let suffix = format!("/{branch}");
+        let candidates: Vec<&String> = remotes.iter().filter(|r| r.ends_with(&suffix)).collect();
+        match candidates.len() {
+            0 => {
+                return Err(AppCommandError::invalid_input(format!(
+                    "Branch '{branch}' has no upstream and no remote-tracking counterpart"
+                )));
+            }
+            1 => {
+                let target = candidates[0];
+                let set_out = git_output(path, &["branch", &format!("--set-upstream-to={target}"), branch]).await?;
+                if !set_out.status.success() {
+                    return Err(AppCommandError::external_command(
+                        "Failed to set upstream",
+                        String::from_utf8_lossy(&set_out.stderr).trim().to_string(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(AppCommandError::invalid_input(format!(
+                    "Branch '{branch}' matches multiple remotes ({}); configure upstream explicitly",
+                    candidates.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                )));
+            }
+        }
     }
 
     crate::commands::folders::git_update_branch_core(path, branch, false, credentials, db, data_dir)
@@ -644,7 +787,7 @@ pub async fn git_pull_branch_core(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tauri commands
+// Tauri command wrappers
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "tauri-runtime")]
@@ -670,10 +813,11 @@ pub async fn git_worktree_add_existing(
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn git_worktree_remove_temp(
+    db: tauri::State<'_, AppDatabase>,
     path: String,
     worktree_path: String,
 ) -> Result<(), AppCommandError> {
-    git_worktree_remove_temp_core(path, worktree_path).await
+    git_worktree_remove_temp_core(Some(&db), path, worktree_path).await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -724,6 +868,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fnv_hasher_is_deterministic() {
+        let mut h1 = FnvHasher::new();
+        let mut h2 = FnvHasher::new();
+        let data = vec!["refs/heads/main", "refs/heads/dev", "HEAD"];
+        data.hash(&mut h1);
+        data.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+        assert_ne!(h1.finish(), 0);
+    }
+
+    #[test]
     fn effective_env_prefers_repo_then_project() {
         assert_eq!(
             effective_env(Some("release/uat"), Some("uat")).as_deref(),
@@ -761,5 +916,133 @@ mod tests {
     fn resolve_repo_path_joins_relative() {
         let p = resolve_repo_path("/root", "svc/api");
         assert!(p.contains("svc"));
+    }
+
+    #[test]
+    fn env_config_signature_tracks_configuration() {
+        let base = env_config_signature(&[("dev".into(), "develop".into())], true);
+        let renamed = env_config_signature(&[("dev".into(), "main".into())], true);
+        let unconfigured = env_config_signature(&[("dev".into(), "develop".into())], false);
+        assert_ne!(base, renamed, "renaming an env branch must change the key");
+        assert_ne!(base, unconfigured, "the configured flag must change the key");
+
+        // Order-independent.
+        let a = env_config_signature(
+            &[("uat".into(), "u".into()), ("dev".into(), "d".into())],
+            true,
+        );
+        let b = env_config_signature(
+            &[("dev".into(), "d".into()), ("uat".into(), "u".into())],
+            true,
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn remote_state_from_counts_covers_all_directions() {
+        assert_eq!(state_from_counts(0, 0), RemoteState::Synced);
+        assert_eq!(state_from_counts(2, 0), RemoteState::Ahead);
+        assert_eq!(state_from_counts(0, 3), RemoteState::Behind);
+        assert_eq!(state_from_counts(1, 1), RemoteState::Diverged);
+    }
+
+    // ── Temporary-repository integration tests ──────────────────────────────
+    //
+    // These exercise the real git probes (multiple remotes, upstream config,
+    // local-only branches) against throwaway repositories. No network access:
+    // remotes are local bare repos.
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("spawn git")
+            .status
+            .success()
+    }
+
+    fn init_repo(dir: &std::path::Path) {
+        assert!(git(dir, &["init", "-q", "-b", "main"]));
+        assert!(git(dir, &["config", "user.name", "t"]));
+        assert!(git(dir, &["config", "user.email", "t@example.com"]));
+        assert!(git(dir, &["config", "core.autocrlf", "false"]));
+        std::fs::write(dir.join("a.txt"), "a\n").expect("write");
+        assert!(git(dir, &["add", "-A"]));
+        assert!(git(dir, &["commit", "-q", "-m", "base"]));
+    }
+
+    fn path_str(p: &std::path::Path) -> String {
+        p.to_string_lossy().replace('\\', "/")
+    }
+
+    async fn row_for(path: &str, branch: &str) -> BranchRow {
+        compute_repo_matrix(path, &[])
+            .await
+            .expect("compute_repo_matrix")
+            .into_iter()
+            .find(|r| r.branch == branch)
+            .unwrap_or_else(|| panic!("branch {branch} missing for {path}"))
+    }
+
+    #[tokio::test]
+    async fn remote_status_uses_non_origin_upstream() {
+        let repo_dir = tempfile::tempdir().expect("repo");
+        let remote_dir = tempfile::tempdir().expect("remote");
+        init_repo(repo_dir.path());
+        assert!(git(remote_dir.path(), &["init", "-q", "--bare", "company.git"]));
+        let bare = path_str(&remote_dir.path().join("company.git"));
+        assert!(git(repo_dir.path(), &["remote", "add", "company", &bare]));
+        assert!(git(repo_dir.path(), &["push", "-q", "-u", "company", "main"]));
+
+        assert!(git(repo_dir.path(), &["checkout", "-q", "-b", "feat/x"]));
+        std::fs::write(repo_dir.path().join("x.txt"), "x\n").expect("write");
+        assert!(git(repo_dir.path(), &["add", "-A"]));
+        assert!(git(repo_dir.path(), &["commit", "-q", "-m", "x"]));
+        assert!(git(repo_dir.path(), &["push", "-q", "-u", "company", "feat/x"]));
+
+        let path = path_str(repo_dir.path());
+        let feat = row_for(&path, "feat/x").await;
+        assert_eq!(
+            feat.upstream.as_deref(),
+            Some("company/feat/x"),
+            "upstream should track the company remote, not origin"
+        );
+        assert_eq!(feat.remote_state, RemoteState::Synced);
+        assert!(feat.has_remote);
+        assert!(!feat.needs_push && !feat.needs_pull);
+    }
+
+    #[tokio::test]
+    async fn remote_status_distinguishes_unpublished_from_no_remote() {
+        // A remote is configured, but this local branch was never pushed.
+        let repo_dir = tempfile::tempdir().expect("repo");
+        let remote_dir = tempfile::tempdir().expect("remote");
+        init_repo(repo_dir.path());
+        assert!(git(remote_dir.path(), &["init", "-q", "--bare", "r.git"]));
+        let bare = path_str(&remote_dir.path().join("r.git"));
+        assert!(git(repo_dir.path(), &["remote", "add", "origin", &bare]));
+        assert!(git(repo_dir.path(), &["checkout", "-q", "-b", "feat/local"]));
+        std::fs::write(repo_dir.path().join("l.txt"), "l\n").expect("write");
+        assert!(git(repo_dir.path(), &["add", "-A"]));
+        assert!(git(repo_dir.path(), &["commit", "-q", "-m", "l"]));
+
+        let local = row_for(&path_str(repo_dir.path()), "feat/local").await;
+        assert_eq!(local.remote_state, RemoteState::Unpublished);
+        assert!(local.needs_push, "unpublished branches belong in 'needs push'");
+        assert!(!local.has_remote);
+
+        // A repository with no remotes at all is `no_remote`, never `synced`.
+        let bare_dir = tempfile::tempdir().expect("bare");
+        init_repo(bare_dir.path());
+        let main = row_for(&path_str(bare_dir.path()), "main").await;
+        assert_eq!(main.remote_state, RemoteState::NoRemote);
+        assert!(!main.needs_push && !main.needs_pull);
     }
 }

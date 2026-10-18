@@ -10,15 +10,21 @@ import {
   RefreshCw,
   ArrowLeft,
   Download,
+  GitBranch,
 } from "lucide-react"
 import {
   getProject,
   updateProject,
+  updateProjectRepo,
   scanGitRepos,
   addProjectRepo,
   removeProjectRepo,
 } from "@/lib/platform/api"
-import type { ProjectDetail, GitRepoScanResult } from "@/lib/platform/types"
+import type {
+  ProjectDetail,
+  GitRepoScanResult,
+  ProjectRepoInfo,
+} from "@/lib/platform/types"
 import { KnowledgeManager } from "./knowledge-manager"
 import { usePlatform } from "@/contexts/platform-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
@@ -39,6 +45,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 
 /** Resolve task status label using i18n (same pattern as task-detail/kanban). */
 function resolveStatusLabel(t: (key: never) => string, status: string): string {
@@ -95,6 +108,15 @@ export function ProjectDetail({ id }: { id: number }) {
   )
   const [failedAddRepos, setFailedAddRepos] = useState<string[]>([])
   const [cloneOpen, setCloneOpen] = useState(false)
+
+  // Per-repo environment branch overrides (dev/uat/prd).
+  const [repoEnvEdit, setRepoEnvEdit] = useState<{
+    repo: ProjectRepoInfo
+    dev: string
+    uat: string
+    prd: string
+  } | null>(null)
+  const [savingRepoEnv, setSavingRepoEnv] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -160,6 +182,30 @@ export function ProjectDetail({ id }: { id: number }) {
     editPrdBranch,
     loadProjects,
   ])
+
+  const handleSaveRepoEnv = useCallback(async () => {
+    if (!repoEnvEdit) return
+    setSavingRepoEnv(true)
+    try {
+      const updated = await updateProjectRepo({
+        id: repoEnvEdit.repo.id,
+        devBranch: repoEnvEdit.dev.trim() || null,
+        uatBranch: repoEnvEdit.uat.trim() || null,
+        prdBranch: repoEnvEdit.prd.trim() || null,
+      })
+      setDetail(
+        (prev) =>
+          prev && {
+            ...prev,
+            repos: prev.repos.map((r) => (r.id === updated.id ? updated : r)),
+          }
+      )
+      setRepoEnvEdit(null)
+    } catch (e) {
+      console.error("Failed to save repo env branches:", e)
+    }
+    setSavingRepoEnv(false)
+  }, [repoEnvEdit, setRepoEnvEdit])
 
   const handleScan = useCallback(async () => {
     if (!detail) return
@@ -523,6 +569,24 @@ export function ProjectDetail({ id }: { id: number }) {
                           </span>
                         </div>
                       )}
+                      {(project.devBranch ||
+                        project.uatBranch ||
+                        project.prdBranch) && (
+                        <div className="flex flex-col gap-1">
+                          <span className="text-[0.75rem] text-muted-foreground">
+                            {t("project.envBranches")}
+                          </span>
+                          <span className="text-[0.875rem]">
+                            {[
+                              project.devBranch,
+                              project.uatBranch,
+                              project.prdBranch,
+                            ]
+                              .filter((b) => b && b.trim())
+                              .join(" / ")}
+                          </span>
+                        </div>
+                      )}
                     </>
                   )}
                 </CardContent>
@@ -605,10 +669,39 @@ export function ProjectDetail({ id }: { id: number }) {
                               CLAUDE.md
                             </Badge>
                           )}
+                          {(repo.devBranch ||
+                            repo.uatBranch ||
+                            repo.prdBranch) && (
+                            <Badge
+                              variant="outline"
+                              className="text-[0.625rem] shrink-0"
+                            >
+                              <GitBranch className="mr-1 h-3 w-3" />
+                              {[repo.devBranch, repo.uatBranch, repo.prdBranch]
+                                .filter((b) => b && b.trim())
+                                .join(" / ")}
+                            </Badge>
+                          )}
                           <Button
                             variant="ghost"
                             size="icon"
-                            className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive ml-auto"
+                            className="h-6 w-6 shrink-0 text-muted-foreground hover:text-foreground ml-auto"
+                            title={t("project.envBranches")}
+                            onClick={() =>
+                              setRepoEnvEdit({
+                                repo,
+                                dev: repo.devBranch ?? "",
+                                uat: repo.uatBranch ?? "",
+                                prd: repo.prdBranch ?? "",
+                              })
+                            }
+                          >
+                            <GitBranch className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive"
                             onClick={() => handleRemoveRepo(repo.id)}
                           >
                             <X className="h-3.5 w-3.5" />
@@ -702,6 +795,72 @@ export function ProjectDetail({ id }: { id: number }) {
           onSuccess={handleCloneSuccess}
         />
       )}
+      {/* Per-repo environment branch overrides */}
+      <Dialog
+        open={repoEnvEdit !== null}
+        onOpenChange={(o) => !o && setRepoEnvEdit(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {t("project.envBranches")}
+              {repoEnvEdit ? ` · ${repoEnvEdit.repo.name}` : ""}
+            </DialogTitle>
+          </DialogHeader>
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-1.5">
+              <Label>Dev</Label>
+              <Input
+                placeholder={t("project.envDevPlaceholder")}
+                value={repoEnvEdit?.dev ?? ""}
+                onChange={(e) =>
+                  setRepoEnvEdit((prev) =>
+                    prev ? { ...prev, dev: e.target.value } : prev
+                  )
+                }
+              />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label>UAT</Label>
+              <Input
+                placeholder={t("project.envUatPlaceholder")}
+                value={repoEnvEdit?.uat ?? ""}
+                onChange={(e) =>
+                  setRepoEnvEdit((prev) =>
+                    prev ? { ...prev, uat: e.target.value } : prev
+                  )
+                }
+              />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label>PRD</Label>
+              <Input
+                placeholder={t("project.envPrdPlaceholder")}
+                value={repoEnvEdit?.prd ?? ""}
+                onChange={(e) =>
+                  setRepoEnvEdit((prev) =>
+                    prev ? { ...prev, prd: e.target.value } : prev
+                  )
+                }
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRepoEnvEdit(null)}>
+              {t("project.cancel")}
+            </Button>
+            <Button
+              onClick={() => void handleSaveRepoEnv()}
+              disabled={savingRepoEnv}
+            >
+              {savingRepoEnv ? (
+                <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+              ) : null}
+              {t("project.save")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   )
 }

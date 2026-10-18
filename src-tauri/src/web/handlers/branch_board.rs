@@ -57,9 +57,15 @@ pub struct GitWorktreeRemoveTempParams {
 }
 
 pub async fn git_worktree_remove_temp(
+    Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<GitWorktreeRemoveTempParams>,
 ) -> Result<Json<serde_json::Value>, AppCommandError> {
-    branch_board_commands::git_worktree_remove_temp_core(params.path, params.worktree_path).await?;
+    branch_board_commands::git_worktree_remove_temp_core(
+        Some(&state.db),
+        params.path,
+        params.worktree_path,
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

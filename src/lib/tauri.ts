@@ -932,12 +932,14 @@ export async function gitDiff(path: string, file?: string): Promise<string> {
 export async function gitDiffWithBranch(
   path: string,
   branch: string,
-  file?: string
+  file?: string,
+  baseBranch?: string
 ): Promise<string> {
   return invoke("git_diff_with_branch", {
     path,
     branch,
     file: file ?? null,
+    baseBranch: baseBranch ?? null,
   })
 }
 

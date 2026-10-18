@@ -70,6 +70,20 @@ export interface GitRepoScanResult {
 
 export type EnvKey = "dev" | "uat" | "prd"
 
+/**
+ * Explicit relationship between a local branch and its remote counterpart(s).
+ * `unknown` is a real state (a failed/ambiguous probe) and must never be
+ * rendered as `synced`.
+ */
+export type RemoteState =
+  | "no_remote"
+  | "unpublished"
+  | "synced"
+  | "ahead"
+  | "behind"
+  | "diverged"
+  | "unknown"
+
 export interface EnvMergeStatus {
   env: EnvKey
   merged: boolean
@@ -89,6 +103,9 @@ export interface BranchRow {
   createdBy: string | null
   upstream: string | null
   hasRemote: boolean
+  remoteState: RemoteState
+  ahead: number
+  behind: number
   needsPush: boolean
   needsPull: boolean
   envs: EnvMergeStatus[]

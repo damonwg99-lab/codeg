@@ -412,13 +412,19 @@ pub struct GitDiffWithBranchParams {
     pub path: String,
     pub branch: String,
     pub file: Option<String>,
+    pub base_branch: Option<String>,
 }
 
 pub async fn git_diff_with_branch(
     Json(params): Json<GitDiffWithBranchParams>,
 ) -> Result<Json<String>, AppCommandError> {
-    let result =
-        folder_commands::git_diff_with_branch(params.path, params.branch, params.file).await?;
+    let result = folder_commands::git_diff_with_branch(
+        params.path,
+        params.branch,
+        params.file,
+        params.base_branch,
+    )
+    .await?;
     Ok(Json(result))
 }
 

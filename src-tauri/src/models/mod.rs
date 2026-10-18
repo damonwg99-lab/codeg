@@ -84,4 +84,4 @@ pub use platform_knowledge_doc::{
 pub mod platform_knowledge;
 pub use platform_knowledge::{KbInitResult, ScanResultInfo, ScannedDoc, SkillInfo};
 pub use platform_branch_state::BranchStateInfo;
-pub use branch_board::{BranchRow, EnvMergeStatus, RepoBranchMatrix};
+pub use branch_board::{BranchRow, EnvMergeStatus, RemoteState, RepoBranchMatrix};

@@ -49,41 +49,36 @@ pub async fn upsert<C: ConnectionTrait>(
     is_archived: Option<bool>,
     description: Option<Option<String>>,
 ) -> Result<BranchStateInfo, DbError> {
-    let existing = platform_branch_state::Entity::find()
-        .filter(platform_branch_state::Column::RepoId.eq(repo_id))
-        .filter(platform_branch_state::Column::Branch.eq(branch))
-        .one(conn)
-        .await?;
     let now = Utc::now();
-
-    match existing {
-        Some(m) => {
-            let mut a: platform_branch_state::ActiveModel = m.into();
-            if let Some(v) = is_archived {
-                a.is_archived = Set(v);
-                a.archived_at = Set(if v { Some(now) } else { None });
-            }
-            if let Some(v) = description {
-                a.description = Set(v);
-            }
-            a.updated_at = Set(now);
-            Ok(to_info(a.update(conn).await?))
-        }
-        None => {
-            let archived = is_archived.unwrap_or(false);
-            let a = platform_branch_state::ActiveModel {
-                repo_id: Set(repo_id),
-                branch: Set(branch.to_string()),
-                is_archived: Set(archived),
-                archived_at: Set(if archived { Some(now) } else { None }),
-                description: Set(description.flatten()),
-                created_at: Set(now),
-                updated_at: Set(now),
-                ..Default::default()
-            };
-            Ok(to_info(a.insert(conn).await?))
-        }
-    }
+    let archived = is_archived.unwrap_or(false);
+    let description = description.flatten();
+    let a = platform_branch_state::ActiveModel {
+        repo_id: Set(repo_id),
+        branch: Set(branch.to_string()),
+        is_archived: Set(archived),
+        archived_at: Set(if archived { Some(now) } else { None }),
+        description: Set(description.clone()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+    let inserted = platform_branch_state::Entity::insert(a)
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::columns([
+                platform_branch_state::Column::RepoId,
+                platform_branch_state::Column::Branch,
+            ])
+            .update_columns([
+                platform_branch_state::Column::IsArchived,
+                platform_branch_state::Column::ArchivedAt,
+                platform_branch_state::Column::Description,
+                platform_branch_state::Column::UpdatedAt,
+            ])
+            .to_owned(),
+        )
+        .exec_with_returning(conn)
+        .await?;
+    Ok(to_info(inserted))
 }
 
 /// Ensure a state row exists for `branch` and is archived. No-op when a row
