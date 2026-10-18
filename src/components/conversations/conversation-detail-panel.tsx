@@ -28,7 +28,12 @@ import { useAcpAgents } from "@/hooks/use-acp-agents"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions, useTabStore } from "@/contexts/tab-context"
-import { groupOfTab, isReparentUnmount } from "@/stores/tab-store"
+import {
+  groupOfTab,
+  isReparentUnmount,
+  reparentedViewRuntimeConversationId,
+  trackConversationView,
+} from "@/stores/tab-store"
 import { computeRects, leafIds } from "@/lib/tab-group-layout"
 import { useTaskContext } from "@/contexts/task-context"
 import { cn, copyTextToClipboard, randomUUID } from "@/lib/utils"
@@ -95,12 +100,16 @@ import {
   shouldQueueDirectSend,
   shouldRejectDuplicateCreate,
 } from "@/lib/queue-flush"
-import { TurnBusyError, isNoActiveTurnRejection } from "@/lib/turn-busy"
+import { TurnBusyError } from "@/lib/turn-busy"
+import { deliverQueuedSteer } from "@/lib/queued-steer"
 import { toErrorMessage } from "@/lib/app-error"
+import { notify } from "@/lib/notify"
 import {
+  claimRuntimeSession,
   getConversationIdByExternalIdFromStore,
   getRuntimeSession,
   getTimelineTurns,
+  releaseRuntimeSession,
   useConversationRuntimeActions,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
@@ -110,6 +119,7 @@ import {
   buildSteerPayload,
   extractUserImagesFromDraft,
   getPromptDraftDisplayText,
+  promptDraftTitleSeed,
 } from "@/lib/prompt-draft"
 import {
   type AgentType,
@@ -123,7 +133,6 @@ import {
   type QuestionAnswer,
   type UserMessageBlock,
 } from "@/lib/types"
-import { useRouter } from "next/navigation"
 import {
   lastUserPromptText,
   type SessionFailureAction,
@@ -300,7 +309,6 @@ const ConversationTabView = memo(function ConversationTabView({
     markOutOfTurnContent,
     refetchDetail,
     syncTurnMetadata,
-    removeConversation,
     setAcpLoadError,
     setDbConversationId,
     setExternalId,
@@ -315,9 +323,19 @@ const ConversationTabView = memo(function ConversationTabView({
 
   // Stable runtime session key — set once at mount, never changes.
   // For new conversations this is a virtual (negative) ID; for existing
-  // conversations opened from the sidebar it equals the real DB ID.
+  // conversations opened from the sidebar it equals the real DB ID. A view
+  // remounted by a reparent carries on with its predecessor's key, which for a
+  // tab that started as a draft is still the virtual one (see
+  // `reparentedViewRuntimeConversationId`).
   const [effectiveConversationId] = useState(
-    () => conversationId ?? buildVirtualConversationId(`draft-${tabId}`)
+    () =>
+      reparentedViewRuntimeConversationId(useTabStore.getState(), tabId) ??
+      conversationId ??
+      buildVirtualConversationId(`draft-${tabId}`)
+  )
+  useEffect(
+    () => trackConversationView(tabId, groupId, effectiveConversationId),
+    [tabId, groupId, effectiveConversationId]
   )
   const [createdConversationId, setCreatedConversationId] = useState<
     number | null
@@ -378,8 +396,10 @@ const ConversationTabView = memo(function ConversationTabView({
     setTabRuntimeConversationId,
   ])
 
-  // Clear pendingCleanup when tab is (re)opened
+  // Clear pendingCleanup when tab is (re)opened, and take the session back from
+  // a release the view just before this one scheduled on it.
   useEffect(() => {
+    claimRuntimeSession(effectiveConversationId)
     setPendingCleanup(effectiveConversationId, false)
   }, [effectiveConversationId, setPendingCleanup])
 
@@ -638,6 +658,7 @@ const ConversationTabView = memo(function ConversationTabView({
     dequeue: mqDequeue,
     remove: mqRemove,
     reorder: mqReorder,
+    moveToFront: mqMoveToFront,
     updateItem: mqUpdateItem,
     editingItemId: mqEditingItemId,
     startEditing: mqStartEditing,
@@ -884,7 +905,7 @@ const ConversationTabView = memo(function ConversationTabView({
   // rekey path: close+reopen mid-turn, where detail.turns may already hold user
   // turns that would otherwise drop the live assistant stream). Turn-end clearing
   // is owned by COMPLETE_TURN (nulls liveMessage); unmount clearing by
-  // removeConversation. `tabId` is the connection contextKey.
+  // releaseRuntimeSession. `tabId` is the connection contextKey.
   useEffect(() => {
     return acpActions.registerLiveMessageSink(tabId, (liveMessage, isLive) =>
       setLiveMessage(effectiveConversationId, liveMessage, isLive)
@@ -1026,21 +1047,43 @@ const ConversationTabView = memo(function ConversationTabView({
     mountedRef.current = true
     return () => {
       mountedRef.current = false
+      if (isReparentUnmount(useTabStore.getState(), tabId, groupId)) {
+        // Dragging the tab into another group reparents this view: React
+        // remounts it under that group's shell while the tab stays open. The
+        // connection is already held across that unmount (see
+        // `isTransientUnmount` above) and the runtime session has to be held
+        // with it — it holds the transcript. Dropping it emptied the message
+        // list and nothing brought it back: the remounted view re-registers
+        // its live-message sink on the connection it just kept, which recreates
+        // the session with a `liveMessage` and no `detail`, and `fetchDetail`
+        // skips a session that already has live data. Header, title and
+        // composer all read the tab row, so they looked untouched while the
+        // transcript stayed blank until the tab was closed and reopened.
+        //
+        // The post-turn metadata sync is left running for the same reason: it
+        // patches the session, not this view, and short of reopening the
+        // conversation it is the only thing that lands a live reply's usage,
+        // model and fork-point name. Cancelling it here lost them whenever the
+        // drag came within its retry window of a reply finishing.
+        return
+      }
       syncCancelRef.current?.()
       if (connStatusRef.current === "prompting" && !isViewerRef.current) {
         // Owner, agent still responding — keep the session for deferred cleanup
         // (the background turn_complete handler removes it once done).
         setPendingCleanup(effectiveConversationId, true)
       } else {
-        // Idle owner, or a VIEWER (any status): remove immediately. A viewer's
-        // unmount detaches its attach subscription, so no turn_complete will
-        // arrive to resolve a deferred cleanup — deferring would leak the
-        // runtime session (especially in web mode, which has no event firehose
-        // after detach).
-        removeConversation(effectiveConversationId)
+        // Idle owner, or a VIEWER (any status): remove now rather than on a
+        // turn_complete. A viewer's unmount detaches its attach subscription,
+        // so no turn_complete will arrive to resolve a deferred cleanup —
+        // waiting for one would leak the runtime session (especially in web
+        // mode, which has no event firehose after detach). "Now" is the end of
+        // this task, so a view mounting straight back onto the session can
+        // still claim it (see `releaseRuntimeSession`).
+        releaseRuntimeSession(effectiveConversationId)
       }
     }
-  }, [effectiveConversationId, removeConversation, setPendingCleanup])
+  }, [effectiveConversationId, groupId, setPendingCleanup, tabId])
 
   const handleSend = useCallback(
     (
@@ -1174,10 +1217,7 @@ const ConversationTabView = memo(function ConversationTabView({
       // depends on the flush-on-connect queue to deliver its first prompt.
       if (createConversationPendingRef.current) return
       createConversationPendingRef.current = true
-      const title = getPromptDraftDisplayText(
-        draft,
-        sharedT("attachedResources")
-      ).slice(0, 80)
+      const title = promptDraftTitleSeed(draft, sharedT("attachedResources"))
       const chatSend = sendOwnTab?.isChat === true
       const chatExistingDir = sendOwnTab?.workingDir
 
@@ -1403,18 +1443,21 @@ const ConversationTabView = memo(function ConversationTabView({
       } catch (err) {
         // A turn in flight is transient here, not a failure to report as one —
         // there is no draft to re-queue, so say so and let the user retry.
-        toast.error(
-          err instanceof TurnBusyError
-            ? t("forkSessionBusy")
-            : t("forkSessionFailed", {
-                error:
-                  err instanceof Error
-                    ? err.message
-                    : typeof err === "object" && err !== null
-                      ? JSON.stringify(err)
-                      : String(err),
-              })
-        )
+        notify({
+          level: "error",
+          key: `fork-failed:${connectionId}`,
+          title:
+            err instanceof TurnBusyError
+              ? t("forkSessionBusy")
+              : t("forkSessionFailed", {
+                  error:
+                    err instanceof Error
+                      ? err.message
+                      : typeof err === "object" && err !== null
+                        ? JSON.stringify(err)
+                        : String(err),
+                }),
+        })
       }
     },
     [
@@ -1438,14 +1481,22 @@ const ConversationTabView = memo(function ConversationTabView({
       if (!connectionId) return false
       try {
         const stopped = await acpStopAsyncTask(connectionId, taskId)
-        if (!stopped) toast.warning(tAsyncTasks("stopDeclined"))
+        if (!stopped) {
+          notify({
+            level: "warning",
+            key: `async-task-stop:${connectionId}:${taskId}`,
+            title: tAsyncTasks("stopDeclined"),
+          })
+        }
         return stopped
       } catch (err) {
-        toast.error(
-          tAsyncTasks("stopFailed", {
+        notify({
+          level: "error",
+          key: `async-task-stop:${connectionId}:${taskId}`,
+          title: tAsyncTasks("stopFailed", {
             error: err instanceof Error ? err.message : String(err),
-          })
-        )
+          }),
+        })
         return false
       }
     },
@@ -1957,13 +2008,15 @@ const ConversationTabView = memo(function ConversationTabView({
     goalActions,
   ])
 
-  // AIR session-failure strip actions. `retry` re-submits the LAST user
-  // prompt through the message queue — same mechanism as the live-feedback
-  // resend fallback: enqueue survives the turn-end status race and flushes as
-  // soon as the connection can take a prompt, so the retry is never silently
-  // dropped. `login` lands on the agents settings page (auth lives there);
-  // `new_session` reuses the load-error banner's fresh-draft path.
-  const router = useRouter()
+  // AIR session-failure recovery actions — the buttons on a failed turn's
+  // notification (the provider raises it; this view answers it). `retry`
+  // re-submits the LAST user prompt through the message queue — same
+  // mechanism as the live-feedback resend fallback: enqueue survives the
+  // turn-end status race and flushes as soon as the connection can take a
+  // prompt, so the retry is never silently dropped. `login` opens the settings
+  // window on this agent's page (auth lives there) — a `router.push` would
+  // swap the workspace itself for the settings route; `new_session` reuses
+  // the load-error banner's fresh-draft path.
   const tSessionFailure = useTranslations("Folder.chat.sessionFailure")
   const detailTurns = detail?.turns
   const handleSessionFailureAction = useCallback(
@@ -1994,7 +2047,7 @@ const ConversationTabView = memo(function ConversationTabView({
           break
         }
         case "login":
-          router.push("/settings/agents")
+          handleOpenAgentsSettings()
           break
         case "new_session":
           handleOpenNewSession()
@@ -2006,11 +2059,23 @@ const ConversationTabView = memo(function ConversationTabView({
       detailTurns,
       mqEnqueue,
       selectedModeId,
-      router,
+      handleOpenAgentsSettings,
       handleOpenNewSession,
       tSessionFailure,
     ]
   )
+  // Offered to this session's failure notifications while the view is
+  // mounted (see `AcpActionsValue.registerSessionFailureActions`). Owners of a
+  // live connection only — mirrors the goal-control gate: a viewer watches the
+  // session, and recovering it is the owner's call.
+  const canRecoverSession = conn.connectionId !== null && !conn.isViewer
+  useEffect(() => {
+    if (!canRecoverSession) return
+    return acpActions.registerSessionFailureActions(
+      tabId,
+      handleSessionFailureAction
+    )
+  }, [acpActions, canRecoverSession, handleSessionFailureAction, tabId])
 
   // Closing a strip is client-local (it only resolves the record in this
   // client's projection), so unlike the recovery actions it is offered to
@@ -2131,9 +2196,8 @@ const ConversationTabView = memo(function ConversationTabView({
   // over the same live-feedback channel the composer's mid-turn dropdown uses.
   // The block/text encoding is the shared `buildSteerPayload` — one call site,
   // no policy here beyond the row's own lifecycle: success removes the row;
-  // the turn-end race leaves it queued so the auto-flush sends it with the
-  // next turn — never lost. Any other failure keeps the row untouched and
-  // surfaces the error.
+  // a turn-end race prioritizes the row for the existing queue auto-flush.
+  // Failures keep the row available for retry.
   const handleQueueSteer = useCallback(
     async (id: string) => {
       const item = msgQueue.find((m) => m.id === id)
@@ -2148,23 +2212,36 @@ const ConversationTabView = memo(function ConversationTabView({
       // when the turn-end edge lands mid-round-trip.
       setQueueSteerInFlight(true)
       try {
-        await feedbackSteer(payload.text, payload.blocks)
-        mqRemove(id)
-      } catch (err: unknown) {
-        if (isNoActiveTurnRejection(err)) {
-          // The turn ended mid-click — the queue flush will deliver it.
-          toast.info(tCmp("steerQueuedInstead"))
-          return
-        }
-        toast.error(
-          tCmp(feedback.channel === "pull" ? "steerNoteFailed" : "steerFailed"),
-          { description: toErrorMessage(err) }
+        const delivered = await deliverQueuedSteer(
+          () => feedbackSteer(payload.text, payload.blocks),
+          () => mqMoveToFront(id)
         )
+        // Not delivered means the turn ended first, so the row goes out as the
+        // next turn instead; say so, as the composer's steer does.
+        if (delivered) mqRemove(id)
+        else toast.info(tCmp("steerQueuedInstead"))
+      } catch (err: unknown) {
+        notify({
+          level: "error",
+          key: `steer-failed:${tabId}`,
+          title: tCmp(
+            feedback.channel === "pull" ? "steerNoteFailed" : "steerFailed"
+          ),
+          description: toErrorMessage(err),
+        })
       } finally {
         setQueueSteerInFlight(false)
       }
     },
-    [msgQueue, feedbackSteer, mqRemove, feedback.channel, tCmp]
+    [
+      msgQueue,
+      feedbackSteer,
+      mqRemove,
+      feedback.channel,
+      tabId,
+      tCmp,
+      mqMoveToFront,
+    ]
   )
 
   return (
@@ -2184,16 +2261,8 @@ const ConversationTabView = memo(function ConversationTabView({
       promptCapabilities={conn.promptCapabilities}
       defaultPath={workingDirForConnection}
       agentName={getAgentLabel(selectedAgent)}
-      error={conn.error}
       claudeApiRetry={conn.claudeApiRetry}
       sessionFailures={conn.sessionFailures}
-      onSessionFailureAction={
-        // Owners of a live connection only — mirrors the goal-control gate:
-        // viewers must see the strips but not drive recovery.
-        conn.connectionId !== null && !conn.isViewer
-          ? handleSessionFailureAction
-          : undefined
-      }
       onSessionFailureDismiss={handleSessionFailureDismiss}
       asyncTasks={conn.asyncTasks}
       onStopAsyncTask={

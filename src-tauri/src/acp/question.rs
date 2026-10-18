@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sacp::schema::{
+use agent_client_protocol::schema::v1::{
     CreateElicitationRequest, CreateElicitationResponse, ElicitationAcceptAction, ElicitationAction,
     ElicitationContentValue, ElicitationMode, ElicitationPropertySchema, ElicitationScope,
     MultiSelectItems, StringPropertySchema,
@@ -447,7 +447,7 @@ pub fn build_outcome(questions: &[QuestionSpec], answer: &QuestionAnswer) -> Que
 /// question text. Synthesize one from the leading characters, bounded to
 /// [`MAX_HEADER_CHARS`]. Always returns a non-empty, in-bounds string so
 /// [`validate_specs`] accepts it.
-fn synthesize_header(question: &str) -> String {
+pub(crate) fn synthesize_header(question: &str) -> String {
     let header: String = question.trim().chars().take(MAX_HEADER_CHARS).collect();
     let header = header.trim();
     if header.is_empty() {
@@ -798,7 +798,7 @@ fn multi_select_choices(items: &MultiSelectItems) -> Vec<ElicitationChoice> {
                 value: o.value.clone(),
             })
             .collect(),
-        MultiSelectItems::Untitled(u) => u
+        MultiSelectItems::String(u) => u
             .values
             .iter()
             .map(|v| ElicitationChoice {
@@ -1008,7 +1008,8 @@ impl ElicitationPeer {
 /// stamps it on every `request_user_input` field (question properties carry
 /// `isOther`/`isSecret`, companions carry `questionId` plus the role marker),
 /// and on nothing else — a generic MCP server's form has no `codex` namespace.
-/// The typed sacp property structs drop `_meta`, so this reads the raw JSON.
+/// The typed schema property structs carry no `_meta`, so this reads the raw
+/// JSON.
 fn codex_property_meta<'a>(raw: &'a Value, id: &str) -> Option<&'a Value> {
     raw.get("requestedSchema")?
         .get("properties")?
@@ -1077,8 +1078,15 @@ fn codex_form_shape(raw: &Value, peer: ElicitationPeer) -> Option<CodexUserInput
     )
 }
 
-/// The synthetic choice codex-acp ≥1.12.0 appends to an `isOther` question's
-/// `oneOf`, verbatim — label and description both.
+/// The synthetic choice codex-acp 1.12.0–2.0.x appends to an `isOther`
+/// question's `oneOf`, verbatim — label and description both.
+///
+/// codex-acp 2.1.0 (#570) stopped appending it for AIR clients — and codeg is
+/// one, by advertising `_meta.jetbrains.air` at all — in favour of the
+/// AIR custom answer (see [`build_elicitation_response`]). So against the pin
+/// this filter never fires; it stays for the older adapters a custom pin or a
+/// PATH install can still launch, which keep injecting the option for every
+/// client.
 ///
 /// codeg's card already offers a free-text "Other" input on every question and
 /// writes it to the MAIN field, while the note field this option points at is
@@ -1163,17 +1171,42 @@ fn is_codex_synthetic_other_choice(raw: &Value, id: &str, label: &str, value: &s
 /// marker means codeg keeps collapsing the companion into the card's built-in
 /// "Other" input no matter which adapter produced the form.
 ///
-/// Like [`is_secret_property`], this reads the raw JSON: the typed sacp
-/// property structs drop `_meta`.
+/// claude-agent-acp 0.82.0 moved the marker to
+/// `_meta.jetbrains.air.customAnswer` (same value) and sends the old key to no
+/// client, so both spellings are read.
+///
+/// codex-acp 2.1.0 (#570) marks its `request_user_input` note field with the
+/// same AIR key but a different value: a bare `true` rather than claude's
+/// `{questionId, isCustomAnswer: true}` (both adapters' `docs/air-extensions.md`
+/// say so). 2.1.1 (#577) adds the old root key with that same bare `true`,
+/// because released AIR builds read only the old key. Either value is read
+/// under either key. A codex peer's note field is already skipped by its
+/// `_meta.codex.role`; reading the marker too means the companion is
+/// recognised by the shared AIR key alone, whoever sends it.
+///
+/// Like [`is_secret_property`], this reads the raw JSON: the typed schema
+/// property structs carry no `_meta`.
 fn is_custom_answer_property(raw: &Value, id: &str) -> bool {
-    raw.get("requestedSchema")
+    let Some(meta) = raw
+        .get("requestedSchema")
         .and_then(|s| s.get("properties"))
         .and_then(|p| p.get(id))
         .and_then(|prop| prop.get("_meta"))
-        .and_then(|m| m.get("_askUserQuestionCustomAnswer"))
-        .and_then(|c| c.get("isCustomAnswer"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let is_marked = |marker: &Value| match marker {
+        Value::Bool(marked) => *marked,
+        marker => marker
+            .get("isCustomAnswer")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    };
+    meta.get("_askUserQuestionCustomAnswer")
+        .is_some_and(is_marked)
+        || crate::acp::air_contract::air_meta_value(Some(meta), "customAnswer")
+            .is_some_and(is_marked)
 }
 
 /// True when the request is codex's MCP tool-call approval elicitation. The
@@ -1184,17 +1217,6 @@ fn is_mcp_tool_call_approval(raw: &Value) -> bool {
         .and_then(|m| m.get("codex_approval_kind"))
         .and_then(Value::as_str)
         == Some("mcp_tool_call")
-}
-
-/// Codex's auto-resolution timeout for a `request_user_input` elicitation
-/// (`_meta.codex.autoResolutionMs`). When set, codex-acp races the elicitation
-/// against this timer and answers `{answers: {}}` itself on expiry — the
-/// connection handler mirrors it to reap the by-then-pointless card.
-pub fn elicitation_auto_resolution_ms(raw: &Value) -> Option<u64> {
-    raw.get("_meta")?
-        .get("codex")?
-        .get("autoResolutionMs")?
-        .as_u64()
 }
 
 /// Classify a form `elicitation/create` request (the raw JSON params) into its
@@ -1299,7 +1321,7 @@ fn decline_approval_option() -> ElicitationApprovalOption {
 /// Allow/Decline. Mirrors codex-acp's own `request_permission` fallback
 /// (`buildToolApprovalOptions`) so approvals look identical either way.
 fn approval_from_form(
-    form: &sacp::schema::ElicitationFormMode,
+    form: &agent_client_protocol::schema::v1::ElicitationFormMode,
     message: String,
     tool_call_id: Option<String>,
 ) -> ElicitationApproval {
@@ -1359,8 +1381,8 @@ fn approval_from_form(
 }
 
 /// True when the raw schema property carries codex's secret marker
-/// (`_meta.codex.isSecret`). The typed sacp property structs drop `_meta`, so
-/// this reads the raw JSON alongside them.
+/// (`_meta.codex.isSecret`). The typed schema property structs carry no
+/// `_meta`, so this reads the raw JSON alongside them.
 fn is_secret_property(raw: &Value, id: &str) -> bool {
     raw.get("requestedSchema")
         .and_then(|s| s.get("properties"))
@@ -1378,7 +1400,7 @@ fn is_secret_property(raw: &Value, id: &str) -> bool {
 /// always-present "Other" input) — including plain strings, numbers, integers,
 /// and choice fields whose options were all empty/duplicate.
 fn parse_form_questions(
-    form: &sacp::schema::ElicitationFormMode,
+    form: &agent_client_protocol::schema::v1::ElicitationFormMode,
     raw: &Value,
     peer: ElicitationPeer,
 ) -> ElicitationQuestions {
@@ -1564,7 +1586,14 @@ fn parse_bool_answer(v: &str) -> Option<bool> {
 /// Every value is written under the MAIN field id, including a free-text
 /// "Other": the companion property skipped by [`is_custom_answer_property`] /
 /// [`is_other_companion`] is never written back. That is correct for codex,
-/// which falls back to the main field. If codeg ever advertises
+/// which falls back to the main field — and from codex-acp 2.1.0 (#570) it is
+/// the documented AIR contract: a choice field's string that matches none of
+/// an `isOther` question's options is the user's own answer, which the adapter
+/// hands codex in codex's own "Other" encoding,
+/// `["None of the above", "user_note: <text>"]` (≤2.0.x passed the text through
+/// as the answer itself). The reloaded rollout therefore carries that pair, and
+/// the frontend's `parseCodexAnswers` decodes it back to the text the user
+/// typed, so the live card and the reloaded one agree. If codeg ever advertises
 /// `elicitation.form` to an agent that requires the answer under the companion
 /// key instead (claude-agent-acp reads `question_<n>_custom` separately), this
 /// has to route the free-text answer there using the marker's `questionId`.
@@ -2396,6 +2425,185 @@ mod tests {
         );
     }
 
+    /// The `request_user_input` form codex-acp 2.1.1 sends codeg, verbatim but
+    /// for the two ids: recorded live over stdio with codeg's exact
+    /// `clientCapabilities`, a plan-mode turn whose model calls
+    /// `request_user_input` (it matches upstream's
+    /// `elicitation-user-input-air-custom-answer.json`). 2.1.0's recording
+    /// lacks only the note field's root `_askUserQuestionCustomAnswer: true`.
+    /// 2.0.1's lacks that and the note field's `jetbrains` block too, and its
+    /// `next_step` `oneOf` carries a third, synthetic "None of the above"
+    /// entry.
+    #[test]
+    fn classify_elicitation_reads_codex_211_air_custom_answer_form() {
+        let raw = json!({
+            "sessionId": "test-session-id",
+            "toolCallId": "request-user-input-1",
+            "mode": "form",
+            "message": "Codex needs your input to continue.",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "next_step": {
+                        "title": "What should I do next?",
+                        "description": "Next step",
+                        "_meta": {"codex": {"isOther": true, "isSecret": false}},
+                        "type": "string",
+                        "oneOf": [
+                            {"const": "Run tests", "title": "Run tests",
+                             "description": "Run the focused test suite."},
+                            {"const": "Stop", "title": "Stop",
+                             "description": "Stop and report current status."}
+                        ]
+                    },
+                    "next_step_note": {
+                        "type": "string",
+                        "title": "Additional answer or note",
+                        "_meta": {
+                            "codex": {"questionId": "next_step", "role": "user_note", "isSecret": false},
+                            "_askUserQuestionCustomAnswer": true,
+                            "jetbrains": {"air": {"version": 1, "customAnswer": true}}
+                        }
+                    }
+                },
+                "required": ["next_step"]
+            },
+            "_meta": {"codex": {"autoResolutionMs": null}}
+        });
+        let q = expect_questions(
+            classify_elicitation(
+                &raw,
+                ElicitationPeer::Codex(Some(CodexUserInputShape::QuestionInTitle)),
+            )
+            .unwrap(),
+        );
+        assert_eq!(q.specs.len(), 1, "the note field is the card's own Other");
+        assert_eq!(q.specs[0].id, "next_step");
+        assert_eq!(q.specs[0].question, "What should I do next?");
+        assert_eq!(q.specs[0].header, "Next step");
+        let labels: Vec<_> = q.specs[0]
+            .options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect();
+        assert_eq!(labels, ["Run tests", "Stop"]);
+        assert_eq!(q.tool_call_id.as_deref(), Some("request-user-input-1"));
+
+        // What codeg writes back, and (recorded in the same live run, off the
+        // tool output the model then received) what codex is handed for it:
+        //   pick "Run tests"          → content.next_step = "Run tests"
+        //                               → codex ["Run tests"]
+        //   type "Inspect flaky logs" → content.next_step = "Inspect flaky logs"
+        //                               → codex ["None of the above",
+        //                                        "user_note: Inspect flaky logs"]
+        // The typed text goes to the MAIN field and nothing to the note field:
+        // that main-field string is what 2.1.0+ reads as the AIR custom answer.
+        for (picked, expected) in [
+            ("Run tests", "Run tests"),
+            ("Inspect flaky logs", "Inspect flaky logs"),
+        ] {
+            let answer = QuestionAnswer {
+                answers: vec![QuestionAnswerItem {
+                    question_id: "next_step".into(),
+                    labels: vec![picked.into()],
+                }],
+                declined: false,
+            };
+            let outcome = build_outcome(&q.specs, &answer);
+            let v = serde_json::to_value(build_elicitation_response(&q, &outcome)).unwrap();
+            assert_eq!(v["action"], "accept");
+            assert_eq!(v["content"], json!({"next_step": expected}));
+        }
+    }
+
+    /// The AIR `customAnswer` key carries a different value per adapter: codex
+    /// 2.1.0 writes a bare `true`, claude 0.82+ `{questionId, isCustomAnswer:
+    /// true}`. Either marks the companion. Asserted under a NON-codex peer,
+    /// where the marker is the only thing that can skip a field (a codex peer's
+    /// note field would already be skipped by its `_meta.codex.role`).
+    #[test]
+    fn classify_elicitation_reads_both_air_custom_answer_values() {
+        let raw = elicitation_raw(
+            json!({
+                "q1": {"type": "string", "title": "Pick one", "enum": ["a", "b"]},
+                "codex_style": {
+                    "type": "string",
+                    "title": "Additional answer or note",
+                    "_meta": {"jetbrains": {"air": {"version": 1, "customAnswer": true}}}
+                },
+                "claude_style": {
+                    "type": "string",
+                    "title": "Other",
+                    "_meta": {"jetbrains": {"air": {
+                        "version": 1,
+                        "customAnswer": {"questionId": "q1", "isCustomAnswer": true}
+                    }}}
+                },
+                "bool_false": {
+                    "type": "string",
+                    "title": "Kept 1",
+                    "_meta": {"jetbrains": {"air": {"version": 1, "customAnswer": false}}}
+                },
+                "object_false": {
+                    "type": "string",
+                    "title": "Kept 2",
+                    "_meta": {"jetbrains": {"air": {
+                        "version": 1,
+                        "customAnswer": {"questionId": "q1", "isCustomAnswer": false}
+                    }}}
+                },
+                "string_true": {
+                    "type": "string",
+                    "title": "Kept 3",
+                    "_meta": {"jetbrains": {"air": {"version": 1, "customAnswer": "true"}}}
+                }
+            }),
+            json!(["q1"]),
+        );
+        let q = expect_questions(classify_elicitation(&raw, ElicitationPeer::Other).unwrap());
+        let ids: Vec<&str> = q.specs.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["bool_false", "object_false", "q1", "string_true"],
+            "a bare `true` or `isCustomAnswer: true` skips; nothing else does"
+        );
+    }
+
+    /// codex-acp 2.1.1 (#577) also writes its bare `true` under the old root
+    /// key, the one claude's marker used before it moved under AIR. Read on its
+    /// own (a non-codex peer, no AIR key), it skips the companion like the
+    /// object form always did; `false` does not.
+    #[test]
+    fn classify_elicitation_reads_a_bare_true_under_the_legacy_key() {
+        let raw = elicitation_raw(
+            json!({
+                "q1": {"type": "string", "title": "Pick one", "enum": ["a", "b"]},
+                "bare_true": {
+                    "type": "string",
+                    "title": "Additional answer or note",
+                    "_meta": {"_askUserQuestionCustomAnswer": true}
+                },
+                "object_true": {
+                    "type": "string",
+                    "title": "Other",
+                    "_meta": {"_askUserQuestionCustomAnswer": {
+                        "questionId": "q1",
+                        "isCustomAnswer": true
+                    }}
+                },
+                "bare_false": {
+                    "type": "string",
+                    "title": "Kept",
+                    "_meta": {"_askUserQuestionCustomAnswer": false}
+                }
+            }),
+            json!(["q1"]),
+        );
+        let q = expect_questions(classify_elicitation(&raw, ElicitationPeer::Other).unwrap());
+        let ids: Vec<&str> = q.specs.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["bare_false", "q1"]);
+    }
+
     #[test]
     fn classify_elicitation_multi_select_marks_multi_and_maps_values() {
         let raw = elicitation_raw(
@@ -2648,16 +2856,6 @@ mod tests {
         assert_eq!(v["action"], "decline");
         let v = serde_json::to_value(elicitation_cancel_response()).unwrap();
         assert_eq!(v["action"], "cancel");
-    }
-
-    #[test]
-    fn elicitation_auto_resolution_ms_reads_codex_meta() {
-        let mut raw = elicitation_raw(json!({}), json!([]));
-        assert_eq!(elicitation_auto_resolution_ms(&raw), None);
-        raw["_meta"] = json!({"codex": {"autoResolutionMs": 30000}});
-        assert_eq!(elicitation_auto_resolution_ms(&raw), Some(30000));
-        raw["_meta"] = json!({"codex": {"autoResolutionMs": null}});
-        assert_eq!(elicitation_auto_resolution_ms(&raw), None);
     }
 
     #[test]
