@@ -698,9 +698,10 @@ export async function gitHasMergeHead(path: string): Promise<boolean> {
 
 export async function gitFetch(
   path: string,
-  credentials?: GitCredentials | null
+  credentials?: GitCredentials | null,
+  prune = false
 ): Promise<string> {
-  return invoke("git_fetch", { path, credentials: credentials ?? null })
+  return invoke("git_fetch", { path, credentials: credentials ?? null, prune })
 }
 
 export async function gitPushInfo(path: string): Promise<GitPushInfo> {

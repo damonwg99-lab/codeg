@@ -117,6 +117,11 @@ export interface RepoBranchMatrix {
   envs: EnvKey[]
   branches: BranchRow[]
   /**
+   * RFC 3339 timestamp of the repo's last fetch, from git's `FETCH_HEAD`.
+   * `null` when it has never been fetched — the remote column may be stale.
+   */
+  lastFetchAt: string | null
+  /**
    * Why this repo could not be scanned, with `branches` left empty. A project
    * may contain repos the current developer has not cloned, so these are
    * reported per repo instead of failing the whole matrix.

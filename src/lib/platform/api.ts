@@ -165,13 +165,20 @@ export async function removeProjectRepo(id: number): Promise<void> {
 
 // ─── Branch Board ───
 
+/**
+ * Branch matrix for a project. `fetch` runs `git fetch --prune` first, so
+ * branches deleted on the remote stop reporting as synced; it degrades to the
+ * offline view when the remote is unreachable.
+ */
 export async function getProjectBranchMatrix(
   projectId: number,
-  force = false
+  force = false,
+  fetch = false
 ): Promise<RepoBranchMatrix[]> {
   return getTransport().call<RepoBranchMatrix[]>("git_project_branch_matrix", {
     projectId,
     force,
+    fetch,
   })
 }
 
@@ -786,4 +793,3 @@ function getUploadBaseUrl(): string {
 }
 
 // ─── (release/branch API removed with the legacy release feature) ───
-

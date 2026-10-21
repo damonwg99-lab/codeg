@@ -2462,11 +2462,13 @@ export async function gitHasMergeHead(path: string): Promise<boolean> {
 
 export async function gitFetch(
   path: string,
-  credentials?: GitCredentials | null
+  credentials?: GitCredentials | null,
+  prune = false
 ): Promise<string> {
   return getTransport().call("git_fetch", {
     path,
     credentials: credentials ?? null,
+    prune,
   })
 }
 

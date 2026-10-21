@@ -1668,9 +1668,13 @@ pub(crate) async fn git_fetch_core(
     credentials: Option<&GitCredentials>,
     db: &AppDatabase,
     data_dir: &std::path::Path,
+    prune: bool,
 ) -> Result<String, AppCommandError> {
     let mut cmd = crate::process::tokio_command("git");
     cmd.args(["fetch", "--all"]).current_dir(path);
+    if prune {
+        cmd.arg("--prune");
+    }
     prepare_remote_git_cmd(&mut cmd, path, credentials, db, data_dir).await;
 
     let output = cmd.output().await.map_err(AppCommandError::io)?;
@@ -1688,6 +1692,7 @@ pub async fn git_fetch(
     credentials: Option<GitCredentials>,
     db: tauri::State<'_, AppDatabase>,
     app_handle: tauri::AppHandle,
+    prune: Option<bool>,
 ) -> Result<String, AppCommandError> {
     let data_dir = app_handle.path().app_data_dir().map_err(|e| {
         AppCommandError::external_command("Failed to resolve app data dir", e.to_string())
@@ -1696,7 +1701,14 @@ pub async fn git_fetch(
     // `CODEG_DATA_DIR` reaches the git credential helper invoked by
     // this subprocess.
     let data_dir = crate::paths::resolve_effective_data_dir(&data_dir);
-    git_fetch_core(&path, credentials.as_ref(), &db, &data_dir).await
+    git_fetch_core(
+        &path,
+        credentials.as_ref(),
+        &db,
+        &data_dir,
+        prune.unwrap_or(false),
+    )
+    .await
 }
 
 /// Read a single git config value, or `None` when unset/empty.

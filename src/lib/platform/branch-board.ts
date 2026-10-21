@@ -145,6 +145,26 @@ export function canMerge(entries: GitStatusEntry[]): {
   return { ok: dirtyPaths.length === 0, dirtyPaths }
 }
 
+/**
+ * Whether `path` is one of codeg's leftover merge worktrees (`.codeg-wt-*`).
+ * Merges used to create such a worktree silently and delete it on success —
+ * but a leftover one keeps the environment branch checked out, so every new
+ * merge into that environment is dirty-gated with no visible way out. We only
+ * match the directory NAME, so a user's own worktree named like the repo is
+ * never offered for cleanup.
+ */
+export function isResidualTempWorktreePath(
+  path: string | null | undefined
+): boolean {
+  if (!path) return false
+  const base =
+    path
+      .replace(/[\\/]+$/, "")
+      .split(/[\\/]/)
+      .pop() ?? ""
+  return base.startsWith(".codeg-wt-")
+}
+
 export type CellKind = "env" | "unconfigured" | "unmerged" | "merged"
 
 export interface CellState {
@@ -167,6 +187,10 @@ export interface EnvCellLabels {
  * drift apart (they previously each rebuilt the same ternary chain and had
  * already diverged on how a merged-with-date cell reads).
  *
+ * A fast-forward merge reads like any other merge: the user's question is
+ * "did it land, and when", not "how". The how (a fast-forward leaves no merge
+ * commit) is offered as a hover hint instead — see [`envCellTooltip`].
+ *
  * `compact` drops the "merged" word when a date is available, for the narrow
  * table column where the date alone carries the meaning.
  */
@@ -179,11 +203,19 @@ export function envCellLabel(
   if (cell.kind === "unconfigured") return labels.notConfigured
   if (cell.kind === "unmerged") return labels.unmerged
   const date = cell.mergeDate ? cell.mergeDate.slice(0, 10) : null
-  if (cell.mergeVia === "fast_forward") {
-    return date ? `${labels.fastForward} ${date}` : labels.fastForward
-  }
   if (!date) return labels.merged
   return compact ? date : `${labels.merged} · ${date}`
+}
+
+/**
+ * Hover hint for a cell, for the nuance the label no longer carries: a
+ * fast-forward merge means no merge commit exists in the environment history.
+ */
+export function envCellTooltip(
+  cell: CellState,
+  labels: EnvCellLabels
+): string | undefined {
+  return cell.mergeVia === "fast_forward" ? labels.fastForward : undefined
 }
 
 /**

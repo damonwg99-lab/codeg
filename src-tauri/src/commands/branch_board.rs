@@ -22,7 +22,10 @@ const REPO_CONCURRENCY: usize = 6;
 /// an upgrade an unchanged repo would keep serving rows computed by the OLD
 /// logic (wrong merge status, wrong creator, ...) until some ref happened to
 /// move or the user pressed refresh. Mixing this into the key retires them.
-const MATRIX_CACHE_VERSION: u32 = 2;
+// Bumped to 3: merge_info now dates fast-forward merges (reflog / tip commit),
+// so cached rows computed with None dates would keep rendering a dateless
+// "merged" cell until the next ref change.
+const MATRIX_CACHE_VERSION: u32 = 3;
 
 /// Max branches probed concurrently *within* one repo. Multiplies with
 /// [`REPO_CONCURRENCY`], so kept small enough that the product stays a sane
@@ -420,7 +423,9 @@ async fn current_branch(path: &str) -> Option<String> {
 /// 1. Finds the earliest merge commit on `env` bringing `branch` in via `--merges`.
 ///    If found, returns `(Some("merge"), Some(merge_commit_date))`.
 /// 2. If no merge commit exists in `branch..env`, the branch was incorporated via
-///    fast-forward: returns `(Some("fast_forward"), None)`.
+///    fast-forward. The date the user cares about ("when did it land?") is
+///    reconstructed from the env ref's own move history — see
+///    [`ff_merge_date`].
 async fn merge_info(
     path: &str,
     branch: &str,
@@ -450,13 +455,74 @@ async fn merge_info(
             return (Some("merge".to_string()), Some(date));
         }
     }
-    (Some("fast_forward".to_string()), None)
+    (
+        Some("fast_forward".to_string()),
+        ff_merge_date(path, branch, env).await,
+    )
+}
+
+/// The landing date of a fast-forward merge: no merge commit exists to point
+/// at, so the best evidence is when the env ref itself first moved to the
+/// branch's tip — every ref move (local `merge`, `push`, and fetches that
+/// advance a remote-tracking ref) appends a reflog entry with a timestamp.
+/// Without such an entry — reflog expired or disabled, or the merge happened
+/// elsewhere and this clone only ever saw the aftermath — fall back to the
+/// tip's commit date: the same kind of answer, though it may understate the
+/// landing moment by however long the branch sat finished before being merged.
+async fn ff_merge_date(path: &str, branch: &str, env: &str) -> Option<String> {
+    let tip = git_stdout(
+        path,
+        &["rev-parse", "--quiet", "--verify", branch],
+    )
+    .await
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|s| s.len() == 40);
+    if let Some(tip) = tip {
+        if let Ok(out) = git_stdout(
+            path,
+            &["log", "-g", "--reverse", "--format=%H%x09%gI", env],
+        )
+        .await
+        {
+            for line in out.lines() {
+                let mut parts = line.splitn(2, '\t');
+                let new_sha = parts.next().unwrap_or("").trim();
+                if new_sha == tip {
+                    let date = parts.next().unwrap_or("").trim();
+                    if !date.is_empty() {
+                        return Some(date.to_string());
+                    }
+                }
+            }
+        }
+    }
+    git_stdout(path, &["log", "--max-count=1", "--format=%cI", branch])
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether the branch's own reflog records any move since it was created.
+///
+/// `Some(false)` means the only entry is `branch: Created from ...`: the branch
+/// still sits exactly where it was cut and has no work of its own. `None` when
+/// the reflog is unavailable (fresh clone, gc), where its absence proves
+/// nothing and callers must keep their default.
+fn branch_moved_since_creation(git_dir: &Path, branch: &str) -> Option<bool> {
+    let log_path = git_dir.join("logs").join("refs").join("heads").join(branch);
+    let content = std::fs::read_to_string(log_path).ok()?;
+    Some(
+        content
+            .lines()
+            .any(|line| !line.trim().is_empty() && !line.contains("branch: Created from")),
+    )
 }
 
 /// Branch creation date + creator read straight from the reflog file (no git
 /// process). Returns `(created_at_rfc3339, created_by)`.
-fn created_at_from_reflog(git_dir: &Path, branch: &str) -> Option<(String, Option<String>)> {
-    let log_path = git_dir.join("logs").join("refs").join("heads").join(branch);
+fn created_at_from_reflog(git_dir: &Path, branch: &str) -> Option<(String, Option<String>)> {    let log_path = git_dir.join("logs").join("refs").join("heads").join(branch);
     let content = std::fs::read_to_string(log_path).ok()?;
     for line in content.lines() {
         if line.contains("branch: Created from") {
@@ -513,7 +579,7 @@ async fn first_commit_info(
     args.extend(exclude.iter().map(String::as_str));
     let out = git_stdout(path, &args).await.ok()?;
 
-    let line = out.lines().filter(|l| !l.trim().is_empty()).next_back()?;
+    let line = out.lines().rfind(|l| !l.trim().is_empty())?;
     let mut parts = line.splitn(2, '\t');
     let date = parts.next().unwrap_or("").trim().to_string();
     if date.is_empty() {
@@ -559,33 +625,55 @@ async fn branch_remote_status(
         return (RemoteState::NoRemote, 0, 0, false);
     }
 
+    // A configured upstream is only this branch's counterpart when it names the
+    // branch itself — see [`upstream_tracks_branch`].
     if let Some(upstream) = lb.upstream.as_deref() {
-        let track = parse_upstream_track(&lb.track);
-        if track.gone || !remotes.contains(upstream) {
-            return (RemoteState::Unpublished, 0, 0, false);
+        if upstream_tracks_branch(upstream, &lb.name) {
+            let track = parse_upstream_track(&lb.track);
+            if track.gone || !remotes.contains(upstream) {
+                return (RemoteState::Unpublished, 0, 0, false);
+            }
+            return (
+                state_from_counts(track.ahead, track.behind),
+                track.ahead,
+                track.behind,
+                true,
+            );
         }
-        return (
-            state_from_counts(track.ahead, track.behind),
-            track.ahead,
-            track.behind,
-            true,
-        );
     }
 
-    // No tracking config: adopt the uniquely owning remote ref if there is one.
-    // The prefix must be a bare remote name, else branch `uat` would also match
-    // `origin/release/uat`.
-    let suffix = format!("/{}", lb.name);
-    let mut candidates = remotes.iter().filter(|r| {
-        r.strip_suffix(&suffix)
-            .is_some_and(|remote| !remote.is_empty() && !remote.contains('/'))
+    match same_name_remote_ref(&lb.name, remotes) {
+        Some(target) => match rev_left_right(path, &lb.name, target).await {
+            Some((ahead, behind)) => (state_from_counts(ahead, behind), ahead, behind, true),
+            None => (RemoteState::Unknown, 0, 0, true),
+        },
+        None => (RemoteState::Unpublished, 0, 0, false),
+    }
+}
+
+/// Whether `upstream` (e.g. `origin/feat/x`) names `branch` itself on a remote,
+/// as opposed to a different branch. `git switch -c feat origin/dev` silently
+/// records `origin/dev` as the new branch's upstream; measuring `feat` against
+/// it reports a never-pushed branch as `synced` (or `ahead`/`behind`) relative
+/// to the branch it was cut from, and hides the "local" badge.
+fn upstream_tracks_branch(upstream: &str, branch: &str) -> bool {
+    upstream
+        .strip_suffix(&format!("/{branch}"))
+        .is_some_and(|remote| !remote.is_empty() && !remote.contains('/'))
+}
+
+/// The uniquely owning same-named remote ref for `branch` (e.g. `origin/feat/x`
+/// for `feat/x`). The prefix must be a bare remote name, else branch `uat`
+/// would also match `origin/release/uat`.
+fn same_name_remote_ref<'a>(branch: &str, remotes: &'a HashSet<String>) -> Option<&'a str> {
+    let suffix = format!("/{branch}");
+    let mut candidates = remotes.iter().filter_map(|r| {
+        let remote = r.strip_suffix(&suffix)?;
+        (!remote.is_empty() && !remote.contains('/')).then_some(r.as_str())
     });
-    let (Some(target), None) = (candidates.next(), candidates.next()) else {
-        return (RemoteState::Unpublished, 0, 0, false);
-    };
-    match rev_left_right(path, &lb.name, target).await {
-        Some((ahead, behind)) => (state_from_counts(ahead, behind), ahead, behind, true),
-        None => (RemoteState::Unknown, 0, 0, true),
+    match (candidates.next(), candidates.next()) {
+        (Some(target), None) => Some(target),
+        _ => None,
     }
 }
 
@@ -665,11 +753,26 @@ async fn compute_repo_matrix(
                     .get(env_key)
                     .and_then(|sets| sets.iter().find(|(_, s)| s.contains(&lb.name)))
                     .map(|(r, _)| r.as_str());
-                let is_merged = containing.is_some();
-                let (via, date) = match containing {
+                let (mut via, mut date) = match containing {
                     Some(r) => merge_info(repo_path, &lb.name, r).await,
                     None => (None, None),
                 };
+                let mut is_merged = containing.is_some();
+                // A branch cut from this env and never committed to is an
+                // ancestor of it, so `--merged` lists it — yet nothing has been
+                // merged. Only a fast-forward path can land here; a real
+                // fast-forward merge has moved the branch's own ref since
+                // creation (commits, or a fetch into it).
+                if is_merged
+                    && via.as_deref() == Some("fast_forward")
+                    && git_dir_ref
+                        .and_then(|gd| branch_moved_since_creation(gd, &lb.name))
+                        == Some(false)
+                {
+                    is_merged = false;
+                    via = None;
+                    date = None;
+                }
                 statuses.push(EnvMergeStatus {
                     env: env_key.clone(),
                     merged: is_merged,
@@ -742,6 +845,7 @@ async fn compute_repo_cached(
     configured: bool,
     force: bool,
 ) -> Result<RepoBranchMatrix, AppCommandError> {
+    let last_fetch_at = last_fetch_at(&repo_path);
     let env_sig = env_config_signature(&envs, configured);
     let fp = ref_fingerprint(&repo_path);
     let cache_key = fp
@@ -763,6 +867,7 @@ async fn compute_repo_cached(
                         repo_path,
                         envs: envs.iter().map(|(k, _)| k.clone()).collect(),
                         branches: rows,
+                        last_fetch_at,
                         error: None,
                     });
                 }
@@ -784,8 +889,49 @@ async fn compute_repo_cached(
         repo_path,
         envs: envs.iter().map(|(k, _)| k.clone()).collect(),
         branches: rows,
+        last_fetch_at,
         error: None,
     })
+}
+
+/// `git fetch --all --prune` for one repo, best effort.
+///
+/// The board's remote column is only as fresh as the local remote-tracking
+/// refs: a branch deleted on the remote keeps looking `synced` (or `ahead`)
+/// until a prune drops its ref. A manual refresh therefore prunes first.
+///
+/// Failures (offline, private remote without cached credentials, slow network)
+/// must never fail the scan — they degrade to the offline view. The prompt is
+/// disabled and the call is bounded so a stuck fetch cannot hang the board.
+async fn prune_remote_refs(repo_path: &str) {
+    let mut cmd = crate::process::tokio_command("git");
+    cmd.args(["fetch", "--all", "--prune", "--quiet"])
+        .current_dir(repo_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null());
+    match tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => {}
+        Ok(Ok(out)) => tracing::warn!(
+            "[branch_board] fetch --prune failed for {repo_path}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Ok(Err(e)) => {
+            tracing::warn!("[branch_board] fetch --prune could not run for {repo_path}: {e}")
+        }
+        Err(_) => tracing::warn!("[branch_board] fetch --prune timed out for {repo_path}"),
+    }
+}
+
+/// When this repo last talked to a remote, from the `FETCH_HEAD` mtime, as
+/// RFC 3339. Git records no fetch timestamp anywhere else.
+fn last_fetch_at(repo_path: &str) -> Option<String> {
+    let git_dir = git_dir_no_spawn(repo_path)?;
+    let modified = std::fs::metadata(git_dir.join("FETCH_HEAD"))
+        .ok()?
+        .modified()
+        .ok()?;
+    let local: chrono::DateTime<chrono::Local> = modified.into();
+    Some(local.to_rfc3339())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -796,6 +942,7 @@ pub async fn git_project_branch_matrix_core(
     db: &AppDatabase,
     project_id: i32,
     force: bool,
+    fetch: bool,
 ) -> Result<Vec<RepoBranchMatrix>, AppCommandError> {
     let project = platform_project_service::get_by_id(&db.conn, project_id)
         .await
@@ -831,6 +978,12 @@ pub async fn git_project_branch_matrix_core(
     // the cache after a successful scan), so a later clone recovers on its own.
     let mut results: Vec<RepoBranchMatrix> = stream::iter(tasks)
         .map(|(repo_id, repo_name, repo_path, envs, configured)| async move {
+            // Prune before scanning: a branch deleted on the remote keeps its
+            // stale remote-tracking ref (and therefore looks `synced`) until a
+            // fetch with `--prune` removes it.
+            if fetch {
+                prune_remote_refs(&repo_path).await;
+            }
             match compute_repo_cached(
                 conn,
                 repo_id,
@@ -851,6 +1004,7 @@ pub async fn git_project_branch_matrix_core(
                         repo_path,
                         envs: envs.iter().map(|(k, _)| k.clone()).collect(),
                         branches: Vec::new(),
+                        last_fetch_at: None,
                         error: Some(e.to_string()),
                     }
                 }
@@ -923,10 +1077,12 @@ pub async fn upsert_branch_state_core(
 }
 
 /// Pull (fast-forward) a local branch from its configured upstream. When the
-/// branch has a remote-tracking counterpart but no tracking config, the
-/// uniquely owning remote is adopted via `--set-upstream-to` so the existing
+/// branch has a remote-tracking counterpart but no tracking config of its own,
+/// the uniquely owning remote is adopted via `--set-upstream-to` so the existing
 /// `git_update_branch` (which requires an upstream) can run. Never assumes
-/// `origin`: an ambiguous or absent counterpart is reported explicitly.
+/// `origin`: an ambiguous or absent counterpart is reported explicitly. An
+/// upstream naming a *different* branch (see [`upstream_tracks_branch`]) counts
+/// as no upstream at all, so `feat/x` cut from `origin/dev` never pulls `dev`.
 pub async fn git_pull_branch_core(
     db: &AppDatabase,
     path: &str,
@@ -935,10 +1091,19 @@ pub async fn git_pull_branch_core(
     data_dir: &std::path::Path,
 ) -> Result<crate::commands::folders::GitPullResult, AppCommandError> {
     let tracking = branch_tracking_config(path).await;
-    if !tracking.contains_key(branch) {
+    let has_own_upstream = tracking
+        .get(branch)
+        .is_some_and(|upstream| upstream_tracks_branch(upstream, branch));
+    if !has_own_upstream {
         let remotes = remote_branches(path).await;
         let suffix = format!("/{branch}");
-        let candidates: Vec<&String> = remotes.iter().filter(|r| r.ends_with(&suffix)).collect();
+        let candidates: Vec<&String> = remotes
+            .iter()
+            .filter(|r| {
+                r.strip_suffix(&suffix)
+                    .is_some_and(|remote| !remote.is_empty() && !remote.contains('/'))
+            })
+            .collect();
         match candidates.len() {
             0 => {
                 return Err(AppCommandError::invalid_input(format!(
@@ -987,7 +1152,9 @@ pub async fn git_pull_branch_core(
 
 /// Delete the remote counterpart of `branch`, resolving the remote exactly the
 /// way the board decides a branch is published: its recorded upstream when that
-/// still exists, else the uniquely owning same-named remote branch.
+/// names the branch itself and still exists, else the uniquely owning
+/// same-named remote branch. A `switch -c feat/x origin/dev` leftover upstream
+/// therefore never resolves to `dev`.
 ///
 /// Resolved here rather than in the caller because a branch can be published
 /// with no tracking config (e.g. a same-named remote ref was adopted), in which
@@ -1152,8 +1319,14 @@ pub async fn git_branch_diff_file_core(
 }
 
 /// The remote ref a branch's "pushed" state is measured against: its configured
-/// upstream when that still exists, else the uniquely owning same-named remote
-/// branch. `None` when the branch was never published.
+/// upstream when that names the branch itself and still exists, else the
+/// uniquely owning same-named remote branch. `None` when the branch was never
+/// published.
+///
+/// The same-name rule matters beyond display: deleting a branch's remote
+/// counterpart goes through here, so trusting `origin/dev` as the counterpart
+/// of `feat/x` (a `switch -c feat/x origin/dev` leftover) would delete the
+/// environment branch.
 async fn push_comparison_ref(
     path: &str,
     branch: &str,
@@ -1172,19 +1345,15 @@ async fn push_comparison_ref(
     let mut parts = out.lines().next().unwrap_or("").splitn(2, '\t');
     let upstream = parts.next().unwrap_or("").trim();
     let track = parts.next().unwrap_or("").trim();
-    if !upstream.is_empty() && track != "gone" && remotes.contains(upstream) {
+    if !upstream.is_empty()
+        && upstream_tracks_branch(upstream, branch)
+        && track != "gone"
+        && remotes.contains(upstream)
+    {
         return Some(upstream.to_string());
     }
 
-    let suffix = format!("/{branch}");
-    let mut candidates = remotes.iter().filter(|r| {
-        r.strip_suffix(&suffix)
-            .is_some_and(|remote| !remote.is_empty() && !remote.contains('/'))
-    });
-    match (candidates.next(), candidates.next()) {
-        (Some(only), None) => Some(only.clone()),
-        _ => None,
-    }
+    same_name_remote_ref(branch, remotes).map(str::to_string)
 }
 
 /// Commits that are on `branch` but in NONE of the environment branches — the
@@ -1389,8 +1558,15 @@ pub async fn git_project_branch_matrix(
     db: tauri::State<'_, AppDatabase>,
     project_id: i32,
     force: Option<bool>,
+    fetch: Option<bool>,
 ) -> Result<Vec<RepoBranchMatrix>, AppCommandError> {
-    git_project_branch_matrix_core(&db, project_id, force.unwrap_or(false)).await
+    git_project_branch_matrix_core(
+        &db,
+        project_id,
+        force.unwrap_or(false),
+        fetch.unwrap_or(false),
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -1902,6 +2078,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_info_splits_merge_from_fast_forward_and_dates_fast_forward() {
+        // Third-round review gap: the merge / fast-forward classification had
+        // zero coverage. A `--no-ff` merge reports the merge commit; a plain
+        // fast-forward produces no merge commit at all, so its date has to be
+        // reconstructed (the env ref's reflog — the moment the pointer moved —
+        // or, when that history is absent, the tip's own commit date).
+        let repo_dir = tempfile::tempdir().expect("repo");
+        init_repo(repo_dir.path());
+
+        assert!(git(repo_dir.path(), &["checkout", "-q", "-b", "feat/m"]));
+        std::fs::write(repo_dir.path().join("m.txt"), "m\n").expect("write");
+        assert!(git(repo_dir.path(), &["add", "-A"]));
+        assert!(git(repo_dir.path(), &["commit", "-q", "-m", "m"]));
+        assert!(git(repo_dir.path(), &["checkout", "-q", "main"]));
+        assert!(git(
+            repo_dir.path(),
+            &["merge", "-q", "--no-ff", "-m", "m merge", "feat/m"]
+        ));
+
+        assert!(git(repo_dir.path(), &["checkout", "-q", "-b", "feat/ff"]));
+        std::fs::write(repo_dir.path().join("ff.txt"), "ff\n").expect("write");
+        assert!(git(repo_dir.path(), &["add", "-A"]));
+        assert!(git(repo_dir.path(), &["commit", "-q", "-m", "ff"]));
+        assert!(git(repo_dir.path(), &["checkout", "-q", "main"]));
+        // Default merge mode: main fast-forwards, no merge commit is created.
+        assert!(git(repo_dir.path(), &["merge", "-q", "feat/ff"]));
+
+        let path = path_str(repo_dir.path());
+        let (via_m, date_m) = merge_info(&path, "feat/m", "main").await;
+        assert_eq!(via_m.as_deref(), Some("merge"));
+        assert!(date_m.is_some(), "a real merge must carry its date");
+
+        let (via_ff, date_ff) = merge_info(&path, "feat/ff", "main").await;
+        assert_eq!(via_ff.as_deref(), Some("fast_forward"));
+        let date_ff =
+            date_ff.expect("fast-forward must still carry a landing date");
+        let landed = chrono::DateTime::parse_from_rfc3339(&date_ff)
+            .expect("rfc3339 landing date");
+        // The pointer cannot reach the tip before the tip existed.
+        let tip_date = git_stdout(
+            &path,
+            &["log", "--max-count=1", "--format=%cI", "feat/ff"],
+        )
+        .await
+        .expect("tip date");
+        let tip_at = chrono::DateTime::parse_from_rfc3339(tip_date.trim())
+            .expect("rfc3339 tip date");
+        assert!(
+            landed >= tip_at,
+            "landing time ({landed}) precedes the tip commit ({tip_at})"
+        );
+    }
+
+    #[tokio::test]
     async fn own_commits_exclude_the_environment_history() {
         let repo = tempfile::tempdir().expect("repo");
         init_repo(repo.path());
@@ -2140,5 +2370,157 @@ mod tests {
         let main = row_for(&path_str(bare_dir.path()), "main").await;
         assert_eq!(main.remote_state, RemoteState::NoRemote);
         assert!(!main.needs_push && !main.needs_pull);
+    }
+
+    /// A repo whose `main` is published and whose `feat/new` was cut with
+    /// `git switch -c feat/new origin/main`, which records `origin/main` as
+    /// the new branch's upstream. Returns the repo path.
+    async fn repo_with_branch_tracking_another_branch() -> (tempfile::TempDir, String) {
+        let repo_dir = tempfile::tempdir().expect("repo");
+        let remote_dir = tempfile::tempdir().expect("remote");
+        init_repo(repo_dir.path());
+        assert!(git(remote_dir.path(), &["init", "-q", "--bare", "r.git"]));
+        let bare = path_str(&remote_dir.path().join("r.git"));
+        assert!(git(repo_dir.path(), &["remote", "add", "origin", &bare]));
+        assert!(git(repo_dir.path(), &["push", "-q", "-u", "origin", "main"]));
+        assert!(git(repo_dir.path(), &["checkout", "-q", "-b", "feat/new"]));
+        assert!(git(
+            repo_dir.path(),
+            &["branch", "--set-upstream-to=origin/main", "feat/new"]
+        ));
+        let path = path_str(repo_dir.path());
+        (repo_dir, path)
+    }
+
+    #[tokio::test]
+    async fn remote_status_ignores_upstream_naming_another_branch() {
+        // Measuring `feat/new` against `origin/main` reported a never-pushed
+        // branch as `synced` whenever it sat on the same commit, and hid the
+        // "local" badge — the branch has no remote counterpart at all.
+        let (_repo, path) = repo_with_branch_tracking_another_branch().await;
+        let row = row_for(&path, "feat/new").await;
+        assert_eq!(
+            row.remote_state,
+            RemoteState::Unpublished,
+            "a differently-named upstream is not this branch's counterpart"
+        );
+        assert!(!row.has_remote);
+        assert!(row.needs_push);
+        // The raw config is still reported, it just does not drive the state.
+        assert_eq!(row.upstream.as_deref(), Some("origin/main"));
+    }
+
+    #[tokio::test]
+    async fn push_comparison_ignores_upstream_naming_another_branch() {
+        // Deleting the remote counterpart resolves through this helper, so
+        // trusting `origin/main` would delete `main` on the remote.
+        let (repo_dir, path) = repo_with_branch_tracking_another_branch().await;
+        let remotes = remote_branches(&path).await;
+        assert_eq!(push_comparison_ref(&path, "feat/new", &remotes).await, None);
+
+        // Once published under its own name, the ordinary path applies again.
+        assert!(git(repo_dir.path(), &["push", "-q", "-u", "origin", "feat/new"]));
+        let remotes = remote_branches(&path).await;
+        assert_eq!(
+            push_comparison_ref(&path, "feat/new", &remotes).await.as_deref(),
+            Some("origin/feat/new")
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_remote_refs_drops_refs_of_branches_deleted_on_the_remote() {
+        // A branch deleted on the remote keeps its stale remote-tracking ref, so
+        // the row would keep reporting `synced` forever. The board's refresh
+        // prunes; the row must then read as never published.
+        let repo_dir = tempfile::tempdir().expect("repo");
+        let remote_dir = tempfile::tempdir().expect("remote");
+        init_repo(repo_dir.path());
+        assert!(git(remote_dir.path(), &["init", "-q", "--bare", "r.git"]));
+        let bare = path_str(&remote_dir.path().join("r.git"));
+        assert!(git(repo_dir.path(), &["remote", "add", "origin", &bare]));
+        assert!(git(repo_dir.path(), &["push", "-q", "-u", "origin", "main"]));
+        assert!(git(repo_dir.path(), &["checkout", "-q", "-b", "feat/gone"]));
+        assert!(git(repo_dir.path(), &["push", "-q", "-u", "origin", "feat/gone"]));
+
+        let path = path_str(repo_dir.path());
+        assert_eq!(row_for(&path, "feat/gone").await.remote_state, RemoteState::Synced);
+
+        assert!(git(
+            &remote_dir.path().join("r.git"),
+            &["branch", "-D", "feat/gone"]
+        ));
+        prune_remote_refs(&path).await;
+
+        let row = row_for(&path, "feat/gone").await;
+        assert_eq!(row.remote_state, RemoteState::Unpublished);
+        assert!(!row.has_remote);
+        assert!(row.needs_push);
+    }
+
+    #[tokio::test]
+    async fn last_fetch_at_reports_none_until_the_repo_talks_to_a_remote() {
+        let bare_dir = tempfile::tempdir().expect("bare");
+        init_repo(bare_dir.path());
+        let path = path_str(bare_dir.path());
+        assert_eq!(last_fetch_at(&path), None);
+
+        let remote_dir = tempfile::tempdir().expect("remote");
+        assert!(git(remote_dir.path(), &["init", "-q", "--bare", "r.git"]));
+        let bare = path_str(&remote_dir.path().join("r.git"));
+        assert!(git(bare_dir.path(), &["remote", "add", "origin", &bare]));
+        assert!(git(bare_dir.path(), &["fetch", "-q", "origin"]));
+
+        let at = last_fetch_at(&path).expect("FETCH_HEAD written by fetch");
+        assert!(chrono::DateTime::parse_from_rfc3339(&at).is_ok());
+    }
+
+    #[tokio::test]
+    async fn fresh_cut_branch_is_not_reported_as_merged_into_its_base() {
+        // A branch cut from the env and not committed to yet is an ancestor of
+        // the env, so `--merged` lists it. Showing "merged · <env tip date>"
+        // there is misleading: nothing of the branch has been released.
+        let repo_dir = tempfile::tempdir().expect("repo");
+        init_repo(repo_dir.path());
+        assert!(git(repo_dir.path(), &["checkout", "-q", "-b", "feat/fresh"]));
+
+        let envs = vec![("dev".to_string(), "main".to_string())];
+        let rows = compute_repo_matrix(&path_str(repo_dir.path()), &envs)
+            .await
+            .expect("compute_repo_matrix");
+        let fresh = rows
+            .iter()
+            .find(|r| r.branch == "feat/fresh")
+            .expect("feat/fresh row");
+        let dev = fresh.envs.iter().find(|e| e.env == "dev").expect("dev cell");
+        assert!(!dev.merged);
+        assert_eq!(dev.merge_via, None);
+        assert_eq!(dev.merge_date, None);
+    }
+
+    #[tokio::test]
+    async fn fast_forward_merged_branch_still_reports_merged() {
+        // The fresh-cut rule must not hide a real fast-forward merge: that one
+        // moved the branch's own ref after creation.
+        let repo_dir = tempfile::tempdir().expect("repo");
+        init_repo(repo_dir.path());
+        assert!(git(repo_dir.path(), &["checkout", "-q", "-b", "feat/ff"]));
+        std::fs::write(repo_dir.path().join("f.txt"), "f\n").expect("write");
+        assert!(git(repo_dir.path(), &["add", "-A"]));
+        assert!(git(repo_dir.path(), &["commit", "-q", "-m", "f"]));
+        assert!(git(repo_dir.path(), &["checkout", "-q", "main"]));
+        assert!(git(repo_dir.path(), &["merge", "-q", "--ff-only", "feat/ff"]));
+
+        let envs = vec![("dev".to_string(), "main".to_string())];
+        let rows = compute_repo_matrix(&path_str(repo_dir.path()), &envs)
+            .await
+            .expect("compute_repo_matrix");
+        let ff = rows
+            .iter()
+            .find(|r| r.branch == "feat/ff")
+            .expect("feat/ff row");
+        let dev = ff.envs.iter().find(|e| e.env == "dev").expect("dev cell");
+        assert!(dev.merged);
+        assert_eq!(dev.merge_via.as_deref(), Some("fast_forward"));
+        assert!(dev.merge_date.is_some());
     }
 }

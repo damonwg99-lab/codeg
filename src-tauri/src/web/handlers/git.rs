@@ -634,6 +634,9 @@ pub async fn git_pull(
 pub struct GitFetchParams {
     pub path: String,
     pub credentials: Option<GitCredentials>,
+    /// `git fetch --all --prune`: also drop remote-tracking refs whose branch
+    /// was deleted on the remote.
+    pub prune: Option<bool>,
 }
 
 pub async fn git_fetch(
@@ -646,6 +649,7 @@ pub async fn git_fetch(
         params.credentials.as_ref(),
         db,
         &state.data_dir,
+        params.prune.unwrap_or(false),
     )
     .await?;
     Ok(Json(result))

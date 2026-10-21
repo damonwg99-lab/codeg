@@ -78,6 +78,10 @@ pub struct RepoBranchMatrix {
     /// Configured environment keys for this repo, e.g. ["uat", "prd"].
     pub envs: Vec<String>,
     pub branches: Vec<BranchRow>,
+    /// When the repo last talked to a remote (`FETCH_HEAD` mtime, RFC 3339), so
+    /// the UI can say how fresh the remote column is. None when it has never
+    /// been fetched.
+    pub last_fetch_at: Option<String>,
     /// Why this repo could not be scanned (missing checkout, broken git, …).
     ///
     /// A project may legitimately contain repos the current developer has not

@@ -13,6 +13,9 @@ use crate::models::{BranchStateInfo, GitCredentials, RepoBranchMatrix};
 pub struct GitProjectBranchMatrixParams {
     pub project_id: i32,
     pub force: Option<bool>,
+    /// Prune remote-tracking refs (`git fetch --prune`) before scanning, so
+    /// branches deleted on the remote stop reporting as `synced`.
+    pub fetch: Option<bool>,
 }
 
 pub async fn git_project_branch_matrix(
@@ -24,6 +27,7 @@ pub async fn git_project_branch_matrix(
             &state.db,
             params.project_id,
             params.force.unwrap_or(false),
+            params.fetch.unwrap_or(false),
         )
         .await?,
     ))

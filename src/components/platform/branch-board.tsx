@@ -68,7 +68,9 @@ import {
   canMerge,
   envCellLabel,
   envCellState,
+  envCellTooltip,
   filterRows,
+  isResidualTempWorktreePath,
   remoteCountsLabel,
   remoteStatusKey,
   resolveEffectiveEnv,
@@ -104,6 +106,13 @@ const STALE_AFTER_MS = 60_000
 interface DirtyBlock {
   repoName: string
   paths: string[]
+  /** Where the merge was meant to run, plus the git anchor used to reach it.
+   * Present only for a merge the user just started, so a leftover
+   * `.codeg-wt-` directory from the old auto-temp flow can be offered for
+   * cleanup right in the gate (it keeps the env branch checked out and the
+   * tree dirty, blocking every later merge into that environment). */
+  worktreePath?: string
+  repoPath?: string
 }
 
 interface ConflictState {
@@ -111,7 +120,6 @@ interface ConflictState {
   repo: ProjectRepoInfo
   targetPath: string
   targetFolderId: number
-  temp: boolean
 }
 
 interface NoteEdit {
@@ -173,6 +181,11 @@ export function BranchBoard({ projectId, active = true }: Props) {
   const [page, setPage] = useState(1)
 
   const [dirtyBlock, setDirtyBlock] = useState<DirtyBlock | null>(null)
+  const [checkoutPrompt, setCheckoutPrompt] = useState<{
+    repo: ProjectRepoInfo
+    row: BranchRow
+    env: EnvKey
+  } | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<{
     repo: ProjectRepoInfo
     row: BranchRow
@@ -204,13 +217,16 @@ export function BranchBoard({ projectId, active = true }: Props) {
 
   const stateKey = (repoId: number, branch: string) => `${repoId}:${branch}`
 
-  // Set true when a conflict is resolved/aborted so a following dialog close
-  // can distinguish "done" from "dismissed without resolving".
-  const conflictResolvedRef = useRef(false)
-
   // When the current snapshot was loaded (0 = never), so becoming visible can
   // decide between reusing it and refetching.
   const loadedAtRef = useRef(0)
+  // Which project the current snapshot belongs to. Switching projects must
+  // bypass the "still fresh" shortcut, otherwise the previous project's rows
+  // stay on screen.
+  const loadedProjectIdRef = useRef<number | null>(null)
+  // Monotonic request id: a response that arrives after a project switch is
+  // dropped instead of overwriting the new project's board.
+  const requestSeqRef = useRef(0)
   // Whether rows are currently on screen. A ref, not `matrices.length`, so
   // `refresh` keeps a stable identity and the visibility effect below is not
   // re-armed by its own result.
@@ -220,8 +236,11 @@ export function BranchBoard({ projectId, active = true }: Props) {
   const inFlightRef = useRef(false)
 
   const refresh = useCallback(
-    async (force = false) => {
+    async (force = false, fetch = false) => {
       if (!projectId) return
+      // Tag this run so a late response from a project we have already switched
+      // away from is ignored instead of overwriting the current board.
+      const seq = ++requestSeqRef.current
       // Only the very first load swaps the whole board to a placeholder;
       // subsequent refreshes keep the DOM (dialogs, scroll position) intact.
       inFlightRef.current = true
@@ -229,9 +248,10 @@ export function BranchBoard({ projectId, active = true }: Props) {
       setError(null)
       try {
         const [m, s] = await Promise.all([
-          getProjectBranchMatrix(projectId, force),
+          getProjectBranchMatrix(projectId, force, fetch),
           listBranchStates(projectId),
         ])
+        if (seq !== requestSeqRef.current) return
         setMatrices(m ?? [])
         hasRowsRef.current = (m ?? []).length > 0
         setStates(
@@ -247,8 +267,10 @@ export function BranchBoard({ projectId, active = true }: Props) {
           return row ? { ...prev, row } : null
         })
         loadedAtRef.current = Date.now()
+        loadedProjectIdRef.current = projectId
         setLoading(false)
       } catch (e) {
+        if (seq !== requestSeqRef.current) return
         const detail = errorText(e)
         setError(detail)
         console.error("branch matrix failed:", e)
@@ -259,22 +281,51 @@ export function BranchBoard({ projectId, active = true }: Props) {
           toast.error(t("task.opFailed", { action: t("task.refresh"), detail }))
         }
       } finally {
-        inFlightRef.current = false
-        setRefreshing(false)
-        setLoading(false)
+        if (seq === requestSeqRef.current) {
+          inFlightRef.current = false
+          setRefreshing(false)
+          setLoading(false)
+        }
       }
     },
     [projectId, t]
   )
 
-  // Load on first becoming visible, and again when the snapshot has gone stale
-  // while the tab was hidden.
+  // Load on first becoming visible, when the snapshot has gone stale while the
+  // tab was hidden, and whenever the active project changes. The board stays
+  // mounted across projects (parents use `forceMount`), so a project switch is
+  // detected here and the previous project's rows are cleared first.
   useEffect(() => {
-    if (!active || inFlightRef.current) return
+    if (!active) return
+    const switched =
+      loadedProjectIdRef.current !== null &&
+      loadedProjectIdRef.current !== projectId
+    if (switched) {
+      // Abandon any in-flight load from the previous project and reset the
+      // per-project view state, so old branches can never be shown.
+      requestSeqRef.current += 1
+      inFlightRef.current = false
+      hasRowsRef.current = false
+      loadedAtRef.current = 0
+      setMatrices([])
+      setStates(new Map())
+      setDetail(null)
+      setError(null)
+      setRepoFilter("all")
+      setPage(1)
+      setLoading(true)
+    }
+    if (inFlightRef.current) return
     const loadedAt = loadedAtRef.current
-    if (loadedAt !== 0 && Date.now() - loadedAt <= STALE_AFTER_MS) return
+    if (
+      !switched &&
+      loadedAt !== 0 &&
+      Date.now() - loadedAt <= STALE_AFTER_MS
+    ) {
+      return
+    }
     void refresh()
-  }, [active, refresh])
+  }, [active, refresh, projectId])
 
   const repoById = useMemo(() => {
     const map = new Map<number, ProjectRepoInfo>()
@@ -289,6 +340,25 @@ export function BranchBoard({ projectId, active = true }: Props) {
     for (const mat of matrices) map.set(mat.repoId, mat.repoPath)
     return map
   }, [matrices])
+
+  // How fresh each repo's remote column is. A refresh prunes remote-tracking
+  // refs, but branches can still be deleted on the remote between refreshes;
+  // the tooltip says when the data was last checked against the remote.
+  const lastFetchByRepoId = useMemo(() => {
+    const map = new Map<number, string | null>()
+    for (const mat of matrices) map.set(mat.repoId, mat.lastFetchAt)
+    return map
+  }, [matrices])
+
+  const remoteFreshnessHint = useCallback(
+    (repoId: number) => {
+      const at = lastFetchByRepoId.get(repoId)
+      return at
+        ? t("task.remoteStatusAsOf", { time: new Date(at).toLocaleString() })
+        : t("task.remoteNeverFetched")
+    },
+    [lastFetchByRepoId, t]
+  )
 
   const repoPathOf = useCallback(
     (repo: ProjectRepoInfo) => pathByRepoId.get(repo.id) ?? repo.localDir,
@@ -428,7 +498,7 @@ export function BranchBoard({ projectId, active = true }: Props) {
         const results = await Promise.allSettled(
           batch.map((repo) => {
             const path = repoPathOf(repo)
-            return withCredentialRetry((creds) => gitFetch(path, creds), {
+            return withCredentialRetry((creds) => gitFetch(path, creds, true), {
               folderPath: path,
             }).then(() => repo.name)
           })
@@ -478,13 +548,11 @@ export function BranchBoard({ projectId, active = true }: Props) {
       )
       if (res.conflict?.has_conflicts) {
         if (repo.folderId != null) {
-          conflictResolvedRef.current = false
           setConflict({
             info: res.conflict,
             repo,
             targetPath: repoPathOf(repo),
             targetFolderId: repo.folderId,
-            temp: false,
           })
         } else {
           // No folder handle for the conflict dialog — never swallow this.
@@ -511,19 +579,20 @@ export function BranchBoard({ projectId, active = true }: Props) {
   }
 
   /**
-   * Remove a temporary merge worktree. The backend reports a failed removal
-   * rather than claiming success. There is nothing to ask the user at these
-   * call sites (the merge has already succeeded or failed), so it is not
-   * thrown — but a leftover `.codeg-wt-` directory blocks the next merge into
-   * this environment, so the user is told where it is.
+   * Remove a leftover `.codeg-wt-` merge worktree from the old auto-temp flow.
+   * It keeps the environment branch checked out, so `git worktree remove
+   * --force` is the only way out of the dirty gate — offered right there.
    */
-  const cleanupTempWorktree = async (repoPath: string, tempPath: string) => {
+  const removeResidualWorktree = async (repoPath: string, wtPath: string) => {
     try {
-      await removeTempWorktree(repoPath, tempPath)
+      await removeTempWorktree(repoPath, wtPath)
+      toast.success(t("task.residualCleanupDone"))
     } catch (e) {
-      console.warn(`failed to remove temp worktree ${tempPath}:`, e)
-      toast.warning(t("task.tempWorktreeCleanupFailed", { path: tempPath }))
+      console.warn(`failed to remove residual worktree ${wtPath}:`, e)
+      toast.warning(t("task.tempWorktreeCleanupFailed", { path: wtPath }))
+      return
     }
+    await refresh()
   }
 
   const performMerge = async (
@@ -551,56 +620,44 @@ export function BranchBoard({ projectId, active = true }: Props) {
     }
 
     setBusy(true)
-    let tempPath: string | null = null
     const repoPath = repoPathOf(repo)
     try {
-      // Resolve where the env branch is checked out and reuse that worktree.
-      // Only create a temporary worktree when the branch is not checked out
-      // anywhere — a branch checked out in a linked worktree cannot be added
-      // again, so blindly creating one would fail.
-      let targetPath: string
-      let targetFolderId: number
-      let temp = false
+      // Merging is only possible into a CHECKED-OUT branch, so the environment
+      // branch's worktree is the execution site. Reused when present; when the
+      // branch is not checked out anywhere, offer an explicit, visible
+      // worktree through the checkout prompt below instead of silently
+      // creating (and racing to clean up) a temporary one — that auto-temp
+      // path is where confusing worktree failures used to surface.
       const resolution = await resolveWorktreeFolder(repoPath, envBranch)
-      if (resolution.path) {
-        targetPath = resolution.path
-        targetFolderId = resolution.folder_id ?? repo.folderId ?? 0
-      } else {
-        const parent = repoPath.replace(/[\\/][^\\/]*$/, "")
-        tempPath = `${parent}/.codeg-wt-${repo.name}-${env}-${Date.now()}`
-        await addExistingWorktree(repoPath, tempPath, envBranch)
-        const folder = await openWorktreeFolder(tempPath, repo.folderId ?? 0)
-        targetPath = tempPath
-        targetFolderId = folder.id
-        temp = true
+      if (!resolution.path) {
+        setCheckoutPrompt({ repo, row, env })
+        return
       }
+      const targetPath = resolution.path
 
       // Hard gate: the actual merge target tree must be clean (unrelated dirt
       // in another worktree must not block this merge).
       const status = await gitStatus(targetPath)
       const gate = canMerge(status)
       if (!gate.ok) {
-        if (temp && tempPath) {
-          await cleanupTempWorktree(repoPath, tempPath)
-        }
-        setDirtyBlock({ repoName: repo.name, paths: gate.dirtyPaths })
+        setDirtyBlock({
+          repoName: repo.name,
+          paths: gate.dirtyPaths,
+          worktreePath: targetPath,
+          repoPath,
+        })
         return
       }
 
       const res = await gitMerge(targetPath, row.branch)
       if (res.conflict?.has_conflicts) {
-        conflictResolvedRef.current = false
         setConflict({
           info: res.conflict,
           repo,
           targetPath,
-          targetFolderId,
-          temp,
+          targetFolderId: resolution.folder_id ?? repo.folderId ?? 0,
         })
         return
-      }
-      if (temp && tempPath) {
-        await cleanupTempWorktree(repoPath, tempPath)
       }
       toast.success(
         res.merged_commits === 0
@@ -613,9 +670,6 @@ export function BranchBoard({ projectId, active = true }: Props) {
         setPushPrompt({ repo, branch: envBranch })
       }
     } catch (e) {
-      if (tempPath) {
-        await cleanupTempWorktree(repoPathOf(repo), tempPath)
-      }
       toast.error(
         t("task.opFailed", {
           action: t("task.merge"),
@@ -627,25 +681,44 @@ export function BranchBoard({ projectId, active = true }: Props) {
     }
   }
 
-  // Only a successful resolution/abort removes the temporary worktree this
-  // merge created. A plain dialog dismissal keeps it (and the user's conflict
-  // edits) so the work can be resumed.
-  const handleConflictClose = () => {
-    const c = conflict
-    setConflict(null)
-    if (c?.temp && !conflictResolvedRef.current) {
-      toast.warning(t("task.conflictLeftTemp"))
+  /** Checkout-prompt action: create a real, persisting worktree for the
+   * environment branch, register it in the sidebar, then rerun the normal
+   * merge flow — which now finds the branch checked out. Kept on purpose:
+   * future merges reuse the same checkout, and nothing is deleted behind the
+   * user's back. */
+  const handleCheckoutAndMerge = async () => {
+    const p = checkoutPrompt
+    setCheckoutPrompt(null)
+    if (!p || !activeProject) return
+    const envBranch = resolveEffectiveEnv(p.repo, activeProject, p.env)
+    if (!envBranch) return
+    setBusy(true)
+    const repoPath = repoPathOf(p.repo)
+    try {
+      const parent = repoPath.replace(/[\\/][^\\/]*$/, "")
+      const wtPath = `${parent}/.codeg-wt-${p.repo.name}-${p.env}-${Date.now()}`
+      await addExistingWorktree(repoPath, wtPath, envBranch)
+      await openWorktreeFolder(wtPath, p.repo.folderId ?? 0)
+      await performMerge(p.repo, p.row, p.env)
+    } catch (e) {
+      toast.error(
+        t("task.opFailed", {
+          action: t("task.checkoutPromptAction"),
+          detail: errorText(e),
+        })
+      )
+    } finally {
+      setBusy(false)
     }
+  }
+
+  const handleConflictClose = () => {
+    setConflict(null)
     void refresh()
   }
 
   const handleConflictResolved = () => {
-    const c = conflict
-    conflictResolvedRef.current = true
     setConflict(null)
-    if (c?.temp) {
-      void cleanupTempWorktree(repoPathOf(c.repo), c.targetPath)
-    }
     void refresh()
   }
 
@@ -914,7 +987,7 @@ export function BranchBoard({ projectId, active = true }: Props) {
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={() => void refresh(true)}
+                onClick={() => void refresh(true, true)}
                 disabled={busy}
               >
                 <RefreshCw
@@ -1049,6 +1122,7 @@ export function BranchBoard({ projectId, active = true }: Props) {
                             return (
                               <td key={e} className="px-2 py-2">
                                 <span
+                                  title={envCellTooltip(cell, envLabels)}
                                   className={cn(
                                     "text-[0.75rem]",
                                     cell.kind === "merged" &&
@@ -1069,7 +1143,10 @@ export function BranchBoard({ projectId, active = true }: Props) {
                               ? row.lastCommitAt.slice(0, 10)
                               : "—"}
                           </td>
-                          <td className="px-2 py-2 whitespace-nowrap">
+                          <td
+                            className="px-2 py-2 whitespace-nowrap"
+                            title={remoteFreshnessHint(repoId)}
+                          >
                             <span
                               className={cn(
                                 "text-[0.7rem]",
@@ -1289,6 +1366,58 @@ export function BranchBoard({ projectId, active = true }: Props) {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>{t("task.cancel")}</AlertDialogCancel>
+            {/* The old auto-temp merge flow could leave a `.codeg-wt-`
+                worktree behind; it keeps the env branch checked out and its
+                tree dirty, so every merge into that environment lands here.
+                Offer the removal the user would otherwise have to do by hand. */}
+            {isResidualTempWorktreePath(dirtyBlock?.worktreePath) && (
+              <AlertDialogAction
+                onClick={() => {
+                  const d = dirtyBlock
+                  setDirtyBlock(null)
+                  if (d?.worktreePath && d?.repoPath) {
+                    void removeResidualWorktree(d.repoPath, d.worktreePath)
+                  }
+                }}
+              >
+                {t("task.residualCleanupButton")}
+              </AlertDialogAction>
+            )}
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Env branch not checked out anywhere — offer an explicit, persisting
+          worktree instead of the old silently-created temp one. */}
+      <AlertDialog
+        open={checkoutPrompt !== null}
+        onOpenChange={(o) => !o && setCheckoutPrompt(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("task.checkoutPromptTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("task.checkoutPromptBody", {
+                branch: checkoutPrompt?.row.branch ?? "",
+                env:
+                  checkoutPrompt && activeProject
+                    ? (resolveEffectiveEnv(
+                        checkoutPrompt.repo,
+                        activeProject,
+                        checkoutPrompt.env
+                      ) ?? checkoutPrompt.env.toUpperCase())
+                    : "",
+              })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("task.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => void handleCheckoutAndMerge()}
+              disabled={busy}
+            >
+              {t("task.checkoutPromptAction")}
+            </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

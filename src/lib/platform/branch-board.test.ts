@@ -4,8 +4,10 @@ import {
   canMerge,
   envCellLabel,
   envCellState,
+  envCellTooltip,
   filterRows,
   isFullyMerged,
+  isResidualTempWorktreePath,
   remoteCountsLabel,
   remoteStatusKey,
   resolveEffectiveEnv,
@@ -142,7 +144,7 @@ describe("envCellLabel", () => {
     expect(envCellLabel(cell, labels)).toBe("MERGED · 2026-09-01")
   })
 
-  it("marks fast-forward merges, with or without a date", () => {
+  it("a fast-forward merge reads like any merge; the how goes to the tooltip", () => {
     expect(
       envCellLabel(
         {
@@ -152,14 +154,34 @@ describe("envCellLabel", () => {
         },
         labels
       )
-    ).toBe("FF 2026-09-01")
-    // Previously rendered as "— (FF)", which read as "no data".
+    ).toBe("MERGED · 2026-09-01")
+    // Previously rendered as "— (FF)" / bare "FF", which hid the date the user
+    // actually cares about ("when did it land?").
     expect(
       envCellLabel(
         { kind: "merged", mergeVia: "fast_forward", mergeDate: null },
         labels
       )
+    ).toBe("MERGED")
+  })
+
+  it("only fast-forward merges trade the extra word for a tooltip", () => {
+    expect(
+      envCellTooltip(
+        {
+          kind: "merged",
+          mergeVia: "fast_forward",
+          mergeDate: "2026-09-01T00:00:00Z",
+        },
+        labels
+      )
     ).toBe("FF")
+    expect(
+      envCellTooltip(
+        { kind: "merged", mergeVia: "merge", mergeDate: null },
+        labels
+      )
+    ).toBeUndefined()
   })
 
   it("falls back to the merged label when no date is known", () => {
@@ -484,5 +506,25 @@ describe("canMerge", () => {
 
   it("allows a clean tree", () => {
     expect(canMerge([]).ok).toBe(true)
+  })
+})
+
+describe("isResidualTempWorktreePath", () => {
+  it("matches codeg's .codeg-wt- directories in either separator style", () => {
+    expect(isResidualTempWorktreePath("D:/repos/.codeg-wt-api-dev-123")).toBe(
+      true
+    )
+    expect(isResidualTempWorktreePath("D:\\repos\\.codeg-wt-prd-9")).toBe(true)
+    expect(isResidualTempWorktreePath("/repos/.codeg-wt-frontend-uat-1")).toBe(
+      true
+    )
+  })
+
+  it("rejects real worktrees, normal paths and empty input", () => {
+    expect(isResidualTempWorktreePath("D:\\repos\\api-dev")).toBe(false)
+    expect(isResidualTempWorktreePath("D:\\repos\\api\\feature-wt")).toBe(false)
+    expect(isResidualTempWorktreePath("")).toBe(false)
+    expect(isResidualTempWorktreePath(null)).toBe(false)
+    expect(isResidualTempWorktreePath(undefined)).toBe(false)
   })
 })

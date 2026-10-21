@@ -58,6 +58,7 @@ import {
 import {
   envCellLabel,
   envCellState,
+  envCellTooltip,
   remoteCountsLabel,
   remoteStatusKey,
   resolveEffectiveEnv,
@@ -747,52 +748,55 @@ export function BranchDetailPanel({
                   these are NOT part of a merge, which is easy to forget when a
                   branch looks finished. (The merge gate checks the TARGET
                   environment's worktree, not this one.) */}
-              {isCheckedOut && (statusError || (status && status.length > 0)) && (
-                <section className="flex flex-col gap-2">
-                  <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
-                    {t("task.detailWorkingTree")}
-                    {status && status.length > 0 && (
-                      <span className="ml-1.5 normal-case tracking-normal">
-                        ·{" "}
-                        {t("task.detailChangedFiles", { count: status.length })}
-                      </span>
-                    )}
-                  </h3>
-                  {statusError ? (
-                    <p className="text-[0.75rem] text-destructive">
-                      {t("task.detailStatusError")}
-                    </p>
-                  ) : (
-                    <>
-                      <p className="text-[0.75rem] text-amber-600 dark:text-amber-400">
-                        {t("task.workingChangesNotMerged")}
-                      </p>
-                      <details className="group rounded-md border border-border/60">
-                        <summary className="cursor-pointer select-none px-2.5 py-1.5 text-[0.75rem] text-muted-foreground">
+              {isCheckedOut &&
+                (statusError || (status && status.length > 0)) && (
+                  <section className="flex flex-col gap-2">
+                    <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
+                      {t("task.detailWorkingTree")}
+                      {status && status.length > 0 && (
+                        <span className="ml-1.5 normal-case tracking-normal">
+                          ·{" "}
                           {t("task.detailChangedFiles", {
-                            count: status?.length ?? 0,
+                            count: status.length,
                           })}
-                        </summary>
-                        <div className="flex max-h-56 flex-col divide-y divide-border/60 overflow-auto border-t border-border/60 px-2.5">
-                          {status?.map((s) => (
-                            <div
-                              key={s.file}
-                              className="flex items-center gap-2 py-1.5 text-[0.75rem]"
-                            >
-                              <span className="inline-flex h-5 w-6 shrink-0 items-center justify-center rounded bg-muted font-mono text-[0.625rem] text-muted-foreground">
-                                {s.status}
-                              </span>
-                              <span className="min-w-0 truncate font-mono">
-                                {s.file}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      </details>
-                    </>
-                  )}
-                </section>
-              )}
+                        </span>
+                      )}
+                    </h3>
+                    {statusError ? (
+                      <p className="text-[0.75rem] text-destructive">
+                        {t("task.detailStatusError")}
+                      </p>
+                    ) : (
+                      <>
+                        <p className="text-[0.75rem] text-amber-600 dark:text-amber-400">
+                          {t("task.workingChangesNotMerged")}
+                        </p>
+                        <details className="group rounded-md border border-border/60">
+                          <summary className="cursor-pointer select-none px-2.5 py-1.5 text-[0.75rem] text-muted-foreground">
+                            {t("task.detailChangedFiles", {
+                              count: status?.length ?? 0,
+                            })}
+                          </summary>
+                          <div className="flex max-h-56 flex-col divide-y divide-border/60 overflow-auto border-t border-border/60 px-2.5">
+                            {status?.map((s) => (
+                              <div
+                                key={s.file}
+                                className="flex items-center gap-2 py-1.5 text-[0.75rem]"
+                              >
+                                <span className="inline-flex h-5 w-6 shrink-0 items-center justify-center rounded bg-muted font-mono text-[0.625rem] text-muted-foreground">
+                                  {s.status}
+                                </span>
+                                <span className="min-w-0 truncate font-mono">
+                                  {s.file}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </details>
+                      </>
+                    )}
+                  </section>
+                )}
 
               {/* Merge to env */}
               <section className="flex flex-col gap-2">
@@ -826,6 +830,7 @@ export function BranchDetailPanel({
                           </span>
                           <div className="flex items-center gap-2">
                             <span
+                              title={envCellTooltip(cell, envLabels)}
                               className={
                                 cell.kind === "merged"
                                   ? "text-green-600 dark:text-green-400"
@@ -980,8 +985,9 @@ export function BranchDetailPanel({
                         )}
                         className="rounded-md border-border/60 bg-transparent text-xs [&>div]:p-1"
                       >
-                        {renderFileTree(diffTree, (f) =>
-                          void openDiffFile(f.path)
+                        {renderFileTree(
+                          diffTree,
+                          (f) => void openDiffFile(f.path)
                         )}
                       </FileTree>
                       {diffPatch && (
