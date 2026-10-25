@@ -14,6 +14,8 @@ pub struct KnowledgeDocInfo {
     pub description: Option<String>,
     pub skill_name: Option<String>,
     pub task_id: Option<i32>,
+    pub file_mtime: Option<i64>,
+    pub file_size: Option<i64>,
     pub last_scanned_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -33,6 +35,8 @@ pub struct CreateKnowledgeDocDraft {
     pub description: Option<String>,
     pub skill_name: Option<String>,
     pub task_id: Option<i32>,
+    pub file_mtime: Option<i64>,
+    pub file_size: Option<i64>,
 }
 
 fn default_doc_type() -> String {
@@ -49,6 +53,8 @@ pub struct UpdateKnowledgeDocDraft {
     pub description: Option<Option<String>>,
     pub skill_name: Option<Option<String>>,
     pub task_id: Option<Option<i32>>,
+    pub file_mtime: Option<Option<i64>>,
+    pub file_size: Option<Option<i64>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,4 +71,6 @@ pub struct UpsertKnowledgeDocDraft {
     pub description: Option<String>,
     pub skill_name: Option<String>,
     pub task_id: Option<i32>,
+    pub file_mtime: Option<i64>,
+    pub file_size: Option<i64>,
 }

@@ -162,6 +162,8 @@ pub async fn update_knowledge_doc(
         description: params.description,
         skill_name: params.skill_name,
         task_id: params.task_id,
+        file_mtime: None,
+        file_size: None,
     };
     Ok(Json(
         knowledge_commands::update_knowledge_doc_core(&state.db, params.id, draft).await?,

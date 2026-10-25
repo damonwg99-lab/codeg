@@ -50,6 +50,10 @@ pub struct ScannedDoc {
     pub skill_name: Option<String>,
     /// File content for full-text search indexing.
     pub content: Option<String>,
+    /// File modification time (unix epoch in seconds) for change detection.
+    pub file_mtime: Option<i64>,
+    /// File size in bytes for change detection.
+    pub file_size: Option<i64>,
 }
 
 /// Result of scanning a knowledge base directory.

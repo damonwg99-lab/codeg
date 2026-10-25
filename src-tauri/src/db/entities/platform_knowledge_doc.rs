@@ -20,6 +20,8 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub skill_name: Option<String>,
     pub task_id: Option<i32>,
+    pub file_mtime: Option<i64>,
+    pub file_size: Option<i64>,
     pub last_scanned_at: Option<DateTimeUtc>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,

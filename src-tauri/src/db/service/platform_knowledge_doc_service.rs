@@ -3,7 +3,6 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait,
     IntoActiveModel, QueryFilter, QueryOrder, Set,
 };
-use sea_orm::sea_query::LikeExpr;
 
 use crate::db::entities::platform_knowledge_doc;
 use crate::db::error::DbError;
@@ -23,6 +22,8 @@ fn to_info(m: platform_knowledge_doc::Model) -> KnowledgeDocInfo {
         description: m.description,
         skill_name: m.skill_name,
         task_id: m.task_id,
+        file_mtime: m.file_mtime,
+        file_size: m.file_size,
         last_scanned_at: m.last_scanned_at,
         created_at: m.created_at,
         updated_at: m.updated_at,
@@ -72,6 +73,12 @@ pub async fn create(
         active.description = Set(draft.description);
         active.skill_name = Set(draft.skill_name);
         active.task_id = Set(draft.task_id);
+        if let Some(mt) = draft.file_mtime {
+            active.file_mtime = Set(Some(mt));
+        }
+        if let Some(sz) = draft.file_size {
+            active.file_size = Set(Some(sz));
+        }
         active.last_scanned_at = Set(None);
         active.deleted_at = Set(None);
         active.updated_at = Set(Utc::now());
@@ -90,6 +97,8 @@ pub async fn create(
             description: Set(draft.description),
             skill_name: Set(draft.skill_name),
             task_id: Set(draft.task_id),
+            file_mtime: Set(draft.file_mtime),
+            file_size: Set(draft.file_size),
             last_scanned_at: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
@@ -132,6 +141,12 @@ pub async fn update(
     }
     if let Some(v) = draft.task_id {
         active.task_id = Set(v);
+    }
+    if let Some(v) = draft.file_mtime {
+        active.file_mtime = Set(v);
+    }
+    if let Some(v) = draft.file_size {
+        active.file_size = Set(v);
     }
     active.updated_at = Set(Utc::now());
     let result = active.update(conn).await?;
@@ -179,10 +194,10 @@ pub async fn get_by_id(
 pub async fn search(
     conn: &DatabaseConnection,
     project_id: i32,
-    keyword: &str,
+    query: &str,
 ) -> Result<Vec<KnowledgeDocInfo>, DbError> {
-    // W1: Escape LIKE special characters so % and _ in keyword are treated as literals.
-    let pattern = LikeExpr::new(format!("%{}%", escape_like(keyword))).escape('\\');
+    let escaped = escape_like(query);
+    let pattern = format!("%{escaped}%");
     let rows = platform_knowledge_doc::Entity::find()
         .filter(platform_knowledge_doc::Column::ProjectId.eq(project_id))
         .filter(platform_knowledge_doc::Column::DeletedAt.is_null())
@@ -253,6 +268,12 @@ pub async fn upsert_by_path(
         active.description = Set(draft.description);
         active.skill_name = Set(draft.skill_name);
         active.task_id = Set(draft.task_id);
+        if let Some(mt) = draft.file_mtime {
+            active.file_mtime = Set(Some(mt));
+        }
+        if let Some(sz) = draft.file_size {
+            active.file_size = Set(Some(sz));
+        }
         active.last_scanned_at = Set(Some(Utc::now()));
         // Revive if soft-deleted
         active.deleted_at = Set(None);
@@ -272,6 +293,8 @@ pub async fn upsert_by_path(
             description: Set(draft.description),
             skill_name: Set(draft.skill_name),
             task_id: Set(draft.task_id),
+            file_mtime: Set(draft.file_mtime),
+            file_size: Set(draft.file_size),
             last_scanned_at: Set(Some(now)),
             created_at: Set(now),
             updated_at: Set(now),

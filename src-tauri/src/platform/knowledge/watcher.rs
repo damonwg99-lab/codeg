@@ -136,7 +136,11 @@ async fn wait_next_relevant(rx: &mut mpsc::Receiver<Event>) -> Option<Event> {
 async fn do_scan(db: &AppDatabase, emitter: &EventEmitter, project_id: i32) {
     match scan_knowledge_repo_core(db, project_id).await {
         Ok(result) => {
-            emit_event(emitter, "knowledge://index-changed", &result);
+            // Only emit index-changed event if there are actual new/updated/deleted documents
+            // to prevent unnecessary frontend re-renders and re-fetches.
+            if result.new_count > 0 || result.updated_count > 0 || result.deleted_count > 0 {
+                emit_event(emitter, "knowledge://index-changed", &result);
+            }
         }
         Err(err) => {
             tracing::error!(

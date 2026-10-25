@@ -42,20 +42,25 @@ async fn ensure_kb_dir(db: &AppDatabase, project_id: i32) -> Result<String, AppC
         .map_err(AppCommandError::from)?
         .ok_or_else(|| AppCommandError::not_found(format!("Project not found: {project_id}")))?;
 
-    let kb_dir = project
-        .kb_local_dir
-        .clone()
-        .unwrap_or_else(|| {
+    let kb_dir = if let Some(ref custom_dir) = project.kb_local_dir {
+        let p = Path::new(custom_dir);
+        if p.is_absolute() {
+            custom_dir.clone()
+        } else {
             let mut buf = PathBuf::from(&project.root_dir);
-            buf.push(KNOWLEDGE_DIR_NAME);
+            buf.push(custom_dir);
             buf.to_string_lossy().to_string()
-        });
+        }
+    } else {
+        let mut buf = PathBuf::from(&project.root_dir);
+        buf.push(KNOWLEDGE_DIR_NAME);
+        buf.to_string_lossy().to_string()
+    };
 
-    // If the directory doesn't exist on disk, auto-init
+    // If the directory doesn't exist on disk, auto-init only if using default
     if !Path::new(&kb_dir).is_dir() {
-        let _result = init::init_kb_dir(&kb_dir)?;
-        // Update project.kb_local_dir if it was empty
         if project.kb_local_dir.is_none() {
+            let _result = init::init_kb_dir(&kb_dir)?;
             platform_project_service::update(
                 conn,
                 project_id,
@@ -78,6 +83,8 @@ async fn ensure_kb_dir(db: &AppDatabase, project_id: i32) -> Result<String, AppC
             )
             .await
             .map_err(AppCommandError::from)?;
+        } else {
+            std::fs::create_dir_all(&kb_dir).map_err(AppCommandError::io)?;
         }
     }
 
@@ -93,71 +100,128 @@ pub async fn scan_knowledge_repo_core(
     let conn = &db.conn;
     let kb_dir = ensure_kb_dir(db, project_id).await?;
 
-    // Scan the directory
-    let scanned_docs = scanner::scan_kb_dir(&kb_dir).await?;
+    // Fast discover all file entries with metadata (mtime, size) without reading content
+    let file_entries = scanner::discover_kb_files(&kb_dir)?;
+    let scanned_count = file_entries.len() as i32;
 
     // Build a set of scanned file paths for deletion detection
     let scanned_paths: std::collections::HashSet<String> =
-        scanned_docs.iter().map(|d| d.file_path.clone()).collect();
+        file_entries.iter().map(|d| d.rel_path.clone()).collect();
 
-    // Upsert each scanned doc, preserving task_id on existing rows
-    // (task attachments have a non-null task_id set by upload_task_attachment_core;
-    //  the scanner cannot infer it, so we must not overwrite it with None).
-    let mut new_count = 0;
-    let mut updated_count = 0;
-
-    // Get existing docs to distinguish new vs updated and to preserve task_id
+    // Get existing docs to check for incremental changes and preserve task_id
     let existing_docs = platform_knowledge_doc_service::list_by_project(conn, project_id)
         .await
         .map_err(AppCommandError::from)?;
-    let existing_paths: std::collections::HashSet<String> =
-        existing_docs.iter().map(|d| d.file_path.clone()).collect();
-    // Also build a map for quick task_id lookup by file_path
-    let existing_task_ids: std::collections::HashMap<String, Option<i32>> =
-        existing_docs.iter().map(|d| (d.file_path.clone(), d.task_id)).collect();
 
-    for doc in &scanned_docs {
-        // Preserve existing task_id if present; otherwise set None
-        let preserved_task_id = existing_task_ids.get(&doc.file_path)
-            .and_then(|tid| *tid)
-            .or_else(|| {
-                // Infer task_id from path for newly scanned task attachment files
-                // Path format: .private/tasks/{task_id}/{filename}
-                infer_task_id_from_path(&doc.file_path)
-            });
+    let mut existing_map: std::collections::HashMap<String, &crate::models::KnowledgeDocInfo> =
+        std::collections::HashMap::with_capacity(existing_docs.len());
+    for doc in &existing_docs {
+        existing_map.insert(doc.file_path.clone(), doc);
+    }
 
-        let draft = UpsertKnowledgeDocDraft {
-            project_id,
-            doc_type: doc.doc_type.clone(),
-            title: doc.title.clone(),
-            file_path: doc.file_path.clone(),
-            is_shared: doc.is_shared,
-            tags_json: doc.tags_json.clone(),
-            description: doc.description.clone(),
-            skill_name: doc.skill_name.clone(),
-            task_id: preserved_task_id,
-        };
+    let mut new_count = 0;
+    let mut updated_count = 0;
 
-        let upserted = platform_knowledge_doc_service::upsert_by_path(conn, draft)
-            .await
-            .map_err(AppCommandError::from)?;
+    for entry in &file_entries {
+        if let Some(existing) = existing_map.get(&entry.rel_path) {
+            // Incremental check: if file_mtime and file_size match, skip reading & writing!
+            if entry.file_mtime.is_some()
+                && existing.file_mtime == entry.file_mtime
+                && existing.file_size == entry.file_size
+            {
+                continue;
+            }
 
-        let content_str = doc.content.as_deref().unwrap_or("");
-        let tags_str = doc.tags_json.as_deref().unwrap_or("");
-        let desc_str = doc.description.as_deref().unwrap_or("");
-        let _ = fts::sync_doc_fts(
-            conn,
-            upserted.id,
-            project_id,
-            &upserted.title,
-            tags_str,
-            desc_str,
-            content_str,
-        ).await;
+            // File changed! Read content on-demand
+            let doc = match scanner::read_scanned_doc(entry) {
+                Ok(d) => d,
+                Err(err) => {
+                    tracing::warn!("[kb-scanner] failed reading {}: {}", entry.rel_path, err);
+                    continue;
+                }
+            };
 
-        if existing_paths.contains(&doc.file_path) {
+            let preserved_task_id = existing
+                .task_id
+                .or_else(|| infer_task_id_from_path(&doc.file_path));
+
+            let draft = UpsertKnowledgeDocDraft {
+                project_id,
+                doc_type: doc.doc_type.clone(),
+                title: doc.title.clone(),
+                file_path: doc.file_path.clone(),
+                is_shared: doc.is_shared,
+                tags_json: doc.tags_json.clone(),
+                description: doc.description.clone(),
+                skill_name: doc.skill_name.clone(),
+                task_id: preserved_task_id,
+                file_mtime: doc.file_mtime,
+                file_size: doc.file_size,
+            };
+
+            let upserted = platform_knowledge_doc_service::upsert_by_path(conn, draft)
+                .await
+                .map_err(AppCommandError::from)?;
+
+            let content_str = doc.content.as_deref().unwrap_or("");
+            let tags_str = doc.tags_json.as_deref().unwrap_or("");
+            let desc_str = doc.description.as_deref().unwrap_or("");
+            let _ = fts::sync_doc_fts(
+                conn,
+                upserted.id,
+                project_id,
+                &upserted.title,
+                tags_str,
+                desc_str,
+                content_str,
+            )
+            .await;
+
             updated_count += 1;
         } else {
+            // New file! Read content on-demand
+            let doc = match scanner::read_scanned_doc(entry) {
+                Ok(d) => d,
+                Err(err) => {
+                    tracing::warn!("[kb-scanner] failed reading new file {}: {}", entry.rel_path, err);
+                    continue;
+                }
+            };
+
+            let inferred_task_id = infer_task_id_from_path(&doc.file_path);
+
+            let draft = UpsertKnowledgeDocDraft {
+                project_id,
+                doc_type: doc.doc_type.clone(),
+                title: doc.title.clone(),
+                file_path: doc.file_path.clone(),
+                is_shared: doc.is_shared,
+                tags_json: doc.tags_json.clone(),
+                description: doc.description.clone(),
+                skill_name: doc.skill_name.clone(),
+                task_id: inferred_task_id,
+                file_mtime: doc.file_mtime,
+                file_size: doc.file_size,
+            };
+
+            let upserted = platform_knowledge_doc_service::upsert_by_path(conn, draft)
+                .await
+                .map_err(AppCommandError::from)?;
+
+            let content_str = doc.content.as_deref().unwrap_or("");
+            let tags_str = doc.tags_json.as_deref().unwrap_or("");
+            let desc_str = doc.description.as_deref().unwrap_or("");
+            let _ = fts::sync_doc_fts(
+                conn,
+                upserted.id,
+                project_id,
+                &upserted.title,
+                tags_str,
+                desc_str,
+                content_str,
+            )
+            .await;
+
             new_count += 1;
         }
     }
@@ -182,7 +246,7 @@ pub async fn scan_knowledge_repo_core(
 
     Ok(ScanResultInfo {
         project_id,
-        scanned_count: scanned_docs.len() as i32,
+        scanned_count,
         new_count,
         updated_count,
         deleted_count,
@@ -387,6 +451,8 @@ pub async fn upload_kb_doc_core(
         description: None,
         skill_name,
         task_id: None,
+        file_mtime: None,
+        file_size: None,
     };
 
     platform_knowledge_doc_service::upsert_by_path(conn, draft)
@@ -432,6 +498,8 @@ pub async fn upload_task_attachment_core(
         description: None,
         skill_name: None,
         task_id: Some(task_id),
+        file_mtime: None,
+        file_size: None,
     };
 
     platform_knowledge_doc_service::upsert_by_path(conn, draft)
@@ -476,6 +544,8 @@ pub async fn upload_task_ai_intermediate_doc_core(
         description: None,
         skill_name: None,
         task_id: Some(task_id),
+        file_mtime: None,
+        file_size: None,
     };
 
     platform_knowledge_doc_service::upsert_by_path(conn, draft)
@@ -625,6 +695,8 @@ pub async fn update_knowledge_doc(
         description,
         skill_name,
         task_id,
+        file_mtime: None,
+        file_size: None,
     };
     update_knowledge_doc_core(&db, id, draft).await
 }
