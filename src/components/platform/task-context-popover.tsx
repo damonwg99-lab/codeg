@@ -44,13 +44,12 @@ interface ProjectResourcePickerProps {
   ) => Promise<void>
   /** Active project ID for task search. */
   activeProjectId: number | null
-  /** KB data — loaded lazily by the host when popover opens. */
-  kbDocs: KnowledgeDocInfo[]
+  /** Task attachment docs — loaded lazily by the host when popover opens. */
   attachments: KnowledgeDocInfo[]
   /** Linked conversations for the current task. */
   linkedConversations?: TaskConversationInfo[]
-  /** Whether KB data is still loading. */
-  kbLoading?: boolean
+  /** Whether attachment data is still loading. */
+  attachmentsLoading?: boolean
   /** KB directory path relative to the project root (e.g., "_knowledge").
    *  Used to prefix doc filePaths so they become project-root-relative. */
   kbDirPrefix?: string
@@ -73,11 +72,7 @@ const VISIBLE_GROUPS_A: InjectOptionGroup[] = [
   "basic",
   "attachments",
   "conversations",
-  "kb_docs",
 ]
-
-/** Visible groups for Mode B/C (no linked task). KB docs only. */
-const VISIBLE_GROUPS_BC: InjectOptionGroup[] = ["kb_docs"]
 
 function inferRole(taskType: string): string {
   return TASK_TYPE_ROLE_MAP[taskType] ?? "discussion"
@@ -89,10 +84,9 @@ export function ProjectResourcePicker({
   onInject,
   onLink,
   activeProjectId,
-  kbDocs,
   attachments,
   linkedConversations,
-  kbLoading,
+  attachmentsLoading,
   kbDirPrefix,
 }: ProjectResourcePickerProps) {
   const t = useTranslations("Platform.inject")
@@ -102,13 +96,13 @@ export function ProjectResourcePicker({
     if (!linkedTask) return []
     return buildInjectOptions(
       linkedTask,
-      kbDocs,
+      [],
       attachments,
       linkedConversations ?? [],
       t as InjectI18nFn,
       kbDirPrefix
     )
-  }, [linkedTask, kbDocs, attachments, linkedConversations, t, kbDirPrefix])
+  }, [linkedTask, attachments, linkedConversations, t, kbDirPrefix])
 
   const linkedDefaultIds = useMemo(
     () =>
@@ -136,68 +130,10 @@ export function ProjectResourcePicker({
     })
   }
 
-  const [kbDocSearchQuery, setKbDocSearchQuery] = useState("")
-
-  // Filter kb_docs by search query
-  const filteredLinkedOptions = useMemo(() => {
-    if (!kbDocSearchQuery) return linkedOptions
-    const q = kbDocSearchQuery.toLowerCase()
-    return linkedOptions.filter(
-      (opt) =>
-        opt.group !== "kb_docs" ||
-        opt.label.toLowerCase().includes(q) ||
-        opt.description.toLowerCase().includes(q)
-    )
-  }, [kbDocSearchQuery, linkedOptions])
-
   const groupLabelResolver = (group: InjectOptionGroup) =>
     t(`groupLabel.${group}`)
 
-  // ─── Mode B/C: Project resources (no linked task) ───
-  const projectOptions = useMemo<InjectOption[]>(
-    () => buildProjectOptions(kbDocs, [], [], t as InjectI18nFn, kbDirPrefix),
-    [kbDocs, t, kbDirPrefix]
-  )
-
-  const projectDefaultIds = useMemo(
-    () =>
-      new Set<OptionId>(
-        projectOptions
-          .filter((option) => option.defaultChecked)
-          .map((option) => option.id)
-      ),
-    [projectOptions]
-  )
-  const [projectChecked, setProjectChecked] =
-    useState<Set<OptionId>>(projectDefaultIds)
-
-  useMemo(() => {
-    setProjectChecked(projectDefaultIds)
-  }, [projectDefaultIds])
-
-  function projectToggle(id: OptionId, value: boolean) {
-    setProjectChecked((prev) => {
-      const next = new Set(prev)
-      if (value) next.add(id)
-      else next.delete(id)
-      return next
-    })
-  }
-
-  const [projectKbDocSearchQuery, setProjectKbDocSearchQuery] = useState("")
-
-  const filteredProjectOptions = useMemo(() => {
-    if (!projectKbDocSearchQuery) return projectOptions
-    const q = projectKbDocSearchQuery.toLowerCase()
-    return projectOptions.filter(
-      (opt) =>
-        opt.group !== "kb_docs" ||
-        opt.label.toLowerCase().includes(q) ||
-        opt.description.toLowerCase().includes(q)
-    )
-  }, [projectKbDocSearchQuery, projectOptions])
-
-  // ─── Task list (accordion) ───
+  // ─── Mode B/C: Task list (no linked task) ───
   const [expandedTaskId, setExpandedTaskId] = useState<number | null>(null)
   const [taskSearchQuery, setTaskSearchQuery] = useState("")
   const [allTasks, setAllTasks] = useState<TaskInfo[]>([])
@@ -301,13 +237,10 @@ export function ProjectResourcePicker({
   async function handleModeBCInject() {
     setInjecting(true)
     try {
-      // Combine project KB options + expanded task options
-      const allChecked = new Set<OptionId>([
-        ...projectChecked,
-        ...expandedTaskChecked,
-      ])
-      const allOptions = [...projectOptions, ...expandedTaskOptions]
-      const payload = buildPayloadFromOptions(allOptions, allChecked)
+      const payload = buildPayloadFromOptions(
+        expandedTaskOptions,
+        expandedTaskChecked
+      )
       onInject(payload)
 
       // Auto-link: set pendingTaskLink for new conversations
@@ -328,7 +261,7 @@ export function ProjectResourcePicker({
   // ─── Render ───
 
   if (linkedTask && linkedTaskInfo) {
-    // Mode A: Already linked — show task summary + KB files
+    // Mode A: Already linked — show task summary + attachments
     return (
       <div className="flex flex-col">
         <div className="flex flex-col gap-2 p-2">
@@ -340,24 +273,21 @@ export function ProjectResourcePicker({
           </div>
 
           {/* Inject options */}
-          {kbLoading ? (
+          {attachmentsLoading ? (
             <div className="flex items-center justify-center py-3 text-xs text-muted-foreground">
               {t("loading")}
             </div>
           ) : (
             <InjectOptionList
-              options={filteredLinkedOptions}
+              options={linkedOptions}
               checked={linkedChecked}
               onToggle={linkedToggle}
               variant="compact"
               visibleGroups={VISIBLE_GROUPS_A}
               groupLabelResolver={groupLabelResolver}
               emptyMessages={{
-                kb_docs: t("noDocs"),
                 attachments: t("noAttachments"),
               }}
-              kbDocSearchQuery={kbDocSearchQuery}
-              onKbDocSearchChange={setKbDocSearchQuery}
             />
           )}
         </div>
@@ -378,31 +308,10 @@ export function ProjectResourcePicker({
     )
   }
 
-  // Mode B/C: No linked task — show KB docs + accordion task list
+  // Mode B/C: No linked task — show the pending task list
   return (
     <div className="flex flex-col">
       <div className="flex flex-col gap-2 p-2">
-        {/* KB file selection */}
-        {kbLoading ? (
-          <div className="flex items-center justify-center py-3 text-xs text-muted-foreground">
-            {t("loading")}
-          </div>
-        ) : (
-          <InjectOptionList
-            options={filteredProjectOptions}
-            checked={projectChecked}
-            onToggle={projectToggle}
-            variant="compact"
-            visibleGroups={VISIBLE_GROUPS_BC}
-            groupLabelResolver={groupLabelResolver}
-            emptyMessages={{
-              kb_docs: t("noDocs"),
-            }}
-            kbDocSearchQuery={projectKbDocSearchQuery}
-            onKbDocSearchChange={setProjectKbDocSearchQuery}
-          />
-        )}
-
         {/* Pending tasks section (accordion) */}
         {activeProjectId && (
           <section className="mt-2">
@@ -520,11 +429,7 @@ export function ProjectResourcePicker({
         <Button
           size="sm"
           onClick={handleModeBCInject}
-          disabled={
-            injecting ||
-            (projectChecked.size === 0 && expandedTaskChecked.size === 0) ||
-            kbLoading
-          }
+          disabled={injecting || expandedTaskChecked.size === 0}
           className="w-full h-8"
         >
           <ClipboardList className="mr-1 h-3.5 w-3.5" />

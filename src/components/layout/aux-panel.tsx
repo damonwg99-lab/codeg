@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 import {
+  BookOpen,
   Folder,
   FolderPen,
   GitCommit,
@@ -34,28 +35,37 @@ import { SessionDetailsTab } from "./aux-panel-session-details-tab"
 import { FileTreeTab } from "./aux-panel-file-tree-tab"
 import { GitChangesTab } from "./aux-panel-git-changes-tab"
 import { GitLogTab } from "./aux-panel-git-log-tab"
+import { AuxPanelKbTab } from "@/components/platform/aux-panel-kb-tab"
 
-const LAZY_TABS: AuxPanelTab[] = ["file_tree", "changes", "git_log"]
+const LAZY_TABS: AuxPanelTab[] = [
+  "file_tree",
+  "knowledge_base",
+  "changes",
+  "git_log",
+]
 
 // Visible order + icon for every aux tab. Both the desktop segmented control
 // and the collapsed picker map over this, so the two surfaces can never drift.
 const TAB_ORDER: AuxPanelTab[] = [
   "session_details",
   "file_tree",
+  "knowledge_base",
   "changes",
   "git_log",
 ]
 const TAB_ICONS: Record<AuxPanelTab, LucideIcon> = {
   session_details: ReceiptText,
   file_tree: Folder,
+  knowledge_base: BookOpen,
   changes: FolderPen,
   git_log: GitCommit,
 }
 // The three folder-scoped tabs share one label namespace (Folder.auxPanel.tabs);
 // session details resolves from its own (Folder.sessionDetails.menuLabel). The
 // value type is the literal key union so next-intl's typed `t()` accepts it.
+// knowledge_base is a platform-owned tab and resolves its own label below.
 const FOLDER_TAB_LABEL_KEY: Record<
-  Exclude<AuxPanelTab, "session_details">,
+  Exclude<AuxPanelTab, "session_details" | "knowledge_base">,
   "files" | "changes" | "commits"
 > = {
   file_tree: "files",
@@ -203,7 +213,10 @@ export function AuxPanel() {
     (tab: AuxPanelTab) =>
       tab === "session_details"
         ? tDetails("menuLabel")
-        : t(FOLDER_TAB_LABEL_KEY[tab]),
+        : tab === "knowledge_base"
+          ? // Platform-owned tab; label is hardcoded like the other KB UI.
+            "知识库"
+          : t(FOLDER_TAB_LABEL_KEY[tab]),
     [t, tDetails]
   )
 
@@ -367,6 +380,13 @@ export function AuxPanel() {
           className="mt-0 flex-1 min-h-0 overflow-hidden"
         >
           {mountedTabs.has("file_tree") ? <FileTreeTab /> : null}
+        </TabsContent>
+        <TabsContent
+          value="knowledge_base"
+          forceMount
+          className="mt-0 flex-1 min-h-0 overflow-hidden"
+        >
+          {mountedTabs.has("knowledge_base") ? <AuxPanelKbTab /> : null}
         </TabsContent>
         <TabsContent
           value="changes"

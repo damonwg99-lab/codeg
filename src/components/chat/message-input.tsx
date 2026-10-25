@@ -76,6 +76,10 @@ import {
   type AppendTextToSessionDetail,
 } from "@/lib/session-attachment-events"
 import {
+  INJECT_KB_REFS_TO_SESSION_EVENT,
+  type InjectKbRefsToSessionDetail,
+} from "@/lib/platform/kb-reference-events"
+import {
   ConversationContextBar,
   ConversationFolderBranchPicker,
   useConversationFolderBranchPickerVisible,
@@ -1991,6 +1995,27 @@ export function MessageInput({
   // Platform composer toolbar callback — converts InjectOption[] selections
   // from ProjectResourcePicker into inline reference badges in the composer.
   const handlePlatformInject = usePlatformInjectHandler(editorRef)
+
+  // Aux-panel 知识库 tab "注入会话": the selected KB docs arrive as reference
+  // badges through the same window-event bridge the file tree uses to attach
+  // files, reusing handlePlatformInject so the insertion is identical.
+  useEffect(() => {
+    if (!attachmentTabId) return
+
+    const handleInjectKbRefs = (event: Event) => {
+      const customEvent = event as CustomEvent<InjectKbRefsToSessionDetail>
+      if (!customEvent.detail) return
+      if (customEvent.detail.tabId !== attachmentTabId) return
+      handlePlatformInject(customEvent.detail.refs)
+    }
+
+    window.addEventListener(INJECT_KB_REFS_TO_SESSION_EVENT, handleInjectKbRefs)
+    return () =>
+      window.removeEventListener(
+        INJECT_KB_REFS_TO_SESSION_EVENT,
+        handleInjectKbRefs
+      )
+  }, [attachmentTabId, handlePlatformInject])
 
   const actionButtons = isEditingQueueItem ? (
     <div className="flex items-center gap-1">

@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef } from "react"
+import { toast } from "sonner"
 import {
   usePlatformTabSlice,
   type PendingTaskLink,
 } from "@/stores/platform-tab-slice"
 import { linkConversation } from "@/lib/platform/api"
 import type { RichComposerHandle } from "@/components/chat/composer/rich-composer"
+import { editorHasReference } from "@/components/chat/composer/attachment-files"
 import type { ReferenceAttrs } from "@/components/chat/composer/types"
 
 /**
@@ -102,11 +104,41 @@ export function usePlatformInjectHandler(
     (refs: ReferenceAttrs[]) => {
       const editor = editorRef.current?.getEditor()
       if (!editor) return
+      // Duplicate control, same rule the session-mention bridge uses
+      // (editorHasReference by refType+uri): a KB doc reference badge with an
+      // identical uri is never inserted twice. Only uri-carrying refs dedupe —
+      // plain-text refs (uri: null, e.g. task context) always insert. The seen
+      // set covers repeats within one batch, since the editor state only
+      // reflects the insertions after the chain runs.
+      const seen = new Set<string>()
+      let inserted = 0
+      let skipped = 0
       let chain = editor.chain().focus("end")
       for (const ref of refs) {
+        if (ref.uri) {
+          const key = `${ref.refType}:${ref.uri}`
+          if (
+            seen.has(key) ||
+            editorHasReference(editor, ref.refType, ref.uri)
+          ) {
+            skipped++
+            continue
+          }
+          seen.add(key)
+        }
         chain = chain.insertReference(ref).insertContent(" ")
+        inserted++
+      }
+      if (inserted === 0) {
+        toast.info("所选内容均已在会话中，未重复添加")
+        return
       }
       chain.run()
+      if (skipped > 0) {
+        toast.warning(`已添加 ${inserted} 项，跳过 ${skipped} 项（已在会话中）`)
+      } else {
+        toast.success(`已添加 ${inserted} 项引用到会话`)
+      }
     },
     [editorRef]
   )

@@ -28,7 +28,6 @@ export function PlatformComposerToolbar({
   onInjectReferences: (refs: ReferenceAttrs[]) => void
 }) {
   const [taskPopoverOpen, setTaskPopoverOpen] = useState(false)
-  const [popoverKbDocs, setPopoverKbDocs] = useState<KnowledgeDocInfo[]>([])
   const [popoverAttachments, setPopoverAttachments] = useState<
     KnowledgeDocInfo[]
   >([])
@@ -52,15 +51,15 @@ export function PlatformComposerToolbar({
   const { activeFolder } = useActiveFolder()
   const setPendingTaskLink = usePlatformTabSlice((s) => s.setPendingTaskLink)
 
+  // Only load task attachments for Task Popover when a task is linked
   useEffect(() => {
     if (!taskPopoverOpen || !activeProject) return
     let cancelled = false
-    async function loadKBData() {
+    async function loadAttachments() {
       try {
         const projectId = activeProject!.id
         const allDocs = await listKnowledgeDocs({ projectId })
         if (cancelled) return
-        setPopoverKbDocs(allDocs.filter((d) => d.docType !== "task_attachment"))
         const taskAttachments = allDocs.filter(
           (d) => d.docType === "task_attachment"
         )
@@ -70,11 +69,11 @@ export function PlatformComposerToolbar({
             : taskAttachments
         )
       } catch {
-        // Popover KB preload is best-effort; swallow silently
+        // Popover attachment preload is best-effort; swallow silently
       }
       if (!cancelled) setPopoverKbLoading(false)
     }
-    void loadKBData()
+    void loadAttachments()
     return () => {
       cancelled = true
     }
@@ -117,10 +116,6 @@ export function PlatformComposerToolbar({
     ]
   )
 
-  // Start the spinner in the popover's own change handler rather than a
-  // synchronous setState inside the load effect (react-hooks/set-state-in-effect):
-  // the effect re-runs while the popover stays open (e.g. linkedTask changes)
-  // and only refills data, so the spinner belongs to the open transition.
   const handlePopoverOpenChange = useCallback((open: boolean) => {
     setTaskPopoverOpen(open)
     if (open) setPopoverKbLoading(true)
@@ -139,40 +134,42 @@ export function PlatformComposerToolbar({
   if (!activeProject) return null
 
   return (
-    <Popover
-      modal
-      open={taskPopoverOpen}
-      onOpenChange={handlePopoverOpenChange}
-    >
-      <PopoverTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          className="shrink-0 text-muted-foreground"
-          title="Task context"
-          aria-label="Task context"
-        >
-          <ClipboardList className="size-4" />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent
-        side="top"
-        align="start"
-        className="w-[22rem] max-w-[calc(100vw-1rem)] p-0"
+    <div className="flex items-center gap-0.5">
+      {/* Task Context & Attachment Popover Trigger */}
+      <Popover
+        modal
+        open={taskPopoverOpen}
+        onOpenChange={handlePopoverOpenChange}
       >
-        <ProjectResourcePicker
-          conversationId={conversationId}
-          linkedTaskInfo={linkedTaskInfo}
-          linkedTask={linkedTask}
-          onInject={handleTaskInject}
-          onLink={handleTaskLink}
-          activeProjectId={activeProject?.id ?? null}
-          kbDocs={popoverKbDocs}
-          attachments={popoverAttachments}
-          kbLoading={popoverKbLoading}
-          kbDirPrefix={kbDirPrefix}
-        />
-      </PopoverContent>
-    </Popover>
+        <PopoverTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            className="shrink-0 text-muted-foreground hover:text-foreground transition-colors"
+            title="关联任务上下文"
+            aria-label="关联任务上下文"
+          >
+            <ClipboardList className="size-4" />
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent
+          side="top"
+          align="start"
+          className="w-[22rem] max-w-[calc(100vw-1rem)] p-0"
+        >
+          <ProjectResourcePicker
+            conversationId={conversationId}
+            linkedTaskInfo={linkedTaskInfo}
+            linkedTask={linkedTask}
+            onInject={handleTaskInject}
+            onLink={handleTaskLink}
+            activeProjectId={activeProject?.id ?? null}
+            attachments={popoverAttachments}
+            attachmentsLoading={popoverKbLoading}
+            kbDirPrefix={kbDirPrefix}
+          />
+        </PopoverContent>
+      </Popover>
+    </div>
   )
 }
