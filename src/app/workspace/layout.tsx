@@ -190,6 +190,18 @@ function resolvePanelSizeRange(
   return { minSize, maxSize }
 }
 
+/** The library warns ("default size should not be greater than max size")
+ *  when defaultSize falls outside [minSize, maxSize], and a closed panel's
+ *  range collapses to [0, 0] — so its default collapses with it. The real
+ *  size still comes from the pixel-pinned `style`, not from defaultSize. */
+function defaultPanelSize(
+  value: number,
+  open: boolean,
+  range: { minSize: number; maxSize: number }
+): number {
+  return open ? clamp(value, range.minSize, range.maxSize) : 0
+}
+
 /**
  * Returns `true` for a brief window after `open` flips, so the caller can add
  * the `.panel-slide-animating` class that animates the panel resize (a "push"
@@ -1342,7 +1354,7 @@ function FolderWorkspaceShell({ children }: { children: React.ReactNode }) {
         <ResizablePanel
           id={FOLDER_SHELL_LEFT_PANEL_ID}
           order={1}
-          defaultSize={18}
+          defaultSize={defaultPanelSize(18, sidebarOpen, sidebarSizeRange)}
           style={sidebarPanelStyle}
           minSize={sidebarOpen ? sidebarSizeRange.minSize : 0}
           maxSize={sidebarOpen ? sidebarSizeRange.maxSize : 0}
@@ -1418,7 +1430,11 @@ function FolderWorkspaceShell({ children }: { children: React.ReactNode }) {
               <ResizablePanel
                 id={FOLDER_MAIN_TERMINAL_PANEL_ID}
                 order={2}
-                defaultSize={28}
+                defaultSize={defaultPanelSize(
+                  28,
+                  terminalOpen,
+                  terminalSizeRange
+                )}
                 style={terminalPanelStyle}
                 minSize={terminalOpen ? terminalSizeRange.minSize : 0}
                 maxSize={terminalOpen ? terminalSizeRange.maxSize : 0}
@@ -1442,7 +1458,7 @@ function FolderWorkspaceShell({ children }: { children: React.ReactNode }) {
         <ResizablePanel
           id={FOLDER_SHELL_RIGHT_PANEL_ID}
           order={3}
-          defaultSize={18}
+          defaultSize={defaultPanelSize(18, auxOpen, auxSizeRange)}
           style={auxPanelStyle}
           minSize={auxOpen ? auxSizeRange.minSize : 0}
           maxSize={auxOpen ? auxSizeRange.maxSize : 0}
