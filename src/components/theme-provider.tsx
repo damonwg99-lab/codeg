@@ -67,7 +67,14 @@ function ThemeColorMetaSync() {
 
 export function ThemeProvider({ children, ...props }: ThemeProviderProps) {
   return (
-    <NextThemesProvider {...props}>
+    // The pre-paint script next-themes renders is redundant here: the raw
+    // `APPEARANCE_INIT_SCRIPT` in the root layout already applies the theme
+    // class + colorScheme before first paint (same `theme` storage key). On
+    // Next 16.4+ / React 19.2 a client-rendered `<script>` also trips a
+    // console error ("Scripts inside React components are never executed"),
+    // so demote it to a non-executable data block (next-themes#387's endorsed
+    // workaround). Callers can still override via props.scriptProps.
+    <NextThemesProvider scriptProps={{ type: "application/json" }} {...props}>
       <ThemeColorMetaSync />
       {children}
     </NextThemesProvider>
