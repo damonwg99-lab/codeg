@@ -13,6 +13,7 @@ import {
   AgentConfigSection,
   effectiveSelections,
   snapshotLabels,
+  useBooleanOptionLabels,
 } from "@/components/automations/agent-config-section"
 import { useAgentOptions } from "@/components/automations/use-agent-options"
 import { getAgentLabel } from "@/lib/custom-agents"
@@ -232,7 +233,13 @@ function TaskEditorBody({
   // quietly ignored.
   const choosesBranch = task?.source_kind !== "forge_pr"
 
-  const agentOptions = useAgentOptions(agentType, folderPath, true)
+  const agentOptions = useAgentOptions(
+    agentType,
+    folderPath,
+    true,
+    configValues
+  )
+  const booleanLabels = useBooleanOptionLabels()
 
   // An untouched pill is saved as "inherit" only while it shows the agent that
   // inheriting launches. It can show another: the placeholder when nothing is
@@ -292,7 +299,7 @@ function TaskEditorBody({
       config_values,
       label_snapshot: {
         agent_label: getAgentLabel(agentType) ?? agentType,
-        ...snapshotLabels(snapshot, mode_id, config_values),
+        ...snapshotLabels(snapshot, mode_id, config_values, booleanLabels),
       },
       base_branch,
     }
@@ -465,11 +472,15 @@ function TaskEditorBody({
           onChange={setPrompt}
           onAttachmentsChange={setAttachmentCount}
           editorClassName="max-h-[14rem] min-h-[6rem]"
+          // The bar below probes with these; so must the composer, or the two
+          // stop sharing one probe and the agent is spawned twice.
+          probeConfigValues={configValues}
           bottomBarExtra={
             <AgentConfigSection
               agentType={agentOptions.snapshotAgentType}
               snapshot={agentOptions.snapshot}
               loading={agentOptions.loading}
+              stale={!agentOptions.current}
               error={agentOptions.error}
               onReload={agentOptions.reload}
               modeId={modeId}

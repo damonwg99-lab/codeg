@@ -110,6 +110,31 @@ const TOP_CONVERSATIONS: usize = 8;
 ///   the two (which every shared helper does, because for Claude they are
 ///   disjoint) inflated input and total by the cached amount. See
 ///   `parsers::qoder::qoder_turn_usage`.
+/// * `4` — Codex cache writes split out of input. Codex's `input_tokens` is
+///   the whole prompt: besides the cache read it includes
+///   `cache_write_input_tokens`, which some providers and gateways report
+///   (codeg's own bound provider among them) and OpenAI's API leaves at 0.
+///   Only the read was split out, so every write counted as fresh input and
+///   the cache-write column stayed 0. Totals are unchanged; the columns are
+///   not.
+///   See `parsers::codex::codex_usage_counters`.
+/// * `5` — Qoder sub-agent spend counted. Each delegated run writes its own
+///   transcript (`<sessionId>/subagents/agent-*.jsonl`) and nothing read it,
+///   so a session that delegated work was short by everything its
+///   sub-agents spent. Now each call is deduped by `message.id`, has its
+///   cached prefix split out, and lands on the turn current at its own
+///   timestamp — totals grow for unchanged transcripts. The same release
+///   made a Qoder session's model its LAST one instead of its first, which
+///   is what a turn naming no model falls back to. See
+///   `parsers::qoder::attribute_subagent_usage`.
+/// * `6` — Claude fork sub-agents counted from their own work on. A
+///   `subagent_type: "fork"` transcript opens with a copy of the context it
+///   inherited — the parent's launching record, or a launching subagent's
+///   whole history — with the original `message.id`s and usage, which were
+///   already counted where they were spent; reading the file whole counted
+///   them again. Forks are on by default in the terminal since CLI 2.1.232
+///   and in every Agent SDK session since 2.1.302, so unchanged transcripts
+///   read differently now. See `parsers::claude::is_fork_directive_record`.
 ///
 /// Only the accounting stored in `token_usage_turn` counts: the four token
 /// counters, the duration and the timestamp. A conversation's context WINDOW is
@@ -124,7 +149,7 @@ const TOP_CONVERSATIONS: usize = 8;
 /// counters predate it, since a custom/BYO model has always exposed them and
 /// the parser reads every session under `~/.qoder/projects`, not just the ones
 /// codeg launched.
-const FACT_SCHEMA_VERSION: &str = "3";
+const FACT_SCHEMA_VERSION: &str = "6";
 
 const FACT_SCHEMA_VERSION_KEY: &str = "token_usage_fact_schema_version";
 
@@ -1358,6 +1383,9 @@ mod tests {
                 parent_tool_use_id: None,
                 delegation_call_id: None,
                 origin_cwd: None,
+                assistant_id: None,
+                source: None,
+                assistant_name: None,
                 tag_ids: Vec::new(),
             },
             turns,
@@ -1367,6 +1395,7 @@ mod tests {
             turns_offset: None,
             turns_total: None,
             assistant_turns_before_offset: None,
+            user_turns_before_offset: None,
             prefix_hash: None,
             uncovered_prefix_max_ts: None,
         }

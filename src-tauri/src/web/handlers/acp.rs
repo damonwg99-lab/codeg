@@ -201,9 +201,10 @@ pub struct AcpPreflightParams {
 }
 
 pub async fn acp_preflight(
+    Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpPreflightParams>,
 ) -> Result<Json<PreflightResult>, AppCommandError> {
-    let result = acp_commands::acp_preflight(params.agent_type, params.force_refresh)
+    let result = acp_commands::acp_preflight_core(&state.db, params.agent_type, params.force_refresh)
         .await
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(result))
@@ -420,6 +421,10 @@ pub struct AcpDescribeAgentOptionsParams {
     pub agent_type: crate::models::AgentType,
     #[serde(default)]
     pub working_dir: Option<String>,
+    /// Config selections to apply on the probe session before reading the
+    /// snapshot — callers pass the model so per-model option lists match.
+    #[serde(default)]
+    pub config_values: Option<std::collections::BTreeMap<String, String>>,
 }
 
 pub async fn acp_describe_agent_options(
@@ -432,6 +437,7 @@ pub async fn acp_describe_agent_options(
         &state.data_dir,
         params.agent_type,
         params.working_dir,
+        params.config_values.unwrap_or_default(),
     )
     .await
     .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
@@ -1145,6 +1151,29 @@ pub async fn acp_download_agent_binary(
     .await
     .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpUpdateSystemAgentParams {
+    pub agent_type: AgentType,
+    pub task_id: String,
+}
+
+pub async fn acp_update_system_agent(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpUpdateSystemAgentParams>,
+) -> Result<Json<Option<String>>, AppCommandError> {
+    let emitter = state.emitter.clone();
+    let version = acp_commands::acp_update_system_agent_core(
+        params.agent_type,
+        params.task_id,
+        &state.db,
+        &emitter,
+    )
+    .await
+    .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(version))
 }
 
 #[derive(Deserialize)]

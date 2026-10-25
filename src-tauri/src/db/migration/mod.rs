@@ -60,6 +60,13 @@ mod m20260920_platform_000012_branch_matrix_cache;
 mod m20260929_000001_canvas_board;
 mod m20260930_000001_agent_setting_drop_adapter_channel;
 mod m20261006_000001_conversation_tag;
+mod m20261015_000001_kiro_builtin_agent;
+mod m20261015_000001_work_task_deferred_at;
+mod m20261016_000001_assistant;
+mod m20261016_000002_conversation_assistant;
+mod m20261017_000002_conversation_source;
+mod m20261020_000001_folder_command_run_local;
+mod m20261022_000001_tool_approval;
 mod m20261023_platform_000013_add_kb_doc_mtime;
 
 pub struct Migrator;
@@ -97,7 +104,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260726_000001_custom_agent::Migration),
             Box::new(m20260727_000001_custom_agent_skills::Migration),
             Box::new(m20260728_000001_custom_agent_skills_dir::Migration),
-             Box::new(m20260728_000002_custom_agent_source::Migration),
+            Box::new(m20260728_000002_custom_agent_source::Migration),
             Box::new(m20260622_platform_000001_create_core_tables::Migration),
             Box::new(m20260622_platform_000002_create_config_tables::Migration),
             Box::new(m20260622_platform_000003_create_activity_log::Migration),
@@ -128,7 +135,54 @@ impl MigratorTrait for Migrator {
             Box::new(m20260929_000001_canvas_board::Migration),
             Box::new(m20260930_000001_agent_setting_drop_adapter_channel::Migration),
             Box::new(m20261006_000001_conversation_tag::Migration),
+            Box::new(m20261015_000001_kiro_builtin_agent::Migration),
+            Box::new(m20261015_000001_work_task_deferred_at::Migration),
+            Box::new(m20261016_000001_assistant::Migration),
+            Box::new(m20261016_000002_conversation_assistant::Migration),
+            Box::new(m20261017_000002_conversation_source::Migration),
+            Box::new(m20261020_000001_folder_command_run_local::Migration),
+            Box::new(m20261022_000001_tool_approval::Migration),
             Box::new(m20261023_platform_000013_add_kb_doc_mtime::Migration),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm_migration::MigratorTrait;
+
+    use crate::db::migration::Migrator;
+
+    /// A backup records the last migration here as its schema version, and a
+    /// build refuses a backup naming a migration it does not know. A new
+    /// migration listed ahead of a released one (an easy slip when a rebase
+    /// conflicts on this list) leaves the released name last, so that release
+    /// accepts the newer backup and then cannot start on the migration the
+    /// restore brought in. Names are dated when written, so name order keeps
+    /// the newest migration last. A new migration whose name sorts before a
+    /// released one needs a later name, not an earlier place in the list.
+    ///
+    /// Platform exception: the `*_platform_*` migrations belong to the
+    /// ai-platform fork, which shipped them interleaved with the upstream
+    /// list (their dates predate upstream migrations they run after). That
+    /// execution order is what already-deployed databases recorded, so the
+    /// list keeps it; this test therefore checks name order only within the
+    /// upstream series and within the platform series, not across the two.
+    #[test]
+    fn migrations_are_listed_in_name_order() {
+        let names: Vec<String> = Migrator::migrations()
+            .iter()
+            .map(|m| m.name().to_string())
+            .collect();
+        let assert_sorted = |label: &str, series: Vec<String>| {
+            let mut sorted = series.clone();
+            sorted.sort();
+            assert_eq!(series, sorted, "{label} migrations out of name order");
+        };
+        let (platform, upstream): (Vec<String>, Vec<String>) = names
+            .into_iter()
+            .partition(|n| n.contains("_platform_"));
+        assert_sorted("upstream", upstream);
+        assert_sorted("platform", platform);
     }
 }

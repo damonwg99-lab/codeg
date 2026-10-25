@@ -1,5 +1,6 @@
 pub mod agent_setting_service;
 pub mod app_metadata_service;
+pub mod assistant_service;
 pub mod automation_service;
 pub mod canvas_service;
 pub mod chat_channel_message_log_service;
@@ -33,4 +34,5 @@ pub mod platform_task_decomposition_service;
 pub mod platform_task_service;
 pub mod platform_task_type_mapping_service;
 pub mod token_usage_service;
+pub mod tool_approval_service;
 pub mod work_task_service;

@@ -27,6 +27,7 @@ import type {
   GitRepoScanResult,
   ProjectRepoInfo,
 } from "@/lib/platform/types"
+import type { FolderDetail } from "@/lib/types"
 import { errorText } from "@/lib/platform/errors"
 import { openFileDialog } from "@/lib/platform"
 import { KnowledgeManager } from "./knowledge-manager"
@@ -366,8 +367,9 @@ export function ProjectDetail({ id }: { id: number }) {
   )
 
   const handleCloneSuccess = useCallback(
-    async (fullPath: string) => {
+    async (folder: FolderDetail) => {
       if (!detail) return
+      const fullPath = folder.path
       const repoName = fullPath.split("/").pop() ?? fullPath
       const localDir = fullPath
       try {
@@ -942,7 +944,7 @@ export function ProjectDetail({ id }: { id: number }) {
           open={cloneOpen}
           onOpenChange={setCloneOpen}
           defaultTargetDir={detail.project.rootDir}
-          onSuccess={handleCloneSuccess}
+          onFolderOpened={handleCloneSuccess}
         />
       )}
       {/* Per-repo environment branch overrides */}

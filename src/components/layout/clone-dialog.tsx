@@ -26,14 +26,22 @@ interface CloneDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   defaultTargetDir?: string
-  onSuccess?: (fullPath: string, detail: FolderDetail) => void
+  /**
+   * Called once the cloned repository has been opened as a workspace folder —
+   * the same hook `WorkspaceFolderDialog` offers, so a caller can act on the
+   * new folder (the sidebar files it into the group the clone started from).
+   * It is the callback of the render the Clone click happened in, so a clone
+   * still finishing after the dialog was reopened elsewhere reports to the
+   * caller that started it.
+   */
+  onFolderOpened?: (folder: FolderDetail) => void
 }
 
 export function CloneDialog({
   open,
   onOpenChange,
   defaultTargetDir,
-  onSuccess,
+  onFolderOpened,
 }: CloneDialogProps) {
   const t = useTranslations("Folder.cloneDialog")
   const tToasts = useTranslations("Folder.toasts")
@@ -83,7 +91,7 @@ export function CloneDialog({
         { remoteUrl: url }
       )
       const detail = await openFolder(fullPath)
-      await onSuccess?.(fullPath, detail)
+      onFolderOpened?.(detail)
       onOpenChange(false)
       resetForm()
     } catch (err) {

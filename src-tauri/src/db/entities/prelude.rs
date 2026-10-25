@@ -2,6 +2,7 @@
 
 pub use super::agent_setting::Entity as AgentSetting;
 pub use super::app_metadata::Entity as AppMetadata;
+pub use super::assistant::Entity as Assistant;
 pub use super::automation::Entity as Automation;
 pub use super::automation_run::Entity as AutomationRun;
 pub use super::canvas_board::Entity as CanvasBoard;
@@ -37,6 +38,7 @@ pub use super::platform_task_decomposition::Entity as PlatformTaskDecomposition;
 pub use super::platform_task_type_mapping::Entity as PlatformTaskTypeMapping;
 pub use super::token_usage_sync::Entity as TokenUsageSync;
 pub use super::token_usage_turn::Entity as TokenUsageTurn;
+pub use super::tool_approval::Entity as ToolApproval;
 pub use super::work_task::Entity as WorkTask;
 pub use super::work_task_event::Entity as WorkTaskEvent;
 pub use super::work_task_settings::Entity as WorkTaskSettings;

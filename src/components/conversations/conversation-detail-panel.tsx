@@ -19,11 +19,12 @@ import {
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import {
+  extractPermissionToolCallId,
   getCachedSelectors,
   useAcpActions,
   useAcpEvent,
-  useConnectionStore,
 } from "@/contexts/acp-connections-context"
+import { ActivityLiveProvider } from "@/components/message/activity/activity-live-context"
 import { useAcpAgents } from "@/hooks/use-acp-agents"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
@@ -66,6 +67,7 @@ import { WelcomeHero, WelcomeTip } from "@/components/chat/welcome-hero"
 import { QuickActions } from "@/components/chat/quick-actions"
 import type { ComposerInjectContent } from "@/components/chat/message-input"
 import { TileScrollContainer } from "@/components/conversations/tile-scroll-container"
+import { stableTabViewOrder } from "@/lib/tab-view-order"
 import { GroupSplitHandle } from "@/components/conversations/group-split-handle"
 import { OverlayHostHiddenProvider } from "@/components/ui/overlay-host-hidden"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -78,6 +80,7 @@ import { useIsMobile } from "@/hooks/use-mobile"
 import { usePlatform } from "@/hooks/use-platform"
 import { useZoomLevel } from "@/hooks/use-appearance"
 import { isDesktop } from "@/lib/platform"
+import { ChromeReserve } from "@/components/layout/chrome-reserve"
 import { leftChromeReserve, rightChromeReserve } from "@/lib/window-chrome"
 import {
   acpFork,
@@ -91,10 +94,6 @@ import {
 import { flushPendingTaskLink } from "@/hooks/use-platform-composer"
 import { isWindowedDetail } from "@/lib/turn-window"
 import {
-  hasTranscriptOverlay,
-  isOutOfTurnContentEvent,
-} from "@/lib/background-agent"
-import {
   flushRetryDelayMs,
   isConnectionReady,
   shouldQueueDirectSend,
@@ -103,6 +102,7 @@ import {
 import { TurnBusyError } from "@/lib/turn-busy"
 import { deliverQueuedSteer } from "@/lib/queued-steer"
 import { toErrorMessage } from "@/lib/app-error"
+import { blockingPrompts } from "@/lib/blocking-prompts"
 import { notify } from "@/lib/notify"
 import {
   claimRuntimeSession,
@@ -115,6 +115,7 @@ import {
 } from "@/stores/conversation-runtime-store"
 import { useShallow } from "zustand/react/shallow"
 import { useConversationDetail } from "@/hooks/use-conversation-detail"
+import { useOutOfTurnContentNotice } from "@/hooks/use-out-of-turn-content-notice"
 import {
   buildSteerPayload,
   extractUserImagesFromDraft,
@@ -190,6 +191,17 @@ interface ConversationTabViewProps {
    *  reparent (the tab moved to another group — remount, keep the connection)
    *  apart from a real teardown (pane switch / route change — disconnect). */
   groupId: string
+  /** Whether this view is actually on screen: the active tab, or every member
+   *  of a tiled group. A mounted-but-hidden tab keeps its runtime session
+   *  alive, but it must NOT auto-fetch its own detail. Restoring a workspace
+   *  with N open tabs used to issue N concurrent `get_folder_conversation`
+   *  calls — each one a tail window of up to `TAIL_TURNS_DEFAULT` (120) turns,
+   *  so tens of MB across a large tab set — before the user had looked at a
+   *  single one of them. A hidden tab now fetches on the first frame it
+   *  becomes visible, so the workspace opens fetching only the tabs on screen
+   *  (one per split group, or every member of a tiled one) instead of all N.
+   *  Only that first load waits: see the fetch gate in the view. */
+  isVisible: boolean
 }
 
 function buildOptimisticUserTurnFromDraft(
@@ -256,6 +268,7 @@ const ConversationTabView = memo(function ConversationTabView({
   showActiveFlow,
   reloadSignal,
   groupId,
+  isVisible,
 }: ConversationTabViewProps) {
   const t = useTranslations("Folder.conversation")
   // Composer-namespace copy for the queue row's click-to-insert outcomes
@@ -306,7 +319,6 @@ const ConversationTabView = memo(function ConversationTabView({
     removeOptimisticTurn,
     appendViewerUserTurn,
     completeTurn,
-    markOutOfTurnContent,
     refetchDetail,
     syncTurnMetadata,
     setAcpLoadError,
@@ -317,9 +329,6 @@ const ConversationTabView = memo(function ConversationTabView({
     setSyncState,
   } = useConversationRuntimeActions()
   const acpActions = useAcpActions()
-  // Stable store handle, for event-time status reads that must not go through
-  // an effect-refreshed ref (see the out-of-turn subscriber below).
-  const connectionStore = useConnectionStore()
 
   // Stable runtime session key — set once at mount, never changes.
   // For new conversations this is a virtual (negative) ID; for existing
@@ -493,12 +502,40 @@ const ConversationTabView = memo(function ConversationTabView({
     setAgentConnectError(null)
   }, [agentType, conversationId])
 
+  // Gate the auto-fetch on VISIBILITY, not on mount. Every open tab stays
+  // mounted (that is what keeps a background session's stream and scroll state
+  // alive), so an ungated hook here would fire one detail fetch per open tab
+  // the moment the workspace restores — the N-concurrent-requests /
+  // tens-of-MB first paint described on `isVisible`. A hidden tab's effect
+  // re-runs when `isVisible` flips true (tab switch, group selection, tiling),
+  // which is also the moment its detail is first needed; until then the panel
+  // renders an empty transcript behind `invisible`, costing nothing. The
+  // render that first shows it already reports `detailLoading` (the hook
+  // counts a fetch it is about to start as loading) — that is what keeps
+  // `awaitingHistoricalSessionId` below closed on that render. `isActive` is in
+  // the gate as well, so that holds without leaning on the tab store always
+  // keeping the active tab its group's selected one.
+  //
+  // Only the FIRST load waits. Once this view has held a detail it fetches the
+  // way every view did before the gate, on screen or not. A hidden view can
+  // lose its session (closing the sub-agent viewer drops the session it shares
+  // with an open tab), and if the tab holds a live connection, the next
+  // streamed batch recreates that session with live data and no detail, which
+  // `fetchDetail` then never fills in: the tab came back without its history.
+  // Refetching straight away, as before, normally starts ahead of that batch.
+  // Latched on a held detail rather than on having been shown, so a view
+  // remounted while hidden onto a session that is already loaded (a move to
+  // another group) keeps it loaded too.
+  const [heldDetail, setHeldDetail] = useState(false)
   const {
     detail,
     loading: detailLoading,
     error: detailError,
     acpLoadError,
-  } = useConversationDetail(effectiveConversationId)
+  } = useConversationDetail(effectiveConversationId, {
+    enabled: isVisible || isActive || heldDetail,
+  })
+  if (detail != null && !heldDetail) setHeldDetail(true)
 
   // Subscribe to only the fields this panel actually reads from its runtime
   // session — NOT the whole session object. The live-message sink rewrites the
@@ -558,6 +595,12 @@ const ConversationTabView = memo(function ConversationTabView({
   // the backend falls back to session/new, orphaning the historical
   // context. cline doesn't support session resume, so it connects
   // immediately regardless.
+  //
+  // `detailLoading` must already be true on the render a tab turns active,
+  // since the auto-connect effect reads this gate from that very render: a
+  // restored tab that was hidden has a runtime session but no detail, and its
+  // fetch starts only in that render's effects. `useConversationDetail`
+  // reports the fetch it is about to start as loading for exactly this.
   const awaitingHistoricalSessionId =
     hasPersistedConversation && selectedAgent !== "cline" && detailLoading
   // Install status of the currently selected agent. An agent can be enabled and
@@ -672,7 +715,6 @@ const ConversationTabView = memo(function ConversationTabView({
   useEffect(() => {
     isViewerRef.current = conn.isViewer
   }, [conn.isViewer])
-  const isConnecting = connStatus === "connecting"
   // The tab's connection is keyed by a stable tabId, but agent switching is
   // async — and for a not-installed target, connect()'s preflight throws BEFORE
   // it tears down the old connection. So `conn` can still describe the PREVIOUS
@@ -732,10 +774,12 @@ const ConversationTabView = memo(function ConversationTabView({
     () => effectiveConfigOptions ?? [],
     [effectiveConfigOptions]
   )
-  const connectionCommands = useMemo(
-    () => (connIsForOtherAgent ? [] : (conn.availableCommands ?? [])),
-    [connIsForOtherAgent, conn.availableCommands]
-  )
+  // `null` until this tab's agent has advertised (no connection, one still
+  // coming up, or one still bound to another agent), never `[]`, which is an
+  // answer: the agent offers no commands. The composers read the two alike;
+  // the transcript tells them apart, badging from what this agent last
+  // advertised in this folder while the list is unknown.
+  const connectionCommands = connIsForOtherAgent ? null : conn.availableCommands
   const selectedModeId = useMemo(() => {
     if (connectionModes.length === 0) return null
     if (modeId && connectionModes.some((mode) => mode.id === modeId)) {
@@ -947,48 +991,8 @@ const ConversationTabView = memo(function ConversationTabView({
     )
   )
 
-  // An agent can run a turn CODEG never started: CodeBuddy drains a finished
-  // background task by prompting itself, and streams a whole turn for it.
-  // `applyStreamingAction`'s out-of-turn guard drops that content because the
-  // `background_activity` overlay is supposed to own it — but that overlay only
-  // has a producer for Claude Code, so for every other agent the turn renders
-  // nowhere and the session looks frozen until it is reopened. The content IS
-  // on disk and the agent's own parser already reads it correctly, so flag the
-  // session and let the timeline offer a re-read.
-  //
-  // This runs per streamed token, so every step is O(1) and ordered cheapest
-  // first; the reducer also early-returns once the flag is set.
-  useAcpEvent(
-    useCallback(
-      (envelope: EventEnvelope) => {
-        if (!isOutOfTurnContentEvent(envelope)) return
-        if (envelope.connection_id !== conn.connectionId) return
-        // The same condition the guard drops on, read from the SAME place the
-        // guard read it. Not `connStatusRef`: that is refreshed in an effect,
-        // so it still says "connected" for any envelope that lands between the
-        // StatusChanged(prompting) dispatch and React committing — which is
-        // exactly the burst at the start of every turn, and would arm the pill
-        // on turns we started ourselves. `getConnection` reads the store the
-        // reducer just wrote, and subscribers fire after that write.
-        if (connectionStore.getConnection(tabId)?.status === "prompting") return
-        // Unknown agent (no connection bound yet) → no pill. A connection that
-        // is streaming content always carries its type, so this only degrades
-        // to today's behavior in a case that shouldn't arise.
-        if (conn.agentType == null || hasTranscriptOverlay(conn.agentType)) {
-          return
-        }
-        markOutOfTurnContent(effectiveConversationId)
-      },
-      [
-        conn.agentType,
-        conn.connectionId,
-        connectionStore,
-        tabId,
-        effectiveConversationId,
-        markOutOfTurnContent,
-      ]
-    )
-  )
+  // A turn the agent runs on its own renders nowhere live; offer a re-read.
+  useOutOfTurnContentNotice(tabId, conn.connectionId, effectiveConversationId)
 
   useEffect(() => {
     if (effectiveConversationId <= 0) return
@@ -1502,6 +1506,16 @@ const ConversationTabView = memo(function ConversationTabView({
     },
     [conn.connectionId, tAsyncTasks]
   )
+
+  /** Turn Claude Code's Remote Control off the way the user would: by sending
+   *  `/remote-control off`, which the adapter answers itself. */
+  const handleRemoteControlOff = useCallback(() => {
+    const command = "/remote-control off"
+    handleSend({
+      blocks: [{ type: "text", text: command }],
+      displayText: command,
+    })
+  }, [handleSend])
 
   const handleOpenAgentsSettings = useCallback(() => {
     openSettingsWindow("agents", { agentType: selectedAgent }).catch((err) => {
@@ -2103,13 +2117,29 @@ const ConversationTabView = memo(function ConversationTabView({
     [effectiveConversationId]
   )
 
+  // Which tool call a pending approval is about, so the activity timeline can
+  // mark that step as waiting on the user; whether any blocking prompt is
+  // open, so a live reply stops saying its agent is at work; and how the
+  // connection's answered approvals went, for the chips on their rows.
+  const awaitingToolCallId = extractPermissionToolCallId(
+    conn.pendingPermission?.tool_call
+  )
+  const awaitingUser = blockingPrompts(conn) !== null
+  const approvals = conn.toolApprovals
+  const activityLive = useMemo(
+    () => ({ awaitingToolCallId, awaitingUser, approvals }),
+    [awaitingToolCallId, awaitingUser, approvals]
+  )
+
   const messageListNode = (
     <PlatformDecompositionBridge conversationId={effectiveConversationId}>
       <GoalControlProvider value={goalControlValue}>
+        <ActivityLiveProvider value={activityLive}>
         <MessageListView
           conversationId={effectiveConversationId}
           imageRoot={workingDirForConnection ?? null}
           agentType={selectedAgent}
+          availableCommands={connectionCommands}
           connStatus={connStatus}
           isActive={isActive}
           sendSignal={sendSignal}
@@ -2117,6 +2147,9 @@ const ConversationTabView = memo(function ConversationTabView({
           detailError={detailError}
           acpLoadError={acpLoadError}
           hideEmptyState={!hasPersistedConversation || hasSentMessage}
+          // The conversation page's navigator, plan and sub-agents show in the
+          // Session Details side panel rather than over the messages.
+          insightsInSidebar
           onReload={canShowDetailErrorActions ? handleReloadDetail : undefined}
           onNewSession={
             canShowDetailErrorActions ? handleOpenNewSession : undefined
@@ -2147,6 +2180,7 @@ const ConversationTabView = memo(function ConversationTabView({
               : undefined
           }
         />
+          </ActivityLiveProvider>
       </GoalControlProvider>
     </PlatformDecompositionBridge>
   )
@@ -2246,6 +2280,7 @@ const ConversationTabView = memo(function ConversationTabView({
 
   return (
     <ConversationShell
+      resizableWidth
       getSentHistory={getSentHistory}
       topBanner={
         <>
@@ -2272,6 +2307,13 @@ const ConversationTabView = memo(function ConversationTabView({
           ? handleStopAsyncTask
           : undefined
       }
+      remoteControl={connIsForOtherAgent ? null : conn.remoteControl}
+      onRemoteControlOff={
+        // Owners of a live connection only, like the stop above.
+        conn.connectionId !== null && !conn.isViewer
+          ? handleRemoteControlOff
+          : undefined
+      }
       pendingPermission={conn.pendingPermission}
       pendingQuestion={conn.pendingQuestion}
       pendingAskQuestion={conn.pendingAskQuestion}
@@ -2293,6 +2335,8 @@ const ConversationTabView = memo(function ConversationTabView({
       onConfigOptionChange={handleSetConfigOption}
       agentType={selectedAgent}
       availableCommands={connectionCommands}
+      // The previous agent's prediction is no use to the one just picked.
+      promptSuggestion={connIsForOtherAgent ? null : conn.promptSuggestion}
       attachmentTabId={tabId}
       draftStorageKey={draftStorageKey}
       hideInput={isWelcomeMode || Boolean(acpLoadError)}
@@ -2362,7 +2406,7 @@ const ConversationTabView = memo(function ConversationTabView({
         >
           <div className="flex min-h-full flex-col">
             <div className="flex-1" />
-            <div className="mx-auto flex w-full max-w-3xl shrink-0 flex-col gap-6 px-4 py-4">
+            <div className="mx-auto flex w-full chat-content-w shrink-0 flex-col gap-6 px-4 py-4">
               <WelcomeHero />
               <QuickActions
                 onSelect={handleQuickAction}
@@ -2385,7 +2429,9 @@ const ConversationTabView = memo(function ConversationTabView({
                     )
                   }}
                   onOpenAgentsSettings={handleOpenAgentsSettings}
-                  disabled={isConnecting || dbConversationId != null}
+                  // Drafts remain switchable while connecting; saved
+                  // conversations retain the agent they were created with.
+                  disabled={dbConversationId != null}
                 />
               </div>
               {composerBlockedMessage ? (
@@ -2445,7 +2491,7 @@ const ConversationTabView = memo(function ConversationTabView({
               />
             </div>
             <div className="flex-1" />
-            <div className="mx-auto w-full max-w-3xl shrink-0 px-4 pb-6">
+            <div className="mx-auto w-full chat-content-w shrink-0 px-4 pb-6">
               <WelcomeTip />
             </div>
           </div>
@@ -2465,7 +2511,8 @@ const ConversationTabView = memo(function ConversationTabView({
                 )
               }}
               onOpenAgentsSettings={handleOpenAgentsSettings}
-              disabled={isConnecting || dbConversationId != null}
+              // Same draft/saved rule as the welcome-mode picker above.
+              disabled={dbConversationId != null}
             />
             {composerBlockedMessage ? (
               <div className="mt-2 flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
@@ -2526,34 +2573,33 @@ const GROUP_EDGE_EPSILON = 0.1
  * exactly what the unsplit strip row does: left for LeftEdgeChrome while the
  * sidebar is collapsed (the conversation column then owns the window's left
  * edge), right for RightEdgeChrome while the column owns the right edge (aux
- * panel closed + conversation mode). Mobile shows the full-width
- * FolderTitleBar instead of corner overlays — no reserve. Self-subscribed so
- * sidebar/aux/zoom toggles re-render these slivers, not the whole panel.
+ * panel closed + conversation mode, or the column maximized over the file
+ * column). Like that row, the reserve is mounted while its column holds the
+ * corner — the right one only then; a mode switch or a maximize toggle snaps
+ * the layout — and sized by the side panel over the corner, so a sidebar/aux
+ * toggle slides it (ChromeReserve). Mobile shows the full-width FolderTitleBar
+ * instead of corner overlays — no reserve. Self-subscribed so sidebar/aux/zoom
+ * toggles re-render these slivers, not the whole panel.
  */
 function SplitStripCornerReserve({ side }: { side: "left" | "right" }) {
   const isMobile = useIsMobile()
   const { isOpen: sidebarOpen } = useSidebarContext()
   const { isOpen: auxOpen } = useAuxPanelContext()
-  const { mode } = useWorkspaceView()
+  const { mode, conversationMaximized } = useWorkspaceView()
   const { isMac, isWindows, isLinux } = usePlatform()
   const { zoomLevel } = useZoomLevel()
   if (isMobile) return null
+  const holdsRight = mode === "conversation" || conversationMaximized
+  if (side === "right" && !holdsRight) return null
   const width =
     side === "left"
       ? sidebarOpen
         ? 0
         : leftChromeReserve(isMac && isDesktop(), zoomLevel)
-      : !auxOpen && mode === "conversation"
-        ? rightChromeReserve(isDesktop() && (isWindows || isLinux), zoomLevel)
-        : 0
-  if (width <= 0) return null
-  return (
-    <div
-      data-tauri-drag-region
-      className="h-full shrink-0 ws-strip-line"
-      style={{ width }}
-    />
-  )
+      : auxOpen
+        ? 0
+        : rightChromeReserve(isDesktop() && (isWindows || isLinux), zoomLevel)
+  return <ChromeReserve width={width} />
 }
 
 export function ConversationDetailPanel() {
@@ -2913,6 +2959,7 @@ export function ConversationDetailPanel() {
         showActiveFlow={(isSplit || canTileG) && active}
         reloadSignal={reloadByTabId[tab.id] ?? 0}
         groupId={groupId}
+        isVisible={visible}
       />
     )
     return (
@@ -2925,6 +2972,11 @@ export function ConversationDetailPanel() {
             tileTabRefs.current.delete(tab.id)
           }
         }}
+        // Tiled, everything below this wrapper is invisible to the row's
+        // scrollbar (a tile clips its content), so TileScrollContainer skips
+        // the layout read its observer would otherwise force per mutation.
+        data-tile-scroll-item=""
+        style={canTileG ? { order: indexInGroup } : undefined}
         className={cn(
           canTileG
             ? cn(
@@ -2998,11 +3050,13 @@ export function ConversationDetailPanel() {
       >
         {/* While split, each group owns its own strip (the workspace layout's
             title-bar row is gone entirely), and the TOP-edge strips add the
-            corner reserves that row normally carries. */}
+            corner reserves that row normally carries. The top-right one also
+            takes over the unsplit strip's maximize/restore button — the
+            column has one, so only one strip may carry it. */}
         {isSplit && (
           <div className="flex h-10 shrink-0 items-stretch bg-muted ws-transparent-bg">
             {touchesLeft && <SplitStripCornerReserve side="left" />}
-            <TabBar groupId={groupId} />
+            <TabBar groupId={groupId} maximizeControl={touchesRight} />
             {touchesRight && <SplitStripCornerReserve side="right" />}
           </div>
         )}
@@ -3038,8 +3092,12 @@ export function ConversationDetailPanel() {
                 canTileG && "flex min-w-full flex-row"
               )}
             >
-              {groupTabs.map((tab, indexInGroup) =>
-                renderTabWrapper(tab, indexInGroup, groupId, canTileG)
+              {/* Strip order reaches the screen only through CSS `order`:
+                  a reorder that moved these nodes would reset each moved
+                  transcript's scroll offset and blank it (see
+                  stableTabViewOrder). */}
+              {stableTabViewOrder(groupTabs).map(({ tab, visualIndex }) =>
+                renderTabWrapper(tab, visualIndex, groupId, canTileG)
               )}
             </div>
           </TileScrollContainer>
