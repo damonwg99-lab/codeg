@@ -1581,14 +1581,16 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
                                           listener calls openConversations() to
                                           surface a launcher-opened folder. */}
                                     <WorkspaceOpenFolderListener />
-                                    <FolderLayoutShell>
-                                      {/* [ai-platform] Platform project context for the shell: the sidebar
-                                        project section, the aux KB tab and the workbench routes all
-                                        read it (see platform-shell-provider.tsx for the D31 note). */}
-                                      <PlatformShellProvider>
+                                    {/* [ai-platform] Platform project context wraps the WHOLE
+                                        shell — WorkspaceChromeController's folder dialog, the
+                                        sidebar project section, the aux KB tab and the workbench
+                                        routes all read it. See platform-shell-provider.tsx for
+                                        the D31 history note. */}
+                                    <PlatformShellProvider>
+                                      <FolderLayoutShell>
                                         {children}
-                                      </PlatformShellProvider>
-                                    </FolderLayoutShell>
+                                      </FolderLayoutShell>
+                                    </PlatformShellProvider>
                                   </WorkbenchRouteProvider>
                                 </TasksViewProvider>
                               </AutomationsViewProvider>
