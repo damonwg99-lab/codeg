@@ -83,7 +83,15 @@ pub async fn get_task_core(
         .await
         .map_err(AppCommandError::from)?;
 
-    let all_docs = platform_knowledge_doc_service::find_by_task_id(conn, id)
+    // [ai-platform] Scope the docs to the task's own project: the KB scanner
+    // infers task_id from `.private/tasks/{id}/` per project, so the same
+    // number can exist in several projects' KB tables.
+    let all_docs =
+        platform_knowledge_doc_service::find_by_task_and_project(
+            conn,
+            task.project_id,
+            id,
+        )
         .await
         .map_err(AppCommandError::from)?;
 

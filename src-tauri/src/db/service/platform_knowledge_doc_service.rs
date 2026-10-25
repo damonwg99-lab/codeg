@@ -227,11 +227,18 @@ pub async fn find_by_skill_name(
     Ok(rows.into_iter().map(to_info).collect())
 }
 
-pub async fn find_by_task_id(
+/// Task-scoped docs for a task detail page. Task ids are global, but the
+/// scanner stamps `task_id` from each project's own `.private/tasks/{id}/`
+/// path — a folder numbered `108` in ANY project's KB yields rows with
+/// `task_id = 108` in THAT project. The project filter is what keeps another
+/// project's same-numbered folder from bleeding into this task's detail.
+pub async fn find_by_task_and_project(
     conn: &DatabaseConnection,
+    project_id: i32,
     task_id: i32,
 ) -> Result<Vec<KnowledgeDocInfo>, DbError> {
     let rows = platform_knowledge_doc::Entity::find()
+        .filter(platform_knowledge_doc::Column::ProjectId.eq(project_id))
         .filter(platform_knowledge_doc::Column::TaskId.eq(task_id))
         .filter(platform_knowledge_doc::Column::DeletedAt.is_null())
         .all(conn)
@@ -302,5 +309,81 @@ pub async fn upsert_by_path(
         };
         let result = model.insert(conn).await?;
         Ok(to_info(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::test_helpers::fresh_in_memory_db;
+
+    fn draft(project_id: i32, file_path: &str, task_id: i32) -> UpsertKnowledgeDocDraft {
+        UpsertKnowledgeDocDraft {
+            project_id,
+            doc_type: "ai_intermediate".to_string(),
+            title: file_path.to_string(),
+            file_path: file_path.to_string(),
+            is_shared: false,
+            tags_json: None,
+            description: None,
+            skill_name: None,
+            task_id: Some(task_id),
+            file_mtime: None,
+            file_size: None,
+        }
+    }
+
+    /// The KB scanner stamps `task_id` from each project's own
+    /// `.private/tasks/{id}/` path, so the same number exists in several
+    /// projects' tables whenever their KB folders happen to share it. A task
+    /// detail page must see only its own project's docs (the cross-project
+    /// bleed this once shipped).
+    #[tokio::test]
+    async fn task_docs_are_scoped_to_the_task_project() {
+        let db = fresh_in_memory_db().await;
+        let project_a = crate::db::service::platform_project_service::create(
+            &db.conn, "project-a", "/tmp/project-a", None, None, None, None,
+        )
+        .await
+        .expect("seed project a")
+        .id;
+        let project_b = crate::db::service::platform_project_service::create(
+            &db.conn, "project-b", "/tmp/project-b", None, None, None, None,
+        )
+        .await
+        .expect("seed project b")
+        .id;
+
+        // Both projects' KBs carry a `.private/tasks/108/` folder.
+        upsert_by_path(
+            &db.conn,
+            draft(project_a, ".private/tasks/108/ai-intermediate/a.md", 108),
+        )
+        .await
+        .expect("seed project-a doc");
+        upsert_by_path(
+            &db.conn,
+            draft(project_b, ".private/tasks/108/notes.md", 108),
+        )
+        .await
+        .expect("seed project-b doc");
+
+        let docs = find_by_task_and_project(&db.conn, project_a, 108)
+            .await
+            .expect("query");
+        assert_eq!(docs.len(), 1, "project a sees only its own doc");
+        assert_eq!(docs[0].file_path, ".private/tasks/108/ai-intermediate/a.md");
+
+        let docs = find_by_task_and_project(&db.conn, project_b, 108)
+            .await
+            .expect("query");
+        assert_eq!(docs.len(), 1, "project b sees only its own doc");
+        assert_eq!(docs[0].file_path, ".private/tasks/108/notes.md");
+
+        // A project with no such folder sees nothing.
+        let docs = find_by_task_and_project(&db.conn, project_b, 999)
+            .await
+            .expect("query");
+        assert!(docs.is_empty());
     }
 }
