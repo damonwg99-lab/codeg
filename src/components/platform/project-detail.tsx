@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState, useCallback } from "react"
+import { useEffect, useState, useCallback, useMemo } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import {
@@ -11,6 +11,7 @@ import {
   RefreshCw,
   ArrowLeft,
   Download,
+  FolderOpen,
   GitBranch,
 } from "lucide-react"
 import {
@@ -27,6 +28,7 @@ import type {
   ProjectRepoInfo,
 } from "@/lib/platform/types"
 import { errorText } from "@/lib/platform/errors"
+import { openFileDialog } from "@/lib/platform"
 import { KnowledgeManager } from "./knowledge-manager"
 import { usePlatform } from "@/contexts/platform-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
@@ -98,6 +100,8 @@ export function ProjectDetail({ id }: { id: number }) {
   const [editDevBranch, setEditDevBranch] = useState("")
   const [editUatBranch, setEditUatBranch] = useState("")
   const [editPrdBranch, setEditPrdBranch] = useState("")
+  const [editKbLocalDir, setEditKbLocalDir] = useState("")
+  const [editKbRepoUrl, setEditKbRepoUrl] = useState("")
 
   // Project status values (matches backend default + common statuses)
   const PROJECT_STATUSES = ["planning", "active", "completed", "archived"]
@@ -135,6 +139,8 @@ export function ProjectDetail({ id }: { id: number }) {
           setEditDevBranch(d.project.devBranch ?? "")
           setEditUatBranch(d.project.uatBranch ?? "")
           setEditPrdBranch(d.project.prdBranch ?? "")
+          setEditKbLocalDir(d.project.kbLocalDir ?? "")
+          setEditKbRepoUrl(d.project.kbRepoUrl ?? "")
           setLoading(false)
         }
       } catch {
@@ -146,6 +152,62 @@ export function ProjectDetail({ id }: { id: number }) {
       cancelled = true
     }
   }, [id])
+
+  // KB directory picker (same directory dialog the clone-repo flow uses;
+  // web mode falls back to a server-path prompt inside openFileDialog).
+  const handleBrowseKbDir = useCallback(async () => {
+    try {
+      const result = await openFileDialog({
+        directory: true,
+        title: "选择知识库目录",
+      })
+      if (result && typeof result === "string") {
+        setEditKbLocalDir(result)
+      }
+    } catch (e) {
+      console.error("browse kb dir failed:", e)
+    }
+  }, [])
+
+  // Which select option reflects the current KB git URL / local dir: a repo
+  // whose gitUrl matches wins, then one whose localDir is the KB directory
+  // (the KB working copy may be a repo without a known URL), otherwise a
+  // custom URL keeps a synthetic entry so the select can display it.
+  const kbRepoSelectValue = useMemo(() => {
+    const repos = detail?.repos ?? []
+    const url = editKbRepoUrl.trim()
+    if (url) {
+      const byUrl = repos.find((r) => r.gitUrl && r.gitUrl === url)
+      if (byUrl) return `repo:${byUrl.localDir}`
+    }
+    const dir = editKbLocalDir.trim().replace(/\\/g, "/").toLowerCase()
+    if (dir) {
+      const byDir = repos.find(
+        (r) => r.localDir.replace(/\\/g, "/").toLowerCase() === dir
+      )
+      if (byDir) return `repo:${byDir.localDir}`
+    }
+    return url ? "__custom__" : "__none__"
+  }, [detail, editKbRepoUrl, editKbLocalDir])
+
+  const handleKbRepoSelect = useCallback(
+    (value: string) => {
+      if (value === "__none__") {
+        setEditKbRepoUrl("")
+        return
+      }
+      if (value === "__custom__") return
+      if (!value.startsWith("repo:")) return
+      const localDir = value.slice("repo:".length)
+      const repo = detail?.repos.find((r) => r.localDir === localDir)
+      if (!repo) return
+      setEditKbRepoUrl(repo.gitUrl || "")
+      // Associating a repo implies its working copy is the KB; fill the
+      // directory only when the user hasn't set one themselves.
+      setEditKbLocalDir((prev) => prev.trim() || repo.localDir)
+    },
+    [detail]
+  )
 
   const handleSave = useCallback(async () => {
     if (!detail) return
@@ -161,6 +223,8 @@ export function ProjectDetail({ id }: { id: number }) {
         devBranch: editDevBranch,
         uatBranch: editUatBranch,
         prdBranch: editPrdBranch,
+        kbLocalDir: editKbLocalDir.trim() || null,
+        kbRepoUrl: editKbRepoUrl.trim() || null,
       })
       setDetail((prev) => (prev ? { ...prev, project: updated } : null))
       // Refresh PlatformContext's projects list so ProjectList picks up
@@ -182,6 +246,8 @@ export function ProjectDetail({ id }: { id: number }) {
     editDevBranch,
     editUatBranch,
     editPrdBranch,
+    editKbLocalDir,
+    editKbRepoUrl,
     loadProjects,
   ])
 
@@ -218,7 +284,7 @@ export function ProjectDetail({ id }: { id: number }) {
       )
     }
     setSavingRepoEnv(false)
-  }, [repoEnvEdit, loadProjectDetail, t])
+  }, [repoEnvEdit, loadProjectDetail, setRepoEnvEdit, t])
 
   const handleScan = useCallback(async () => {
     if (!detail) return
@@ -527,6 +593,58 @@ export function ProjectDetail({ id }: { id: number }) {
                           />
                         </div>
                       </div>
+                      <div className="flex flex-col gap-1.5">
+                        <Label>
+                          知识库目录 (相对路径如 _knowledge 或外部绝对路径)
+                        </Label>
+                        <div className="flex gap-2">
+                          <Input
+                            placeholder="默认为 _knowledge，或填入本地绝对路径如 D:/repos/team-kb"
+                            value={editKbLocalDir}
+                            onChange={(e) => setEditKbLocalDir(e.target.value)}
+                          />
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="shrink-0"
+                            onClick={handleBrowseKbDir}
+                          >
+                            <FolderOpen className="mr-1 h-3.5 w-3.5" />
+                            选择目录
+                          </Button>
+                        </div>
+                      </div>
+                      <div className="flex flex-col gap-1.5">
+                        <Label>知识库 Git 仓库 (可选，支持团队共享)</Label>
+                        <Select
+                          value={kbRepoSelectValue}
+                          onValueChange={handleKbRepoSelect}
+                        >
+                          <SelectTrigger>
+                            <SelectValue placeholder="未关联 Git 仓库" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="__none__">
+                              未关联 Git 仓库
+                            </SelectItem>
+                            {(detail?.repos ?? []).map((r) => (
+                              <SelectItem
+                                key={r.id}
+                                value={`repo:${r.localDir}`}
+                              >
+                                {r.name}
+                                {r.gitUrl ? ` (${r.gitUrl})` : ""}
+                              </SelectItem>
+                            ))}
+                            {kbRepoSelectValue === "__custom__" && (
+                              <SelectItem value="__custom__">
+                                自定义仓库地址
+                              </SelectItem>
+                            )}
+                          </SelectContent>
+                        </Select>
+                      </div>
                     </>
                   ) : (
                     <>
@@ -597,6 +715,25 @@ export function ProjectDetail({ id }: { id: number }) {
                             ]
                               .filter((b) => b && b.trim())
                               .join(" / ")}
+                          </span>
+                        </div>
+                      )}
+                      <div className="flex flex-col gap-1">
+                        <span className="text-[0.75rem] text-muted-foreground">
+                          知识库目录
+                        </span>
+                        <span className="text-[0.875rem] font-mono text-xs">
+                          {project.kbLocalDir ||
+                            `${project.rootDir}/_knowledge (默认)`}
+                        </span>
+                      </div>
+                      {project.kbRepoUrl && (
+                        <div className="flex flex-col gap-1">
+                          <span className="text-[0.75rem] text-muted-foreground">
+                            知识库 Git 仓库
+                          </span>
+                          <span className="text-[0.875rem] font-mono text-xs text-muted-foreground">
+                            {project.kbRepoUrl}
                           </span>
                         </div>
                       )}
