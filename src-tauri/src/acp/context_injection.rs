@@ -1,12 +1,23 @@
 //! Builds the first-prompt context injection block that is prepended to the
-//! agent's prompt on a new task conversation. The injected content is wrapped
-//! in `<!-- codeg:inject:start/end -->` markers so the frontend rendering
-//! layer can hide it from the user while the agent's LLM still sees it.
+//! agent's prompt on a new conversation. The injected content is wrapped in
+//! `<!-- codeg:inject:start/end -->` markers so the frontend rendering layer
+//! can hide it from the user while the agent's LLM still sees it.
 //!
 //! ## Injection content
-//! 1. **Project KB Rules** — contents of `_knowledge/RULES.md` (real-time read)
-//! 2. **Task Context** — task id, title, type, and directory structure (only
-//!    when the conversation is linked to a task via `platform_task_conversation`)
+//!
+//! One **Knowledge Base Storage Rules** block for every project conversation
+//! (the task association is no longer a gate — it only switches the variant):
+//!
+//! - **Task-linked conversations** — the task directory contract
+//!   (`.private/tasks/{id}/`: `attachments/` read-only, `ai-intermediate/`
+//!   receives ALL documents generated in the session).
+//! - **Plain project conversations** — the default directory
+//!   (`.private/ai-intermediate/`).
+//!
+//! Both variants point at `{kb_dir}/RULES.md` for the full rules instead of
+//! inlining them: the agent reads the file on demand when it actually writes
+//! documents, so conversations that never generate one carry only a ~60-token
+//! contract.
 
 use crate::acp::types::PromptInputBlock;
 use crate::db::service::{
@@ -90,80 +101,76 @@ pub fn build_decomposition_instruction_block() -> PromptInputBlock {
     }
 }
 
-/// Build the first-prompt injection block for a new conversation. Returns
-/// `None` when there is nothing to inject (no RULES.md and no task link).
+/// Build the KB storage-rules block for a first prompt. Task-linked
+/// conversations get the task-directory variant — every document generated in
+/// the session belongs to the task, so there is no non-task fallback line.
+/// Plain conversations get the default `.private/ai-intermediate/` variant.
+/// Both point at RULES.md instead of inlining it (see module docs).
+pub fn build_kb_storage_block(kb_dir: &str, task_id: Option<i32>) -> String {
+    let task_part = match task_id {
+        Some(id) => format!(
+            "Task directory: {kb_dir}/.private/tasks/{id}/\n\
+             \x20 \x20├── attachments/       # user attachments, read-only\n\
+             \x20 \x20└── ai-intermediate/   # save ALL documents generated in this session here\n"
+        ),
+        None => format!(
+            "Save generated documents to: {kb_dir}/.private/ai-intermediate/\n"
+        ),
+    };
+    format!(
+        "=== Knowledge Base Storage Rules ===\n\
+         {task_part}\
+         Before writing any document, read `{kb_dir}/RULES.md` and follow its full rules.\n\
+         === End ==="
+    )
+}
+
+/// Build the first-prompt injection block for a new conversation: the single
+/// KB storage-rules block, in the task or plain variant depending on whether
+/// the conversation is linked to a task. Returns `None` when the conversation
+/// has no project context at all (non-platform / folderless sessions).
 pub async fn build_first_prompt_injection(
     conn: &DatabaseConnection,
-    conversation_id: i32,
+    conversation_id: Option<i32>,
     folder_id: i32,
 ) -> Option<PromptInputBlock> {
-    // Only inject for conversations linked to a task. A plain (non-task)
-    // conversation must not receive the KB rules / task context block.
-    platform_task_conversation_service::get_by_conversation(conn, conversation_id)
-        .await
-        .ok()?
-        .as_ref()?;
+    // Resolve the conversation's task link once — it selects the block
+    // variant and doubles as the project fallback when the folder itself has
+    // no project (a task conversation may run without the project folder
+    // open).
+    let link = match conversation_id {
+        Some(cid) => platform_task_conversation_service::get_by_conversation(conn, cid)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
 
-    let mut parts: Vec<String> = Vec::new();
-
-    // 1. Project KB Rules (from RULES.md)
-    if let Ok(Some(project)) = platform_project_service::get_by_folder_id(conn, folder_id).await {
-        let kb_dir = project
-            .kb_local_dir
-            .unwrap_or_else(|| format!("{}/_knowledge", project.root_dir));
-        let rules_path = std::path::Path::new(&kb_dir).join("RULES.md");
-        if rules_path.is_file() {
-            match std::fs::read_to_string(&rules_path) {
-                Ok(content) => {
-                    parts.push(format!(
-                        "=== Project Knowledge Base Rules ===\n{}\n=== End of Rules ===",
-                        content,
-                    ));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "[context_injection] failed to read RULES.md at {}: {e}",
-                        rules_path.display()
-                    );
-                }
+    let project = match platform_project_service::get_by_folder_id(conn, folder_id).await {
+        Ok(Some(project)) => Some(project),
+        Ok(None) | Err(_) => match link.as_ref() {
+            Some(link) => {
+                let task = platform_task_service::get_by_id(conn, link.task_id)
+                    .await
+                    .ok()
+                    .flatten()?;
+                platform_project_service::get_by_id(conn, task.project_id)
+                    .await
+                    .ok()
+                    .flatten()
             }
-        }
-    }
+            None => None,
+        },
+    }?;
 
-    // 2. Task Context (only when linked to a task)
-    if let Ok(Some(link)) =
-        platform_task_conversation_service::get_by_conversation(conn, conversation_id).await
-    {
-        if let Ok(Some(task)) = platform_task_service::get_by_id(conn, link.task_id).await {
-            if let Ok(Some(project)) =
-                platform_project_service::get_by_id(conn, task.project_id).await
-            {
-                let kb_dir = project
-                    .kb_local_dir
-                    .unwrap_or_else(|| format!("{}/_knowledge", project.root_dir));
-                parts.push(format!(
-                    "=== Task Context ===\n\
-                     Task ID: {}\n\
-                     Task Title: {}\n\
-                     Task Type: {}\n\
-                     Task Directory: {}/.private/tasks/{}/\n\
-                     \x20 \x20├── attachments/       # User attachments, do not modify\n\
-                     \x20 \x20└── ai-intermediate/   # Your generated documents go here\n\
-                     === End Task Context ===",
-                    task.id, task.title, task.task_type, kb_dir, task.id,
-                ));
-            }
-        }
-    }
-
-    if parts.is_empty() {
-        return None;
-    }
+    let kb_dir = project
+        .kb_local_dir
+        .unwrap_or_else(|| format!("{}/_knowledge", project.root_dir));
 
     let text = format!(
         "{}\n{}\n{}",
         INJECTION_MARKER_START,
-        parts.join("\n\n"),
+        build_kb_storage_block(&kb_dir, link.map(|l| l.task_id)),
         INJECTION_MARKER_END,
     );
 
@@ -171,15 +178,24 @@ pub async fn build_first_prompt_injection(
 }
 
 /// Build a compact re-injection preamble for long-running conversations.
-/// Only contains the critical file-storage rules to prevent exceeding token
-/// budgets.
-pub fn build_reinjection_preamble(kb_dir: &str, task_id: i32, _has_git: bool) -> String {
-    let task_dir = format!("{kb_dir}/.private/tasks/{task_id}/ai-intermediate/");
+/// Mirrors the first-prompt storage block's two variants: task-linked
+/// conversations get the task directory, plain ones the default directory.
+/// Both re-point at RULES.md so the full rules stay one read away.
+pub fn build_reinjection_preamble(kb_dir: &str, task_id: Option<i32>) -> String {
+    let dir_line = match task_id {
+        Some(id) => format!(
+            "- Save ALL documents generated in this session to: \
+             `{kb_dir}/.private/tasks/{id}/ai-intermediate/`"
+        ),
+        None => format!(
+            "- Save generated documents to: `{kb_dir}/.private/ai-intermediate/`"
+        ),
+    };
 
     format!(
-        "{}\n=== Task Reminder ===\n\
-         Task ID: {task_id}\n\
-         - Save generated documents to: `{task_dir}`\n\
+        "{}\n=== KB Reminder ===\n\
+         {dir_line}\n\
+         - Full rules: `{kb_dir}/RULES.md`\n\
          === End Reminder ===\n{}",
         INJECTION_MARKER_START, INJECTION_MARKER_END,
     )
@@ -203,39 +219,58 @@ pub fn should_reinject(
         || (current_tokens as f64 / max_tokens as f64) > 0.5
 }
 
-/// Resolve the KB directory + task id + git presence for a conversation
-/// linked to a task (same resolution as the Task Context section of
-/// [`build_first_prompt_injection`]). Returns `None` when the conversation is
-/// not linked to a task.
-async fn resolve_task_context(
+/// Resolve the KB directory + optional task id for a re-injection. Task-linked
+/// conversations resolve through the link (same chain as the task variant of
+/// [`build_first_prompt_injection`]); plain project conversations fall back to
+/// the folder's project. Returns `None` when there is no project context at
+/// all — nothing to remind about.
+async fn resolve_reinjection_context(
     conn: &DatabaseConnection,
     conversation_id: i32,
-) -> Option<(String, i32, bool)> {
-    let link = platform_task_conversation_service::get_by_conversation(conn, conversation_id)
+    folder_id: Option<i32>,
+) -> Option<(String, Option<i32>)> {
+    if let Some(link) =
+        platform_task_conversation_service::get_by_conversation(conn, conversation_id)
+            .await
+            .ok()
+            .flatten()
+    {
+        if let Some(task) = platform_task_service::get_by_id(conn, link.task_id).await.ok().flatten()
+        {
+            if let Some(project) =
+                platform_project_service::get_by_id(conn, task.project_id).await.ok().flatten()
+            {
+                let kb_dir = project
+                    .kb_local_dir
+                    .unwrap_or_else(|| format!("{}/_knowledge", project.root_dir));
+                return Some((kb_dir, Some(task.id)));
+            }
+        }
+    }
+
+    let project = platform_project_service::get_by_folder_id(conn, folder_id?)
         .await
-        .ok()??;
-    let task = platform_task_service::get_by_id(conn, link.task_id).await.ok()??;
-    let project = platform_project_service::get_by_id(conn, task.project_id)
-        .await
-        .ok()??;
+        .ok()
+        .flatten()?;
     let kb_dir = project
         .kb_local_dir
         .unwrap_or_else(|| format!("{}/_knowledge", project.root_dir));
-    let has_git = crate::git_repo::is_git_repo(std::path::Path::new(&project.root_dir));
-    Some((kb_dir, task.id, has_git))
+    Some((kb_dir, None))
 }
 
-/// Build the wrapped re-injection preamble block for a task-linked
-/// conversation, or `None` when the conversation is not linked to a task (in
-/// which case there is nothing to re-inject). Used by the manager on
-/// follow-up prompts, gated by [`should_reinject`].
+/// Build the wrapped re-injection preamble block for a conversation — the
+/// task variant for task-linked conversations, the default-directory variant
+/// for plain project conversations, or `None` when there is no project
+/// context (nothing to remind about). Used by the manager on follow-up
+/// prompts, gated by [`should_reinject`].
 pub async fn build_reinjection_block(
     conn: &DatabaseConnection,
     conversation_id: i32,
+    folder_id: Option<i32>,
 ) -> Option<PromptInputBlock> {
-    let (kb_dir, task_id, has_git) = resolve_task_context(conn, conversation_id).await?;
+    let (kb_dir, task_id) = resolve_reinjection_context(conn, conversation_id, folder_id).await?;
     Some(PromptInputBlock::Text {
-        text: build_reinjection_preamble(&kb_dir, task_id, has_git),
+        text: build_reinjection_preamble(&kb_dir, task_id),
     })
 }
 
@@ -262,17 +297,19 @@ pub fn re_injection_interval_from_env() -> usize {
 /// connection's identity and turn counter alone — the manager only feeds this
 /// the pieces and advances its counter afterwards. The policy, in order:
 ///
-/// - **First prompt on the connection** (`prompt_turn_count == 0`): full
-///   KB-rules/task-context injection (task-linked conversations only), plus
-///   the decomposition instruction when the user's own message expresses
-///   decomposition intent. Gating on the message (rather than injecting
+/// - **First prompt on the connection** (`prompt_turn_count == 0`): the KB
+///   storage-rules block for every project conversation (task-directory
+///   variant when linked, default variant otherwise), plus the decomposition
+///   instruction when the user's own message expresses decomposition intent.
+///   Gating the decomposition block on the message (rather than injecting it
 ///   unconditionally on every turn) keeps the agent from being primed to
 ///   decompose of its own accord when it merely echoes "分解/拆分".
 /// - **Follow-up prompts**: compact re-injection preamble when due per
-///   [`should_reinject`], so long-running sessions keep their file-storage /
-///   branch-tracking rules. Fires for ALL sessions (task-linked or not) so
-///   the decomposition rule is periodically refreshed against long-context
-///   forgetting.
+///   [`should_reinject`] — the task-directory variant for task-linked
+///   conversations, the default-directory variant for plain project
+///   conversations — so long-running sessions keep their file-storage rules.
+///   The decomposition rule is likewise refreshed against long-context
+///   forgetting for ALL sessions.
 /// - Otherwise the blocks pass through unchanged.
 ///
 /// The conversation row's `message_count` is deliberately NOT used: it is
@@ -289,10 +326,12 @@ pub async fn inject_for_prompt(
     let use_decomp_injection = has_decomposition_intent_in_blocks(&blocks);
 
     if prompt_turn_count == 0 {
-        // First prompt on this connection — full context injection.
+        // First prompt on this connection — KB storage contract + optional
+        // decomposition instruction. Only a project folder is required: the
+        // task link is resolved inside (and merely switches the variant).
         let mut injected_blocks = Vec::new();
-        if let (Some(cid), Some(fid)) = (conversation_id, folder_id) {
-            if let Some(block) = build_first_prompt_injection(conn, cid, fid).await {
+        if let Some(fid) = folder_id {
+            if let Some(block) = build_first_prompt_injection(conn, conversation_id, fid).await {
                 injected_blocks.push(block);
             }
         }
@@ -312,7 +351,7 @@ pub async fn inject_for_prompt(
             if use_decomp_injection {
                 reinjected.push(build_decomposition_instruction_block());
             }
-            if let Some(block) = build_reinjection_block(conn, cid).await {
+            if let Some(block) = build_reinjection_block(conn, cid, folder_id).await {
                 reinjected.push(block);
             }
             reinjected.extend(blocks);
@@ -353,13 +392,48 @@ mod tests {
     }
 
     #[test]
+    fn kb_storage_block_task_variant_mentions_task_dir() {
+        let text = build_kb_storage_block("/repo/_knowledge", Some(42));
+        assert!(text.contains("/repo/_knowledge/.private/tasks/42/"));
+        assert!(text.contains("attachments/"));
+        assert!(text.contains("ai-intermediate/"));
+        assert!(text.contains("/repo/_knowledge/RULES.md"));
+        // Task metadata (title/type/description) intentionally absent — it is
+        // already in the user's own conversation; only the storage contract
+        // is injected.
+        assert!(!text.contains("Task Title"));
+        assert!(!text.contains("Task Description"));
+        assert!(!text.contains("Session Role"));
+        // No non-task fallback: a linked session files everything under the
+        // task directory.
+        assert!(!text.contains("Non-task documents"));
+    }
+
+    #[test]
+    fn kb_storage_block_plain_variant_mentions_default_dir() {
+        let text = build_kb_storage_block("/repo/_knowledge", None);
+        assert!(text.contains("/repo/_knowledge/.private/ai-intermediate/"));
+        assert!(text.contains("/repo/_knowledge/RULES.md"));
+        assert!(!text.contains("tasks/"));
+    }
+
+    #[test]
     fn reinjection_preamble_is_marker_wrapped_and_mentions_task_dir() {
-        let text = build_reinjection_preamble("/repo/_knowledge", 42, true);
+        let text = build_reinjection_preamble("/repo/_knowledge", Some(42));
         assert!(text.starts_with(INJECTION_MARKER_START));
         assert!(text.contains(INJECTION_MARKER_END));
         assert!(is_injected_block(&text));
         assert!(text.contains("/repo/_knowledge/.private/tasks/42/ai-intermediate/"));
-        assert!(text.contains("Task ID: 42"));
+        assert!(text.contains("/repo/_knowledge/RULES.md"));
+    }
+
+    #[test]
+    fn reinjection_preamble_plain_variant_mentions_default_dir() {
+        let text = build_reinjection_preamble("/repo/_knowledge", None);
+        assert!(is_injected_block(&text));
+        assert!(text.contains("/repo/_knowledge/.private/ai-intermediate/"));
+        assert!(text.contains("/repo/_knowledge/RULES.md"));
+        assert!(!text.contains("tasks/"));
     }
 
     #[test]
