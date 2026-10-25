@@ -2170,6 +2170,7 @@ export function MessageInput({
                     onAddFeedback={onAddFeedback}
                     feedbackAddDisabled={feedbackAddDisabled}
                   />
+                  {/* [ai-platform] inject toolbar + KB reference handling */}
                   <PlatformComposerToolbar
                     onInjectReferences={handlePlatformInject}
                   />

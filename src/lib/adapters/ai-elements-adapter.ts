@@ -707,7 +707,8 @@ function expandProposedPlanText(
 }
 
 /**
- * Extract ```task_decomposition_json code fences from assistant text and
+ * [ai-platform] Extract ```task_decomposition_json code fences from
+ * assistant text and
  * replace them with structured `AdaptedDecompositionPart` cards. Any prose
  * before/after the fences is preserved as `text` parts.
  *

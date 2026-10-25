@@ -55,6 +55,7 @@ pub mod paths;
 pub mod pet_sessions;
 pub mod pet_state_mapper;
 pub mod pets;
+// [ai-platform] The ai-platform fork's project/task/knowledge-base module.
 pub mod platform;
 #[cfg(feature = "tauri-runtime")]
 pub mod preferences;
@@ -113,20 +114,26 @@ mod tauri_app {
         conversations,
         custom_skills as custom_skills_commands,
         deepseek_settings as deepseek_settings_commands, delegation as delegation_commands,
-        experts as experts_commands, feedback as feedback_commands, file_io, file_search,
-        folder_commands, folder_links,
-        knowledge as knowledge_commands, local_command,
+        experts as experts_commands, feedback as feedback_commands, file_io,
+        folder_commands, folder_links, local_command,
         office_tools as office_tools_commands, open_in,
         folders, logging as logging_commands, mcp as mcp_commands,
         model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
-        project as project_commands,
-        branch_board as branch_board_commands,
         question as question_commands, quick_messages as quick_messages_commands,
         remote_proxy as remote_proxy_commands,
         remote_workspace as remote_workspace_commands, science as science_commands,
         session_info as session_info_commands,
-        system_settings, task as task_commands,
+        system_settings,
         terminal as terminal_commands,
+        // [ai-platform] platform command modules — kept on their own `use`
+        // lines so merges with main never touch the upstream list above.
+        // Their `generate_handler!` registrations live in one contiguous,
+        // `[ai-platform]`-marked block below.
+        file_search,
+        knowledge as knowledge_commands,
+        project as project_commands,
+        branch_board as branch_board_commands,
+        task as task_commands,
         token_usage as token_usage_commands,
         forge as forge_commands, version_control, windows, work_task as work_task_commands,
         workspace_state as workspace_state_commands, workspace_windows,
@@ -2424,7 +2431,7 @@ mod tauri_app {
                 web::update_web_service_config,
                 web::probe_web_service_port,
 
-                // ─── Platform (Cluster A/B/C/D/E) ───────────────────────────
+                // ─── [ai-platform] Platform (Cluster A/B/C/D/E) ─────────
                 // File content search (Cluster E).
                 file_search::search_files_content_streaming,
 

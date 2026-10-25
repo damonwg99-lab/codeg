@@ -268,6 +268,7 @@ function renderPart(
       )
     case "proposed-plan":
       return <ProposedPlanPart key={`proposed-plan-${keyId}`} part={part} />
+    // [ai-platform] task decomposition card
     case "decomposition":
       return (
         <DecompositionCard

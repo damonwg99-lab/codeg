@@ -29,6 +29,7 @@ const PREFS_EVENT = "codeg:mention-panel-changed"
 export const MENTION_TAB_KINDS = [
   "agent",
   "assistant",
+  // [ai-platform] platform knowledge-base documents
   "context",
   "file",
   "session",

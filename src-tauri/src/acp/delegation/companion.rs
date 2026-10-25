@@ -164,7 +164,7 @@ pub struct CompanionFeatures {
     pub feedback: bool,
     pub ask: bool,
     pub sessions: bool,
-    /// Task-decomposition tool group (`create_task_decomposition`). Off by
+    /// [ai-platform] Task-decomposition tool group (`create_task_decomposition`). Off by
     /// default — the parent opts in via `--features decomposition` so the
     /// companion only advertises the tool when the platform's decomposition
     /// runtime is actually live.
@@ -268,6 +268,7 @@ impl CompanionFeatures {
                 "feedback" => f.feedback = true,
                 "ask" => f.ask = true,
                 "sessions" => f.sessions = true,
+                // [ai-platform] task decomposition
                 "decomposition" => f.decomposition = true,
                 "tasks" => f.tasks = true,
                 "result" => f.result = true,

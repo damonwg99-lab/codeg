@@ -44,6 +44,7 @@ import { AuxPanelKbTab } from "@/components/platform/aux-panel-kb-tab"
 
 const LAZY_TABS: AuxPanelTab[] = [
   "file_tree",
+  // [ai-platform] knowledge base
   "knowledge_base",
   "changes",
   "git_log",
@@ -62,6 +63,7 @@ const LAZY_TABS: AuxPanelTab[] = [
 const TAB_ICONS: Record<AuxPanelTab, LucideIcon> = {
   session_details: ReceiptText,
   file_tree: Folder,
+  // [ai-platform] knowledge base
   knowledge_base: BookOpen,
   changes: FolderPen,
   git_log: GitCommit,
@@ -180,6 +182,7 @@ export function AuxPanel() {
       switch (tab) {
         case "session_details":
           return tDetails("menuLabel")
+        // [ai-platform] knowledge base
         case "knowledge_base":
           return t("knowledgeBase")
         case "automations":
@@ -217,6 +220,7 @@ export function AuxPanel() {
       >
         {mountedTabs.has("file_tree") ? <FileTreeTab /> : null}
       </TabsContent>
+      {/* [ai-platform] knowledge base */}
       <TabsContent
         value="knowledge_base"
         forceMount

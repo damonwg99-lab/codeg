@@ -118,10 +118,46 @@ cargo 按最小满足原则保持 lock 已有版本，"重新生成"≠"升到�
 6. **版本自检脚本**：合并后自动核对（a）三处 version=1.1.x 一致（b）tauri npm/crate minor 配对（c）Cargo.lock 中二开自定义依赖仍在。可做成 `scripts/post-merge-check.ps1`。
 7. **合并决策记录**：像本次一样把"版本保留 1.1.6、样式以 main 为准"等决策沉淀进本手册，避免每次重新纠结。
 
-## 六、本次合并档案
+## 六、合并档案
 
+### v0.30.0（2026-09-03，任务 91）
 - 合并基数：ae18f33e（v0.28.1）；上游领先 166 commits / 463 files；二开领先 140 commits / 177 files
 - 冲突 13 文件全部解决；连带修复 2 处隐形冲突 + 2 处 clippy 新 lint
 - 验证：cargo check ×3 ✅ / clippy ×3 ✅ / pnpm build ✅ / pnpm test 预存失败 ⚠️ / cargo test 环境受阻 ⛔（见第四节坑 3）
 - 用户决策记录：版本保留 1.1.6；command.tsx 采用 main 的 18.75rem
 - 详细报告：`_knowledge/.private/tasks/91/ai-intermediate/merge-report.md`
+
+### v0.40.0（2026-10-25）
+- 合并基数：592131c7（v0.34.0）；上游领先 543 commits / 1090 files（含聊天区大重构：message-input −414 行、content-parts-renderer −3092 行、aux-panel tab 体系推倒重来、connection.rs ±2.4 万行）
+- 冲突 25 文件 ≈44 处；冲突规模趋势 v0.31.0→9 / v0.34.0→9 / v0.40.0→25（积压 + 大重构叠加）
+- 上游 7 个新迁移全部落库成功；上游新增"迁移名序"测试，改为按 upstream/platform 两个系列分别校验
+- 隐形冲突 2 处：companion 测试夹具缺 `result` 字段、adapter 测试夹具缺 `pageHandoffName`；测试期望更新 37 处（tab 数量 +1）
+- 用户决策记录：版本保持 1.2.6；迁移排序测试改为分系列校验；react 系依赖取上游（react-day-picker 回落 9.x）
+- 附带修复：next-themes script 触发 React 19.2 告警（纯上游也有的生态问题，scriptProps 降级修复）；面板关闭时 defaultSize 越界告警（1.2.6 起既有）
+
+### 结构性收敛（2026-10-25，降低未来冲突）
+接入点统一标记 `[ai-platform]`（grep 可审计），并完成两项收敛：
+1. **layout.tsx**：PlatformProvider（D31 已失效——ConversationRuntimeProvider 已是透传 shim）与工作台 overlay 分屏抽成
+   `platform/platform-shell-provider.tsx` + `platform/workbench-overlay-split.tsx`，
+   layout.tsx 对上游的接触面 **+233 行 → +37 行**
+2. **lib.rs**：platform 命令模块 import 拆独立 `use` 行，上游 import 列表从此不被触碰
+
+## 七、接入点清单（`[ai-platform]` 标记处 = 冲突时保留二开内容的点）
+
+Rust：lib.rs（mod platform、import 块、manage、generate_handler 注册块）、web/router.rs（一行 merge）、
+app_state.rs（platform_manager + decomposition）、codeg_server.rs（+1 行）、acp/connection.rs（decomposition 4 处）、
+acp/delegation/companion.rs（feature 2 处）、commands/conversations.rs（删除清理钩子）、db/migration/mod.rs（13 个交错迁移）、
+Cargo.toml（rayon/yaml-rust2 + version）
+
+前端：workspace/layout.tsx（2 个 import + overlay 一行 + PlatformShellProvider 接线 + defaultPanelSize）、
+lib/aux-panel-tab-order.ts、lib/mention-panel-prefs.ts、components/layout/aux-panel.tsx（4 点）、
+chat/composer/types.ts + use-reference-search.ts、chat/message-input.tsx、conversations/conversation-detail-panel.tsx（2 点）、
+message/content-parts-renderer.tsx、lib/adapters/ai-elements-adapter.ts、i18n 10 语言（knowledgeBase / mentionGroupContext）
+
+机械冲突（每次必有，30 秒级）：package.json / Cargo.toml / tauri.conf.json 的 version 三处（保持 1.2.x 线，用户已确认）、
+Cargo.lock / pnpm-lock.yaml（**取上游侧后重新生成，不要手工解**）
+
+## 八、用户确认的长期策略（2026-10-25 讨论）
+1. **合并节奏**：上游每个 minor 版本发布后一周内合并一次（积压是最痛的放大器：9→9→25 的曲线直接相关）
+2. **版本号**：维持二开 1.x 版本线不变，接受三处 version 字段的机械冲突
+3. **验证口径**：Windows 上桌面模式 cargo test 只编译不运行（`--no-run`，上游 CI 同款策略），可执行测试由 server/cli 模式承担

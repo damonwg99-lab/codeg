@@ -2131,6 +2131,7 @@ const ConversationTabView = memo(function ConversationTabView({
     [awaitingToolCallId, awaitingUser, approvals]
   )
 
+  // [ai-platform] task-decomposition card bridge wraps the message list.
   const messageListNode = (
     <PlatformDecompositionBridge conversationId={effectiveConversationId}>
       <GoalControlProvider value={goalControlValue}>

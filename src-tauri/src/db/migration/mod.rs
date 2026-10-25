@@ -30,6 +30,9 @@ mod m20260726_000001_custom_agent;
 mod m20260727_000001_custom_agent_skills;
 mod m20260728_000001_custom_agent_skills_dir;
 mod m20260728_000002_custom_agent_source;
+// [ai-platform] platform migrations — interleaved by execution order (the
+// list order is what deployed databases recorded), not by name; the
+// name-order test below checks each series separately.
 mod m20260622_platform_000001_create_core_tables;
 mod m20260622_platform_000002_create_config_tables;
 mod m20260622_platform_000003_create_activity_log;
@@ -105,6 +108,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260727_000001_custom_agent_skills::Migration),
             Box::new(m20260728_000001_custom_agent_skills_dir::Migration),
             Box::new(m20260728_000002_custom_agent_source::Migration),
+            // [ai-platform] platform migrations (see the note on the mod decls)
             Box::new(m20260622_platform_000001_create_core_tables::Migration),
             Box::new(m20260622_platform_000002_create_config_tables::Migration),
             Box::new(m20260622_platform_000003_create_activity_log::Migration),

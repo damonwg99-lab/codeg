@@ -8,6 +8,7 @@ export type ReferenceKind =
   | "session"
   | "commit"
   | "skill"
+  // [ai-platform] platform knowledge-base documents
   | "context"
 
 export const REFERENCE_KINDS: readonly ReferenceKind[] = [

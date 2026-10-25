@@ -2007,7 +2007,7 @@ pub fn build_router_with_proxy_auth(
         )
         .route("/terminal_kill", post(handlers::terminal::terminal_kill))
         .route("/terminal_list", post(handlers::terminal::terminal_list))
-        // ─── Platform (Cluster A/B/C/D/E) ──────────────────────────────
+        // ─── [ai-platform] Platform (Cluster A/B/C/D/E) ─────────────
         // Pulled out into `router_platform::platform_routes()` (a standalone
         // module) so the giant handler list here doesn't carry every platform
         // endpoint inline; auth/CORS layers below still gate these routes

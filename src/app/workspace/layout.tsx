@@ -59,11 +59,11 @@ import {
   useTerminalContext,
 } from "@/contexts/terminal-context"
 import { GitCredentialProvider } from "@/contexts/git-credential-context"
-import { PlatformProvider } from "@/contexts/platform-context"
+import { PlatformShellProvider } from "@/components/platform/platform-shell-provider"
+import { WorkbenchOverlaySplit } from "@/components/platform/workbench-overlay-split"
 import {
   WorkspaceProvider,
   useWorkspaceActions,
-  useWorkspaceFileTabs,
   useWorkspaceView,
 } from "@/contexts/workspace-context"
 import { RemoteConnectionGate } from "@/contexts/remote-connection-context"
@@ -120,7 +120,6 @@ function WorkspaceDocumentTitle() {
 
 const TOAST_DURATION_MS = 15000
 const WORKSPACE_PANEL_GROUP_ID = "workspace-panel-group"
-const WORKSPACE_OVERLAY_PANEL_GROUP_ID = "workspace-overlay-panel-group"
 const WORKSPACE_CONVERSATION_PANEL_ID = "workspace-conversation-panel"
 const WORKSPACE_FILES_PANEL_ID = "workspace-files-panel"
 const FOLDER_SHELL_GROUP_ID = "folder-shell-group"
@@ -290,7 +289,6 @@ function KeptMountedSurface({
 function WorkspaceContent({ children }: { children: React.ReactNode }) {
   const { mode, filesMaximized, conversationMaximized } = useWorkspaceView()
   const { setActivePane } = useWorkspaceActions()
-  const { fileTabs } = useWorkspaceFileTabs()
   const panelGroupRef = useRef<ImperativePanelGroupHandle | null>(null)
   const fusionLayoutRef = useRef<[number, number]>(DEFAULT_FUSION_LAYOUT)
   const desiredLayoutRef = useRef<[number, number]>(DEFAULT_FUSION_LAYOUT)
@@ -305,28 +303,6 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
     if (mode !== "fusion" || conversationMaximized) return
     setActivePane("files")
   }, [mode, conversationMaximized, setActivePane])
-
-  // The file column reused both in the conversation+files split and inside the
-  // full-screen workbench overlay's split (tab strip + header + panel).
-  const fileColumnSection = (
-    <section className="flex h-full min-h-0 flex-col overflow-hidden">
-      <div className="flex h-10 shrink-0 items-stretch bg-muted ws-transparent-bg">
-        <div className="flex min-w-0 flex-1 items-stretch">
-          <FileWorkspaceTabBar />
-        </div>
-      </div>
-      <div
-        className="flex min-h-0 flex-1 flex-col overflow-hidden"
-        onPointerDownCapture={markFileActive}
-        onFocusCapture={markFileActive}
-      >
-        <FileWorkspaceHeader />
-        <div className="flex-1 min-h-0 overflow-hidden">
-          <FileWorkspacePanel />
-        </div>
-      </div>
-    </section>
-  )
 
   const applyLayout = useCallback((layout: [number, number]) => {
     desiredLayoutRef.current = layout
@@ -645,58 +621,9 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
             <WorkbenchRouteStrip />
             <div data-tauri-drag-region className="h-full min-w-0 flex-1" />
           </div>
-          {/* Body: the active route full-width, or — when files are open on a
-              full-screen route (e.g. a task detail with previewed docs) — a
-              split that keeps the route on the left and reuses the file
-              column (tab strip + panel) on the right, so the detail stays
-              visible while the file is inspected. No files: route fills the
-              whole overlay, identical to main. */}
-          {fileTabs.length > 0 ? (
-            /* Kept mounted and switched with CSS (like the conversation+files
-               split below): maximize overlays the file column across the whole
-               split area instead of tearing down / remounting the panel group
-               and the detail route — unmounting the route (e.g. a heavy task
-               detail) on every toggle is what made the button feel laggy. The
-               `relative` wrapper anchors the file column's `absolute inset-0`. */
-            <div className="relative min-h-0 flex-1">
-              <ResizablePanelGroup
-                direction="horizontal"
-                className="min-h-0 flex-1"
-                id={WORKSPACE_OVERLAY_PANEL_GROUP_ID}
-              >
-                <ResizablePanel
-                  defaultSize={60}
-                  minSize={30}
-                  className={cn(filesMaximized && "invisible")}
-                >
-                  <WorkbenchRoutePage />
-                </ResizablePanel>
-                <ResizableHandle
-                  withHandle
-                  className={cn(filesMaximized && "invisible")}
-                />
-                <ResizablePanel defaultSize={40} minSize={20}>
-                  {/* When maximized the file column overlays the whole split
-                      area (anchored by the `relative` wrapper) — visibility
-                      instead of unmount keeps both panes mounted so toggling
-                      never tears down the detail route. */}
-                  <div
-                    className={cn(
-                      "h-full min-h-0",
-                      filesMaximized &&
-                        "absolute inset-0 z-30 bg-background ws-transparent-bg"
-                    )}
-                  >
-                    {fileColumnSection}
-                  </div>
-                </ResizablePanel>
-              </ResizablePanelGroup>
-            </div>
-          ) : (
-            <div className="min-h-0 flex-1">
-              <WorkbenchRoutePage />
-            </div>
-          )}
+          {/* [ai-platform] Route body, or a route + file-column split when
+              files are open on the route (see workbench-overlay-split.tsx). */}
+          <WorkbenchOverlaySplit />
         </div>
       ) : null}
     </div>
@@ -1599,87 +1526,84 @@ function WorkbenchRouteConversationSync() {
 function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
   return (
     <AppWorkspaceProvider>
-      {/* Platform (Cluster A) — scoped project context. Mounted OUTSIDE
-          ConversationRuntimeProvider per D31 so platform pages (project/task
-          releases) can read active project + repos without spawning an ACP
-          session. Sits inside AppWorkspaceProvider because platform-context
-          needs the workspace folder/activeFolder APIs to auto-open the
-          project's root folder. */}
-      <PlatformProvider>
-        <AlertProvider>
-          <GitCredentialProvider>
-            <TaskProvider>
-              <AcpConnectionsProvider>
-                <DelegationProvider>
-                  <ConversationStatusEventBridge />
-                  {/* Tag definitions (names, colours) for every chip in this
-                      window; which tags a conversation carries rides on its
-                      summary instead. */}
-                  <ConversationTagsSync />
-                  <AssistantsSync />
-                  {/* The tag manager, opened from tag pickers, folder menus and
-                      the sidebar's tag filter — all popovers or menus that
-                      unmount as they close, so none can host it. */}
-                  <ConversationTagsManagerHost />
-                  <ConversationRuntimeProvider>
-                    <WorkspaceProvider>
-                      <TabProvider>
-                        <WorkspaceDocumentTitle />
-                        <TabKeysSync />
-                        <BrowserEventsBridge />
-                        {/* Beside the events bridge and not inside it: that one
-                            stops where no built-in browser exists, and a local
-                            server is worth hearing about in web mode too (the
-                            port bridge can show it). */}
-                        <BrowserServiceBridge />
-                        {/* Mounted beside the bridge, not inside a tab: the tab
-                            an agent asks to run code on is usually not the one
-                            the person is looking at. */}
-                        <BrowserEvalConfirm />
-                        {/* Here and not in the browser tab it is opened from:
-                            only the tab on screen is mounted, and a tab opening
-                            on its own would take the marks with it. */}
-                        <BrowserScreenshotMarkupHost />
-                        <BrowserTabsPersistence />
-                        <BrowserTabsSuspender />
-                        <HeavyPluginsWarmup />
-                        <DeepLinkBootstrap />
-                        <PetFocusBridge />
-                        <WorkspaceRestoreNotices />
-                        {/* Always mounted: external-change conflicts must be
-                              resolvable even with the aux file tree closed. */}
-                        <ExternalConflictDialog />
-                        <SidebarProvider>
-                          <AuxPanelProvider>
-                            <TerminalProvider>
-                              <SearchDialogProvider>
-                                <AutomationsViewProvider>
-                                  <TasksViewProvider>
-                                    <WorkbenchRouteProvider>
-                                      <WorkbenchRouteConversationSync />
-                                      {/* Inside WorkbenchRouteProvider: the
-                                            listener calls openConversations() to
-                                            surface a launcher-opened folder. */}
-                                      <WorkspaceOpenFolderListener />
-                                      <FolderLayoutShell>
+      <AlertProvider>
+        <GitCredentialProvider>
+          <TaskProvider>
+            <AcpConnectionsProvider>
+              <DelegationProvider>
+                <ConversationStatusEventBridge />
+                {/* Tag definitions (names, colours) for every chip in this
+                    window; which tags a conversation carries rides on its
+                    summary instead. */}
+                <ConversationTagsSync />
+                <AssistantsSync />
+                {/* The tag manager, opened from tag pickers, folder menus and
+                    the sidebar's tag filter — all popovers or menus that
+                    unmount as they close, so none can host it. */}
+                <ConversationTagsManagerHost />
+                <ConversationRuntimeProvider>
+                  <WorkspaceProvider>
+                    <TabProvider>
+                      <WorkspaceDocumentTitle />
+                      <TabKeysSync />
+                      <BrowserEventsBridge />
+                      {/* Beside the events bridge and not inside it: that one
+                          stops where no built-in browser exists, and a local
+                          server is worth hearing about in web mode too (the
+                          port bridge can show it). */}
+                      <BrowserServiceBridge />
+                      {/* Mounted beside the bridge, not inside a tab: the tab
+                          an agent asks to run code on is usually not the one
+                          the person is looking at. */}
+                      <BrowserEvalConfirm />
+                      {/* Here and not in the browser tab it is opened from:
+                          only the tab on screen is mounted, and a tab opening
+                          on its own would take the marks with it. */}
+                      <BrowserScreenshotMarkupHost />
+                      <BrowserTabsPersistence />
+                      <BrowserTabsSuspender />
+                      <HeavyPluginsWarmup />
+                      <DeepLinkBootstrap />
+                      <PetFocusBridge />
+                      <WorkspaceRestoreNotices />
+                      {/* Always mounted: external-change conflicts must be
+                            resolvable even with the aux file tree closed. */}
+                      <ExternalConflictDialog />
+                      <SidebarProvider>
+                        <AuxPanelProvider>
+                          <TerminalProvider>
+                            <SearchDialogProvider>
+                              <AutomationsViewProvider>
+                                <TasksViewProvider>
+                                  <WorkbenchRouteProvider>
+                                    <WorkbenchRouteConversationSync />
+                                    {/* Inside WorkbenchRouteProvider: the
+                                          listener calls openConversations() to
+                                          surface a launcher-opened folder. */}
+                                    <WorkspaceOpenFolderListener />
+                                    <FolderLayoutShell>
+                                      {/* [ai-platform] Platform project context for the shell: the sidebar
+                                        project section, the aux KB tab and the workbench routes all
+                                        read it (see platform-shell-provider.tsx for the D31 note). */}
+                                      <PlatformShellProvider>
                                         {children}
-                                      </FolderLayoutShell>
-                                    </WorkbenchRouteProvider>
-                                  </TasksViewProvider>
-                                </AutomationsViewProvider>
-                              </SearchDialogProvider>
-                            </TerminalProvider>
-                          </AuxPanelProvider>
-                        </SidebarProvider>
-                      </TabProvider>
-                    </WorkspaceProvider>
-                  </ConversationRuntimeProvider>
-                </DelegationProvider>
-              </AcpConnectionsProvider>
-            </TaskProvider>
-          </GitCredentialProvider>
-        </AlertProvider>
-      </PlatformProvider>
+                                      </PlatformShellProvider>
+                                    </FolderLayoutShell>
+                                  </WorkbenchRouteProvider>
+                                </TasksViewProvider>
+                              </AutomationsViewProvider>
+                            </SearchDialogProvider>
+                          </TerminalProvider>
+                        </AuxPanelProvider>
+                      </SidebarProvider>
+                    </TabProvider>
+                  </WorkspaceProvider>
+                </ConversationRuntimeProvider>
+              </DelegationProvider>
+            </AcpConnectionsProvider>
+          </TaskProvider>
+        </GitCredentialProvider>
+      </AlertProvider>
     </AppWorkspaceProvider>
   )
 }

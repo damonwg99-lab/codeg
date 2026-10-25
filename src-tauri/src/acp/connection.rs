@@ -7079,7 +7079,8 @@ pub struct DelegationInjection {
     /// is on, and the companion's `--features` lists `sessions` to expose the
     /// `get_session_info` tool. No teardown handle (the lookup is stateless).
     pub sessions: crate::acp::session_info::SessionInfoRuntimeConfig,
-    /// Hot-swappable "is create_task_decomposition enabled?" flag. Read at
+    /// [ai-platform] Hot-swappable "is create_task_decomposition enabled?"
+    /// flag. Read at
     /// injection time alongside the other four so `codeg-mcp` is injected
     /// when ANY of the five is on, and the companion's `--features` lists
     /// `decomposition` to expose the `create_task_decomposition` tool. No
@@ -7212,7 +7213,8 @@ struct CompanionFeatureFlags {
     /// it still injects the companion so a task session always has its reporting
     /// tools.
     tasks: bool,
-    /// `create_task_decomposition`, gated by the decomposition setting.
+    /// [ai-platform] `create_task_decomposition`, gated by the
+    /// decomposition setting.
     decomposition: bool,
     /// `submit_result`: per-spawn too, for the root of a `codeg-cli` run given
     /// `--output-schema`.
@@ -7259,6 +7261,7 @@ fn companion_features_arg(flags: CompanionFeatureFlags) -> Option<String> {
     if flags.sessions {
         features.push("sessions");
     }
+    // [ai-platform] task decomposition
     if flags.decomposition {
         features.push("decomposition");
     }
@@ -7400,6 +7403,7 @@ where
         ask: injection.ask.is_enabled().await,
         sessions: injection.sessions.is_enabled().await,
         tasks: groups.tasks,
+        // [ai-platform] task decomposition
         decomposition: injection.decomposition.is_enabled().await,
         result: groups.result,
         automations: authoring.automations_enabled,

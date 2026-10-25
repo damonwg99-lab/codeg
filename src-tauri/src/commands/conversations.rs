@@ -11,8 +11,9 @@ use crate::db::service::{
     agent_setting_service, conversation_service, folder_service, import_service,
     platform_task_conversation_service, tab_service, tool_approval_service,
 };
-/// Event emitted when task-conversation links change (unlink / delete cleanup).
-/// Must match the constant in task.rs so the frontend receives the same event.
+/// [ai-platform] Event emitted when task-conversation links change (unlink /
+/// delete cleanup). Must match the constant in task.rs so the frontend
+/// receives the same event.
 pub(crate) const PLATFORM_TASK_CONVERSATION_CHANGED_EVENT: &str = "platform_task_conversation://changed";
 #[cfg(feature = "tauri-runtime")]
 use crate::db::AppDatabase;
@@ -2929,7 +2930,8 @@ pub async fn delete_conversation_with_cleanup_core(
     if let Some(folder_id) = folder_id {
         cleanup_chat_folder_for_deleted_conversation(conn, folder_id).await;
     }
-    // Cluster A: drop any task-conversation links pointing at this conversation
+    // [ai-platform] Cluster A: drop any task-conversation links pointing at
+    // this conversation
     // so the task detail page no longer shows a dangling reference to a deleted
     // conversation. Decoupled per D26: body lives in the platform service.
     platform_task_conversation_service::delete_by_conversation(conn, conversation_id)

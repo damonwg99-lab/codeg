@@ -180,7 +180,7 @@ export function buildReferenceGroups(
     }
   }
 
-  // Knowledge base documents (refType: "context")
+  // [ai-platform] Knowledge base documents (refType: "context")
   const kbMatches = (sources.kbDocs ?? [])
     .filter((doc) => matchesKbDoc(doc, q))
     .map((doc) => kbDocToSuggestion(doc))
