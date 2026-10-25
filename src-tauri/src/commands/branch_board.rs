@@ -1861,7 +1861,7 @@ mod tests {
     // remotes are local bare repos.
 
     fn git(dir: &std::path::Path, args: &[&str]) -> bool {
-        std::process::Command::new("git")
+        let out = std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -1871,9 +1871,18 @@ mod tests {
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@example.com")
             .output()
-            .expect("spawn git")
-            .status
-            .success()
+            .expect("spawn git");
+        if !out.status.success() {
+            // A bare `assert!(git(...))` says only that git failed; print the
+            // command and its stderr so the actual cause is visible.
+            eprintln!(
+                "git {args:?} in {} failed ({}):\n{}",
+                dir.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        out.status.success()
     }
 
     /// Like [`git`], but attributes the commit to `author` so a test can tell
@@ -2013,7 +2022,9 @@ mod tests {
 
         let commit_on_branch = |name: &str| {
             assert!(git(work.path(), &["checkout", "-q", "-b", name, "main"]));
-            std::fs::write(work.path().join(format!("{name}.txt")), "x\n").expect("write");
+            // Branch names contain slashes ("feat/x"); the file must not.
+            let file = format!("{}.txt", name.replace('/', "-"));
+            std::fs::write(work.path().join(file), "x\n").expect("write");
             assert!(git(work.path(), &["add", "-A"]));
             assert!(git(work.path(), &["commit", "-q", "-m", name]));
             assert!(git(work.path(), &["checkout", "-q", "main"]));
@@ -2374,8 +2385,11 @@ mod tests {
 
     /// A repo whose `main` is published and whose `feat/new` was cut with
     /// `git switch -c feat/new origin/main`, which records `origin/main` as
-    /// the new branch's upstream. Returns the repo path.
-    async fn repo_with_branch_tracking_another_branch() -> (tempfile::TempDir, String) {
+    /// the new branch's upstream. Returns the repo dir, the remote dir (kept
+    /// alive — dropping the TempDir deletes the bare remote out from under
+    /// any later `git push`), and the repo path.
+    async fn repo_with_branch_tracking_another_branch()
+    -> (tempfile::TempDir, tempfile::TempDir, String) {
         let repo_dir = tempfile::tempdir().expect("repo");
         let remote_dir = tempfile::tempdir().expect("remote");
         init_repo(repo_dir.path());
@@ -2389,7 +2403,7 @@ mod tests {
             &["branch", "--set-upstream-to=origin/main", "feat/new"]
         ));
         let path = path_str(repo_dir.path());
-        (repo_dir, path)
+        (repo_dir, remote_dir, path)
     }
 
     #[tokio::test]
@@ -2397,7 +2411,7 @@ mod tests {
         // Measuring `feat/new` against `origin/main` reported a never-pushed
         // branch as `synced` whenever it sat on the same commit, and hid the
         // "local" badge — the branch has no remote counterpart at all.
-        let (_repo, path) = repo_with_branch_tracking_another_branch().await;
+        let (_repo, _remote, path) = repo_with_branch_tracking_another_branch().await;
         let row = row_for(&path, "feat/new").await;
         assert_eq!(
             row.remote_state,
@@ -2414,7 +2428,7 @@ mod tests {
     async fn push_comparison_ignores_upstream_naming_another_branch() {
         // Deleting the remote counterpart resolves through this helper, so
         // trusting `origin/main` would delete `main` on the remote.
-        let (repo_dir, path) = repo_with_branch_tracking_another_branch().await;
+        let (repo_dir, _remote, path) = repo_with_branch_tracking_another_branch().await;
         let remotes = remote_branches(&path).await;
         assert_eq!(push_comparison_ref(&path, "feat/new", &remotes).await, None);
 
