@@ -2921,6 +2921,7 @@ describe("adaptMessageTurn — codeg injection stripping", () => {
   const msgText = {
     attachedResources: "Attached resources",
     toolCallFailed: "Tool failed",
+    pageHandoffName,
   }
   const INJECT =
     "<!-- codeg:inject:start -->\n=== Rules ===\n<!-- codeg:inject:end -->"
