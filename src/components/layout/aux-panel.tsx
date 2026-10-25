@@ -181,8 +181,7 @@ export function AuxPanel() {
         case "session_details":
           return tDetails("menuLabel")
         case "knowledge_base":
-          // Platform-owned tab; label is hardcoded like the other KB UI.
-          return "知识库"
+          return t("knowledgeBase")
         case "automations":
           return tAutomations("title")
         case "tasks":

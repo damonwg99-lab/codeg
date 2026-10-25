@@ -2479,7 +2479,8 @@
       "tabs": {
         "files": "Fichiers",
         "changes": "Changements",
-        "commits": "Validations"
+        "commits": "Validations",
+        "knowledgeBase": "Base de connaissances"
       },
       "noFolderTitle": "Aucun dossier ouvert",
       "noFolderHint": "Ouvrez un dossier pour voir son contenu ici",
@@ -3461,7 +3462,8 @@
         "mentionGroupSession": "Sessions",
         "mentionGroupCommit": "Commits",
         "mentionGroupSkill": "Compétences",
-        "mentionGroupAssistant": "Assistants"
+        "mentionGroupAssistant": "Assistants",
+        "mentionGroupContext": "Documents de connaissances"
       },
       "messageQueue": {
         "addToQueue": "Mettre en file",
@@ -6783,7 +6785,8 @@
       "deleteBranch": "Delete Branch",
       "deleteForce": "Forcer la suppression",
       "deleteForceHint": "Cette branche contient des commits non fusionnés. La supprimer de force quand même ?",
-      "deleteRemoteToo": "Supprimer aussi la branche distante",       "deleteUnmergedWarning": "Cette branche n'est pas fusionnée dans : {envs}",
+      "deleteRemoteToo": "Supprimer aussi la branche distante",
+      "deleteUnmergedWarning": "Cette branche n'est pas fusionnée dans : {envs}",
       "prevPage": "Prev",
       "nextPage": "Next",
       "envMerged": "Merged",

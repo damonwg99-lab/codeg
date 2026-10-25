@@ -305,8 +305,7 @@ export function TaskKanban({ projectId }: { projectId: number }) {
   const { setRoute, routeParams } = useWorkbenchRoute()
   const [tasks, setTasks] = useState<TaskInfo[]>([])
   const [loading, setLoading] = useState(true)
-  const initialTab =
-    routeParams.tab === "archive" ? routeParams.tab : "kanban"
+  const initialTab = routeParams.tab === "archive" ? routeParams.tab : "kanban"
   const [activeTab, setActiveTab] = useState(initialTab)
 
   const [searchInput, setSearchInput] = useState("")

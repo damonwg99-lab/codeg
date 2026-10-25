@@ -24,6 +24,7 @@ const custom: MentionPanelPrefs = {
     { kind: "commit", visible: true },
     { kind: "agent", visible: false },
     { kind: "assistant", visible: true },
+    { kind: "context", visible: true },
     { kind: "session", visible: true },
   ],
 }
@@ -48,6 +49,7 @@ describe("mention panel preferences", () => {
     expect(visibleMentionTabKinds(loadMentionPanelPrefs())).toEqual([
       "agent",
       "assistant",
+      "context",
       "file",
       "session",
       "commit",
@@ -71,6 +73,7 @@ describe("mention panel preferences", () => {
       "file",
       "commit",
       "assistant",
+      "context",
       "session",
     ])
   })
@@ -106,6 +109,7 @@ describe("mention panel preferences", () => {
       // that is there — first when none is — shown.
       { kind: "agent", visible: true },
       { kind: "assistant", visible: true },
+      { kind: "context", visible: true },
       { kind: "file", visible: true },
       // First occurrence wins.
       { kind: "commit", visible: false },
@@ -138,6 +142,7 @@ describe("mention panel preferences", () => {
       "file",
       "agent",
       "assistant",
+      "context",
       "session",
       "commit",
     ])
@@ -254,13 +259,26 @@ describe("mention panel preferences", () => {
     it("hands a hook a visible-tab list that only changes with the value", () => {
       const { result } = renderHook(() => useVisibleMentionTabs())
       const first = result.current
-      expect(first).toEqual(["agent", "assistant", "file", "session", "commit"])
+      expect(first).toEqual([
+        "agent",
+        "assistant",
+        "context",
+        "file",
+        "session",
+        "commit",
+      ])
 
       act(() => writeFromAnotherWindow("unrelated", "x"))
       expect(result.current).toBe(first)
 
       act(() => saveMentionPanelPrefs(custom))
-      expect(result.current).toEqual(["file", "commit", "assistant", "session"])
+      expect(result.current).toEqual([
+        "file",
+        "commit",
+        "assistant",
+        "context",
+        "session",
+      ])
     })
   })
 })

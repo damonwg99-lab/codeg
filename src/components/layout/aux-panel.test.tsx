@@ -150,6 +150,7 @@ const KEY = "workspace:right-sidebar-tab-order"
 const BUILT_IN = [
   "Session Details",
   "Files",
+  "Knowledge base",
   "Changes",
   "Commits",
   "Automations",
@@ -166,6 +167,7 @@ const REVERSED: AuxPanelTab[] = [
   "automations",
   "git_log",
   "changes",
+  "knowledge_base",
   "file_tree",
   "session_details",
 ]
@@ -364,6 +366,7 @@ describe("AuxPanel", () => {
       writeFromAnotherWindow([
         "tasks",
         "file_tree",
+        "knowledge_base",
         "session_details",
         "issues",
         "git_log",
@@ -375,6 +378,7 @@ describe("AuxPanel", () => {
     expect(railTabs()).toEqual([
       "To-dos",
       "Files",
+      "Knowledge base",
       "Session Details",
       "Issues",
       "Commits",
@@ -398,6 +402,7 @@ describe("AuxPanel", () => {
       "Pull requests",
       "Changes",
       "Files",
+      "Knowledge base",
       "Session Details",
     ])
   })
@@ -408,6 +413,7 @@ describe("AuxPanel", () => {
       "changes",
       "session_details",
       "file_tree",
+      "knowledge_base",
       "git_log",
       "automations",
       "tasks",
@@ -418,6 +424,7 @@ describe("AuxPanel", () => {
       "Changes",
       "Session Details",
       "Files",
+      "Knowledge base",
       "Commits",
       "Automations",
       "To-dos",
@@ -467,8 +474,9 @@ describe("AuxPanel", () => {
     fireEvent.keyDown(changes, { key: "ArrowUp", altKey: true })
     expect(railTabs()).toEqual([
       "Session Details",
-      "Changes",
       "Files",
+      "Changes",
+      "Knowledge base",
       "Commits",
       "Automations",
       "To-dos",
@@ -477,8 +485,9 @@ describe("AuxPanel", () => {
     ])
     expect(storedOrder()).toEqual([
       "session_details",
-      "changes",
       "file_tree",
+      "changes",
+      "knowledge_base",
       "git_log",
       "automations",
       "tasks",
@@ -487,6 +496,10 @@ describe("AuxPanel", () => {
     ])
     expect(screen.getByRole("tab", { name: "Changes" })).toHaveFocus()
 
+    fireEvent.keyDown(screen.getByRole("tab", { name: "Changes" }), {
+      key: "ArrowUp",
+      altKey: true,
+    })
     fireEvent.keyDown(screen.getByRole("tab", { name: "Changes" }), {
       key: "ArrowUp",
       altKey: true,
@@ -503,7 +516,7 @@ describe("AuxPanel", () => {
     expect(localStorage.getItem(KEY)).toBe(before)
 
     // Back down to where it started: the stored value goes with it.
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; i < 3; i++) {
       fireEvent.keyDown(screen.getByRole("tab", { name: "Changes" }), {
         key: "ArrowDown",
         altKey: true,

@@ -115,6 +115,7 @@ describe("MentionPanelSettingsSection", () => {
     expect(rowNames()).toEqual([
       "agent",
       "assistant",
+      "context",
       "file",
       "session",
       "commit",
@@ -122,6 +123,7 @@ describe("MentionPanelSettingsSection", () => {
     for (const name of [
       "Agents",
       "Assistants",
+      "Knowledge Docs",
       "Files",
       "Sessions",
       "Commits",
@@ -158,6 +160,7 @@ describe("MentionPanelSettingsSection", () => {
     expect(storedKinds()).toEqual([
       "agent",
       "assistant",
+      "context",
       "file",
       "session",
       "commit",
@@ -179,6 +182,7 @@ describe("MentionPanelSettingsSection", () => {
     expect(stored()?.tabs).toEqual([
       { kind: "agent", visible: true },
       { kind: "assistant", visible: true },
+      { kind: "context", visible: true },
       { kind: "file", visible: true },
       { kind: "session", visible: false },
       { kind: "commit", visible: false },
@@ -187,7 +191,14 @@ describe("MentionPanelSettingsSection", () => {
 
   it("saves a dragged order once, on release", () => {
     renderSection()
-    const dragged = ["file", "commit", "agent", "assistant", "session"]
+    const dragged = [
+      "file",
+      "commit",
+      "agent",
+      "assistant",
+      "context",
+      "session",
+    ]
 
     // Mid-drag the rows follow the pointer, but nothing is written yet — every
     // open composer is subscribed to the stored value.
@@ -204,10 +215,24 @@ describe("MentionPanelSettingsSection", () => {
     renderSection()
     const setItem = vi.spyOn(Storage.prototype, "setItem")
     act(() =>
-      motion.onReorder?.(["file", "agent", "assistant", "session", "commit"])
+      motion.onReorder?.([
+        "file",
+        "agent",
+        "assistant",
+        "context",
+        "session",
+        "commit",
+      ])
     )
     act(() =>
-      motion.onReorder?.(["agent", "assistant", "file", "session", "commit"])
+      motion.onReorder?.([
+        "agent",
+        "assistant",
+        "context",
+        "file",
+        "session",
+        "commit",
+      ])
     )
     act(() => motion.dragEnd.get("agent")?.())
     // A press that never moved a row doesn't even report an order.
@@ -216,6 +241,7 @@ describe("MentionPanelSettingsSection", () => {
     expect(rowNames()).toEqual([
       "agent",
       "assistant",
+      "context",
       "file",
       "session",
       "commit",
@@ -233,13 +259,21 @@ describe("MentionPanelSettingsSection", () => {
   it("keeps a switch flipped in another window while a drag is in flight", () => {
     renderSection()
     act(() =>
-      motion.onReorder?.(["file", "agent", "assistant", "session", "commit"])
+      motion.onReorder?.([
+        "file",
+        "agent",
+        "assistant",
+        "context",
+        "session",
+        "commit",
+      ])
     )
     // The Commits tab is hidden elsewhere mid-drag…
     writeElsewhere({
       tabs: [
         { kind: "agent", visible: true },
         { kind: "assistant", visible: true },
+        { kind: "context", visible: true },
         { kind: "file", visible: true },
         { kind: "session", visible: true },
         { kind: "commit", visible: false },
@@ -253,6 +287,7 @@ describe("MentionPanelSettingsSection", () => {
       "file",
       "agent",
       "assistant",
+      "context",
       "session",
       "commit",
     ])
@@ -263,6 +298,7 @@ describe("MentionPanelSettingsSection", () => {
       { kind: "file", visible: true },
       { kind: "agent", visible: true },
       { kind: "assistant", visible: true },
+      { kind: "context", visible: true },
       { kind: "session", visible: true },
       { kind: "commit", visible: false },
     ])
@@ -271,7 +307,14 @@ describe("MentionPanelSettingsSection", () => {
   it("lets a reorder made elsewhere stand when a drag ends where it started", () => {
     renderSection()
     act(() =>
-      motion.onReorder?.(["file", "agent", "assistant", "session", "commit"])
+      motion.onReorder?.([
+        "file",
+        "agent",
+        "assistant",
+        "context",
+        "session",
+        "commit",
+      ])
     )
     const elsewhere: MentionPanelPrefs = {
       tabs: [
@@ -280,11 +323,19 @@ describe("MentionPanelSettingsSection", () => {
         { kind: "file", visible: true },
         { kind: "agent", visible: true },
         { kind: "assistant", visible: true },
+        { kind: "context", visible: true },
       ],
     }
     writeElsewhere(elsewhere)
     act(() =>
-      motion.onReorder?.(["agent", "assistant", "file", "session", "commit"])
+      motion.onReorder?.([
+        "agent",
+        "assistant",
+        "context",
+        "file",
+        "session",
+        "commit",
+      ])
     )
     act(() => motion.dragEnd.get("file")?.())
     // No net move here, so nothing of this drag's starting order is replayed.
@@ -295,6 +346,7 @@ describe("MentionPanelSettingsSection", () => {
       "file",
       "agent",
       "assistant",
+      "context",
     ])
   })
 
@@ -306,7 +358,7 @@ describe("MentionPanelSettingsSection", () => {
     handle.focus()
 
     fireEvent.keyDown(handle, { key: "ArrowDown" })
-    const once = ["assistant", "agent", "file", "session", "commit"]
+    const once = ["assistant", "agent", "context", "file", "session", "commit"]
     expect(storedKinds()).toEqual(once)
     expect(rowNames()).toEqual(once)
     expect(handle).toHaveFocus()
@@ -314,7 +366,8 @@ describe("MentionPanelSettingsSection", () => {
     fireEvent.keyDown(handle, { key: "ArrowDown" })
     fireEvent.keyDown(handle, { key: "ArrowDown" })
     fireEvent.keyDown(handle, { key: "ArrowDown" })
-    const last = ["assistant", "file", "session", "commit", "agent"]
+    fireEvent.keyDown(handle, { key: "ArrowDown" })
+    const last = ["assistant", "context", "file", "session", "commit", "agent"]
     expect(rowNames()).toEqual(last)
     expect(handle).toHaveFocus()
 
@@ -326,6 +379,7 @@ describe("MentionPanelSettingsSection", () => {
     fireEvent.keyDown(handle, { key: "ArrowUp" })
     expect(rowNames()).toEqual([
       "assistant",
+      "context",
       "file",
       "session",
       "agent",
@@ -349,6 +403,7 @@ describe("MentionPanelSettingsSection", () => {
       "file",
       "agent",
       "assistant",
+      "context",
       "session",
     ])
 
@@ -357,6 +412,7 @@ describe("MentionPanelSettingsSection", () => {
     expect(rowNames()).toEqual([
       "agent",
       "assistant",
+      "context",
       "file",
       "session",
       "commit",
@@ -389,6 +445,7 @@ describe("MentionPanelSettingsSection", () => {
       "session",
       "agent",
       "assistant",
+      "context",
       "file",
       "commit",
     ])

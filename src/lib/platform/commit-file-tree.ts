@@ -56,10 +56,12 @@ function toSortedTreeNodes(
 function compressAndAnnotateDir(
   node: CommitFileTreeDirNode
 ): CommitFileTreeDirNode {
-  let compressedChildren: CommitFileTreeNode[] = node.children.map((child) => {
-    if (child.kind === "file") return child
-    return compressAndAnnotateDir(child)
-  })
+  const compressedChildren: CommitFileTreeNode[] = node.children.map(
+    (child) => {
+      if (child.kind === "file") return child
+      return compressAndAnnotateDir(child)
+    }
+  )
 
   let nextNode: CommitFileTreeDirNode = {
     ...node,

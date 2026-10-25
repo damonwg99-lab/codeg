@@ -2479,7 +2479,8 @@
       "tabs": {
         "files": "文件",
         "changes": "变更",
-        "commits": "提交"
+        "commits": "提交",
+        "knowledgeBase": "知识库"
       },
       "noFolderTitle": "暂无打开的文件夹",
       "noFolderHint": "打开一个文件夹后在这里查看",
@@ -3461,7 +3462,8 @@
         "mentionGroupSession": "会话",
         "mentionGroupCommit": "提交",
         "mentionGroupSkill": "技能",
-        "mentionGroupAssistant": "助手"
+        "mentionGroupAssistant": "助手",
+        "mentionGroupContext": "知识库文档"
       },
       "messageQueue": {
         "addToQueue": "加入队列",
@@ -6783,7 +6785,8 @@
       "deleteBranch": "删除分支",
       "deleteForce": "强制删除",
       "deleteForceHint": "该分支存在未合并的提交。仍要强制删除吗？",
-      "deleteRemoteToo": "同时删除远端分支",       "deleteUnmergedWarning": "此分支尚未合并到：{envs}",
+      "deleteRemoteToo": "同时删除远端分支",
+      "deleteUnmergedWarning": "此分支尚未合并到：{envs}",
       "prevPage": "上一页",
       "nextPage": "下一页",
       "envMerged": "已合并",

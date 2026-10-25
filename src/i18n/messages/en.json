@@ -2479,7 +2479,8 @@
       "tabs": {
         "files": "Files",
         "changes": "Changes",
-        "commits": "Commits"
+        "commits": "Commits",
+        "knowledgeBase": "Knowledge base"
       },
       "noFolderTitle": "No folder open",
       "noFolderHint": "Open a folder to see its contents here",
@@ -3461,7 +3462,8 @@
         "mentionGroupSession": "Sessions",
         "mentionGroupCommit": "Commits",
         "mentionGroupSkill": "Skills",
-        "mentionGroupAssistant": "Assistants"
+        "mentionGroupAssistant": "Assistants",
+        "mentionGroupContext": "Knowledge Docs"
       },
       "messageQueue": {
         "addToQueue": "Queue message",
@@ -6783,7 +6785,8 @@
       "deleteBranch": "Delete Branch",
       "deleteForce": "Force delete",
       "deleteForceHint": "This branch has unmerged commits. Delete it anyway (force)?",
-      "deleteRemoteToo": "Also delete the remote branch",       "deleteUnmergedWarning": "This branch is not merged into: {envs}",
+      "deleteRemoteToo": "Also delete the remote branch",
+      "deleteUnmergedWarning": "This branch is not merged into: {envs}",
       "prevPage": "Prev",
       "nextPage": "Next",
       "envMerged": "Merged",

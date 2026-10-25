@@ -138,7 +138,7 @@ describe("buildReferenceGroups", () => {
 
   it("keeps every group present (empty groups are not dropped)", () => {
     const groups = buildReferenceGroups("", emptySources())
-    expect(groups).toHaveLength(5)
+    expect(groups).toHaveLength(6)
     expect(groups.every((g) => g.items.length === 0)).toBe(true)
   })
 
@@ -623,6 +623,7 @@ describe("useReferenceSearch", () => {
     expect(itemsOf(groups, "commit")).toHaveLength(0)
     // Still every group, so the provider's shape doesn't depend on the tabs.
     expect(groups.map((g) => g.kind)).toEqual([
+      "context",
       "file",
       "agent",
       "assistant",

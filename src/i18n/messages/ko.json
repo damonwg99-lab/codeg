@@ -2479,7 +2479,8 @@
       "tabs": {
         "files": "파일",
         "changes": "변경사항",
-        "commits": "커밋"
+        "commits": "커밋",
+        "knowledgeBase": "지식 베이스"
       },
       "noFolderTitle": "열린 폴더 없음",
       "noFolderHint": "폴더를 열면 여기에 표시됩니다",
@@ -3461,7 +3462,8 @@
         "mentionGroupSession": "세션",
         "mentionGroupCommit": "커밋",
         "mentionGroupSkill": "스킬",
-        "mentionGroupAssistant": "어시스턴트"
+        "mentionGroupAssistant": "어시스턴트",
+        "mentionGroupContext": "지식 문서"
       },
       "messageQueue": {
         "addToQueue": "대기열에 추가",
@@ -6783,7 +6785,8 @@
       "deleteBranch": "Delete Branch",
       "deleteForce": "강제 삭제",
       "deleteForceHint": "이 브랜치에는 병합되지 않은 커밋이 있습니다. 그래도 강제로 삭제할까요?",
-      "deleteRemoteToo": "원격 브랜치도 삭제",       "deleteUnmergedWarning": "이 브랜치는 다음에 병합되지 않았습니다: {envs}",
+      "deleteRemoteToo": "원격 브랜치도 삭제",
+      "deleteUnmergedWarning": "이 브랜치는 다음에 병합되지 않았습니다: {envs}",
       "prevPage": "Prev",
       "nextPage": "Next",
       "envMerged": "Merged",

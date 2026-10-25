@@ -20,6 +20,7 @@ const KEY = "workspace:right-sidebar-tab-order"
 const custom: AuxTabOrder = [
   "git_log",
   "file_tree",
+  "knowledge_base",
   "session_details",
   "changes",
   "pull_requests",
@@ -54,6 +55,7 @@ describe("aux panel tab order", () => {
     expect(loadAuxTabOrder()).toEqual([
       "session_details",
       "file_tree",
+      "knowledge_base",
       "changes",
       "git_log",
       "automations",
@@ -88,6 +90,7 @@ describe("aux panel tab order", () => {
       // there — first when none is.
       "session_details",
       "file_tree",
+      "knowledge_base",
       "changes",
       "git_log",
       "automations",
@@ -103,6 +106,7 @@ describe("aux panel tab order", () => {
       "pull_requests",
       "session_details",
       "file_tree",
+      "knowledge_base",
       "changes",
     ])
   })
@@ -122,6 +126,7 @@ describe("aux panel tab order", () => {
       "pull_requests",
       "changes",
       "file_tree",
+      "knowledge_base",
       "session_details",
     ])
 
@@ -131,6 +136,7 @@ describe("aux panel tab order", () => {
     )
     expect(loadAuxTabOrder()).toEqual([
       "file_tree",
+      "knowledge_base",
       "session_details",
       "changes",
       "git_log",
@@ -158,6 +164,7 @@ describe("aux panel tab order", () => {
     expect(JSON.parse(localStorage.getItem(KEY) ?? "null")).toEqual([
       "session_details",
       "file_tree",
+      "knowledge_base",
       "git_log",
       "automations",
       "tasks",
@@ -184,8 +191,9 @@ describe("aux panel tab order", () => {
     it("moves a tab by the given number of slots", () => {
       expect(moveAuxTab(DEFAULT_AUX_TAB_ORDER, "changes", -1)).toEqual([
         "session_details",
-        "changes",
         "file_tree",
+        "changes",
+        "knowledge_base",
         "git_log",
         "automations",
         "tasks",
@@ -194,9 +202,10 @@ describe("aux panel tab order", () => {
       ])
       expect(moveAuxTab(DEFAULT_AUX_TAB_ORDER, "session_details", 3)).toEqual([
         "file_tree",
+        "knowledge_base",
         "changes",
-        "git_log",
         "session_details",
+        "git_log",
         "automations",
         "tasks",
         "issues",

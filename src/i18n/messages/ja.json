@@ -2479,7 +2479,8 @@
       "tabs": {
         "files": "ファイル",
         "changes": "変更",
-        "commits": "コミット"
+        "commits": "コミット",
+        "knowledgeBase": "ナレッジベース"
       },
       "noFolderTitle": "開いているフォルダがありません",
       "noFolderHint": "フォルダを開くとここに表示されます",
@@ -3461,7 +3462,8 @@
         "mentionGroupSession": "セッション",
         "mentionGroupCommit": "コミット",
         "mentionGroupSkill": "スキル",
-        "mentionGroupAssistant": "アシスタント"
+        "mentionGroupAssistant": "アシスタント",
+        "mentionGroupContext": "ナレッジドキュメント"
       },
       "messageQueue": {
         "addToQueue": "キューに追加",
@@ -6783,7 +6785,8 @@
       "deleteBranch": "Delete Branch",
       "deleteForce": "強制削除",
       "deleteForceHint": "このブランチには未マージのコミットがあります。それでも強制削除しますか？",
-      "deleteRemoteToo": "リモートブランチも削除する",       "deleteUnmergedWarning": "このブランチは次に未マージです: {envs}",
+      "deleteRemoteToo": "リモートブランチも削除する",
+      "deleteUnmergedWarning": "このブランチは次に未マージです: {envs}",
       "prevPage": "Prev",
       "nextPage": "Next",
       "envMerged": "Merged",

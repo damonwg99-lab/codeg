@@ -2479,7 +2479,8 @@
       "tabs": {
         "files": "الملفات",
         "changes": "التغييرات",
-        "commits": "الالتزامات"
+        "commits": "الالتزامات",
+        "knowledgeBase": "قاعدة المعرفة"
       },
       "noFolderTitle": "لا يوجد مجلد مفتوح",
       "noFolderHint": "افتح مجلدا لعرض محتواه هنا",
@@ -3461,7 +3462,8 @@
         "mentionGroupSession": "الجلسات",
         "mentionGroupCommit": "عمليات الإيداع",
         "mentionGroupSkill": "المهارات",
-        "mentionGroupAssistant": "المساعدون"
+        "mentionGroupAssistant": "المساعدون",
+        "mentionGroupContext": "مستندات المعرفة"
       },
       "messageQueue": {
         "addToQueue": "إضافة للقائمة",
@@ -3769,9 +3771,9 @@
         "resumeReasonLabel": "سبب الاستئناف",
         "detailTitle": "محادثة الوكيل الفرعي",
         "detailDescription": "عرض للقراءة فقط لمحادثة الوكيل الفرعي المُفوَّض.",
-        "waitForResult": "في انتظار نتيجة المهمة \u2066{task}\u2069",
+        "waitForResult": "في انتظار نتيجة المهمة ⁦{task}⁩",
         "waitForResultNoTask": "في انتظار نتيجة المهمة",
-        "cancelTask": "جارٍ إلغاء المهمة \u2066{task}\u2069",
+        "cancelTask": "جارٍ إلغاء المهمة ⁦{task}⁩",
         "cancelTaskNoTask": "جارٍ إلغاء المهمة",
         "resultPageOf": "{current} / {total}",
         "prevResult": "النتيجة السابقة",
@@ -3924,7 +3926,7 @@
           "moreLines": "{count, plural, zero {+0 سطر} one {+سطر واحد} two {+سطران} few {+# أسطر} many {+# سطراً} other {+# سطر}}",
           "command": "أمر",
           "codexScript": "نص برمجي",
-          "background": "في الخلفية · \u2066#{id}\u2069",
+          "background": "في الخلفية · ⁦#{id}⁩",
           "backgroundShort": "في الخلفية",
           "sessionWait": "انتظار",
           "sessionTerminate": "إيقاف",
@@ -6783,7 +6785,8 @@
       "deleteBranch": "Delete Branch",
       "deleteForce": "حذف قسري",
       "deleteForceHint": "يحتوي هذا الفرع على التزامات غير مدمجة. هل تريد حذفه قسريًا على أي حال؟",
-      "deleteRemoteToo": "حذف الفرع البعيد أيضًا",       "deleteUnmergedWarning": "لم يتم دمج هذا الفرع في: {envs}",
+      "deleteRemoteToo": "حذف الفرع البعيد أيضًا",
+      "deleteUnmergedWarning": "لم يتم دمج هذا الفرع في: {envs}",
       "prevPage": "Prev",
       "nextPage": "Next",
       "envMerged": "Merged",

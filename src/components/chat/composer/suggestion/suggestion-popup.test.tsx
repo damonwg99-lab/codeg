@@ -903,6 +903,7 @@ describe("SuggestionPopup with a chosen tab order", () => {
     expect(tabNames()).toEqual([
       "Agents",
       "Assistants",
+      "Knowledge Docs",
       "Files",
       "Sessions",
       "Commits",

@@ -5135,6 +5135,7 @@ mod tests {
         sessions: true,
         decomposition: false,
         tasks: false,
+        result: false,
         automations: false,
         taskboard: false,
         browser: false,

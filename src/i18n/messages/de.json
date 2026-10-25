@@ -2479,7 +2479,8 @@
       "tabs": {
         "files": "Dateien",
         "changes": "Änderungen",
-        "commits": "Einträge"
+        "commits": "Einträge",
+        "knowledgeBase": "Wissensbasis"
       },
       "noFolderTitle": "Kein Ordner geöffnet",
       "noFolderHint": "Öffnen Sie einen Ordner, um seinen Inhalt hier zu sehen",
@@ -3461,7 +3462,8 @@
         "mentionGroupSession": "Sitzungen",
         "mentionGroupCommit": "Commits",
         "mentionGroupSkill": "Fähigkeiten",
-        "mentionGroupAssistant": "Assistenten"
+        "mentionGroupAssistant": "Assistenten",
+        "mentionGroupContext": "Wissensdokumente"
       },
       "messageQueue": {
         "addToQueue": "Zur Warteschlange",
@@ -6783,7 +6785,8 @@
       "deleteBranch": "Delete Branch",
       "deleteForce": "Erzwungen löschen",
       "deleteForceHint": "Dieser Branch hat nicht zusammengeführte Commits. Trotzdem erzwungen löschen?",
-      "deleteRemoteToo": "Auch den Remote-Branch löschen",       "deleteUnmergedWarning": "Dieser Branch ist nicht gemergt in: {envs}",
+      "deleteRemoteToo": "Auch den Remote-Branch löschen",
+      "deleteUnmergedWarning": "Dieser Branch ist nicht gemergt in: {envs}",
       "prevPage": "Prev",
       "nextPage": "Next",
       "envMerged": "Merged",

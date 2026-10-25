@@ -2479,7 +2479,8 @@
       "tabs": {
         "files": "Archivos",
         "changes": "Cambios",
-        "commits": "Confirmaciones"
+        "commits": "Confirmaciones",
+        "knowledgeBase": "Base de conocimiento"
       },
       "noFolderTitle": "No hay carpeta abierta",
       "noFolderHint": "Abre una carpeta para ver su contenido aquí",
@@ -3461,7 +3462,8 @@
         "mentionGroupSession": "Sesiones",
         "mentionGroupCommit": "Commits",
         "mentionGroupSkill": "Habilidades",
-        "mentionGroupAssistant": "Asistentes"
+        "mentionGroupAssistant": "Asistentes",
+        "mentionGroupContext": "Documentos de conocimiento"
       },
       "messageQueue": {
         "addToQueue": "Agregar a la cola",
@@ -6783,7 +6785,8 @@
       "deleteBranch": "Delete Branch",
       "deleteForce": "Forzar eliminación",
       "deleteForceHint": "Esta rama tiene commits sin fusionar. ¿Eliminarla forzadamente de todos modos?",
-      "deleteRemoteToo": "Eliminar también la rama remota",       "deleteUnmergedWarning": "Esta rama no está fusionada en: {envs}",
+      "deleteRemoteToo": "Eliminar también la rama remota",
+      "deleteUnmergedWarning": "Esta rama no está fusionada en: {envs}",
       "prevPage": "Prev",
       "nextPage": "Next",
       "envMerged": "Merged",

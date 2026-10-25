@@ -2479,7 +2479,8 @@
       "tabs": {
         "files": "Arquivos",
         "changes": "Alterações",
-        "commits": "Confirmações"
+        "commits": "Confirmações",
+        "knowledgeBase": "Base de conhecimento"
       },
       "noFolderTitle": "Nenhuma pasta aberta",
       "noFolderHint": "Abra uma pasta para ver seu conteúdo aqui",
@@ -3461,7 +3462,8 @@
         "mentionGroupSession": "Sessões",
         "mentionGroupCommit": "Commits",
         "mentionGroupSkill": "Habilidades",
-        "mentionGroupAssistant": "Assistentes"
+        "mentionGroupAssistant": "Assistentes",
+        "mentionGroupContext": "Documentos de conhecimento"
       },
       "messageQueue": {
         "addToQueue": "Adicionar à fila",
@@ -6783,7 +6785,8 @@
       "deleteBranch": "Delete Branch",
       "deleteForce": "Forçar exclusão",
       "deleteForceHint": "Este branch tem commits não mesclados. Excluí-lo forçadamente mesmo assim?",
-      "deleteRemoteToo": "Excluir também o branch remoto",       "deleteUnmergedWarning": "Este branch não está mesclado em: {envs}",
+      "deleteRemoteToo": "Excluir também o branch remoto",
+      "deleteUnmergedWarning": "Este branch não está mesclado em: {envs}",
       "prevPage": "Prev",
       "nextPage": "Next",
       "envMerged": "Merged",
