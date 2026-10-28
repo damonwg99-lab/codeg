@@ -70,6 +70,7 @@ mod m20261016_000002_conversation_assistant;
 mod m20261017_000002_conversation_source;
 mod m20261020_000001_folder_command_run_local;
 mod m20261022_000001_tool_approval;
+mod m20261022_000001_work_task_delivery;
 mod m20261023_platform_000013_add_kb_doc_mtime;
 
 pub struct Migrator;
@@ -146,6 +147,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261017_000002_conversation_source::Migration),
             Box::new(m20261020_000001_folder_command_run_local::Migration),
             Box::new(m20261022_000001_tool_approval::Migration),
+            Box::new(m20261022_000001_work_task_delivery::Migration),
             Box::new(m20261023_platform_000013_add_kb_doc_mtime::Migration),
         ]
     }
