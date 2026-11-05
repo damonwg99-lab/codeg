@@ -43,12 +43,30 @@ cargo check --no-default-features --bin codeg-server    # 服务器
 cargo check --no-default-features --bin codeg-mcp       # MCP
 ```
 
-### 第 6 步：完整验证链 + 提交
+### 第 6 步：默认快速验证 + 提交（2026-11-01 起）
+
+**增量合并默认跑快速模式**，避免全量验证拖慢节奏：
+
 ```powershell
-pnpm eslint; pnpm test
+pnpm build
+cargo check --features test-utils
+cargo check --no-default-features --features server-bin --bin codeg-server
+pnpm exec eslint src --rule "prettier/prettier: off"
+pnpm exec vitest run <本次改动/冲突涉及的文件> --no-file-parallelism
+```
+
+- 快速模式必跑：`pnpm build`（类型检查）+ 桌面/服务器 `cargo check` + 定向 vitest。
+- 不在每次合并跑：三模式 clippy、全量 `pnpm test`、`cargo test --no-run`（30 分钟级）。
+- 遇到以下情况升级为完整验证：改动触及 Rust 签名 / 共享类型 / DB 迁移；上游含大重构；发版前或合入 `release/ai-platform` 前。
+
+完整验证链（按需）：
+```powershell
+pnpm test
 cargo clippy --all-targets --features test-utils -- -D warnings
-cargo clippy --no-default-features --bin codeg-server --lib -- -D warnings
-cargo clippy --no-default-features --bin codeg-mcp -- -D warnings
+cargo clippy --no-default-features --features server-bin --bin codeg-server --lib -- -D warnings
+cargo clippy --no-default-features --features mcp-bin --bin codeg-mcp -- -D warnings
+cargo test --no-default-features --features server-bin --bin codeg-server --lib
+cargo test --features test-utils --no-run
 ```
 提交信息惯例：`Merge branch 'main' into release/ai-platform-merage-vX.Y.Z`。
 
@@ -161,3 +179,4 @@ Cargo.lock / pnpm-lock.yaml（**取上游侧后重新生成，不要手工解**�
 1. **合并节奏**：上游每个 minor 版本发布后一周内合并一次（积压是最痛的放大器：9→9→25 的曲线直接相关）
 2. **版本号**：维持二开 1.x 版本线不变，接受三处 version 字段的机械冲突
 3. **验证口径**：Windows 上桌面模式 cargo test 只编译不运行（`--no-run`，上游 CI 同款策略），可执行测试由 server/cli 模式承担
+4. **默认验证模式**：增量合并默认快速模式（build + 桌面/服务器 check + 定向 vitest）；三模式 clippy、全量测试、cargo 测试编译仅在改签名 / 大重构 / 发版或合入主线前执行
