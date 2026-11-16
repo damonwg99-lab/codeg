@@ -19,9 +19,9 @@ import type {
   FileContentMatch,
 } from "@/lib/types"
 import { useContentFileSearch } from "@/hooks/use-content-file-search"
-import { filterFileEntriesForSearch } from "@/lib/file-search-filter"
 import { ContentSearchResults } from "./content-search-results"
 import { useFileTree, type FlatFileEntry } from "@/hooks/use-file-tree"
+import { rankFileMatches } from "@/lib/file-search-match"
 import { compareAgentType } from "@/lib/types"
 import { getAgentLabel } from "@/lib/custom-agents"
 import { AgentIcon } from "@/components/agent-icon"
@@ -102,7 +102,8 @@ export function SearchCommandDialog({
     reset: resetFileTree,
   } = useFileTree({
     folderPath: folderPath || undefined,
-    enabled: activeTab === "files",
+    enabled: open && activeTab === "files",
+    query,
   })
 
   // Compute which agent types exist in current folder
@@ -110,11 +111,10 @@ export function SearchCommandDialog({
     new Set(conversations.map((c) => c.agent_type))
   ).sort(compareAgentType)
 
-  // Filter files by query — the strategy (browse mode on empty query,
-  // substring match otherwise) lives in `@/lib/file-search-filter` so main's
-  // component refactors never touch it.
+  // The backend ranks the whole workspace before capping the response, so a
+  // deeply nested match remains reachable without retaining the full index.
   const filteredFiles = useMemo(
-    () => filterFileEntriesForSearch(query, allFiles),
+    () => rankFileMatches(query, allFiles, 100),
     [allFiles, query]
   )
 
@@ -161,7 +161,9 @@ export function SearchCommandDialog({
       setAgentFilter(null)
       setResults([])
       setActiveTab("conversations")
-      resetFileTree()
+      // Like the full re-list this replaced, each opening searches files as
+      // they are now, not a native snapshot left over from before it opened.
+      resetFileTree(true)
     }
   }, [open, resetFileTree])
 
