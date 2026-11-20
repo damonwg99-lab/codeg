@@ -120,7 +120,7 @@ pub async fn list_all_conversations(
     status: Option<String>,
     include_children: Option<bool>,
 ) -> Result<Vec<DbConversationSummary>, AppCommandError> {
-    let emitter = EventEmitter::Tauri(app.clone());
+    let emitter = EventEmitter::from_app(&app);
     let db = app.state::<AppDatabase>();
     let chat_channel_manager =
         app.state::<crate::chat_channel::manager::ChatChannelManager>();
@@ -215,7 +215,7 @@ pub async fn save_opened_tabs(
 ) -> Result<SaveTabsOutcome, AppCommandError> {
     save_opened_tabs_core(
         &db.conn,
-        &EventEmitter::Tauri(app),
+        &EventEmitter::from_app(&app),
         items,
         expected_version,
         origin,
@@ -532,7 +532,7 @@ pub async fn import_local_conversations(
 ) -> Result<ImportResult, AppCommandError> {
     import_local_conversations_core(
         &db.conn,
-        &EventEmitter::Tauri(app),
+        &EventEmitter::from_app(&app),
         &chat_channel_manager,
         folder_id,
     )
@@ -861,7 +861,7 @@ pub async fn scan_importable_sessions(
     db: tauri::State<'_, AppDatabase>,
     chat_channel_manager: tauri::State<'_, crate::chat_channel::manager::ChatChannelManager>,
 ) -> Result<ScanResult, AppCommandError> {
-    scan_importable_sessions_core(&db.conn, &EventEmitter::Tauri(app), &chat_channel_manager).await
+    scan_importable_sessions_core(&db.conn, &EventEmitter::from_app(&app), &chat_channel_manager).await
 }
 
 /// Batch-import the selected sessions, creating (or reopening) each target
@@ -1197,7 +1197,7 @@ pub async fn import_selected_sessions(
     db: tauri::State<'_, AppDatabase>,
     selections: Vec<SelectedSessionKey>,
 ) -> Result<ImportSelectedResult, AppCommandError> {
-    import_selected_sessions_core(&db.conn, &EventEmitter::Tauri(app), selections).await
+    import_selected_sessions_core(&db.conn, &EventEmitter::from_app(&app), selections).await
 }
 
 /// Build the `meta["codeg.delegation"]` value for a delegation child loaded
@@ -2202,7 +2202,7 @@ pub async fn get_folder_conversation(
         &db.conn,
         &manager,
         &chat_channel_manager,
-        &EventEmitter::Tauri(app),
+        &EventEmitter::from_app(&app),
         conversation_id,
         window,
     )
@@ -2499,7 +2499,7 @@ pub async fn create_conversation(
     title: Option<String>,
 ) -> Result<i32, AppCommandError> {
     let id = create_conversation_core(&db.conn, folder_id, agent_type, title).await?;
-    emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, id).await;
+    emit_conversation_upsert(&EventEmitter::from_app(&app), &db.conn, id).await;
     Ok(id)
 }
 
@@ -2779,7 +2779,7 @@ pub async fn create_chat_conversation(
         existing_dir.as_deref(),
     )
     .await?;
-    emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, result.conversation_id).await;
+    emit_conversation_upsert(&EventEmitter::from_app(&app), &db.conn, result.conversation_id).await;
     Ok(result)
 }
 
@@ -2842,7 +2842,7 @@ pub async fn update_conversation_status(
     status: String,
 ) -> Result<(), AppCommandError> {
     update_conversation_status_core(&db.conn, conversation_id, status).await?;
-    emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, conversation_id).await;
+    emit_conversation_upsert(&EventEmitter::from_app(&app), &db.conn, conversation_id).await;
     Ok(())
 }
 
@@ -2884,7 +2884,7 @@ pub async fn update_conversation_title(
     title: String,
 ) -> Result<(), AppCommandError> {
     update_conversation_title_core(&db.conn, conversation_id, title).await?;
-    emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, conversation_id).await;
+    emit_conversation_upsert(&EventEmitter::from_app(&app), &db.conn, conversation_id).await;
     sync_conversation_title_to_channels_core(&db.conn, &chat_channel_manager, conversation_id).await;
     Ok(())
 }
@@ -2908,7 +2908,7 @@ pub async fn update_conversation_pinned(
     pinned: bool,
 ) -> Result<(), AppCommandError> {
     update_conversation_pinned_core(&db.conn, conversation_id, pinned).await?;
-    emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, conversation_id).await;
+    emit_conversation_upsert(&EventEmitter::from_app(&app), &db.conn, conversation_id).await;
     Ok(())
 }
 
@@ -3027,7 +3027,7 @@ pub async fn delete_conversation(
     manager: tauri::State<'_, crate::acp::manager::ConnectionManager>,
     conversation_id: i32,
 ) -> Result<(), AppCommandError> {
-    let emitter = EventEmitter::Tauri(app);
+    let emitter = EventEmitter::from_app(&app);
     delete_conversation_with_cleanup_core(&emitter, &db.conn, &manager, conversation_id).await
 }
 
@@ -3270,7 +3270,7 @@ pub async fn move_conversations(
     conversation_ids: Vec<i32>,
     target_folder_id: i32,
 ) -> Result<MoveConversationsResult, AppCommandError> {
-    let emitter = EventEmitter::Tauri(app);
+    let emitter = EventEmitter::from_app(&app);
     move_conversations_core(
         &emitter,
         &db.conn,

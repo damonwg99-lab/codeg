@@ -780,7 +780,7 @@ pub async fn start_kb_watch(
     db: State<'_, AppDatabase>,
     project_id: i32,
 ) -> Result<ScanResultInfo, AppCommandError> {
-    let emitter = EventEmitter::Tauri(app);
+    let emitter = EventEmitter::from_app(&app);
     start_kb_watch_core(&db, &emitter, project_id).await
 }
 
