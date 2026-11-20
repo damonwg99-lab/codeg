@@ -160,6 +160,12 @@ cargo 按最小满足原则保持 lock 已有版本，"重新生成"≠"升到�
    layout.tsx 对上游的接触面 **+233 行 → +37 行**
 2. **lib.rs**：platform 命令模块 import 拆独立 `use` 行，上游 import 列表从此不被触碰
 
+### v0.45.0（2026-11-16，任务 91）
+- 合并基数：94adaddc（v0.42.3）；上游 96 commits / 514 files；二开 247 commits / 235 files
+- 冲突 9 文件：4 个版本/锁文件机械冲突；`use-reference-search.ts`（main 渐进式后端搜索 + 二开知识库 context 分组）；`conversation-detail-panel.tsx`（main liveRuns + 二开 decomposition bridge）；`search-command-dialog.tsx`；`content-parts-renderer.tsx`（保留 decomposition 卡片，接受 main 删除 CollabAgentCard）；`ai-elements-adapter.test.ts`（两套测试并存）
+- 用户决策记录：Files 页签完全按 main（输入才搜索，删除二开 `file-search-filter`）；版本保持 1.2.11，审查后升 1.2.12；接受 main 删除旧协作卡片（collab-agent-card / agent-capsule / async-task-strip）；本次快速验证
+- 验证：`pnpm build` ✅ / 桌面 `cargo check` ✅ / server `cargo check` ✅ / 定向 vitest（消息/适配器/平台/搜索/文件树/i18n）✅ / 冲突文件 eslint ✅
+
 ## 七、接入点清单（`[ai-platform]` 标记处 = 冲突时保留二开内容的点）
 
 Rust：lib.rs（mod platform、import 块、manage、generate_handler 注册块）、web/router.rs（一行 merge）、

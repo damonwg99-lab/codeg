@@ -136,7 +136,7 @@ pub async fn search_files_content_streaming(
 ) -> Result<(), AppCommandError> {
     use crate::web::event_bridge::EventEmitter;
     search_files_content_streaming_core(
-        &EventEmitter::Tauri(app_handle),
+        &EventEmitter::from_app(&app_handle),
         search_id,
         base_path,
         keyword,
